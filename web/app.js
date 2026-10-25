@@ -56,20 +56,22 @@ const TAUGHT = {}; CUR.courses.forEach(c=>c.concepts.forEach(id=>(TAUGHT[id]=TAU
 const courseLabel = code => code.replace(/^([A-Z]+)(\d)/,"$1 $2");
 
 const LSKEY = "dts:user:v1";
+const BOX_DAYS = [0, 1, 3, 7, 21, 60];   // Leitner box -> days until the next review
+function today(off){ const d=new Date(); d.setDate(d.getDate()+(off||0)); return d.toISOString().slice(0,10); }
 function lsLoad(){ try{ return JSON.parse(localStorage.getItem(LSKEY))||null; }catch(e){ return null; } }
 function lsSave(u){ try{ localStorage.setItem(LSKEY, JSON.stringify(u)); }catch(e){} }
 const Store = {
-  me: {progress:{}, bookmarks:[], notes:{}, time:{}, recent:[]},
+  me: {progress:{}, bookmarks:[], notes:{}, time:{}, recent:[], review:{}},
   local: null,
   async init(){
-    if(STANDALONE){ this.local = lsLoad() || {progress:{}, bookmarks:[], notes:{}, time:{}}; this.syncLocal(); }
+    if(STANDALONE){ this.local = lsLoad() || {progress:{}, bookmarks:[], notes:{}, time:{}}; this.local.review = this.local.review || {}; this.syncLocal(); }
     else { try{ this.me = await api("GET","/api/me"); }catch(e){ toast("Could not load your progress"); } }
   },
   syncLocal(){
     const u=this.local, now=new Date().toISOString().slice(0,19);
     const recent = Object.entries(Object.assign({}, ...Object.entries(u.time).map(([k,v])=>({[k]:v.at})), ...Object.entries(u.progress).map(([k,v])=>({[k]:v.at}))))
       .sort((a,b)=>a[1]<b[1]?1:-1).slice(0,12).map(([id,at])=>({id,at}));
-    this.me = {progress:u.progress, bookmarks:u.bookmarks, notes:Object.fromEntries(Object.entries(u.notes).filter(([k,v])=>v.length).map(([k,v])=>[k,v.length])), time:Object.fromEntries(Object.entries(u.time).map(([k,v])=>[k,v.s])), recent};
+    this.me = {review:u.review||{}, progress:u.progress, bookmarks:u.bookmarks, notes:Object.fromEntries(Object.entries(u.notes).filter(([k,v])=>v.length).map(([k,v])=>[k,v.length])), time:Object.fromEntries(Object.entries(u.time).map(([k,v])=>[k,v.s])), recent};
     lsSave(u); return now;
   },
   stamp(){ return new Date().toISOString().slice(0,19); },
@@ -80,8 +82,19 @@ const Store = {
   status(id){ const p=this.me.progress[id]; return p?p.status:null; },
   isBookmarked(id){ return this.me.bookmarks.some(b=>b.id===id); },
   async setProgress(id, status){
-    if(STANDALONE){ if(status) this.local.progress[id]={status, at:this.stamp()}; else delete this.local.progress[id]; this.syncLocal(); return; }
-    this.me = status ? await api("PUT","/api/progress/"+id,{status}) : await api("DELETE","/api/progress/"+id);
+    if(STANDALONE){ if(status) this.local.progress[id]={status, at:this.stamp()}; else delete this.local.progress[id]; this.syncLocal(); }
+    else this.me = status ? await api("PUT","/api/progress/"+id,{status}) : await api("DELETE","/api/progress/"+id);
+    if(status==="read" && N[id]) { try{ await this.enroll(id); }catch(e){} }
+  },
+  async setReview(id, q, box, due){
+    if(STANDALONE){ this.local.review[id+"#"+q]=[box, due]; this.syncLocal(); return; }
+    this.me = await api("PUT","/api/review/"+id+"/"+q,{box, due});
+  },
+  // add a concept's self-check questions to the review deck (box 1, due today); returns how many were added
+  async enroll(id){
+    const r = await this.read(id), n = (r.rd && r.rd.quiz || []).length; let added = 0;
+    for(let q=0; q<n; q++){ if(!this.me.review[id+"#"+q]){ await this.setReview(id, q, 1, today()); added++; } }
+    return added;
   },
   async toggleBookmark(id){
     const on = this.isBookmarked(id);
@@ -339,6 +352,43 @@ async function renderLibrary(){
 }
 
 /* ---------------- you ---------------- */
+/* ---------------- spaced review ---------------- */
+const REV = { q:[], cur:null, shown:false, done:0, knew:0 };
+function dueCards(){ const t=today(); return Object.entries(Store.me.review||{}).filter(([k,v])=>v[1]<=t && N[k.split("#")[0]]).sort((a,b)=>a[1][1]<b[1][1]?-1:a[1][1]>b[1][1]?1:a[1][0]-b[1][0]).map(([k])=>k); }
+function reviewSummary(){
+  const all = Object.values(Store.me.review||{}), due = dueCards().length;
+  const boxes = [1,2,3,4,5].map(b=>all.filter(v=>v[0]===b).length);
+  return {all:all.length, due, boxes};
+}
+async function startReview(){ REV.q = dueCards().slice(0, 20); REV.done=0; REV.knew=0; return nextReview(); }
+async function nextReview(){
+  const el = $("review"); if(!el) return;
+  if(!REV.q.length){ el.innerHTML = `<div class="rev-card"><p class="rev-meta">Session finished</p><p class="rev-q">${REV.done? `You reviewed ${REV.done} question${REV.done===1?"":"s"} and knew ${REV.knew}.` : "Nothing is due right now."}</p><div class="btnrow"><button type="button" class="btn" data-revstop>Close</button></div></div>`; return; }
+  const key = REV.q[0], [id, qi] = key.split("#"), r = await Store.read(id), item = (r.rd.quiz||[])[+qi];
+  if(!item){ REV.q.shift(); return nextReview(); }
+  const i = item.indexOf(" || "), box = Store.me.review[key][0];
+  REV.cur = {key, id, qi:+qi, a:item.slice(i+4)}; REV.shown=false;
+  el.innerHTML = `<div class="rev-card" style="--c:${lc(N[id].l)}"><p class="rev-meta"><span class="lpill" style="--c:${lc(N[id].l)}"><span class="sw"></span>L${N[id].l}</span> ${esc(N[id].label)} · box ${box} of 5 · ${REV.q.length} left</p><p class="rev-q">${esc(item.slice(0,i))}</p><div id="rev-a"></div><div class="btnrow" id="rev-btns"><button type="button" class="btn on" data-revshow>Show answer</button><button type="button" class="btn" data-read="${id}">Open the read</button></div></div>`;
+}
+function showReviewAnswer(){
+  if(!REV.cur) return; REV.shown=true;
+  $("rev-a").innerHTML = `<p class="rev-ans">${esc(REV.cur.a)}</p>`;
+  $("rev-btns").innerHTML = `<button type="button" class="btn on" data-revgrade="1">I knew it</button><button type="button" class="btn" data-revgrade="0">Not yet</button>`;
+}
+async function gradeReview(knew){
+  const c = REV.cur; if(!c) return;
+  const box = Store.me.review[c.key][0], nb = knew ? Math.min(5, box+1) : 1;
+  await Store.setReview(c.id, c.qi, nb, today(knew ? BOX_DAYS[nb] : 0));
+  REV.q.shift(); REV.done++; if(knew) REV.knew++; else if(!REV.q.includes(c.key)) REV.q.push(c.key);
+  if(!knew && REV.q.filter(k=>k===c.key).length>1) REV.q.pop();
+  return nextReview();
+}
+function reviewHTML(){
+  const s = reviewSummary();
+  if(!s.all) return `<div id="review"><div class="rev-card"><p class="rev-meta">Review deck</p><p class="rev-q" style="font-weight:500">When you mark a deep read as read, its five self-check questions join your review deck. Each question comes back after 1, 3, 7, 21 and then 60 days while you keep answering it correctly, and goes back to the start when you miss it. This spacing is what moves ideas into long-term memory.</p></div></div>`;
+  return `<div id="review"><div class="rev-card"><p class="rev-meta">Review deck · ${s.all} questions · ${s.boxes.map((n,i)=>`box ${i+1}: ${n}`).join(" · ")}</p><p class="rev-q">${s.due? `${s.due} question${s.due===1?" is":"s are"} due today.` : "Nothing is due today. Come back tomorrow."}</p>${s.due?`<div class="btnrow"><button type="button" class="btn on" data-revstart>Start review (${Math.min(20,s.due)})</button></div>`:""}</div></div>`;
+}
+
 function renderYou(){
   const me = Store.me, prog = me.progress;
   const read = DATA.nodes.filter(n=>prog[n.id]&&prog[n.id].status==="read");
@@ -361,7 +411,8 @@ function renderYou(){
       <div class="card"><div class="big">${essays}<span style="font-size:15px;color:var(--muted)"> / 6</span></div><div class="lbl">layer essays read</div></div>
       <div class="card"><div class="big">${fmt(secs)}</div><div class="lbl">time spent reading · ${notes} note${notes===1?"":"s"} · ${me.bookmarks.length} saved</div></div>
     </div>
-    <h3 style="font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:500;margin:0 0 8px">Depth reached, layer by layer</h3>
+    <h3 class="ysec">Review</h3>${reviewHTML()}
+    <h3 style="font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:500;margin:18px 0 8px">Depth reached, layer by layer</h3>
     ${LAYERS.map((L,i)=>{ const d=byLayer[i].filter(n=>readSet.has(n.id)).length; return `<div class="lprog" style="--c:${lc(i)}"><span><b>L${i}</b> ${esc(L.n)}</span><span class="track"><span class="fill" style="display:block;width:${Math.round(100*d/byLayer[i].length)}%"></span></span><span class="num">${d}/${byLayer[i].length}</span></div>`; }).join("")}
     <div style="height:18px"></div>
     ${started.length?`<h3 class="ysec">Continue reading</h3><div class="ylist">${started.map(id=>row(id, me.time[id]?fmt(me.time[id])+" so far":"")).join("")}</div>`:""}
@@ -377,6 +428,10 @@ function refsHTML(refs){
   return `<ul class="refs">${refs.map(r=>`<li><span class="rk">${esc(KIND[r.k]||r.k)}</span><span><a href="${esc(refURL(r))}" target="_blank" rel="noopener noreferrer">${esc(r.t)}</a>${r.u?"":`<span class="via">${r.k==="paper"?"via Scholar":"via search"}</span>`}<span class="rw">${esc(r.w)}</span></span></li>`).join("")}</ul>`;
 }
 function P(list, cls){ return (list||[]).map((p,i)=>`<p${i===0&&cls?` class="${cls}"`:""}>${esc(p)}</p>`).join(""); }
+function termsHTML(list){ return list&&list.length ? `<dl class="terms">${list.map(t=>{const i=t.indexOf(" — "); return i<0?`<div><dt>${esc(t)}</dt></div>`:`<div><dt>${esc(t.slice(0,i))}</dt><dd>${esc(t.charAt(i+3).toUpperCase()+t.slice(i+4))}</dd></div>`;}).join("")}</dl>` : ""; }
+function diagramHTML(list){ return list&&list.length ? `<figure class="diagram"><pre>${esc(list.join("\n"))}</pre></figure>` : ""; }
+function mistakesHTML(list){ return list&&list.length ? `<div class="mistakes">${list.map(p=>`<p>${esc(p)}</p>`).join("")}</div>` : ""; }
+function quizHTML(list, id){ const inDeck = id && Store.me.review[id+"#0"]; return list&&list.length ? `<p class="stand-sum">Try to answer each one in your head first, then open it to check. ${id?(inDeck?"These questions are in your review deck; they come back in the You tab when they are due.":`<button type="button" class="btn" data-enroll="${id}" style="margin-left:4px">Add to my review deck</button>`):""}</p><ol class="quiz">${list.map(q=>{const i=q.indexOf(" || "); return `<li><details><summary>${esc(q.slice(0,i))}</summary><p>${esc(q.slice(i+4))}</p></details></li>`;}).join("")}</ol>` : ""; }
 function sec(id, no, title, body){ return body ? `<section class="rd-sec" id="rs-${id}"><h2><span class="no">${no}</span>${title}</h2>${body}</section>` : ""; }
 function srow(id, reason, dash, meta){ const m=N[id]; return `<button type="button" class="srow" style="--c:${lc(m.l)}" data-read="${id}"><span class="bar${dash?" dash":""}"></span><span><span class="sn">${esc(m.label)}</span><span class="sm">${meta||"L"+m.l}</span>${markHTML(id)}<span class="sr">${esc(reason)}</span></span></button>`; }
 function groupByLayer(list, key){
@@ -411,19 +466,22 @@ function nodeRead(n, r, ctx){
   if(ctx) h += `<div class="rd-ctx"><b>${esc(ctx.k)}</b>${esc(ctx.t)}</div>`;
   h += ladderHTML(n);
   if(TAUGHT[n.id]) h += `<p class="ladder-cap">Taught in Stanford ${TAUGHT[n.id].map(code=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-course="${code}">${esc(courseLabel(code))}</button>`).join(", ")}.</p>`;
-  const toc = [["value","Why it exists"],rd.history&&["history","How we got here"],["how","How it works"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
+  const toc = [["value","Why it exists"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How it works"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],rd.quiz&&["quiz","Check yourself"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
   h += `<nav class="toc" aria-label="Sections">${toc.map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
   let no=0; const NO=()=>String(++no).padStart(2,"0");
   h += sec("value", NO(), "Why it exists", P(rd.value,"lead"));
+  if(rd.terms) h += sec("terms", NO(), "Key terms", termsHTML(rd.terms));
   if(rd.history) h += sec("history", NO(), "How we got here", P(rd.history));
-  h += sec("how", NO(), "How it works", P(rd.how));
+  h += sec("how", NO(), "How it works", P(rd.how) + diagramHTML(rd.diagram));
   if(rd.example) h += sec("example", NO(), "A worked example", `<div class="example">${P(rd.example)}</div>`);
   if(downs.length||insp.length) h += sec("stands", NO(), "What it stands on",
     `<p class="stand-sum">${esc(n.label)} rests directly on ${downs.length} idea${downs.length===1?"":"s"}. Counting everything beneath those, it stands on ${tot} concepts across ${lays.length} layer${lays.length===1?"":"s"} (${lays.map(l=>"L"+l).join(", ")}). Each line says what that lower layer contributes.</p>` +
     groupByLayer(downs,"t") + (insp.length?`<div class="sgrp" style="--c:var(--muted)"><div class="sh"><span class="sw"></span>Borrowed ideas (analogies, not mechanisms)</div>${insp.map(e=>srow(e.t,e.r,true)).join("")}</div>`:""));
   h += sec("intuition", NO(), "Why it makes sense", (rd.intuition&&rd.intuition.length?`<p class="rd-quote">${esc(rd.intuition[0])}</p>`+P(rd.intuition.slice(1)):""));
+  if(rd.mistakes) h += sec("mistakes", NO(), "Common misunderstandings", mistakesHTML(rd.mistakes));
   h += sec("friction", NO(), "Where it still hurts", P(rd.friction));
   if(rd.practice) h += sec("practice", NO(), "In practice", P(rd.practice));
+  if(rd.quiz) h += sec("quiz", NO(), "Check yourself", quizHTML(rd.quiz, n.id));
   if(ups.length) h += sec("built", NO(), "What's built on it", `<p class="stand-sum">${ups.length} concept${ups.length===1?"":"s"} use ${esc(n.label)} directly.</p>` + groupByLayer(ups,"s"));
   if(n.side.length) h += sec("side", NO(), "Neighbours", n.side.map(s=>srow(s.o, s.r, false, SIDE[s.t]||s.t)).join(""));
   h += sec("deeper", NO(), "Go deeper", refsHTML(r.refs));
@@ -436,15 +494,18 @@ function essayRead(l, r){
   let h = `<div class="rd-eye"><span class="lpill" style="--c:${lc(l)}"><span class="sw"></span>Layer ${l} of 5</span><span class="mono">${LAYERS[l].rm} min read</span><span>${byLayer[l].length} concepts</span></div>
   <h1>${esc(LAYERS[l].n)}</h1><p class="rd-sub">${esc(LAYERS[l].d)}</p>${actionsHTML("L"+l, lc(l))}
   <div class="ladder" aria-hidden="true">${LAYERS.map((L,i)=>`<div class="${i===l?"on":""}" style="--c:${lc(i)}"><span class="ln">L${i}<i>${byLayer[i].length}</i></span><span class="bar" style="width:${Math.round(100*byLayer[i].length/150)}%"></span></div>`).join("")}</div>
-  <nav class="toc" aria-label="Sections">${[["value","What this layer adds"],rd.history&&["history","How we got here"],["how","How the layers below support it"],rd.example&&["example","A worked example"],["intuition","Why it makes sense"],["friction","Where it still hurts"],rd.practice&&["practice","How to use this layer"],["here","What lives here"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean).map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
+  <nav class="toc" aria-label="Sections">${[["value","What this layer adds"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How the layers below support it"],rd.example&&["example","A worked example"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],["friction","Where it still hurts"],rd.practice&&["practice","How to use this layer"],rd.quiz&&["quiz","Check yourself"],["here","What lives here"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean).map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
   let no=0; const NO=()=>String(++no).padStart(2,"0");
   h += sec("value",NO(),"What this layer adds", P(rd.value,"lead"));
+  if(rd.terms) h += sec("terms",NO(),"Key terms", termsHTML(rd.terms));
   if(rd.history) h += sec("history",NO(),"How we got here", P(rd.history));
-  h += sec("how",NO(),"How the layers below support it", P(rd.how));
+  h += sec("how",NO(),"How the layers below support it", P(rd.how) + diagramHTML(rd.diagram));
   if(rd.example) h += sec("example",NO(),"A worked example", `<div class="example">${P(rd.example)}</div>`);
   h += sec("intuition",NO(),"Why it makes sense", rd.intuition&&rd.intuition.length?`<p class="rd-quote">${esc(rd.intuition[0])}</p>`+P(rd.intuition.slice(1)):"");
+  if(rd.mistakes) h += sec("mistakes",NO(),"Common misunderstandings", mistakesHTML(rd.mistakes));
   h += sec("friction",NO(),"Where it still hurts", P(rd.friction));
   if(rd.practice) h += sec("practice",NO(),"How to use this layer", P(rd.practice));
+  if(rd.quiz) h += sec("quiz",NO(),"Check yourself", quizHTML(rd.quiz));
   h += sec("here",NO(),"What lives here", `<p class="stand-sum">The most depended-on concepts in this layer, then everything by area. Each opens its own read.</p><div class="sgrp" style="--c:${lc(l)}"><div class="sh"><span class="sw"></span>Most depended-on</div>${top.map(n=>srow(n.id, n.m, false, n.indeg+" use it")).join("")}</div>` +
     cats.map(c=>`<div class="agrp"><h3>${esc(c)}</h3><div class="chips">${byLayer[l].filter(n=>n.cat===c).sort(byLabel).map(n=>`<button type="button" class="chip${hubSet.has(n.id)?" hub":""}" style="--c:${lc(l)}" data-read="${n.id}"><span class="sw"></span>${esc(n.label)}${markHTML(n.id)}</button>`).join("")}</div></div>`).join(""));
   h += sec("deeper",NO(),"Go deeper", refsHTML(r.refs));
@@ -552,6 +613,11 @@ document.addEventListener("click", async e=>{
     if(d.addnote){ const t=$("nt"); const v=(t&&t.value||"").trim(); if(!v) return toast("Write something first"); await Store.addNote(d.addnote, v); toast("Note saved"); fillNotes(d.addnote); return refreshMarks(); }
     if(d.delnote){ const owner=$("notes").dataset.owner; await Store.delNote(owner, isNaN(+d.delnote)?d.delnote:+d.delnote); toast("Note deleted"); fillNotes(owner); return refreshMarks(); }
     if(d.export!==undefined) return Store.exportData();
+    if(d.enroll){ const k = await Store.enroll(d.enroll); toast(k?`${k} questions added to your review deck`:"Already in your review deck"); b.outerHTML = `<span class="mono" style="font-size:12px;color:var(--muted)">Added. Review them in the You tab.</span>`; return; }
+    if(d.revstart!==undefined) return startReview();
+    if(d.revshow!==undefined) return showReviewAnswer();
+    if(d.revgrade!==undefined) return gradeReview(d.revgrade==="1");
+    if(d.revstop!==undefined){ REV.q=[]; return renderYou(); }
     if(d.libkind){ state.libKind=d.libkind; state.libN=120; return renderLibrary(); }
     if(d.libmore!==undefined){ state.libN+=200; return renderLibrary(); }
     if(d.read){ const inSeq = SEQ() && SEQ().ids.includes(d.read); return openRead({type:"node", id:d.read}, inSeq?{}:{seq: (!R.open && state.view==="explore" && state.path.includes(d.read)) ? pathSeq() : null}); }

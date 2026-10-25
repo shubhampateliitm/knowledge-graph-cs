@@ -28,7 +28,7 @@ WEB = os.path.join(ROOT, "web")
 CONTENT_DB = os.path.join(ROOT, "data", "content.db")
 USER_DB = os.environ.get("DTS_USER_DB") or os.path.join(ROOT, "data", "user.db")
 MAX_BODY = 64 * 1024
-SECTIONS = ("value", "history", "how", "example", "intuition", "friction", "practice")
+SECTIONS = ("value", "terms", "history", "how", "diagram", "example", "intuition", "mistakes", "friction", "practice", "quiz")
 
 USER_SCHEMA = [
     # migration 1
@@ -38,6 +38,10 @@ USER_SCHEMA = [
     CREATE TABLE notes (id INTEGER PRIMARY KEY, node_id TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE INDEX notes_node ON notes(node_id);
     CREATE TABLE reading_time (node_id TEXT PRIMARY KEY, seconds INTEGER NOT NULL, last_at TEXT NOT NULL);
+    """,
+    # migration 2: spaced review of self-check questions (Leitner boxes 1-5, due date YYYY-MM-DD)
+    """
+    CREATE TABLE review (node_id TEXT NOT NULL, q INTEGER NOT NULL, box INTEGER NOT NULL CHECK (box BETWEEN 1 AND 5), due TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (node_id, q));
     """,
 ]
 
@@ -162,13 +166,14 @@ class UserData:
                 bookmarks=[dict(id=r[0], at=r[1]) for r in c.execute("SELECT node_id, created_at FROM bookmarks ORDER BY created_at DESC")],
                 notes={r[0]: r[1] for r in c.execute("SELECT node_id, count(*) FROM notes GROUP BY node_id")},
                 time={r[0]: r[1] for r in c.execute("SELECT node_id, seconds FROM reading_time")},
+                review={f"{r[0]}#{r[1]}": [r[2], r[3]] for r in c.execute("SELECT node_id, q, box, due FROM review")},
                 recent=[dict(id=r[0], at=r[1]) for r in c.execute("SELECT node_id, max(at) AS at FROM (SELECT node_id, updated_at AS at FROM progress UNION ALL SELECT node_id, last_at FROM reading_time) GROUP BY node_id ORDER BY at DESC LIMIT 12")],
             )
 
     def export(self):
         with self.lock:
             c = self.conn
-            return {t: [dict(r) for r in c.execute(f"SELECT * FROM {t}")] for t in ("progress", "bookmarks", "notes", "reading_time")}
+            return {t: [dict(r) for r in c.execute(f"SELECT * FROM {t}")] for t in ("progress", "bookmarks", "notes", "reading_time", "review")}
 
 
 class App:
@@ -299,6 +304,18 @@ def make_handler(app, allowed_hosts):
                     except (TypeError, ValueError): return self.err(400, "seconds must be a number")
                     secs = max(0, min(secs, 1800))
                     U.q("INSERT INTO reading_time VALUES (?,?,?) ON CONFLICT(node_id) DO UPDATE SET seconds=seconds+excluded.seconds, last_at=excluded.last_at", (nid, secs, now()))
+                return self.send(200, U.me())
+            m = re.fullmatch(r"/api/review/([A-Za-z0-9-]+)/(\d{1,2})", p)
+            if m:
+                nid, qi = m.group(1), int(m.group(2))
+                if not self.known(nid): return
+                if method == "PUT":
+                    box, due = body.get("box"), str(body.get("due", ""))
+                    if not isinstance(box, int) or not 1 <= box <= 5: return self.err(400, "box must be 1-5")
+                    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", due): return self.err(400, "due must be YYYY-MM-DD")
+                    U.q("INSERT INTO review VALUES (?,?,?,?,?) ON CONFLICT(node_id, q) DO UPDATE SET box=excluded.box, due=excluded.due, updated_at=excluded.updated_at", (nid, qi, box, due, now()))
+                elif method == "DELETE": U.q("DELETE FROM review WHERE node_id=? AND q=?", (nid, qi))
+                else: return self.err(405, "use PUT or DELETE")
                 return self.send(200, U.me())
             if p == "/api/notes" and method == "POST":
                 nid, text = body.get("node", ""), str(body.get("body", "")).strip()

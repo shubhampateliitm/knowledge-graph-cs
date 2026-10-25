@@ -78,6 +78,21 @@ class API(unittest.TestCase):
         s, me = self.req("DELETE", "/api/bookmarks/raft"); self.assertEqual(me["bookmarks"], [])
         s, ex = self.get("/api/export"); self.assertIn("progress", ex)
 
+    def test_review(self):
+        s, me = self.req("PUT", "/api/review/bloom/0", {"box": 1, "due": "2026-10-26"}); self.assertEqual(me["review"]["bloom#0"], [1, "2026-10-26"])
+        s, me = self.req("PUT", "/api/review/bloom/0", {"box": 3, "due": "2026-11-02"}); self.assertEqual(me["review"]["bloom#0"], [3, "2026-11-02"])
+        self.assertEqual(self.req("PUT", "/api/review/bloom/0", {"box": 9, "due": "2026-11-02"})[0], 400)
+        self.assertEqual(self.req("PUT", "/api/review/bloom/0", {"box": 2, "due": "soon"})[0], 400)
+        self.assertEqual(self.req("PUT", "/api/review/nope/0", {"box": 2, "due": "2026-11-02"})[0], 404)
+        s, me = self.req("DELETE", "/api/review/bloom/0"); self.assertNotIn("bloom#0", me["review"])
+
+    def test_learning_sections(self):
+        s, r = self.get("/api/read/bloom"); self.assertEqual(s, 200)
+        self.assertEqual(len(r["rd"]["quiz"]), 5)
+        self.assertGreaterEqual(len(r["rd"]["terms"]), 6)
+        self.assertTrue(r["rd"]["diagram"][0].startswith("  "))   # leading spaces kept in diagrams
+        self.assertEqual(list(r["rd"]).index("terms"), 1)          # sections come back in reading order
+
     def test_security(self):
         self.assertEqual(self.req("PUT", "/api/progress/raft", {"status": "read"}, ctype="text/plain")[0], 415)   # forces CORS preflight from other sites
         self.assertEqual(self.req("GET", "/api/me", host="evil.example")[0], 403)                                  # DNS-rebinding guard

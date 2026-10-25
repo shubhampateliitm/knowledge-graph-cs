@@ -79,6 +79,20 @@ const shots = process.argv[3] || null;
   // deep link
   await page.goto(url.replace(/#.*$/, '') + '#read/raft'); await page.waitForSelector('#reader h1');
   ok((await page.textContent('#reader h1')) === 'Raft', 'deep link #read/raft');
+  // learning aids + spaced review
+  await page.goto(url.replace(/#.*$/, '') + '#read/bloom'); await page.waitForSelector('#reader .quiz');
+  ok((await page.$$('#reader .terms dt')).length >= 6, 'key terms render');
+  ok(!!(await page.$('#reader .diagram pre')), 'diagram renders');
+  ok((await page.$$('#reader .quiz details')).length === 5, 'five self-check questions');
+  await page.click('#reader .quiz summary'); ok(await page.isVisible('#reader .quiz details[open] p'), 'answer opens');
+  await page.click('[data-markread="bloom"]'); await page.waitForTimeout(300);
+  await page.click('[data-rclose]').catch(()=>{}); await page.click('[data-view="you"]'); await page.waitForSelector('#review');
+  ok(/due today/.test(await page.textContent('#review')), 'marking a deep read as read fills the review deck');
+  await page.click('[data-revstart]'); await page.waitForSelector('[data-revshow]');
+  await page.click('[data-revshow]'); await page.waitForSelector('.rev-ans');
+  await page.click('[data-revgrade="1"]'); await page.waitForTimeout(200);
+  ok(/4 left/.test(await page.textContent('#review')), 'grading moves to the next question');
+  if (shots) await page.screenshot({ path: shots + '/6-review.png' });
   // mobile
   await page.setViewportSize({ width: 390, height: 844 }); await page.goto(url.replace(/#.*$/, '') + '#explore'); await page.waitForSelector('.col .item');
   const sw = await page.evaluate(() => document.documentElement.scrollWidth);

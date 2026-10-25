@@ -9,6 +9,9 @@ Source files (plain text, easy to diff and edit):
   content/reads/*.txt        "@@ id" then section lines:  value: / history: / how: / intuition: / friction: / practice:
                              lines without a key continue the previous section as a new paragraph
                              ref: kind | title | who, year | url (url optional)
+                             terms: "Term — definition" per line;  quiz: "question || answer" per line
+                             diagram: preformatted lines (leading spaces kept, max 72 columns)
+                             mistakes: one misunderstanding per paragraph
   content/reads/long/*.txt   "@@ id" replaces a read with a long one; "@@+ id" extends an existing read.
                              Every read touched here is marked as a deep read.
 Layer essays use the ids L0 .. L5.
@@ -17,8 +20,10 @@ import glob, os, re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REQUIRED = ("value", "how", "intuition", "friction")
-OPTIONAL = ("history", "example", "practice")
-SECTIONS = ("value", "history", "how", "example", "intuition", "friction", "practice")
+OPTIONAL = ("terms", "history", "diagram", "example", "mistakes", "practice", "quiz")
+SECTIONS = ("value", "terms", "history", "how", "diagram", "example", "intuition", "mistakes", "friction", "practice", "quiz")
+SEC_RE = re.compile(r"^(" + "|".join(SECTIONS) + r"|ref):\s*(.*)$")
+TERM_SEP, QUIZ_SEP = " — ", " || "
 REF_KINDS = {"paper", "book", "blog", "docs", "course", "video", "spec"}
 SIDE_TYPES = {"alt", "comp", "evol", "related"}
 WPM = 200
@@ -48,8 +53,15 @@ def words(text):
     return len(re.findall(r"\S+", text))
 
 
-def load(root=None):
-    """Return a dict with nodes, edges, side, tours, layers, stats. Raises ContentError listing every problem."""
+def _file_lines(path):
+    with open(path, encoding="utf-8") as fh:
+        for ln, line in enumerate(fh, 1):
+            yield path, ln, line.rstrip("\n")
+
+
+def load(root=None, extra=()):
+    """Return a dict with nodes, edges, side, tours, layers, stats. Raises ContentError listing every problem.
+    extra: paths of additional long-read files (used by tools/checkread.py to check a draft before it is merged)."""
     global ROOT
     if root: ROOT = root
     errs = []
@@ -157,11 +169,12 @@ def load(root=None):
     reads, long_keys = {}, set()
     files = [(f, ln, l, False) for f, ln, l in _lines("content/reads/*.txt")] + \
             [(f, ln, l, False) for f, ln, l in _lines("content/reads/more/*.txt")] + \
-            [(f, ln, l, True) for f, ln, l in _lines("content/reads/long/*.txt")]
+            [(f, ln, l, True) for f, ln, l in _lines("content/reads/long/*.txt")] + \
+            [(f, ln, l, True) for x in extra for f, ln, l in _file_lines(x)]
     rd = sec = None; cur_file = None
     for f, ln, line, is_long in files:
         if f != cur_file: cur_file, rd, sec = f, None, None   # a read never continues into the next file
-        line = line.strip(); where = f"{f}:{ln}"
+        raw = line.rstrip(); line = line.strip(); where = f"{f}:{ln}"
         if not line or line.startswith("# "): continue
         if line.startswith("@@+ ") or line.startswith("@@ "):
             ext = line.startswith("@@+ ")
@@ -177,7 +190,7 @@ def load(root=None):
             rd, sec = reads[key], None
             continue
         if rd is None: errs.append(f"{where} text outside a read"); continue
-        m = re.match(r"^(value|history|how|example|intuition|friction|practice|ref):\s*(.*)$", line)
+        m = SEC_RE.match(line)
         if m and m.group(1) == "ref":
             p = [x.strip() for x in m.group(2).split("|")]
             while len(p) < 4: p.append("")
@@ -186,8 +199,15 @@ def load(root=None):
             if not title: errs.append(f"{where} empty ref title")
             if url and not url.startswith("http"): errs.append(f"{where} bad url {url!r}")
             rd["refs"].append(dict(k=kind, t=title, w=who, u=url)); continue
-        if m: sec = m.group(1); rd["rd"][sec].append(m.group(2)); continue
+        if m:
+            sec = m.group(1)
+            if m.group(2): rd["rd"][sec].append(m.group(2))
+            elif sec != "diagram": errs.append(f"{where} empty {sec}: line")
+            continue
         if sec is None: errs.append(f"{where} paragraph before any section"); continue
+        if sec == "diagram":
+            if len(raw) > 72: errs.append(f"{where} diagram line longer than 72 columns")
+            rd["rd"][sec].append(raw); continue
         rd["rd"][sec].append(line)
 
     layer_reads = []
@@ -203,6 +223,10 @@ def load(root=None):
         for s in REQUIRED:
             if not r["rd"][s]: errs.append(f"read {k} missing section {s}")
         if not r["refs"]: errs.append(f"read {k} has no sources")
+        for t in r["rd"]["terms"]:
+            if TERM_SEP not in t: errs.append(f"read {k}: term line needs ' — ': {t[:50]!r}")
+        for q in r["rd"]["quiz"]:
+            if q.count(QUIZ_SEP) != 1: errs.append(f"read {k}: quiz line needs one ' || ': {q[:50]!r}")
         for s in OPTIONAL:
             if not r["rd"][s]: del r["rd"][s]
 
