@@ -17,8 +17,8 @@ import glob, os, re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REQUIRED = ("value", "how", "intuition", "friction")
-OPTIONAL = ("history", "practice")
-SECTIONS = ("value", "history", "how", "intuition", "friction", "practice")
+OPTIONAL = ("history", "example", "practice")
+SECTIONS = ("value", "history", "how", "example", "intuition", "friction", "practice")
 REF_KINDS = {"paper", "book", "blog", "docs", "course", "video", "spec"}
 SIDE_TYPES = {"alt", "comp", "evol", "related"}
 WPM = 200
@@ -157,10 +157,11 @@ def load(root=None):
     reads, long_keys = {}, set()
     files = [(f, ln, l, False) for f, ln, l in _lines("content/reads/*.txt")] + \
             [(f, ln, l, True) for f, ln, l in _lines("content/reads/long/*.txt")]
-    rd = sec = None
+    rd = sec = None; cur_file = None
     for f, ln, line, is_long in files:
+        if f != cur_file: cur_file, rd, sec = f, None, None   # a read never continues into the next file
         line = line.strip(); where = f"{f}:{ln}"
-        if not line: continue
+        if not line or line.startswith("# "): continue
         if line.startswith("@@+ ") or line.startswith("@@ "):
             ext = line.startswith("@@+ ")
             key = line[4 if ext else 3:].strip()
@@ -170,12 +171,12 @@ def load(root=None):
                 if key in reads and not is_long: errs.append(f"{where} duplicate read {key}")
                 reads[key] = dict(rd={s: [] for s in SECTIONS}, refs=[])
             if is_long:
-                if key in long_keys: errs.append(f"{where} {key} has two long versions")
+                if not ext and key in long_keys: errs.append(f"{where} {key} has two long versions")
                 long_keys.add(key); reads[key]["deep"] = True
             rd, sec = reads[key], None
             continue
         if rd is None: errs.append(f"{where} text outside a read"); continue
-        m = re.match(r"^(value|history|how|intuition|friction|practice|ref):\s*(.*)$", line)
+        m = re.match(r"^(value|history|how|example|intuition|friction|practice|ref):\s*(.*)$", line)
         if m and m.group(1) == "ref":
             p = [x.strip() for x in m.group(2).split("|")]
             while len(p) < 4: p.append("")

@@ -28,7 +28,7 @@ WEB = os.path.join(ROOT, "web")
 CONTENT_DB = os.path.join(ROOT, "data", "content.db")
 USER_DB = os.environ.get("DTS_USER_DB") or os.path.join(ROOT, "data", "user.db")
 MAX_BODY = 64 * 1024
-SECTIONS = ("value", "history", "how", "intuition", "friction", "practice")
+SECTIONS = ("value", "history", "how", "example", "intuition", "friction", "practice")
 
 USER_SCHEMA = [
     # migration 1

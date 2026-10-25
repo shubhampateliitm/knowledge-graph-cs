@@ -9,7 +9,7 @@ const esc = s => String(s==null?"":s).replace(/[&<>"']/g, c => ({"&":"&amp;","<"
 const lc = l => `var(--l${l})`;
 const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const narrow = () => matchMedia("(max-width: 900px)").matches;
-const SECTIONS = ["value","history","how","intuition","friction","practice"];
+const SECTIONS = ["value","history","how","example","intuition","friction","practice"];
 const KIND = {paper:"Paper",book:"Book",blog:"Article",docs:"Docs",course:"Course",video:"Video",spec:"Spec"};
 const SIDE = {alt:"Alternative", comp:"Works with", evol:"Evolved from", related:"Related"};
 
@@ -112,8 +112,9 @@ const Store = {
   },
   exportData(){
     if(!STANDALONE){ location.href="/api/export"; return; }
-    const blob = new Blob([JSON.stringify(this.local,null,2)],{type:"application/json"});
-    const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="down-the-stack-my-data.json"; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+    const text = JSON.stringify(this.local,null,2);
+    const done = ()=>toast("Your data (JSON) was copied to the clipboard");
+    try{ navigator.clipboard.writeText(text).then(done, ()=>window.prompt("Copy your data:", text)); }catch(e){ window.prompt("Copy your data:", text); }
   }
 };
 await Store.init();
@@ -278,7 +279,7 @@ function introHTML(){
   const read = Object.values(Store.me.progress).filter(p=>p.status==="read").length;
   return `<div class="intro"><div class="eyebrow">How to use this</div><h2>Six layers, from tools to first principles</h2>
   <p>Every tool you use is built on ideas, which are built on older ideas, all the way down to physics and logic. Pick something at the top and keep clicking to break it down.</p>
-  <ol><li><b>Explore:</b> each click opens the next column with what it is built on, and why.</li><li><b>Read:</b> every concept has a read (why it exists, how it works, what it stands on, why it makes sense, where it still hurts) and sources to go deeper. ${deepList.length} of them are long, 10-minute reads.</li><li><b>Tours:</b> ${DATA.tours.length} complete descents, such as Kafka down to quantum tunneling.</li><li><b>Library:</b> every book, paper and article cited, ranked by how many concepts rely on it.</li><li><b>You:</b> what you have read, saved and noted.</li></ol>
+  <ol><li><b>Explore:</b> each click opens the next column with what it is built on, and why.</li><li><b>Read:</b> every concept has a read (why it exists, how it works, what it stands on, why it makes sense, where it still hurts) and sources to go deeper. ${deepList.length} are deep reads of 5–12 minutes with history, a worked example and practical advice; the six layer essays take about 10 minutes each.</li><li><b>Tours:</b> ${DATA.tours.length} complete descents, such as Kafka down to quantum tunneling.</li><li><b>Library:</b> every book, paper and article cited, ranked by how many concepts rely on it.</li><li><b>You:</b> what you have read, saved and noted.</li></ol>
   ${read?`<p class="quip" style="--c:var(--l2)"><b>Your progress</b>${read} of ${DATA.nodes.length} concepts read. <button type="button" class="essay-link" style="display:inline;--c:var(--l2)" data-view="you">See your map</button></p>`:""}
   <h3>Start with the six layer essays</h3><div class="legend">${LAYERS.map((L,i)=>`<span class="sw" style="--c:${lc(i)}"></span><span><button type="button" class="essay-link" style="--c:${lc(i)};margin:0;display:inline" data-essay="${i}">L${i} ${esc(L.n)} · ${L.rm} min</button><br>${esc(L.d)}</span>`).join("")}</div>
   <p class="note">${DATA.nodes.length} concepts, ${DATA.edges.length} links, ${DATA.stats.refs} sources and about ${Math.round(DATA.stats.words/1000)}k words of reading. Versions checked as of October 2026. Dashed links are analogies rather than mechanisms. Press <span class="kbd">/</span> to search.</p></div>`;
@@ -312,7 +313,7 @@ function renderCourses(){
 /* ---------------- atlas ---------------- */
 function renderAtlas(){
   let h = `<div class="hubs"><h2 class="vh" style="font-size:18px">The hubs</h2><p>The concepts the most other things are built on. Notice how often the same few ideas (the log, hashing, consensus, the memory hierarchy, linear algebra, probability) sit under very different tools.</p><div class="chips">${hubs.map(n=>`<button type="button" class="chip hub" style="--c:${lc(n.l)}" data-sel="${n.id}" aria-pressed="${state.sel===n.id}"><span class="sw"></span>${esc(n.label)} <span class="mono" style="color:var(--muted);font-size:11px">${n.indeg}</span></button>`).join("")}</div></div>`;
-  h += `<div class="hubs"><h2 class="vh" style="font-size:18px">Deep reads · ${deepList.length}</h2><p>Long reads of about ten minutes each, with history and practical advice.</p><div class="chips">${deepList.map(n=>`<button type="button" class="chip" style="--c:${lc(n.l)}" data-read="${n.id}"><span class="sw"></span>${esc(n.label)} <span class="mono" style="color:var(--muted);font-size:11px">${n.rm}′</span>${markHTML(n.id)}</button>`).join("")}</div></div>`;
+  h += `<div class="hubs"><h2 class="vh" style="font-size:18px">Deep reads · ${deepList.length}</h2><p>Long reads (5–12 minutes) with history, a worked example with real numbers, and practical advice.</p><div class="chips">${deepList.map(n=>`<button type="button" class="chip" style="--c:${lc(n.l)}" data-read="${n.id}"><span class="sw"></span>${esc(n.label)} <span class="mono" style="color:var(--muted);font-size:11px">${n.rm}′</span>${markHTML(n.id)}</button>`).join("")}</div></div>`;
   LAYERS.forEach((L,l)=>{
     const cats = [...new Set(byLayer[l].map(n=>n.cat))];
     h += `<section class="asec" style="--c:${lc(l)}"><h2><span class="ln">L${l}</span>${esc(L.n)}<span class="ct">${byLayer[l].length}</span></h2><p class="desc">${esc(L.d)} <button type="button" class="essay-link" style="--c:${lc(l)};display:inline" data-essay="${l}">Read the layer essay · ${L.rm} min</button></p>` +
@@ -367,7 +368,7 @@ function renderYou(){
     <h3 class="ysec">${read.length?"Next layer down from what you have read":"Good places to start"}</h3><div class="ylist">${start.map(id=>row(id, cand.get(id)?`under ${cand.get(id)} you read`:"")).join("")}</div>
     ${me.bookmarks.length?`<h3 class="ysec">Saved</h3><div class="ylist">${me.bookmarks.filter(b=>N[b.id]).map(b=>row(b.id)).join("")}</div>`:""}
     ${Object.keys(me.notes).length?`<h3 class="ysec">With your notes</h3><div class="ylist">${Object.keys(me.notes).filter(id=>N[id]).map(id=>row(id, me.notes[id]+" note"+(me.notes[id]===1?"":"s"))).join("")}</div>`:""}
-    <div class="btnrow" style="margin-top:18px"><button type="button" class="btn" data-export>Export my data (JSON)</button></div>`;
+    <div class="btnrow" style="margin-top:18px"><button type="button" class="btn" data-export>${STANDALONE?"Copy my data (JSON)":"Export my data (JSON)"}</button></div>`;
   $("v-you").querySelectorAll(".ysec").forEach(h=>h.setAttribute("style","font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:500;margin:0 0 8px"));
 }
 
@@ -410,12 +411,13 @@ function nodeRead(n, r, ctx){
   if(ctx) h += `<div class="rd-ctx"><b>${esc(ctx.k)}</b>${esc(ctx.t)}</div>`;
   h += ladderHTML(n);
   if(TAUGHT[n.id]) h += `<p class="ladder-cap">Taught in Stanford ${TAUGHT[n.id].map(code=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-course="${code}">${esc(courseLabel(code))}</button>`).join(", ")}.</p>`;
-  const toc = [["value","Why it exists"],rd.history&&["history","How we got here"],["how","How it works"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
+  const toc = [["value","Why it exists"],rd.history&&["history","How we got here"],["how","How it works"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
   h += `<nav class="toc" aria-label="Sections">${toc.map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
   let no=0; const NO=()=>String(++no).padStart(2,"0");
   h += sec("value", NO(), "Why it exists", P(rd.value,"lead"));
   if(rd.history) h += sec("history", NO(), "How we got here", P(rd.history));
   h += sec("how", NO(), "How it works", P(rd.how));
+  if(rd.example) h += sec("example", NO(), "A worked example", `<div class="example">${P(rd.example)}</div>`);
   if(downs.length||insp.length) h += sec("stands", NO(), "What it stands on",
     `<p class="stand-sum">${esc(n.label)} rests directly on ${downs.length} idea${downs.length===1?"":"s"}. Counting everything beneath those, it stands on ${tot} concepts across ${lays.length} layer${lays.length===1?"":"s"} (${lays.map(l=>"L"+l).join(", ")}). Each line says what that lower layer contributes.</p>` +
     groupByLayer(downs,"t") + (insp.length?`<div class="sgrp" style="--c:var(--muted)"><div class="sh"><span class="sw"></span>Borrowed ideas (analogies, not mechanisms)</div>${insp.map(e=>srow(e.t,e.r,true)).join("")}</div>`:""));
@@ -434,11 +436,12 @@ function essayRead(l, r){
   let h = `<div class="rd-eye"><span class="lpill" style="--c:${lc(l)}"><span class="sw"></span>Layer ${l} of 5</span><span class="mono">${LAYERS[l].rm} min read</span><span>${byLayer[l].length} concepts</span></div>
   <h1>${esc(LAYERS[l].n)}</h1><p class="rd-sub">${esc(LAYERS[l].d)}</p>${actionsHTML("L"+l, lc(l))}
   <div class="ladder" aria-hidden="true">${LAYERS.map((L,i)=>`<div class="${i===l?"on":""}" style="--c:${lc(i)}"><span class="ln">L${i}<i>${byLayer[i].length}</i></span><span class="bar" style="width:${Math.round(100*byLayer[i].length/150)}%"></span></div>`).join("")}</div>
-  <nav class="toc" aria-label="Sections">${[["value","What this layer adds"],rd.history&&["history","How we got here"],["how","How the layers below support it"],["intuition","Why it makes sense"],["friction","Where it still hurts"],rd.practice&&["practice","How to use this layer"],["here","What lives here"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean).map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
+  <nav class="toc" aria-label="Sections">${[["value","What this layer adds"],rd.history&&["history","How we got here"],["how","How the layers below support it"],rd.example&&["example","A worked example"],["intuition","Why it makes sense"],["friction","Where it still hurts"],rd.practice&&["practice","How to use this layer"],["here","What lives here"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean).map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
   let no=0; const NO=()=>String(++no).padStart(2,"0");
   h += sec("value",NO(),"What this layer adds", P(rd.value,"lead"));
   if(rd.history) h += sec("history",NO(),"How we got here", P(rd.history));
   h += sec("how",NO(),"How the layers below support it", P(rd.how));
+  if(rd.example) h += sec("example",NO(),"A worked example", `<div class="example">${P(rd.example)}</div>`);
   h += sec("intuition",NO(),"Why it makes sense", rd.intuition&&rd.intuition.length?`<p class="rd-quote">${esc(rd.intuition[0])}</p>`+P(rd.intuition.slice(1)):"");
   h += sec("friction",NO(),"Where it still hurts", P(rd.friction));
   if(rd.practice) h += sec("practice",NO(),"How to use this layer", P(rd.practice));
