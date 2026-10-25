@@ -13,7 +13,9 @@ Every concept has a read with the same shape:
 
 A **Courses** view maps the Stanford BS and MS curriculum (CS 103 to CS 336) onto the graph: pick a course and study its concepts in order.
 
-Long "deep reads" (about 10 minutes) add **How we got here** and **In practice**.
+Today: 582 concepts in six layers, 1,591 links (each with its own reason), 21 tours, 31 Stanford courses, about 144,000 words and 1,360 sources.
+
+Long "deep reads" (51 of them, 5 to 12 minutes) add **How we got here**, **A worked example** and **In practice**. Every L1 system concept also has history and practice notes, and each of the six layers has a 10-minute essay.
 
 ## Run it
 

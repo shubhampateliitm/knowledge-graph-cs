@@ -156,6 +156,7 @@ def load(root=None):
     # reads
     reads, long_keys = {}, set()
     files = [(f, ln, l, False) for f, ln, l in _lines("content/reads/*.txt")] + \
+            [(f, ln, l, False) for f, ln, l in _lines("content/reads/more/*.txt")] + \
             [(f, ln, l, True) for f, ln, l in _lines("content/reads/long/*.txt")]
     rd = sec = None; cur_file = None
     for f, ln, line, is_long in files:
