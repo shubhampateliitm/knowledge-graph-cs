@@ -1,0 +1,584 @@
+@@+ kafka
+terms: Topic — a named stream of records, split into a fixed number of partitions.
+Partition — one ordered, append-only log; the unit of ordering, parallelism and replication.
+Offset — the position of a record inside one partition; a 64-bit number that only grows.
+Segment — one file of a partition's log (1 GB by default), with an offset index and a time index beside it.
+Leader and follower — the replica that accepts all writes for a partition, and the replicas that copy from it.
+In-sync replica set (ISR) — the replicas that are caught up with the leader; a follower that lags for more than replica.lag.time.max.ms (30 seconds by default) is removed.
+High watermark — the highest offset that every ISR member has copied; consumers can read only below it.
+Consumer group — a set of consumers that share the partitions of a topic, so each partition is read by exactly one member of the group.
+acks — the producer setting that says how many replicas must hold a write before it is confirmed: 0, 1 or all.
+KRaft — Kafka's built-in Raft quorum of controller nodes that stores cluster metadata; it replaced ZooKeeper.
+diagram:
+  producer: key=d42 -> murmur2(key) mod 12 = 7 -> partition 7
+
+  B2 (leader of p7)
+  offset: ... 4830398 4830399 | 4830400 ... 4830449 |
+          [ committed: all ISR ][ only on some ISR  ]
+                              ^                     ^
+                      high watermark          log end offset
+           |                             |
+           | fetch from LEO 4830450      | fetch from LEO 4830400
+           v                             v
+  B1 (follower, in ISR)         B3 (follower, in ISR, slowest)
+  has up to 4830449             has up to 4830399
+                                -> the slowest ISR member sets the HW
+
+  group "pacing":   member 2 owns p6 p7 p8, committed p7 = 4830000
+  group "lake-load": member 1 owns p0..p11, committed p7 = 4700000
+  Each group stores its own offsets in the topic __consumer_offsets.
+  Reading never removes data; retention (time or size) does.
+mistakes: People often think a Kafka topic keeps all its events in order. In fact order exists only inside one partition. Two events with different keys can be read in a different order than they were written, because they live in different partitions that consumers read independently. Even one key can lose its order if the partition count is changed, because the key then hashes to a new partition while its old events stay in the old one.
+People often think reading a message removes it, as in a classic queue. In fact a read only moves the reader's own offset. The data stays until the retention limit (7 days by default, or a size limit) or compaction removes it. This is why a slow consumer does not fill up the broker or slow down other groups, and why a new group can read the whole history.
+People often think acks=all means "all replicas have the write". In fact it means all members of the current ISR. If two of three followers drop out of the ISR, the leader alone is the whole ISR, and acks=all behaves like acks=1. Only min.insync.replicas = 2 makes the leader reject such writes (with a NotEnoughReplicas error) instead of accepting writes that live on one machine.
+People often think that adding consumers to a group always adds parallelism. In fact each partition is read by at most one member of a group. A group with 20 members on a 12-partition topic has 8 idle members. Parallelism inside one group is capped by the partition count, unless you use share groups, which hand single records to many consumers.
+People often think a compacted topic holds exactly one record per key at every moment. In fact compaction runs in the background and never touches the active segment, so a reader can see several older values of one key before the cleaner runs. A delete is a record with a null value (a tombstone), and the tombstone itself stays for delete.retention.ms (24 hours by default) so that consumers have time to see it.
+quiz: What is the high watermark of a partition, and why can consumers not read past it? || It is the highest offset that every in-sync replica has copied. Records above it exist only on some replicas and could be lost if the leader fails, so Kafka hides them from consumers until they are fully replicated.
+How can a broker send data to consumers with sendfile, without decompressing it? || The producer compresses each batch, and the broker stores the batch bytes as they arrived. A fetch is "bytes from offset X", so the broker copies those stored bytes from the page cache to the socket, and the consumer decompresses them itself.
+How does an idempotent producer stop a retry from writing a duplicate? || The broker gives the producer an ID, and the producer numbers each batch per partition. If a retried batch arrives with a sequence number the broker has already written, the broker acknowledges it without appending it again.
+Producers write 50 MB/s (after compression) to a topic with replication factor 3 and 7-day retention. How much disk does the cluster need? || 50 MB/s × 604,800 seconds ≈ 30 TB of data, times 3 replicas ≈ 91 TB, plus headroom for growth and segment cleanup. Tiered storage would keep only the recent part on broker disks.
+Why not give every new topic 1,000 partitions "to be safe"? || Each partition costs open files, memory, metadata in the controller and work during leader elections, and small per-partition batches compress worse. But adding partitions later remaps keys and breaks per-key order, so choose a count for peak parallelism with some headroom, not the maximum.
+
+@@+ flink
+terms: JobManager — the coordinator process of a job; it schedules tasks, triggers checkpoints and handles recovery.
+TaskManager — a worker JVM that runs tasks in a fixed number of task slots.
+Operator chain — consecutive operators fused into one task, so records pass between them by a method call instead of over the network.
+Keyed state — state that belongs to one key, such as a count per campaign, kept by the one parallel task that owns that key.
+Key group — the unit into which keys are hashed; the number of key groups equals the maximum parallelism, and rescaling moves whole key groups.
+State backend — the component that stores keyed state: the JVM heap, an embedded RocksDB, or ForSt on remote storage in Flink 2.
+Checkpoint barrier — a marker that flows with the records; state snapshots taken as it passes are consistent with each other.
+Watermark — a timestamp that flows with the data and says "no more events older than T are expected here".
+Savepoint — a checkpoint triggered by a person, in a stable format, used to upgrade, rescale or move a job.
+Backpressure — the slowing of upstream tasks when a downstream task cannot keep up, signalled by network credits.
+how: The physical execution explains much of Flink's speed. The job graph is first optimized by operator chaining: a source, a map and a filter that need no repartitioning are fused into one task, which runs in one thread and passes each record by a plain method call. Only at a keyBy or a change of parallelism do records cross a network channel. There they are serialized into network buffers (memory segments of 32 KB by default) and sent over TCP. Credit-based flow control decides when a buffer may be sent: the receiver announces how many free buffers it has (its credits), and the sender never sends more. A slow task therefore stops granting credits, and the slowness travels upstream to the source, which simply reads Kafka more slowly. Buffer debloating (since Flink 1.14) shrinks the amount of data in flight to about one second of throughput, so checkpoint barriers do not wait behind gigabytes of queued records.
+Keyed state is organised so that it can move. Each key is hashed into one of a fixed number of key groups, equal to the job's maximum parallelism (by default at least 128 and at most 32,768). Each parallel task owns a contiguous range of key groups, and a snapshot is written key group by key group. When a job restarts at a new parallelism, every new task simply loads the key groups in its new range; no key is rehashed. The price is that maximum parallelism must be chosen once: changing it changes every key's group, and the old keyed state can no longer be restored. Timers (for windows and for custom logic) are stored per key as well, so they move with their keys.
+The RocksDB backend, built on the LSM tree of the rocksdb concept, gives each state its own column family inside one embedded RocksDB instance per task. Every read and write serializes the key and value to bytes and crosses the JNI boundary from Java into C++, so a RocksDB access costs microseconds where a heap access costs nanoseconds. In exchange, state can be far larger than memory, and garbage collection never sees it. The LSM design also makes incremental checkpoints natural: SST files never change after they are written, so a checkpoint uploads only the SST files created since the previous one and refers to the older files, which are shared between checkpoints and deleted when no checkpoint uses them. The heap backend, by contrast, keeps state as Java objects and uses copy-on-write structures so that a snapshot can be written asynchronously while processing continues.
+Flink 2.0 moved the primary copy of state to a distributed file system. The ForSt backend ("For Streaming", a fork of RocksDB) writes its files to object storage and uses the local disk only as a cache. A remote read can take milliseconds, so Flink 2.0 also added an asynchronous execution model: an operator issues a state read and continues with other records, and Flink keeps the order of records that share a key while letting different keys overtake each other. In the project's Nexmark benchmarks, heavy-state queries reached roughly 75–120% of the local backend's throughput with a 1 GB local cache. Checkpoints and rescaling become light, because the state files already live in shared storage.
+The same runtime runs batch jobs, which is the contribution of the batchproc concept. In BATCH execution mode, a bounded job is cut into stages at every shuffle. Each stage writes its output to disk (a blocking shuffle) and the next stage starts only when its input is complete. Keyed operators do not use a state backend at all: Flink sorts each input by key and processes one key after another, so only one key's state is held at a time. There are no checkpoints. If a task fails, Flink restarts only the region of the graph connected to it and re-reads the blocking shuffle files. Watermarks are not needed either, because at the end of a bounded input every window can safely fire.
+diagram:
+  Kafka p0 -> [Source 0] -+                 +-> [Window 0] -+
+                           \  keyBy(camp.) /    RocksDB      \
+  Kafka p1 -> [Source 1] ---+- hash->group +-> [Window 1] ----+-> [Sink]
+                           /   0 .. 127    \    RocksDB      /   Kafka
+  Kafka p2 -> [Source 2] -+                 +-> [Window 2] -+    txn
+
+  one input channel (newest on the left):
+     ... r9 r8 |B5| r7 r6 r5 |B4| r4 ...       B = checkpoint barrier
+
+  operator: B5 arrived on ALL inputs -> snapshot state (asynchronously)
+  JobManager: every task acked B5 -> checkpoint 5 complete
+              -> sink commits its Kafka transaction for checkpoint 5
+
+  checkpoint 5 in S3:
+     source offsets {p0: 812, p1: 790, p2: 803}
+     + only the SST files created since checkpoint 4
+mistakes: People often think "exactly-once" means every record is processed exactly one time. In fact records after the last completed checkpoint are processed again after a failure. What is exactly-once is the effect on Flink's state and on transactional sinks. A call to an external API inside a map function can still happen twice, so such side effects must be idempotent.
+People often think a checkpoint and a savepoint are interchangeable. In fact checkpoints belong to Flink: they can be incremental, they use the backend's own format, and Flink deletes old ones automatically. Savepoints belong to you, survive until you delete them and can be restored into a different state backend. Both restore only if stateful operators keep stable IDs, so set uid() on every stateful operator before the first deployment.
+People often think parallelism can be raised freely later. In fact keyed state can be spread only over the key groups that exist, so parallelism can never exceed the maximum parallelism, and maximum parallelism cannot change without losing keyed state. A Kafka source also cannot use more subtasks than the topic has partitions; extra subtasks sit idle.
+People often think watermarks follow the wall clock. In fact they are computed from timestamps inside the events. If you replay one day of history, a job can process it in twenty minutes and still fire every one-minute window with correct counts. The other side is that a source with no new events produces no new watermarks, so windows do not fire just because real time has passed.
+quiz: What is the difference between a checkpoint and a savepoint? || A checkpoint is taken automatically for recovery, may be incremental and is managed and deleted by Flink. A savepoint is triggered by a person, kept until they delete it, and used to upgrade, rescale or move a job.
+Why does barrier alignment give a consistent snapshot without stopping the job? || Each barrier divides a stream into records before and after the checkpoint. An operator with several inputs holds back inputs whose barrier has already arrived until barriers come from all of them, then snapshots. Its state then reflects exactly the records before the barrier, matching the source offsets recorded when the barrier was injected.
+How does Flink move keyed state when a job is rescaled from 4 to 8 tasks? || Keys are hashed into a fixed set of key groups, and each task owns a range of them. On restore, each of the 8 new tasks loads the snapshot data for its new range of key groups, so state moves in whole groups and no key needs to be rehashed.
+A job has maximum parallelism 128 and runs at parallelism 48. How are key groups spread, and what does this cause? || 128 = 48 × 2 + 32, so 32 tasks own 3 key groups and 16 tasks own 2. With evenly spread keys, the busiest tasks carry 50% more work than the lightest ones. Choosing a parallelism that divides 128, such as 32 or 64, avoids this.
+When would you choose the heap state backend over RocksDB? || When state is small enough to fit comfortably in the JVM heap (a few GB per TaskManager) and you want the lowest cost per access, because heap access avoids serialization and JNI calls. For state larger than memory, or when you need incremental checkpoints and steady garbage-collection pauses, RocksDB (or ForSt) is the safer choice.
+
+@@+ spark
+terms: Driver — the process that runs your program, plans each query and schedules its tasks.
+Executor — a JVM process on a worker machine that runs tasks and keeps shuffle files and cached data.
+Partition — one slice of a dataset; one task processes one partition.
+Stage — a group of tasks that run without moving data between machines; a stage ends at a shuffle.
+Shuffle — repartitioning data by key across the cluster: map tasks write files to local disk, and reduce tasks fetch their part from every map task.
+Lineage — the recorded chain of transformations that produced a dataset; Spark uses it to recompute lost partitions.
+Catalyst — the Spark SQL optimizer, which rewrites query plans with rules and cost estimates.
+Whole-stage code generation — Tungsten's technique of compiling a chain of operators into one generated Java method.
+Adaptive Query Execution (AQE) — re-planning at each shuffle boundary using the real sizes of the shuffle output.
+Broadcast join — a join in which the small table is copied to every executor, so the large table needs no shuffle.
+how: Scheduling happens inside the driver, a JVM process running Scala code. The DAG scheduler takes the physical plan, cuts it into stages at every shuffle, and submits a stage only when all the stages it depends on have finished. The task scheduler then places each task on a free executor core and prefers data locality: it waits briefly (spark.locality.wait, 3 seconds by default) for a core on the same executor or node as the data before accepting a worse location. This is the mpp idea (one query split over many workers) with a batch twist taken from batchproc. A pipelined engine such as Trino streams data between stages, while Spark writes every stage's output to shuffle files first. That costs disk I/O, but it is why Spark can retry one failed task, or rerun one lost map task, without restarting the whole query.
+The cluster manager only supplies executors. On Hadoop clusters, Spark's ApplicationMaster asks the YARN ResourceManager for containers. On Kubernetes, the driver runs in a pod and creates executor pods directly through the Kubernetes API, and deletes them when the application ends. Dynamic allocation adds executors when tasks are waiting and removes idle ones. This is harder than it sounds, because shuffle files live on executors' local disks: removing an executor would lose them. On YARN an external shuffle service on each node keeps serving the files. On Kubernetes, Spark instead tracks which executors still hold needed shuffle data and keeps them alive, or migrates their blocks to other executors before decommissioning them.
+Scala is not only the implementation language; it shapes the optimizer. A Catalyst plan is a tree of immutable Scala case classes, and each optimization rule is a pattern match that rewrites one shape of subtree into another, for example "a Filter above a Project becomes a Project above a Filter". Spark applies batches of such rules until the plan stops changing. Hundreds of small, separate rules are easier to test and extend than one large optimizer, and extensions can add their own rules, which is how Delta Lake and other libraries plug into planning.
+Two newer layers change how programs reach the engine. Spark Connect (3.4) splits the client from the server: the client builds an unresolved logical plan, encodes it with Protocol Buffers and sends it over gRPC; the server analyzes, optimizes and runs it and streams results back as Apache Arrow batches. A Python or Go client therefore needs no local JVM, and the server can be upgraded separately from the clients. Spark Declarative Pipelines (4.1, from the declpipelines concept) go one step higher: you declare flows, streaming tables and materialized views, and Spark builds the dependency graph between datasets, runs them in order, manages streaming checkpoints and retries failed steps.
+diagram:
+  SQL / DataFrame code
+        |
+        v
+  Catalyst: logical plan -> optimized plan -> physical plan
+        |
+        v   driver: DAG scheduler cuts the plan at each shuffle
+  Stage 1: scan + filter + partial agg     Stage 2: final aggregate
+  +------+ +------+ +------+               +-------+ +-------+
+  |task 0| |task 1| |task 2| ... M tasks   |reduce0| |reduce1| ... R
+  +--+---+ +--+---+ +--+---+               +---^---+ +---^---+
+     |        |        |                       |         |
+     v        v        v                       |         |
+  shuffle files on local disk, split by key ---+---------+
+  [0..R-1]  [0..R-1]  [0..R-1]       each reducer fetches from
+                                     every map task: M x R blocks
+
+  executors = JVMs in YARN containers or Kubernetes pods
+  lost partition -> rerun only the tasks that produced it (lineage)
+mistakes: People often think calling a transformation runs it. In fact transformations only build a plan; nothing runs until an action such as count, collect or write. Errors in a transformation appear only at the action. If a program calls count() and then write() on the same DataFrame, Spark runs the whole plan twice unless the data is cached.
+People often think cache() always makes a job faster. In fact caching is also lazy, it uses executor memory that joins and sorts would otherwise use, and it can spill to disk. For a dataset used once it only adds work. It pays off only when the same expensive intermediate result is read several times, and it should be released with unpersist() afterwards.
+People often think repartition(n) and coalesce(n) are the same. In fact repartition does a full shuffle and produces evenly sized partitions. coalesce only merges existing partitions without a shuffle, so Spark may run the preceding work with fewer tasks too. coalesce(1) before a write can turn the last stage of a large job into one task on one core.
+People often think a Python UDF runs inside the JVM like built-in functions. In fact each executor starts separate Python worker processes, and rows are serialized from the JVM to Python and back (in Arrow batches for pandas UDFs). Their memory sits outside the JVM heap, so a container can be killed for using too much memory while the Spark UI shows a healthy heap; the memory overhead setting must leave room for them.
+quiz: What separates two stages in a Spark job? || A shuffle. Narrow transformations such as filter and select run inside one stage, while wide transformations such as groupBy and join need data repartitioned by key, which starts a new stage.
+Why can Spark recover from a lost executor without restarting the whole job? || Each partition is defined by its lineage, a deterministic recipe from its parents. Spark reruns only the tasks whose output was lost, including map tasks whose shuffle files were on the dead executor, and the rest of the job continues.
+How does AQE handle a skewed join partition at runtime? || After the shuffle it reads the real size of every partition. A partition larger than 5 times the median and above 256 MB (the defaults) is split into smaller pieces, and each piece is joined with a copy of the matching partition from the other side, so several tasks share the work.
+A stage of 2,000 map tasks writes 400 GB of shuffle data into 2,000 reduce partitions. How many shuffle blocks are there and how large are they? || 2,000 × 2,000 = 4 million blocks of about 100 KB each, so every reducer makes 2,000 small fetches. Using 800 partitions gives 1.6 million blocks of about 250 KB and 500 MB per reducer, which is usually faster; AQE can coalesce small partitions like this automatically.
+When is a broadcast join a bad choice even though it avoids a shuffle? || When the "small" side is hundreds of MB or more. It is collected to the driver and a copy is held in memory on every executor, so 100 executors with a 1 GB table use 100 GB of memory and network. A sort-merge join, which shuffles both sides, scales better in that case.
+
+@@+ databricks
+terms: Control plane — the services Databricks runs for you: the web UI, notebooks, job scheduler and the Unity Catalog service.
+Compute plane — where clusters run and data is processed: virtual machines in your cloud account (classic) or in Databricks' account (serverless).
+DBU (Databricks Unit) — the unit of processing that Databricks bills per hour; the price of a DBU depends on the compute type.
+Photon — Databricks' vectorized C++ query engine, which runs inside Spark executors.
+Unity Catalog — the catalog that maps catalog.schema.table names to data, permissions and lineage.
+Credential vending — Unity Catalog giving compute short-lived storage credentials limited to the tables a user may read.
+SQL warehouse — Photon-based compute for SQL and BI queries that scales by adding whole clusters.
+Lakeflow Declarative Pipelines — the pipeline product (formerly Delta Live Tables) built from streaming tables and materialized views.
+Liquid clustering — a Delta layout method that keeps files clustered on up to 4 chosen columns and reclusters incrementally.
+Delta Sharing — an open protocol for sharing tables with other organizations through short-lived file URLs.
+how: The cloud and cloudcomp concepts supply the raw material: virtual machines rented by the second, object storage, and identity and access management (IAM). With classic compute, the control plane launches virtual machines inside the customer's own cloud network through a cross-account role, installs the Databricks Runtime (Spark, Photon, Delta and libraries) and connects the driver back to the control plane. With serverless compute, the machines run in a compute plane inside Databricks' own cloud account in the same region, taken from a pool of machines that are already running. A serverless job therefore starts in seconds instead of the several minutes a new cluster of virtual machines needs, and the customer pays one serverless DBU price that already includes the machines. In both cases the tables stay in object storage.
+Photon is joined to Spark rather than replacing it. According to the 2022 Photon paper, a Catalyst rule walks the physical plan from the file scan upward and replaces each supported operator with a Photon operator until it meets one Photon does not support. That part of the plan is serialized with Protocol Buffers and passed through JNI to a C++ library running inside the executor's JVM process. An adapter at the bottom reads Spark's off-heap columnar scan output without copying it, and a transition node at the top turns columns back into rows when the rest of the plan stays in Spark. Photon reserves memory from Spark's unified memory manager and can spill like any Spark operator. It does not generate code; it runs precompiled loops over column batches and picks a loop per batch: a batch with no nulls skips null checks, and an all-ASCII string batch takes a faster string path. The paper reports about 3 times average speedup on customer workloads and up to 23 times on one TPC-H query.
+Unity Catalog is the catalog concept turned into a service. A metastore per region holds the catalog.schema.table names, owners and grants. When a query reads a table, the engine asks Unity Catalog; the service checks the user's privileges and returns temporary cloud credentials that work only for that table's storage path. Row filters and column masks are SQL functions that the engine adds to the query plan, and lineage is recorded from executed plans down to the column level. Delta Sharing extends the same model across companies: a sharing server checks the recipient's token and returns short-lived pre-signed URLs to the Parquet files of a table version, so the recipient reads the data without a copy. This is how many teams implement the datamesh idea of domains publishing governed data products.
+Pipelines follow the declpipelines and medallion concepts. A Lakeflow pipeline is a graph of datasets: streaming tables, which process each new input record once using Structured Streaming checkpoints, and materialized views, which hold the result of a query. Bronze tables are usually streaming tables over raw input, and silver and gold tables are often materialized views. To refresh a materialized view, a cost-based layer called Enzyme chooses between incremental strategies and a full recompute, using information about what changed in the source tables. The engine also orders the datasets by their dependencies and retries failures.
+Two more pieces complete the platform. SQL warehouses are the mpp concept as a managed service: each warehouse is one or more clusters running the same Spark and Photon engine, tuned for many short SQL queries; under high concurrency it adds clusters and queues queries rather than slowing every query down. Machine-learning work (mlops and featurestore) uses the same catalog: MLflow tracks experiments and registers models in Unity Catalog, and feature tables are Delta tables with primary keys that can be published to a low-latency online store for model serving. Billing ties everything together. Each workload records its DBUs, with its tags, in system tables such as system.billing.usage, which is what cost dashboards query.
+diagram:
+  CONTROL PLANE (Databricks account)
+  +---------------------------------------------------------------+
+  | UI + notebooks | Jobs / Lakeflow | Unity Catalog | SQL gateway |
+  +-------+-------------------------------+-----------------------+
+          | starts compute, sends plans   | checks grants,
+          v                               | vends short-lived creds
+  COMPUTE PLANE                           v
+  +---------------------------+   +---------------------------+
+  | classic: VMs in YOUR VPC  |   | serverless: Databricks    |
+  | driver + executors (JVM)  |   | account, same region,     |
+  | Spark + Photon (C++, JNI) |   | warm pool, starts fast    |
+  +-------------+-------------+   +-------------+-------------+
+                |  read / write with temporary credentials
+                v                               v
+  YOUR OBJECT STORAGE (S3 / ADLS / GCS)
+  +---------------------------------------------------------------+
+  | viewing.prod.events -> _delta_log/*.json + part-*.parquet     |
+  +---------------------------------------------------------------+
+mistakes: People often think Databricks keeps their data inside its own database. In fact, in a typical deployment, tables are Delta files in the customer's own bucket or storage account, and Unity Catalog stores only names, permissions and metadata. This is why other engines can read the same tables, and also why storage costs appear on the cloud bill, not the Databricks bill.
+People often think Photon speeds up every job. In fact Photon runs only the operators it supports. Python UDFs, RDD code and some expressions stay in the JVM engine, and every switch between the two engines converts columns to rows. Photon compute also costs more DBUs per hour. A job dominated by Python UDFs or by waiting on storage can cost more with Photon and run no faster.
+People often think a SQL warehouse is a separate database engine. In fact it runs the same Spark and Photon engine as clusters, with settings, caching and autoscaling designed for many concurrent SQL queries. The same table layout problems (small files, missing clustering, skew) slow it down in exactly the same way.
+People often think Unity Catalog permissions protect a table however it is read. In fact they apply only to access through Unity Catalog. Anyone whose cloud IAM role can read the bucket directly can download the Parquet files and bypass row filters and column masks. The bucket should be readable only through the storage credential that Unity Catalog controls.
+quiz: What runs in the Databricks control plane, and what runs in the compute plane? || The control plane runs the web UI, notebooks, job scheduling and Unity Catalog. The compute plane runs the clusters or serverless machines that execute Spark and Photon and read the data, which stays in the customer's object storage.
+How does Photon take part in a Spark query? || A Catalyst rule replaces supported operators, from the scan upward, with Photon operators. That plan fragment is sent through JNI to a C++ library inside the executor process, which processes column batches and shares Spark's memory manager; a transition node converts results back to rows if Spark operators follow.
+How does credential vending stop a cluster from reading a table the user may not see? || The cluster has no standing access to the bucket. For each table it asks Unity Catalog, which checks the user's grants and, only if they pass, returns short-lived credentials limited to that table's storage path.
+A job uses 20 DBUs per hour at an assumed $0.15 per DBU, on 10 VMs at $0.60 per hour, for 3 hours a day. What does a month cost, and what if the same cluster runs all day as an all-purpose cluster at an assumed $0.40 per DBU? || The job costs 20 × 0.15 + 10 × 0.60 = $9 per hour, × 3 hours × 30 days = $810. The always-on all-purpose cluster costs 20 × 0.40 + 6 = $14 per hour, × 24 × 30 = $10,080, more than 12 times as much for the same work.
+When is classic job compute a better choice than serverless? || When a job runs for many hours at high, steady utilization, so start-up time and idle time hardly matter, and you can use spot or reserved VMs, custom networking or special instance types. Serverless wins for short, bursty or interactive work, where fast start and no idle cost outweigh a higher price per hour.
+ref: paper | Enzyme: Incremental View Maintenance for Data Engineering | Databricks, arXiv 2026 | https://arxiv.org/abs/2603.27775
+
+@@+ delta
+terms: Transaction log — the _delta_log directory of numbered commit files; the table is whatever this log says it is.
+Commit — one numbered JSON file of actions; version N exists once N.json has been written.
+Action — one change inside a commit: add file, remove file, metaData, protocol, commitInfo and a few others.
+Checkpoint — a Parquet file that holds the complete table state at one version, so readers can skip the older JSON files.
+Put-if-absent — a storage write that succeeds only if the file does not exist yet; it is what makes a commit atomic.
+Snapshot — the set of active data files at one version; a reader works on one snapshot from start to end.
+Deletion vector — a compressed bitmap of row positions that count as deleted in one data file.
+Table feature — a named capability, such as deletionVectors or rowTracking, that a client must support to read or write the table.
+Data skipping — skipping files whose min and max statistics show they cannot contain matching rows.
+VACUUM — the command that physically deletes data files no longer referenced by any retained version.
+how: Finding the current version is designed to avoid slow directory listings. Log files are named with the version zero-padded to 20 digits (00000000000000000041.json), so the lexicographic order of an object-store listing is also version order. A small file, _last_checkpoint, names the newest checkpoint. A reader loads that checkpoint, lists only the log files after it, and replays their actions in order. The rule for replay is simple: a data file is active if the last action that mentions its path is an add, not a remove. Large tables can use V2 checkpoints, which split the list of files into sidecar Parquet files, and log compaction files (x.y.compacted.json) that merge a range of commits, so that neither writers nor readers handle one huge file.
+The protocol action is how Delta changes without breaking old clients. It states the minimum reader and writer versions, and, from reader version 3 and writer version 7, a list of named table features. A client must refuse to read a table that lists a reader feature it does not know (deletion vectors, column mapping, V2 checkpoints), and refuse to write one that lists an unknown writer feature. This rule prevents silent wrong reads; the cost is that an old client gets an error. Column mapping is a good example of why features are needed: it gives each column a stable physical name, so a rename or drop only changes metadata in the log, while an old reader that matched Parquet columns by name would silently read the wrong data.
+Parquet contributes the rows and the statistics. When a writer adds a file, it also records in the add action the row count and, per column, the minimum, maximum and null count, by default for the first 32 columns of the schema. The planner can therefore skip a file using only the log, without opening the file. Inside each file, Parquet's own row-group statistics and column pruning then reduce the bytes read further. Two levels of skipping work together: Delta skips files, Parquet skips row groups and columns.
+The s3 concept explains the hardest requirement: an atomic put-if-absent. HDFS and Azure storage could create a file only if it was missing, but Amazon S3 had no such operation until it added conditional writes in August 2024. For years, Delta on S3 therefore allowed only one writing cluster per table, or used a log store that recorded commits in DynamoDB (since Delta 1.2) to arbitrate between clusters. Catalog-managed tables (the catalogManaged feature in Delta 4) move this job to a catalog: the catalog accepts each commit and is the source of truth for which commits exist, which is also the base for transactions across several tables.
+Conflict detection decides when a losing writer may simply retry. The writer records what it read (which files, which predicates) and what it removed. If a concurrent commit removed a file it read or deleted, it fails (ConcurrentDeleteRead or ConcurrentDeleteDelete). If a concurrent commit changed the schema or protocol, it fails. Under the Serializable level, new files that match its read predicate also cause a failure; under WriteSerializable (the Databricks default), they do not, which lets streaming appends run beside updates. Blind appends never conflict with each other. Row tracking, from the rowlineage concept, adds identity on top: each file gets a baseRowId, a row's ID is that base plus its position in the file, and each row keeps the version that last changed it, so downstream jobs can process only changed rows. The change data feed writes the old and new versions of updated rows to separate files for the same purpose.
+diagram:
+  events/                                  (table root in S3)
+  +-- part-0001.parquet  part-0002.parquet ...  (never edited)
+  +-- deletion_vector_ab12.bin              (bitmap of deleted rows)
+  +-- _delta_log/
+      +-- 00000000000000000000.json     v0: metaData, protocol, adds
+      +-- ...
+      +-- 00000000000000000040.checkpoint.parquet  (state at v40)
+      +-- 00000000000000000041.json     v41: add part-1250
+      +-- 00000000000000000042.json     v42: remove X, add X + DV
+      +-- _last_checkpoint              {"version": 40}
+
+  reader of the latest version:
+    1. read _last_checkpoint             -> 40
+    2. load 40.checkpoint.parquet        -> active files at v40
+    3. list and apply 41.json, 42.json   -> active files at v42
+    4. skip files whose min/max cannot match the filter
+
+  writer: wrote new data files, based on v42 -> put-if-absent 43.json
+          created = committed;  exists = check conflicts, then retry
+mistakes: People often think a Delta table can be read like any folder of Parquet files. In fact the folder also holds files that were removed by later commits and files from failed writes that were never committed. A plain Parquet reader pointed at the path reads all of them and returns duplicates and deleted rows. Only the log says which files belong to a version.
+People often think DELETE removes the data from storage. In fact it only writes a remove action, or a deletion vector, and the old Parquet files with the deleted rows stay readable through time travel. For a privacy deletion you need the DELETE, then a rewrite of the affected files (OPTIMIZE, or REORG TABLE ... APPLY (PURGE) when deletion vectors are used), then VACUUM after the retention period has passed.
+People often think time travel is a backup. In fact it lasts only while the old files and log entries are kept: by default VACUUM may delete unreferenced files older than 7 days, and log entries are kept for 30 days. It also lives in the same bucket as the table, so a deleted bucket or a wrong VACUUM removes it too. Real backups need a deep clone, bucket versioning or replication to another location.
+People often think Delta collects statistics on every column. In fact, by default, only the first 32 columns in the schema have statistics. A filter on the 40th column gets no file skipping at all. Put frequently filtered columns early in the schema, or change the statistics settings, and remember that liquid clustering columns must have statistics.
+quiz: What makes a Delta commit atomic? || The writer creates the next log file, N.json, with a put-if-absent operation. Either the file is created and the whole commit becomes visible at once, or the file already exists and the writer knows another commit won that version.
+Why does a reader not have to replay the whole log from version 0? || Every so often (by default every 10 commits) a checkpoint stores the full table state in Parquet, and _last_checkpoint points to the newest one. The reader loads that checkpoint and applies only the few JSON commits written after it.
+How do deletion vectors make a DELETE cheaper than copy-on-write? || Copy-on-write rewrites every data file that contains a deleted row. With deletion vectors, the writer only stores a small bitmap of deleted row positions per file, and readers skip those rows at read time; a later OPTIMIZE rewrites the files and drops the bitmaps.
+A table has 2,000 files of 1 GB each. A DELETE matches a few rows in each of 50 files. How much data is written with and without deletion vectors? || Copy-on-write rewrites 50 files, about 50 GB. With deletion vectors, it writes 50 small bitmaps of a few KB each plus one commit, a reduction of millions of times in bytes written.
+An older Trino or Spark version also reads a table on which you want to enable deletion vectors. What is the trade-off? || Updates and deletes become much cheaper, but deletion vectors are a reader feature, so the older engine will refuse to read the table at all. The upgrade is also hard to reverse, so first upgrade every reader, or keep a separate table for them.
+
+@@+ pinot
+terms: Segment — an immutable, columnar chunk of a table (typically 100–500 MB) with its own dictionaries and indexes.
+Consuming segment — the open, in-memory segment that a server fills from one Kafka partition until it is sealed.
+Deep store — durable object storage, such as S3, that holds a copy of every sealed segment for recovery.
+Broker — the process that receives a query, picks segments and servers, scatters the query and merges the results.
+Controller — the process that assigns segments to servers and coordinates segment commits, using Apache Helix.
+Dictionary encoding — replacing each value with a small integer ID that points into a sorted list of the column's distinct values.
+Forward index — the per-column array that gives the value (usually a dictionary ID) of each row.
+Inverted index — a map from each value to a bitmap of the rows that contain it.
+Star-tree index — a tree of pre-aggregated records over chosen dimensions that limits how many records a group-by reads.
+Hybrid table — a real-time table and an offline table under one name, split at a time boundary.
+how: A Pinot cluster has four roles. Controllers decide where segments live; brokers route queries; servers store segments and run queries; minions run background tasks such as merging small segments, rolling up old data and purging records. Assignment uses Apache Helix, which keeps two maps per table in ZooKeeper: the ideal state (which servers should hold each segment, and in which state: ONLINE, CONSUMING or OFFLINE) and the external view (what the servers report they actually hold). Servers act to make the external view match the ideal state, and brokers build their routing tables from the external view, so a query is only sent to a copy that is really loaded.
+Inside a segment, each column is stored separately. The sorted column is special: only one column per segment can be the physical sort order, and Pinot sorts a consuming segment on it when sealing. For that column, the index is just a start and end row number per value, so a filter on it costs one binary search and reads one contiguous range, with no bitmap. Other filtered columns use inverted indexes, which map each dictionary ID to a Roaring bitmap of rows. High-cardinality metric columns are often stored raw instead of dictionary-encoded, because a dictionary with nearly one entry per row saves nothing.
+The star-tree index is built by sorting the segment's records by a chosen order of dimensions and splitting them into a tree, one dimension per level, until a node holds at most maxLeafRecords records (10,000 by default). At each level, an extra "star" child holds records with that dimension aggregated away. A query that filters on advertiser and groups by hour follows the advertiser branch, takes star nodes for every dimension it does not use, and reads at most a few thousand pre-aggregated records per segment. The limit on leaf size is what makes latency predictable, whatever the data volume.
+Upserts show why partitioning matters. Each server keeps, for the partitions it owns, a map from primary key to the location of the latest row (segment and row number) and its comparison value, such as an event timestamp. When a newer row for a key arrives, the server clears the old row's bit in that segment's bitmap of valid rows and sets the new one; every query is then combined with these bitmaps. All versions of one key must reach the same server, so the Kafka topic must be partitioned by the primary key. The map costs memory for every key, which is the main cost of upserts at billions of keys.
+For joins and window functions, the multi-stage engine (from the olap and rtanalytics concepts: fast scans first, then general SQL) plans a query as several stages. Servers still scan their segments with the usual indexes in the first stage, and then send rows to each other through "mailboxes" over gRPC, partitioned by the join key, so that later stages can join and aggregate. Small dimension tables can instead be copied to every server and joined locally with a lookup, which avoids the shuffle.
+diagram:
+  Kafka "ads": 32 partitions, keyed by advertiser_id
+       p0             p1        ...
+       |              |
+       v              v
+  +------------+ +------------+     +------------------------+
+  | Server A   | | Server B   | ... | Controller + Helix     |
+  | CONSUMING: | | CONSUMING: |     | ideal state + external |
+  |  p0 seg 9  | |  p1 seg 9  |     | view, in ZooKeeper     |
+  | ONLINE:    | | ONLINE:    |     +-----------+------------+
+  |  p0 seg1-8 | |  p1 seg1-8 |                 | routing table
+  +-----+------+ +-----+------+                 v
+        |  sealed segments -> deep store (S3)  +-------------+
+        |              |                       |   Broker    |<- SQL
+        +-- scatter ---+-----------------------| prune by    |
+        +-- partial aggregates --------------->| time, part. |-> result
+                                               +-------------+
+mistakes: People often think Pinot is fast because all its data sits in memory. In fact servers memory-map segment files from local disk, and the operating system's page cache keeps the hot parts in memory. The speed comes from reading very little: pruning segments, using indexes and reading compact dictionary IDs. A table much larger than RAM still serves fast queries if each query touches a small part of it.
+People often think a table can be sorted on several columns. In fact each segment has one physical sort order, so only one column gets the sorted index. Choose the filter that appears in almost every query, such as tenant or advertiser ID, and use inverted or range indexes for the others.
+People often think upserts turn Pinot into a key–value store. In fact an upsert table still answers queries by scanning segments, now filtered by valid-row bitmaps; it does not offer constant-time lookups by key. Upserts also need the stream partitioned by primary key and memory on each server for every key it owns.
+People often think more indexes always make queries faster. In fact each index costs disk, memory-mapped pages and time when a segment is built, which is on the commit path of real-time ingestion. A star-tree over many dimensions can grow very large because it stores many dimension combinations. Add indexes for the query shapes you have measured, not for every column.
+quiz: What is a consuming segment, and what happens when it is sealed? || It is the open, mutable segment into which a server reads one Kafka partition. When it reaches its row or time limit, the controller coordinates a commit: one replica builds the immutable columnar segment with its indexes and uploads it to the deep store, and the other replicas download it or confirm an identical copy.
+Why does partitioning the Kafka topic and the Pinot table on the same key make queries faster? || The broker knows which partition each key belongs to, so a query that filters on that key is sent only to the servers and segments of one partition. With 32 partitions, 31 of every 32 segments are skipped before any server does work.
+How does a star-tree index keep a group-by fast as data grows? || It stores pre-aggregated records in a tree split by dimensions until each leaf has at most 10,000 records by default, plus star nodes that aggregate a dimension away. A query follows the branches for its filters and star nodes for unused dimensions, so it reads a bounded number of records instead of all matching rows.
+A column has 1 billion rows and 1,000 distinct string values averaging 20 bytes. How large is its forward index with dictionary encoding? || 1,000 values need 10-bit IDs (2¹⁰ = 1,024), so the forward index is 10⁹ × 10 bits = 1.25 GB, plus a 20 KB dictionary. Storing the raw strings would take about 20 GB.
+For a dashboard with 500 concurrent users, when would you add a star-tree index instead of relying on inverted indexes? || When the same group-by dimensions and aggregations are asked constantly, so pre-aggregation bounds every query's work and keeps tail latency low. Inverted indexes are more flexible for new filters, but each query still reads all matching rows; the star-tree costs build time and storage that grows with the number of dimensions.
+
+@@+ elasticsearch
+terms: Index — a named collection of documents with one mapping, split into shards.
+Shard — one Lucene index that holds part of an Elasticsearch index; each shard has a primary copy and zero or more replicas.
+Segment — an immutable sub-index inside a shard, created by a refresh and later merged with others.
+Mapping — the schema of an index: the type of each field and how its text is analyzed.
+Analyzer — the chain that turns text into terms: a tokenizer, then filters such as lowercasing and stemming.
+Posting list — the sorted list of document IDs, with frequencies and positions, that contain one term.
+Doc values — a columnar, on-disk copy of field values used for sorting and aggregations.
+Translog — the per-shard write-ahead log that keeps acknowledged writes safe before Lucene commits them.
+Refresh — the step that makes recent documents searchable by writing a new segment, every second by default.
+BM25 — the default relevance formula, built from term frequency, inverse document frequency and field length.
+how: The write path is replicated document by document. The primary shard indexes the document, gives the operation a sequence number together with the primary term (a counter that increases each time a new primary is chosen), and forwards the same operation to every replica in the in-sync set kept in the cluster state. Each replica analyzes and indexes the document again. By default each copy fsyncs its translog before replying (index.translog.durability: request), so an acknowledged write survives a power loss. The global checkpoint is the highest sequence number that every in-sync copy has; when a replica restarts, it only needs the operations above it, not a full copy of the shard.
+A search runs in phases. First, a "can match" step asks each shard whether it can match at all, for example by comparing a time-range filter with the shard's minimum and maximum timestamps, so many shards of a time-series index are skipped. In the query phase, each remaining shard returns only document IDs and scores of its top hits. In the fetch phase, the coordinating node asks the shards for the full documents of the global winners. For each shard, the coordinator picks the copy that has recently answered fastest (adaptive replica selection). The phases explain deep pagination: asking for results 9,990 to 10,000 makes every shard return its top 10,000, so the default limit (index.max_result_window) is 10,000, and deeper scrolling uses search_after with a point-in-time.
+Lucene, the lucene concept, decides the on-disk shape. Postings are stored in compressed blocks of 128 document IDs with skip data, so an AND of two terms can jump over blocks instead of decoding every ID. Stored fields (the original _source) are compressed in blocks with LZ4 by default. The JVM heap holds cluster state, caches and aggregation buckets, while segment files are read through memory mapping and live in the page cache outside the heap. Circuit breakers estimate the memory each request will need and reject it before it can run the heap out of memory.
+For observability workloads, data streams turn this machinery into an append-only time series. A data stream is a name backed by a sequence of hidden indices; index lifecycle management rolls over to a new backing index by age or size and later moves, shrinks or deletes old ones as whole units. The logsdb index mode, the default for new logs-*-* data streams since 9.0, sorts each index by host and timestamp and rebuilds _source from doc values instead of storing it. Elastic's documentation reports up to 60% less storage in benchmarks, with 10–20% slower indexing.
+diagram:
+  index "products": 5 primaries (P), 1 replica (R) each, on 3 nodes
+
+  node 1: P0  P3  R1  R4       node 2: P1  P4  R2
+  node 3: P2  R0  R3
+
+  WRITE id=p91 -> hash(_routing) mod 5 = 3 -> primary P3 (node 1)
+     P3: index into buffer + translog, seq_no 812, term 4
+     P3 --forward--> R3 (node 3): index again, fsync translog
+     both done -> acknowledge client
+     every 1 s: refresh -> new segment -> searchable
+
+  SEARCH "shoes flat feet" -> coordinating node
+     can_match: skip shards that cannot match the filters
+     query phase:  P0 R1 P2 R3 P4 each return top-10 (id, score)
+     fetch phase:  coordinator merges 50 hits -> global top 10
+                   -> fetch _source of those 10 documents
+
+  inside one shard:  seg_a  seg_b  seg_c (immutable)
+     background merge -> seg_abc (deleted docs dropped)
+mistakes: People often think a document is searchable as soon as the index call returns. In fact a GET by ID sees it at once, because a real-time GET notices unrefreshed changes and refreshes that shard first if needed, but a search sees it only after the next refresh, up to one second later by default. A test that indexes and then searches immediately will fail now and then unless it asks for refresh=wait_for.
+People often think deleting documents frees disk space at once. In fact a delete only marks the document in a bitmap of deleted documents in its segment. Space comes back only when a merge rewrites that segment. A large delete_by_query can even raise disk use for a while. For time-series data, delete whole indices instead, which frees space immediately.
+People often think replicas make indexing faster. In fact every copy indexes every document itself, including analysis, so one replica roughly doubles the cluster's indexing work. Replicas add search throughput and protect against node failure; during a large initial load, teams often set replicas to 0 and add them afterwards.
+People often think relevance scores are absolute and comparable across queries. In fact a BM25 score only ranks documents within one query. Each shard also computes document frequencies from its own data by default, so with few documents per shard the same document can score differently in different shards. The dfs_query_then_fetch search type first collects global term statistics, at the cost of an extra round trip.
+quiz: What does a refresh do, and how often does it run by default? || It writes the documents in the in-memory buffer into a new immutable Lucene segment and opens it for search. By default it runs every second, which is why Elasticsearch is called near-real-time.
+Why is updating a document more expensive than inserting one? || Segments are immutable, so an update marks the old version as deleted and indexes a full new version into a new segment. Merges must later rewrite segments to drop the deleted versions, so update-heavy workloads cost extra indexing and extra merge I/O.
+How is a request for results 990 to 1,000 executed over 5 shards, and why does it get slower for deeper pages? || Each shard must return its own top 1,000 IDs and scores, and the coordinator sorts 5,000 entries to keep 10. The work grows with the page depth, so Elasticsearch limits from + size to 10,000 by default and offers search_after with a point-in-time for deep scrolling.
+A cluster takes 2 TB of log data per day, with 1 replica, 30 GB shards and 7 days of retention. How many shard copies and how much disk are needed? || 2,000 GB / 30 GB ≈ 67 primary shards per day, so 134 copies per day and about 940 copies for 7 days. Data on disk is 2 TB × 2 copies × 7 days = 28 TB, and with disk watermarks at about 85–90% the cluster needs well over 32 TB of disk.
+For a heavy indexing job, why might you raise refresh_interval from 1 second to 30 seconds, and what do you give up? || Fewer refreshes create fewer, larger segments, so there is less merge work and indexing throughput rises. The price is freshness: new documents become searchable only up to 30 seconds after they are written.
+
+@@+ postgres
+terms: Heap — the main storage of a table: 8 KB pages that hold row versions in no particular order.
+Tuple — one stored version of a row, with a header that records which transactions created and expired it.
+ctid — a tuple's physical address: the page number and the slot number inside that page.
+xmin / xmax — the ID of the transaction that created a tuple, and of the one that deleted or replaced it.
+Snapshot — a record of which transactions had committed when a statement or transaction started; it decides which tuples are visible.
+WAL (write-ahead log) — the sequential log of every change, flushed at commit and used for recovery and replication.
+LSN (log sequence number) — a byte position in the WAL; pages, replicas and backups track their progress by LSN.
+Checkpoint — a point at which all dirty pages have been written to disk, so crash recovery can start replaying WAL from there.
+VACUUM — the process that removes dead tuples, updates the visibility map and freezes old transaction IDs.
+TOAST — the mechanism that compresses large values and moves them into a side table.
+how: The page layout is the first detail worth drawing. Each 8 KB heap page starts with a 24-byte header, followed by an array of 4-byte line pointers that grows forward, while tuples are placed from the end of the page backward; free space sits in the middle. A ctid such as (7, 2) means "page 7, line pointer 2". Indexes store ctids, so a tuple can move inside its page (during pruning) without index changes, because only the line pointer is updated. Each tuple carries a header of about 23 bytes with xmin, xmax, a command ID, flags and a null bitmap, which is why very narrow rows have high overhead. Values larger than about 2 KB are compressed or moved out of line by TOAST, so a wide JSONB column does not make every row scan slow.
+Visibility is decided tuple by tuple. A snapshot holds the oldest still-running transaction ID, the next unassigned one, and the list of transactions in progress between them. To check a tuple, PostgreSQL looks up whether its xmin and xmax committed, in pg_xact (2 bits per transaction), and then caches the answer as hint bits in the tuple header. This is why the first read after a bulk load can write many pages. Transaction IDs are 32-bit and compared in a circle, so only about 2 billion transactions are "in the past" for any tuple. VACUUM must therefore freeze old tuples, marking them visible to everyone. Autovacuum forces this when a table's oldest unfrozen ID is more than 200 million transactions old (autovacuum_freeze_max_age), long before the real limit.
+The WAL needs two protections beyond fsync. After each checkpoint, the first change to any page writes a full image of that page into the WAL (full_page_writes). An 8 KB page is written to disk as several smaller device writes, and a crash in the middle leaves a torn page that WAL records alone could not repair. Group commit makes fsync affordable: when many sessions commit at the same moment, one flush of the WAL makes all of them durable. With synchronous_commit = off, a commit returns before its WAL is flushed; a crash can then lose the last few hundred milliseconds of commits (at most three times wal_writer_delay, 600 ms by default), but the database stays consistent.
+The C implementation, from the cpp concept, explains the process model and the extension system. The postmaster process forks one backend process per connection; all backends share memory for the buffer pool, the lock tables and WAL buffers. Memory inside a backend is allocated in memory contexts that are freed all at once at the end of a query or transaction, which keeps leaks short-lived. Extensions are shared libraries loaded into these processes. Through hooks and APIs for new types, operators and index access methods, an extension such as pgvector can add an HNSW index that the planner chooses like any built-in index. PostgreSQL 18's asynchronous I/O (io_method = worker by default, or io_uring on Linux) lets sequential scans, bitmap heap scans and VACUUM queue several reads at once instead of waiting for each block in turn.
+diagram:
+  one 8 KB heap page
+  +--------------------------------------------------------------+
+  | header 24 B | lp1 | lp2 | lp3 | ->           free space      |
+  |                                                              |
+  |        free space            <- | tuple 3 | tuple 2 | tup 1 |
+  +--------------------------------------------------------------+
+  line pointers grow forward; tuples grow backward from the end
+  ctid (7, 3) = page 7, line pointer 3
+
+  UPDATE users SET plan = 'pro' WHERE id = 42;   -- transaction 905
+    tuple 1: id=42 plan='free'  xmin=870  xmax=905   (old version)
+    tuple 3: id=42 plan='pro'   xmin=905  xmax=0     (new version)
+
+  snapshot taken before 905 commits  -> sees tuple 1
+  snapshot taken after 905 commits   -> sees tuple 3
+  VACUUM, once no snapshot needs tuple 1 -> its space is reused
+
+  COMMIT: WAL record at LSN 0/3A1F2C8 -> fsync -> client gets OK
+  the data page itself is written later (checkpoint / bgwriter)
+mistakes: People often think VACUUM FULL is the normal way to reclaim space. In fact plain VACUUM, which autovacuum runs, makes dead space reusable inside the table while reads and writes continue; it usually does not shrink the file. VACUUM FULL rewrites the whole table under an exclusive lock that blocks all reads and writes for the duration. For large live tables, tools such as pg_repack rebuild with only short locks.
+People often think an index always makes a query faster. In fact, when a filter matches a large share of rows, random page reads through the index cost more than one sequential scan, and the planner correctly ignores the index. Every extra index also slows inserts and updates and can prevent HOT updates, because an update that changes any indexed column cannot be HOT.
+People often think SELECT count(*) on a big table should be instant. In fact, under MVCC, different transactions can see different numbers of rows, so PostgreSQL must check the visibility of every row it counts. An index-only scan helps only where the visibility map marks pages all-visible. When an estimate is enough, read reltuples from pg_class.
+People often think synchronous_commit = off can corrupt the database. In fact it only risks losing the most recent commits after a crash, never consistency, because WAL is still written in order. The setting that can corrupt data is fsync = off, which should never be used on data you want to keep.
+quiz: What do xmin and xmax in a tuple header record? || xmin is the ID of the transaction that created the tuple, and xmax is the ID of the transaction that deleted or replaced it (0 if none). A snapshot compares them with its list of committed transactions to decide whether the tuple is visible.
+Why must PostgreSQL freeze old tuples? || Transaction IDs are 32-bit and compared in a circle, so after about 2 billion new transactions an old ID would seem to be in the future and its rows would vanish. Freezing marks old tuples as visible to everyone; autovacuum forces it well before that point, and PostgreSQL stops new writes if it gets too close.
+Why does PostgreSQL write full page images into the WAL after a checkpoint? || A crash while an 8 KB page is being written can leave a torn page, half old and half new. WAL records describe changes to a page and need a consistent page to apply them to, so the first change after a checkpoint logs the whole page, which recovery can restore before replaying later records.
+A table has 100 million rows and default autovacuum settings (threshold 50, scale factor 0.2). After how many dead tuples does autovacuum start, and how would you make it start sooner? || After about 50 + 0.2 × 100,000,000 ≈ 20 million dead tuples. Setting autovacuum_vacuum_scale_factor to 0.01 for that table lowers the trigger to about 1 million, so each vacuum has less work and bloat stays small.
+When would you use synchronous replication, and what does it cost? || When a failover must not lose any committed transaction. Each commit then waits for a standby to confirm its WAL, which adds a network round trip (around 1 ms in one zone, tens of ms across regions), and if the standby is down, commits stall unless several standbys are listed, for example ANY 1 (s1, s2).
+
+@@+ redis
+terms: Event loop — one thread that waits for ready sockets (with epoll) and runs each command to completion, one at a time.
+Listpack — a compact, contiguous encoding used for small hashes, lists and sorted sets.
+Skip list — a layered linked list with O(log n) search; together with a hash table it implements sorted sets.
+TTL — the time to live of a key, after which the key is deleted.
+Eviction policy — the maxmemory-policy rule that chooses which keys to drop when memory is full, such as allkeys-lru or noeviction.
+RDB — a point-in-time binary snapshot of the whole dataset, written by a forked child process.
+AOF (append-only file) — a log of write commands that is replayed at startup to rebuild the data.
+Replication backlog — a ring buffer of recent writes on the primary that lets a reconnecting replica catch up without a full copy.
+Hash slot — one of 16,384 parts of the key space in Redis Cluster; a key's slot is CRC16(key) mod 16384.
+Hash tag — the part of a key inside braces, such as {user42}, which alone decides the slot, so related keys can share one.
+how: The keyspace itself is a hash table with chaining that doubles when it fills. Copying 100 million entries at once would stop the server for seconds, so Redis rehashes incrementally: during a resize it keeps the old and the new table, each command moves a few buckets across, and a timer moves more for about a millisecond at a time. Lookups check both tables until the move is complete. Each data type picks its encoding by size. A hash with at most 128 fields of at most 64 bytes is stored as a listpack, one contiguous block scanned linearly, which is faster than a hash table at that size and uses far less memory; above those limits it becomes a real hash table. A sorted set becomes a skip list (for ranges by score) plus a hash table (for finding a member's score in O(1)).
+Expiry and eviction are approximate by design. Keys with a TTL are also recorded in a second table of expiry times. An expired key is removed lazily, when a command touches it, and actively, by a background cycle that samples about 20 keys with TTLs at a time and keeps going while many of them turn out to be expired, within a CPU budget. Expired keys can therefore occupy memory for a while. When memory reaches maxmemory, Redis does not keep an exact LRU list, which would cost memory on every key. It samples a few keys (maxmemory-samples, 5 by default), keeps a small pool of good candidates and evicts the best one. The LFU policies keep an 8-bit logarithmic access counter per key that decays over time.
+Clients speak RESP, a simple text-based protocol. Executing a GET takes around a microsecond on the server, while a network round trip in one data centre takes 100–300 microseconds, so the round trip, not the server, sets the speed of one connection. Pipelining sends many commands without waiting for each reply, and Lua scripts and functions run several steps on the server as one atomic unit. Both turn many round trips into one.
+Replication works by offsets. Each primary has a replication ID and a byte offset into its stream of writes. A replica that reconnects sends PSYNC with the ID and offset it has; if the missing bytes are still in the primary's replication backlog (1 MB by default), the primary sends only those bytes. Otherwise it performs a full synchronization: it writes an RDB snapshot, sends it, and then streams the writes that arrived meanwhile. The WAIT command lets a client block until a number of replicas have acknowledged its writes, which narrows but does not close the window for losing data on failover.
+Redis Cluster spreads this design across machines. Nodes exchange state over a separate cluster bus with a gossip protocol. A client that sends a command to the wrong node receives MOVED with the right address and updates its slot map; during a slot migration it may receive ASK, a one-time redirect. If a primary is unreachable for longer than cluster-node-timeout (15 seconds by default) and a majority of primaries agree, one of its replicas is promoted. The crdt concept appears in Active-Active deployments (part of the commercial Redis Software and Redis Cloud): every region accepts writes, and data types are implemented as CRDTs, such as counters that sum per-region contributions and sets that resolve concurrent adds and removes, so all regions converge to the same value without coordination. For the cachelayer concept, all of this serves one pattern above all: cache-aside, where the application reads Redis first, falls back to the database on a miss, and writes the result back with a TTL.
+diagram:
+  clients --> [ I/O threads: read and parse requests ] --+
+                                                         | one command
+                                                         v at a time
+             +-----------------------------------------------+
+  main       | event loop: epoll -> run command -> reply     |
+  thread     | keyspace table + expiry table, all in RAM     |
+             +-------+--------------------------+------------+
+                     |                          |
+          fork(): child writes RDB       write AOF buffer,
+          (copy-on-write memory)         fsync every second
+                     |
+                     v
+          async replication stream --> replica at offset 98,112,500
+          backlog ring buffer (1 MB) lets a replica resume
+
+  Redis Cluster: slot = CRC16(key) mod 16384
+    primary A: 0-5460    primary B: 5461-10922    primary C: 10923-16383
+    "cart:{u42}" and "views:{u42}" hash only "u42" -> same slot
+    wrong node -> "MOVED 7638 10.0.0.2:6379" -> client fixes its map
+mistakes: People often think Redis can use only one CPU core. In fact only command execution is single-threaded. I/O threads read and write sockets, background threads free memory and fsync files, and a forked child writes snapshots. To use more cores for commands, you run more shards, for example several primaries in a cluster, each with its own thread.
+People often think a key disappears from memory exactly when its TTL ends. In fact expired keys are removed when they are touched or when the sampling cycle finds them, so memory can stay high for a while after many keys expire. Replicas do not expire keys on their own; they hide expired keys from reads and delete them when the primary sends the deletion.
+People often think MULTI/EXEC is a transaction that rolls back on error. In fact it only guarantees that the queued commands run together without other clients' commands in between. If one command fails at run time, for example because of a wrong type, the others still apply. Optimistic checks need WATCH, which aborts EXEC if a watched key changed.
+People often think deleting a key is always instant. In fact DEL on a hash or set with millions of elements frees every element on the main thread and can block all clients for a long time. UNLINK removes the key from the keyspace at once and frees the memory in a background thread.
+quiz: How many hash slots does Redis Cluster have, and how is a key's slot chosen? || 16,384. The slot is CRC16 of the key modulo 16384, or of only the hash tag inside braces if the key has one, so keys with the same tag land in the same slot.
+Why does an RDB snapshot not stop the server, and what does it cost? || Redis forks a child that writes the snapshot from its copy of memory, while the parent keeps serving. Pages are shared until the parent changes them, so under heavy writes memory use can grow toward twice the dataset, and the fork itself pauses the parent briefly to copy page tables.
+How does pipelining raise the throughput of one connection? || Without it, each command waits a full network round trip of 100–300 µs, while the server needs only about 1 µs to run it. Sending many commands before reading the replies pays one round trip for the whole batch, so throughput can rise by 10 times or more.
+A primary receives 5 MB/s of writes, and a replica is cut off for 10 seconds. With the default backlog, can it resume with a partial sync? || No. It missed about 50 MB, but the default backlog holds 1 MB, so it needs a full sync with a new RDB snapshot. A backlog of a few hundred MB (write rate × longest expected outage) would allow a partial resync.
+When would you choose noeviction instead of allkeys-lru? || allkeys-lru suits a pure cache, where any key can be dropped and rebuilt from the database. noeviction suits data that must not vanish silently, such as queues, locks or rate-limit state: writes then fail with an out-of-memory error, which the application can see and handle.
+
+@@+ kubernetes
+terms: Pod — the smallest unit Kubernetes runs: one or more containers that share a network namespace and volumes, always placed together on one node.
+Deployment — an object that declares a pod template and a replica count, and rolls out changes through ReplicaSets.
+Service — a stable virtual IP and DNS name in front of a changing set of pods, chosen by labels.
+Controller — a loop that watches objects and acts to move the actual state toward the desired state.
+kubelet — the agent on each node that starts and stops containers and reports their status.
+etcd — the Raft-replicated key–value store in which the API server keeps every object.
+Request and limit — the resources a container is promised (used for scheduling) and the most it may use (enforced by cgroups).
+Taint and toleration — a mark on a node that keeps pods away, and the pod setting that allows a pod onto such a node.
+Operator — a custom controller with its own resource types that automates running one piece of software, such as Kafka or PostgreSQL.
+resourceVersion — the version stamp of an object, used to resume watches and to detect conflicting updates.
+how: The API machinery, written in Go like the rest of the control plane (the golang concept), is what makes controllers cheap to write. Every object carries a resourceVersion taken from etcd's revision counter. A client lists a resource type once and then watches from that version, receiving a stream of changes instead of polling. The client-go library wraps this in informers: each keeps a local cache of the objects and, on every change, puts the object's key on a work queue. Controller workers take keys from the queue, read the object from the cache and reconcile. Updates use optimistic concurrency: an update that carries an old resourceVersion is rejected with a 409 Conflict, and the controller simply re-reads and tries again. No component holds locks on objects.
+Every write passes the same gate in the API server, which is where the security and multitenancy concepts are enforced. The request is authenticated (client certificate, OIDC token, or a service account token that is short-lived and bound to one pod) and authorized by RBAC, where Roles grant verbs such as get or create on resource types and RoleBindings give them to users or service accounts in one namespace. Then mutating admission webhooks may change the object (add defaults, inject a sidecar), the object is validated against its schema, and validating admission checks policies such as Pod Security Admission or CEL rules in a ValidatingAdmissionPolicy. Only then is it written to etcd. ResourceQuota and LimitRange objects cap what each namespace may request, so teams can share a cluster without one team taking all the capacity.
+Deletion is also declarative. Objects record their owners in ownerReferences, for example a Pod points to its ReplicaSet; when an owner is deleted, the garbage collector deletes its dependents. A finalizer is a name in an object's metadata that blocks its final removal until some controller has done cleanup, such as releasing a cloud load balancer or a disk, and removed the name. An object stuck in "Terminating" usually has a finalizer whose controller is gone.
+On the node, the linux and docker concepts do the real work. The kubelet calls the container runtime through the Container Runtime Interface, a gRPC API. containerd pulls the OCI image layers from a registry, unpacks them into an overlay filesystem and asks runc to create the namespaces and cgroups. A CPU request becomes a cgroup CPU weight, which divides CPU time between containers only when the node is busy. A CPU limit becomes a CFS quota per 100 ms period, which throttles the container once the quota is used, even when the node is idle. A memory limit becomes memory.max, and exceeding it makes the kernel kill the process. Pods fall into QoS classes (Guaranteed, Burstable, BestEffort) that decide which pods the kubelet evicts first when the node runs short of memory. etcd sets limits as well: one object may be at most about 1.5 MiB, and the database has a size quota (2 GB by default), which is why huge ConfigMaps or millions of objects hurt the whole cluster.
+diagram:
+  kubectl apply -f deploy.yaml
+        |
+        v
+  +----------------------------- control plane ----------------------+
+  | API server: authenticate -> RBAC -> mutating admission ->        |
+  |   schema check -> validating admission -> etcd (Raft, 3 nodes)   |
+  |                                                                  |
+  |      watch               watch                 watch             |
+  | Deployment ctrl --> ReplicaSet ctrl --> Scheduler                |
+  | (creates RS)        (creates 3 Pods)    (filter, score, bind)    |
+  +-----------------------------------+------------------------------+
+                                      | Pod bound to node-2
+                                      v
+  node-2: kubelet --CRI--> containerd --> runc: namespaces + cgroups
+          probe /health ok -> Ready -> EndpointSlice updated
+          kube-proxy or eBPF: Service 10.96.0.15 -> pod IPs
+
+  each controller: observe -> compare(desired, actual) -> act, forever
+mistakes: People often think a successful kubectl apply means the change is running. In fact it only means the API server accepted and stored the new desired state. Pods may still fail to schedule, fail to pull an image or never become ready. Use kubectl rollout status or the Deployment's conditions to know whether the rollout finished.
+People often think the scheduler looks at actual CPU and memory use, or at limits. In fact it adds up only the requests of the pods on each node. A node can be full by requests while nearly idle, or overloaded by pods that use far more than they requested. Limits can add up to more than the node has, which works until many pods are busy at the same time.
+People often think a namespace isolates workloads securely. In fact it is a scope for names, RBAC rules and quotas. By default, pods in different namespaces can reach each other over the network, and they share the kernels of the same nodes. Real isolation needs NetworkPolicies, strict RBAC, Pod Security standards and, for untrusted code, separate node pools or sandboxed runtimes.
+People often think a Service is a load-balancer process that spreads requests. In fact it is an API object; kube-proxy or an eBPF program on every node turns it into kernel rules that pick a pod for each new connection. Long-lived HTTP/2 or gRPC connections therefore stay on one pod, and load can be very uneven. Such traffic needs client-side balancing or a proxy that balances per request.
+quiz: Which component is the only one that reads and writes etcd directly? || The API server. Every other component, including the scheduler, controllers and kubelets, talks to the API server and watches it for changes.
+Why does Kubernetes use level-triggered reconciliation instead of reacting only to events? || A controller compares the full desired state with the full actual state every time, so a missed event, a crash or a restart does not matter: after restarting, it re-reads the current state and continues. Any drift, whatever caused it, is corrected the same way.
+How does Kubernetes stop two controllers from overwriting each other's updates to one object? || Each update must carry the object's resourceVersion. If someone else changed the object first, the version no longer matches and the API server rejects the update with a 409 Conflict, so the controller re-reads the object and applies its change again.
+A node has 7.5 CPUs and 28 GiB allocatable. Each pod requests 500m CPU and 1 GiB memory. How many pods fit, and which resource limits it? || CPU allows 7.5 / 0.5 = 15 pods and memory allows 28, so 15 pods fit and CPU is the limiting resource. Actual CPU use does not change this, because the scheduler counts only requests.
+When would you run one large shared cluster instead of one cluster per team? || A shared cluster gives better utilization, fewer upgrades and one set of tools, but isolation is soft, a bad change can affect everyone, and RBAC and quotas need careful design. Separate clusters give strong isolation and independent upgrades at the price of more operations work and more idle capacity.
+
+@@+ jvm
+terms: Bytecode — the portable, stack-based instruction set stored in .class files, which the JVM executes.
+Class loader — the component that finds, loads and links classes, usually the first time they are used.
+JIT compiler — the part of the JVM that compiles hot bytecode to machine code while the program runs: C1 compiles quickly, C2 optimizes heavily.
+Tiered compilation — running a method first in the interpreter, then as C1 code with profiling, then as C2 code, as it gets hotter.
+Deoptimization — discarding compiled code whose assumptions turned out false and continuing in the interpreter.
+Escape analysis — proving that an object never leaves a method or thread, so its heap allocation can be removed.
+TLAB (thread-local allocation buffer) — a private chunk of the heap in which one thread allocates objects by bumping a pointer.
+Safepoint — a point at which all Java threads are stopped so the JVM can do work such as some GC phases or deoptimization.
+Compressed oops — 32-bit object references scaled by 8, which can address a heap of up to about 32 GB.
+Happens-before — the Java Memory Model rule that decides which writes of one thread another thread is guaranteed to see.
+how: Execution starts with class loading, which the langruntime concept frames as the front half of any runtime. javac produces stack-based bytecode: about 200 opcodes that push and pop values on an operand stack, plus a constant pool of names and literals per class. Class loaders form a hierarchy (bootstrap, platform, application) in which each loader first asks its parent, so core classes cannot be replaced by application code. Classes are linked lazily. The verifier type-checks every method using stack map frames recorded by javac, symbolic references are resolved on first use, and static initializers run on first active use. Doing this for thousands of classes is a large part of start-up time; since JDK 24, an ahead-of-time cache (JEP 483, part of Project Leyden) can store classes already loaded and linked by a training run.
+The tiered compiler is driven by counters. In current HotSpot, a method is compiled by C1 with profiling after about 200 invocations, and by C2 after about 5,000 invocations or a combined count of invocations and loop iterations of 15,000. A long-running loop inside a method that is called only once is handled by on-stack replacement: when its back-edge counter overflows, the JVM compiles the loop and jumps from the interpreted frame into the compiled code in the middle of execution. Compiled code lives in the code cache (240 MB reserved by default with tiered compilation). Every speculative optimization is protected by a cheap guard, such as "the receiver's class is X". If a guard fails, the thread traps, the JVM uses debug information to rebuild interpreter frames from the machine state, and execution continues in the interpreter until the method is recompiled.
+Memory layout explains the "Java uses a lot of memory" reputation. On a 64-bit JVM with compressed pointers, every object starts with a 12-byte header (an 8-byte mark word for locking, hashing and GC age, and a 4-byte class pointer), and objects are padded to multiples of 8 bytes. A java.lang.Integer therefore takes 16 bytes to hold 4 bytes of data, and an array of Integers adds a 4-byte reference for each. Compressed oops store references as 32-bit numbers multiplied by 8, which covers heaps up to about 32 GB; above that, references grow to 8 bytes, which is why heaps just over 32 GB can hold less data than a 31 GB heap. JDK 25 made compact object headers (JEP 519) a product option, enabled with -XX:+UseCompactObjectHeaders, which shrinks the header to 8 bytes; the JEP reports 22% less heap in one SPECjbb2015 setup.
+The concgc concept supplies the collectors. G1 splits the heap into equal regions (usually 1 to 32 MB, chosen from the heap size), each tagged as eden, survivor, old or humongous (for very large objects). A young collection stops the application and copies the live objects out of eden and survivor regions, so its cost depends on the live objects, not on the garbage. To avoid scanning the whole old generation for pointers into young regions, a write barrier records cross-region pointers in remembered sets. Concurrent marking then finds old regions that are mostly garbage, and mixed collections evacuate them as well, within a pause goal of 200 ms by default. ZGC goes further: it stores metadata in the pointers themselves and adds a load barrier, so it can mark and move objects while application threads run; its pauses stay under a millisecond whatever the heap size. ZGC has been generational by default since JDK 23, and the non-generational mode was removed in JDK 24.
+The Java Memory Model and the lockfree concept make concurrent code both fast and correct. The model defines happens-before edges: a write to a volatile field, the release of a lock and the end of a constructor (for final fields) make earlier writes visible to threads that later read that field or take that lock. The JIT and the CPU may reorder anything else. On top of this, java.util.concurrent uses compare-and-set instructions (LOCK CMPXCHG on x86) through VarHandles to build lock-free structures: ConcurrentLinkedQueue is the Michael–Scott queue, and LongAdder spreads one counter over several cells so that many threads can increment it without fighting over one cache line. Kafka, Flink and Spark rely on these classes in their hot paths.
+diagram:
+  App.java --javac--> App.class --class loader--> verify, link, init
+                                                        |
+                                                        v
+  invocations:  0 .......... ~200 .............. ~5,000+ ...........
+  runs as:      interpreter  C1 code + profiling  C2 optimized code
+                (counts calls, records types)     (inlining, escape
+                      ^                            analysis, loops)
+                      |                                 |
+                      +--- deoptimize: a guard failed --+
+
+  G1 heap: [E][E][S][O][O][E][H][O][ ][E][O][ ]   regions, often 1-32 MB
+           E = eden  S = survivor  O = old  H = humongous  [ ] = free
+    young GC: copy live objects out of E and S regions (short pause)
+    mixed GC: also evacuate the old regions with the most garbage
+
+  one object on a 64-bit JVM with compressed oops:
+    +-------------+-----------+--------------------+
+    | mark word   | class ptr | fields ...         |  padded to 8 B
+    | 8 bytes     | 4 bytes   |                    |
+    +-------------+-----------+--------------------+
+    java.lang.Integer: 12 B header + 4 B value = 16 B for 4 B of data
+mistakes: People often think Java code is slow because it is interpreted. In fact hot code is compiled to optimized machine code after a few thousand calls. What is slow is the warm-up, and this misleads naive benchmarks: a timer around a loop in main() may measure the interpreter, on-stack replacement or code the JIT removed as dead. Use a harness such as JMH, which warms up and prevents dead-code elimination.
+People often think garbage-collection pauses grow with the amount of garbage. In fact copying collectors touch only live objects; dead objects cost nothing to reclaim. Many short-lived objects are cheap, while large, long-lived structures (big caches, huge maps) make collections expensive, because they must be marked and sometimes copied again and again.
+People often think a volatile field makes count++ atomic. In fact volatile only guarantees visibility and ordering of single reads and writes. count++ is a read, an add and a write, so two threads can both read 5 and both write 6. Use AtomicLong, or LongAdder under heavy contention, which use compare-and-set.
+People often think virtual threads make CPU-bound code faster. In fact they make waiting cheap: a blocked virtual thread releases its carrier thread, so a million tasks waiting on I/O need only a few OS threads. They add no CPU. Before JDK 24, a virtual thread that blocked inside a synchronized block also pinned its carrier thread; JEP 491 removed most of that limitation.
+quiz: What do C1 and C2 do in tiered compilation? || C1 compiles a method quickly with light optimization and adds profiling (call counts, branch and type statistics). C2 later recompiles the hottest methods with heavy optimization, such as inlining, escape analysis and loop optimizations, guided by that profile.
+Why is allocating many short-lived objects cheap on the JVM? || Each thread allocates by bumping a pointer in its own TLAB, which costs a few instructions. A young collection copies only live objects out of the young regions, so objects that are already dead cost nothing to reclaim.
+How does the JVM recover when a speculative optimization turns out to be wrong? || Each speculation is protected by a guard. When the guard fails, the thread traps, the JVM rebuilds interpreter frames from the compiled frame using debug information, and execution continues in the interpreter; the method is later recompiled with the new profile.
+How much memory do 100 million integers take as an ArrayList<Integer> compared with an int[], with compressed oops? || Each Integer is 16 bytes and each list slot holds a 4-byte reference, so about 20 bytes × 10⁸ = 2 GB, against 4 bytes × 10⁸ = 400 MB for an int[]. This 5× overhead is why data systems use primitive arrays and binary formats.
+When would you choose ZGC over G1? || Choose ZGC for latency-sensitive services, especially with large heaps, because its pauses stay under a millisecond whatever the heap size. G1 usually gives somewhat higher throughput and needs less CPU and memory headroom for concurrent work, so it remains a good default for batch and throughput-oriented jobs.
+
+@@+ nvgpu
+terms: Streaming multiprocessor (SM) — one of the GPU's processor blocks, with its own registers, shared memory, warp schedulers and tensor cores; an H100 SXM has 132.
+Warp — a group of 32 threads that execute the same instruction at the same time.
+Tensor core — a unit that multiplies small matrix tiles in one operation, in low-precision formats such as BF16, FP8 or FP4.
+HBM (high-bandwidth memory) — DRAM dies stacked on top of each other beside the GPU, joined to it by a very wide interface.
+Shared memory — fast on-chip memory inside an SM that the threads of one block share and manage explicitly.
+Arithmetic intensity — floating-point operations per byte moved from memory; it decides whether a kernel is limited by compute or by memory.
+NVLink and NVSwitch — NVIDIA's GPU-to-GPU links, and the switch chips that connect many GPUs at full link speed.
+FP8 and FP4 — 8-bit and 4-bit floating-point formats; they double or quadruple tensor-core throughput but need scale factors to keep accuracy.
+MFU (model FLOPs utilization) — the share of the peak FLOP/s that a training run actually spends on the model's math.
+NCCL — NVIDIA's library for collective operations, such as all-reduce, across many GPUs.
+how: Inside an SM, the simt concept is visible in hardware. An H100 SM is divided into four partitions, each with its own warp scheduler, a quarter of the 64K 32-bit registers (256 KB in total) and one tensor core. Every cycle, each scheduler picks one warp whose operands are ready and issues its next instruction. A GPU does not hide memory latency with large caches and out-of-order execution like a CPU; it hides it by keeping many warps resident (up to 64 per SM, 2,048 threads) and switching to another warp when one waits. A kernel needs enough independent work to fill 132 SMs with dozens of warps each, which is why GPUs want large batches and large matrices.
+The memory hierarchy, from the dram concept, sets most limits. Each H100 SM has 256 KB of combined L1 cache and shared memory, the chip has a 50 MB L2 cache, and 80 GB of HBM3 sits in five stacks beside the GPU die on a silicon interposer. Each stack is a pile of DRAM dies connected vertically by through-silicon vias, with a 1,024-bit interface, which is how about 3.35 TB/s becomes possible. Dividing peak compute by bandwidth gives the ridge point of the roofline model: 989 TFLOP/s ÷ 3.35 TB/s ≈ 295 FLOPs per byte. A kernel that does fewer operations per byte fetched from HBM is memory-bound, whatever the tensor cores could do. Generating one token of a language model at batch size 1 reads every weight once (2 bytes in BF16) and does about 2 FLOPs with it, about 1 FLOP per byte, which is why inference servers batch many requests together.
+Hopper changed how tensor cores are fed, which is the tensorcores concept in practice. The Tensor Memory Accelerator (TMA) copies a whole tile of a matrix from HBM into shared memory on the request of a single thread, while the other threads keep computing. Warpgroup instructions (four warps, 128 threads) start an asynchronous matrix multiply on tiles already in shared memory. Fast kernels such as FlashAttention-3 therefore run as pipelines: some warps load the next tiles while others multiply the current ones. Blackwell's fifth-generation tensor cores keep their accumulators in a new per-SM Tensor Memory instead of registers, and add the NVFP4 format: 4-bit values grouped in blocks of 16, each block with its own FP8 scale factor, plus one scale for the whole tensor. Blackwell B200 is also two dies (208 billion transistors in total) joined by a 10 TB/s chip-to-chip link, so that software sees one GPU.
+Between GPUs, the rdma and hpc concepts take over. On H100, each GPU has 18 NVLink 4 links with 900 GB/s in total, and NVSwitch chips connect the 8 GPUs of a server so that every pair can talk at full speed. Blackwell's NVLink 5 doubles this to 1.8 TB/s per GPU, and the GB200 NVL72 rack extends one NVLink domain to 72 GPUs. Beyond that domain, each GPU usually has its own 400 Gbit/s InfiniBand or RoCE network card, and GPUDirect RDMA lets that card read and write GPU memory without copying through the CPU. NCCL chooses ring or tree algorithms over this two-level network. In a ring all-reduce, each GPU sends and receives about 2 × (N − 1)/N times the data size, so the slowest link sets the time.
+The Rubin generation continues each line. NVIDIA's Vera Rubin NVL72 specification lists 72 Rubin GPUs and 36 Vera CPUs per rack, 288 GB of HBM4 per GPU at about 19 TB/s, sixth-generation NVLink with 216 TB/s across the rack, and 50 PFLOPS of NVFP4 inference per GPU (a figure that assumes sparsity). As with every generation, the gains come from more memory bandwidth, lower precision and larger NVLink domains as much as from more raw arithmetic.
+diagram:
+  one H100 SXM GPU
+  +----------------------------------------------------------+
+  |  SM 0           SM 1                     SM 131          |
+  | +------------+ +------------+          +------------+    |
+  | | 4 warp     | | 4 warp     |   ...    | 4 warp     |    |
+  | | schedulers | | schedulers |          | schedulers |    |
+  | | 4 tensor   | | 4 tensor   |          | 4 tensor   |    |
+  | | cores      | | cores      |          | cores      |    |
+  | | 256 KB reg | | 256 KB reg |          | 256 KB reg |    |
+  | | 256 KB L1/ | | 256 KB L1/ |          | 256 KB L1/ |    |
+  | | shared mem | | shared mem |          | shared mem |    |
+  | +-----+------+ +-----+------+          +-----+------+    |
+  |       +--------------+---------+-------------+           |
+  |                      L2 cache, 50 MB                     |
+  +---------------------------+------------------------------+
+                              | about 3.35 TB/s
+           HBM3: 5 stacks, 80 GB (DRAM dies joined by TSVs)
+
+  NVLink 4: 900 GB/s per GPU -> NVSwitch -> 7 other GPUs in server
+  NIC: 400 Gbit/s (50 GB/s) InfiniBand or RoCE -> other servers
+
+  roofline ridge: 989 TFLOP/s / 3.35 TB/s = about 295 FLOP per byte
+mistakes: People often think the peak TFLOP/s figure predicts how fast a workload runs. In fact most kernels below the ridge point are limited by memory bandwidth, and token generation in inference usually is. Datasheets also often quote sparse figures, which assume a 2:4 sparsity pattern most models do not use; the dense figure is half of that.
+People often think GPU threads behave like CPU threads. In fact the 32 threads of a warp run one instruction together. If they take different branches, the warp runs both paths one after the other, with the threads of the other path masked off. A GPU also has small caches per thread and hides latency only by switching between many warps, so it needs thousands of threads of similar work to run well.
+People often think FP8 or FP4 training is just casting numbers to fewer bits. In fact these formats have a tiny range: FP8 E4M3 reaches only about ±448. Values must be multiplied by scale factors (per tensor, or per small block in NVFP4) to fit, and the products are summed in higher precision. Without careful scaling, gradients overflow or vanish, and the model loses accuracy.
+People often think NVLink connects all the GPUs in a cluster. In fact one NVLink domain is a server (8 GPUs) or a rack (72 GPUs in NVL72). Beyond it, each GPU has roughly 50 GB/s of network bandwidth, more than 15 times less than NVLink. Training plans therefore keep the most communication-heavy parallelism, such as tensor parallelism, inside the NVLink domain, and use data or pipeline parallelism across it.
+quiz: What is a warp, and what happens when its threads take different branches? || A warp is a group of 32 threads that execute the same instruction together on an SM. When they branch differently, the warp executes each path in turn with the inactive threads masked off, so divergent code runs slower.
+Why is generating tokens at batch size 1 limited by memory, not by compute? || Each token reads every model weight once (2 bytes in BF16) and does about 2 FLOPs with it, about 1 FLOP per byte. An H100 needs about 295 FLOPs per byte to keep its tensor cores busy, so the HBM bandwidth sets the speed and the tensor cores sit mostly idle.
+How do TMA and asynchronous tensor-core instructions raise utilization on Hopper? || TMA copies whole tiles from HBM to shared memory at the request of one thread, and warpgroup matrix instructions run asynchronously on tiles already loaded. Kernels can then load the next tiles while multiplying the current ones, so memory transfers and math overlap instead of alternating.
+A 70-billion-parameter model in BF16 runs on 2 H100s with tensor parallelism. Roughly what is the upper bound on tokens per second at batch size 1? || The weights take 140 GB, and the two GPUs together read about 6.7 TB/s, so one step needs at least about 21 ms, or about 48 tokens per second. At batch size 32, each step still reads the weights once and takes about as long, so total throughput rises nearly 32 times.
+For serving a large model, when is a GPU with more HBM worth more than one with more FLOPs? || When decoding dominates, because it is memory-bound: capacity limits how much model and KV cache fit and so the batch size, and bandwidth sets the time per step. An H200 has the same compute as an H100 but 141 GB at 4.8 TB/s, so it serves such workloads faster; extra FLOPs matter more for prefill and training.
+ref: docs | NVIDIA Vera Rubin NVL72 (specifications) | NVIDIA, 2026 | https://www.nvidia.com/en-us/data-center/vera-rubin-nvl72/
+
+@@+ commitlog
+terms: Log — an ordered, append-only sequence of records; each new record gets the next position number.
+Offset — a record's position in its partition; it acts as a logical clock for that partition.
+Partition — one independent log; a topic is split into partitions so work runs in parallel, with order kept per key.
+Retention — the rule, by time, size or compaction, that decides when old records may be removed.
+Log compaction — background cleanup that keeps at least the latest record for every key.
+Tombstone — a record with a key and an empty value that marks the key as deleted in a compacted log.
+Consumer offset — the position up to which a reader has processed a partition, saved so it can resume there.
+Materialized view — a table, cache or index built by applying the log's records in order.
+Tiered storage — keeping recent segments on broker disks and older segments in object storage.
+Replicated state machine — deterministic copies that reach the same state by applying the same log in the same order.
+how: An offset is a logical clock, which is the contribution of the lamport concept. Like a Lamport timestamp inside one process, it orders events in one partition without any reference to wall-clock time, and every reader agrees on that order. This makes positions useful for coordination. A producer learns the offset of its write; a service that builds a view from the log can report "I have applied everything up to offset 812"; a client that needs to read its own write simply waits until the view's offset passes its own. Offsets in different partitions cannot be compared, so the position of a reader of a whole topic is a vector, one offset per partition, much like a vector clock. A stream processor's checkpoint is exactly such a vector, stored together with the state derived from it.
+Compaction, from the logcompaction concept, works without changing offsets. The log is seen as a clean tail, already compacted, and a dirty head of newer segments. A cleaner thread reads the dirty head and builds an in-memory map from each key (stored as a hash) to its latest offset. It then rewrites the older segments, copying a record only if no newer record for its key exists, and swaps the new segment files in. Surviving records keep their original offsets, so the log simply has gaps, and a reader asking for a removed offset continues at the next one that exists. Kafka starts cleaning a partition when the dirty part exceeds a share of the log (min.cleanable.dirty.ratio, 0.5 by default), which bounds wasted space at about half.
+Tiered storage, the tieredstorage concept, splits retention into two levels. Closed segments are copied to object storage; broker disks keep only the most recent hours. A read of recent data comes from the page cache as before, while a read of last month's data is served from the object store, with a slower first byte but no load on the broker's disk. Because brokers hold little local data, replacing a broker or moving partitions copies gigabytes instead of terabytes. Storage cost then follows object-storage prices, which are several times lower than replicated block storage.
+The same abstraction allows very different implementations, which is why the map has a separate shardpercore concept. Redpanda keeps the Kafka protocol but runs one thread per CPU core (with the Seastar framework); each partition is owned by one core, so the hot path needs no locks, and each partition is replicated with its own Raft group. Object-storage-native designs such as WarpStream go further: stateless agents write batches straight to object storage, and a separate metadata service assigns them their order and offsets. That removes broker disks and cross-zone replication traffic, in exchange for write latencies of hundreds of milliseconds instead of a few. All of them keep the contract that matters to users: an ordered, replicated, replayable log per partition.
+diagram:
+  topic "orders", partition 0 (records only appended, never edited)
+  offset:   0    1    2    3    4    5    6    7    8
+  key:      o1   o2   o1   o3   o2   o1   o4   o3   o1
+  val:      new  new  paid new  paid ship new  null done
+                           ^                        ^      ^
+                     analytics              email      inventory
+                     (hourly) at 3          at 8       at 9 (the end)
+
+  after compaction: latest record per key, offsets unchanged
+  offset:                       4         6    7    8
+  key:                          o2        o4   o3   o1
+  val:                          paid      new  null done
+                                               ^ tombstone; removed
+                                                 after a delay
+  a topic is many partitions, each with its own order:
+    p0: 0 1 2 3 4 5 6 7 8 ...    a reader's position is a vector,
+    p1: 0 1 2 3 4 5 ...          one offset per partition:
+    p2: 0 1 2 3 4 5 6 7 ...      {p0: 9, p1: 6, p2: 8}
+mistakes: People often think replaying a log always rebuilds the same state. In fact it does so only if the consumer is deterministic and the log is complete. If retention has already deleted the oldest events, if the consumer calls an outside service during replay (today's exchange rate instead of last month's), or if old events no longer match the new code's schema, the rebuilt state differs. Design consumers to depend only on the events, and keep the history they need.
+People often think offsets are timestamps that can be compared across partitions. In fact offset 1,000 in partition 0 and offset 1,000 in partition 1 have no relation; one partition may be weeks ahead of the other. To find "the events of yesterday 10:00", look up offsets by timestamp in each partition separately, and remember that record timestamps are set by producers or brokers and are only approximately ordered.
+People often think writing to the database and then to the log in application code keeps them in sync. In fact a crash between the two writes leaves one without the other, and two concurrent requests can reach the database and the log in different orders. Use the transactional outbox (write the event in the same database transaction, then publish it) or change data capture from the database's own log.
+People often think a commit log can serve any query once the data is in it. In fact it supports only "read from offset X onward" efficiently. Finding all orders of one customer means scanning the partition or building a materialized view keyed by customer. Every query pattern needs its own derived store, which must be kept up to date and rebuilt when it breaks.
+quiz: Why can many consumers read the same log without slowing each other down? || Each consumer keeps its own offset, and reading does not change the log. The log never tracks per-reader state, so a new or slow reader only moves its own position.
+Why does partitioning by key keep the order that applications usually need? || All records with the same key go to the same partition, which has a total order, so all events of one order or one user are seen in sequence. Records with different keys may be in different partitions and are unordered, which lets them be processed in parallel.
+How does compaction keep only the latest value per key while existing offsets stay valid? || A cleaner builds a map from each key to its latest offset, then rewrites old segments, copying only records that are still the latest for their key. Surviving records keep their offsets, so the log has gaps, and a read of a removed offset continues at the next existing one.
+A profile topic has 50 million users, 1 KB records and 10 updates per user per day. How much data does one replica hold with 7-day time retention, and with compaction? || With time retention: 50 million × 10 × 7 × 1 KB = 3.5 TB. With compaction: about one record per user, 50 GB, plus the not-yet-cleaned dirty head (up to about the same again with the default dirty ratio of 0.5).
+When should the log be the source of truth (event sourcing), and when should a database be the source with the log derived by CDC? || Make the log primary when history itself is the product, such as audit, replay or many independent views of the same events. Keep the database primary when you need constraints, transactions and ad-hoc queries; CDC still gives a reliable stream for other systems, without every team having to rebuild state from events.

@@ -190,7 +190,8 @@ def load(root=None, extra=()):
             rd, sec = reads[key], None
             continue
         if rd is None: errs.append(f"{where} text outside a read"); continue
-        m = SEC_RE.match(line)
+        # inside a diagram, indented lines are drawing, even if they look like "value: ..."
+        m = None if (sec == "diagram" and raw[:1] in (" ", "\t")) else SEC_RE.match(line)
         if m and m.group(1) == "ref":
             p = [x.strip() for x in m.group(2).split("|")]
             while len(p) < 4: p.append("")
@@ -250,6 +251,15 @@ def load(root=None, extra=()):
         if not reach5(n): errs.append(f"{n} cannot reach a first principle (L5)")
 
     if errs: raise ContentError("\n".join(errs))
+
+    # drop duplicate sources inside one read (extensions sometimes repeat a source); keep the one with a URL
+    for r in list(reads.values()) + layer_reads:
+        best = {}
+        for x in r["refs"]:
+            k = re.sub(r"[^a-z0-9]", "", x["t"].lower())[:50]
+            if k not in best or (x["u"] and not best[k]["u"]): best[k] = x
+        keep = set(id(v) for v in best.values())
+        r["refs"] = [x for x in r["refs"] if id(x) in keep]
 
     # merge reads, compute reading time
     total_words = 0

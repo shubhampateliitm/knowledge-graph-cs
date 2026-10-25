@@ -1,0 +1,593 @@
+@@+ partitioning
+terms: Partition (shard) — one piece of a dataset that holds a subset of the keys and is served by one machine, or one replica group, at a time.
+Partition key — the field whose value decides which partition a record goes to.
+Hash partitioning — the partition is hash(key) mod N; keys spread evenly, but key order is lost.
+Range partitioning — each partition owns one contiguous range of keys; order is kept and range scans are cheap, but sequential keys create hot spots.
+Consistent hashing — keys and nodes are placed on a ring of hash values, and each key belongs to the next node on the ring, so adding a node moves only about 1/N of the keys.
+Virtual node (vnode) — one of many ring positions owned by the same physical node, used to make each node's share of the ring more even.
+Skew (hot spot) — a partition that receives much more data or traffic than the average, usually because a few keys are very popular.
+Rebalancing — moving or splitting partitions between machines when nodes join, leave or fill up.
+Scatter–gather — sending a query to every partition and merging the answers, needed when the query does not contain the partition key.
+Salting — adding a small suffix to a hot key (for example 0 to 7) so that its records spread over several partitions.
+how: The mapping function decides how much data moves when the number of partitions or nodes changes. With hash(key) mod N, a key keeps its place only if hash mod N equals hash mod (N + 1), which is true for about 1 key in N + 1; going from 4 to 5 partitions moves about 80% of the data. Consistent hashing avoids this: a new node takes over only the arc of the ring just before its position, so about 1/(N + 1) of the keys move, all of them to the new node. Two later algorithms give the same minimal movement with different costs. Rendezvous (highest-random-weight) hashing scores every node with hash(key, node) and picks the highest score; it needs no ring, but each lookup costs O(N). Jump consistent hash (Lamping and Veach, Google, 2014) computes a bucket number from the key in about ln N steps and needs no memory at all, but it only works when buckets are numbered 0 to N − 1 and are added or removed at the end.
+Probability tells you how even the spread is, and it is less even than people expect. N random points on a ring cut it into arcs of very unequal length: the largest arc is on average about (ln N + 0.58)/N of the ring, so with 10 nodes and one point each, the busiest node owns almost 3 times its fair share. Virtual nodes fix this by averaging. A node's share becomes the sum of V small arcs, and its relative spread falls roughly as 1/√V: about 6% with 256 vnodes, about 25% with 16. Cassandra used 256 random tokens per node for years; version 4.0 lowered the default to 16 and paired it with an algorithm that places tokens deliberately instead of randomly, because every vnode adds repair and streaming work. So hash-based schemes balance keys well once there are many keys. They do not balance traffic.
+Power laws explain why traffic stays uneven. Key popularity in real systems is often close to a Zipf distribution, where the k-th most popular key gets traffic in proportion to 1/k. With one million keys and a Zipf exponent of 1, the top key alone receives 1/H(10⁶) ≈ 1/14.4 ≈ 7% of all requests (H(n) is the harmonic number, about ln n + 0.58). Over 50 partitions the average partition gets 2%, but the partition that holds the top key gets at least 7%, 3.5 times the average. Adding partitions does not help, because hashing can never split one key. Amdahl's law then turns this into wall-clock time: a Spark stage or a Kafka consumer group is only as fast as its slowest partition. The fixes all change something other than the hash: change the key (salting or sub-keys), combine before partitioning (local pre-aggregation), or treat the hot partition specially. Spark's adaptive query execution does the last one for joins: a shuffle partition larger than 5 times the median and larger than 256 MB (the defaults) is split into several tasks, and the matching rows from the other side of the join are copied to each of them.
+Range-partitioned systems rebalance by splitting. CockroachDB splits a range once it grows past 512 MiB, and it also splits a range by load when the range receives more than a threshold of queries (2,500 per second by default): it samples the keys being accessed and picks a split point that divides the load roughly in half without cutting through many requests. Each half can then have its leader on a different node. Splitting cannot fix a sequential key, because every new key is larger than all old keys, so all inserts land on the newest range however often it splits. The usual fix is to put a small hash in front of the key (CockroachDB's hash-sharded indexes, or a "hash(id) mod 16" prefix in HBase row keys). Inserts then spread over 16 ranges, at the cost of 16 sub-scans for every query over a time range.
+diagram:
+  mod-N hashing: grow from 4 to 5 partitions
+  key   hash   hash mod 4   hash mod 5
+  k1     17        1            2        moves
+  k2     40        0            0        stays
+  k3     63        3            3        stays
+  k4     86        2            1        moves
+  k5    109        1            4        moves
+  on average only 1 key in 5 keeps its partition (4 of every 20 hashes)
+
+  consistent hashing: ring of positions 0..99; a key belongs to the
+  first node at or after its position, wrapping from 99 back to 0
+  0    10   20   30   40   50   60   70   80   90   99
+  |----|----|----|----|----|----|----|----|----|----|
+        ^            ^             ^           ^
+       A12          B38           C66         A90   (A owns 2 vnodes)
+  key 17 -> B38    key 50 -> C66    key 95 -> wraps -> A12
+
+  add node D at 52: only keys 39..52 move (from C to D);
+  every other key keeps its node
+mistakes: People often think a partitioned Kafka topic delivers events in order. In fact Kafka keeps order only within one partition. Events in different partitions can be consumed in any relative order, and even the order of one key breaks if the partition count changes (the key maps to a new partition) or if a producer without idempotence retries while several requests are in flight. If two events must stay ordered relative to each other, they must share a partition key.
+People often think hash partitioning removes skew. Hashing spreads distinct keys evenly; it does nothing for a key that is hot on its own, because every record with that key goes to the same partition by design. Measure the traffic share of the hottest key, not only the number of keys.
+People often think more partitions always mean more parallelism. Parallelism is capped by the workers: a 512-partition topic read by 32 consumers runs 32 ways in parallel. And each partition has a fixed cost: files and open handles on brokers, replication traffic, leader elections during failover, scheduling overhead for each Spark task (often tens of milliseconds), and small files in a table. Beyond enough parallelism plus room for growth, more partitions only add overhead.
+People often treat partitioning and replication as the same thing. Partitioning divides the data so each machine holds a different part; replication copies the same part to several machines. Partitioning alone makes failures worse: with 64 partitions on 64 machines and no replicas, losing any one machine loses data. Real systems do both and usually replicate each partition on its own (a replication factor per Kafka partition, one Raft group per CockroachDB range).
+People often think consistent hashing means no data moves when a node joins. About 1/(N + 1) of the data still moves, and a ring with one point per node is badly balanced. Many systems (Kafka, Elasticsearch) do not use consistent hashing at all: they keep a fixed number of partitions and move whole partitions between nodes, which gives the same small movement with a simpler map.
+quiz: What does range partitioning keep that hash partitioning loses, and what does it risk? || Range partitioning keeps keys in sorted order, so a range scan touches only a few partitions. It risks hot spots when keys are sequential, such as timestamps, because all new writes go to the last range.
+Why does going from hash mod 4 to hash mod 5 move about 80% of the keys, while adding a fifth node to a consistent-hashing ring moves about 20%? || With mod N, a key stays only if its hash gives the same remainder for 4 and 5, which happens for 4 of every 20 hash values. On a ring, only the keys in the arc taken over by the new node move, about 1/5 of the ring when nodes are evenly spread.
+Why can hashing never fix a single hot key, and what can? || Every record with the same key hashes to the same partition, by design. You must change something else: salt the key into several sub-keys (losing per-key order), pre-aggregate locally before the shuffle, or split the hot partition specially, as Spark's adaptive skew join does.
+One million keys follow a Zipf distribution with exponent 1 and are hashed into 50 partitions. At least how much more traffic than average does the partition with the most popular key receive? || The top key gets 1/H(10⁶) ≈ 1/14.4 ≈ 7% of traffic, while the average partition gets 1/50 = 2%. So that partition receives at least about 3.5 times the average, however many partitions you add.
+When would you choose a global secondary index over a local one? || Choose a global index when reads by the indexed field are frequent and latency-sensitive, because each such read then goes to one partition. Accept that every write becomes a distributed update, often applied asynchronously so the index can be briefly stale. If writes dominate or such reads are rare, local indexes with scatter–gather reads are simpler and cheaper.
+ref: paper | A Fast, Minimal Memory, Consistent Hash Algorithm | John Lamping & Eric Veach, 2014 | https://arxiv.org/abs/1406.2294
+ref: docs | Load-Based Splitting | Cockroach Labs | https://www.cockroachlabs.com/docs/stable/load-based-splitting
+
+@@+ consensus
+terms: Crash fault — a node stops (and may later restart), but it never sends false messages.
+Byzantine fault — a node may behave in any way, including lying; tolerating f such nodes needs 3f + 1 nodes.
+Quorum — a set of nodes large enough that any two such sets share at least one node; usually a majority, f + 1 out of 2f + 1.
+Ballot, term or epoch — a number that grows with every new leader attempt; messages carrying a lower number are rejected.
+State machine replication — every replica applies the same deterministic commands in the same order, so all replicas reach the same state.
+Safety — the promise that nothing bad ever happens: two nodes never decide different values.
+Liveness — the promise that something good eventually happens: a value is eventually decided.
+Partial synchrony — a network model where delays can be unbounded for a while but become bounded after some unknown time.
+Lease — a time-limited promise from a majority that no other leader will be elected before it expires.
+how: Single-decree Paxos shows the core trick that every protocol in this family repeats. A proposer picks a ballot number b higher than any it has seen and sends Prepare(b) to the acceptors. Each acceptor that has not promised a higher ballot promises to ignore smaller ballots from now on, and replies with the value it has already accepted under the highest ballot, if any. With promises from a majority, the proposer moves to phase 2 and sends Accept(b, v), where v must be the value of the highest ballot reported in those promises; only if nobody reported a value may it use its own. A value is chosen once a majority accepts it under the same ballot. The phase 2 rule is where the overlap of majorities does its work: if a value was already chosen, at least one acceptor in the new majority has accepted it and reports it, so the new leader proposes that same value again instead of a conflicting one.
+Running both phases for every log entry would cost two round trips per write. Multi-Paxos, Viewstamped Replication and Raft remove this in the same way: a leader runs phase 1 once, for all future log positions, and after that each new entry needs only phase 2, one round trip to a majority. Viewstamped Replication (Oki and Liskov, 1988) contributed this shape. A primary orders operations and backups apply them; a view change with a higher view number elects a new primary, which first collects the logs of a majority so that nothing committed is lost. Zab and Raft are close relatives, and their epochs and terms play the role of VR's view numbers.
+Distributed systems theory supplies the model and its limits. In the partial synchrony model of Dwork, Lynch and Stockmeyer, delays may be unbounded for a while but become bounded after some unknown time. Chandra, Hadzilacos and Toueg (1996) showed that the weakest failure detector that makes consensus solvable is Ω, which eventually points all correct nodes to the same live leader. Election timeouts are a practical Ω. They can be wrong for a while, so two nodes may both try to lead, and the ballot or term numbers make that harmless: a node holding an old number can no longer get a majority to accept anything.
+The majority itself is not required, only the overlap. Flexible Paxos (2016) showed that the quorum used to elect a leader (Q1) and the quorum used to replicate entries (Q2) only need |Q1| + |Q2| > N. With N = 6, a leader could replicate each entry to any 3 nodes if every election collects 4 nodes. This lets a designer make the common path (replication) cheaper and the rare path (election) more expensive.
+diagram:
+  5 acceptors: A B C D E    majority = 3    tolerates f = 2 crashes
+
+  quorum 1 (old leader, ballot 7):  A B C         accepted v = "x"
+  quorum 2 (new leader, ballot 8):      C D E     any two sets of 3
+                                        ^         out of 5 overlap
+                    C reports (7, "x"), so the new leader must
+                    propose "x" again, never its own value
+
+  one Paxos decision as a message flow
+  proposer                 acceptors A..E
+     |-- Prepare(8) ---------->|   phase 1: "ignore ballots below 8"
+     |<-- Promise(8, last accepted = (7, "x")) from 3 of 5
+     |-- Accept(8, "x") ------>|   phase 2: highest reported value
+     |<-- Accepted(8) from 3 of 5    =>  "x" is chosen
+
+  Multi-Paxos / VR / Raft: phase 1 once per leader,
+  then one phase-2 round trip per log entry
+mistakes: People often think more nodes always mean more fault tolerance. A group of 4 tolerates only 1 failure, the same as a group of 3, because a majority of 4 is 3; the fourth node only makes every write wait for one more acknowledgement. Use odd sizes, usually 3 or 5.
+People often expect a consensus system to stay writable while any node is alive. It needs a live, connected majority. With 3 nodes and 2 down, the last node refuses writes on purpose, because it cannot know whether the other two have elected a new leader and committed different entries.
+People often read FLP as "consensus is impossible in practice". FLP says that no deterministic protocol can guarantee that it finishes in a fully asynchronous network if one node may crash. Practical protocols are always safe, and they finish whenever the network behaves well for long enough; randomized timeouts make endless split elections very unlikely.
+People often think consensus protects against bad data. It replicates whatever the leader proposes, so a bad command or a deterministic software bug reaches every replica at the same time. Standard protocols also assume disks do not lie: a corrupted log entry on one node can break safety, which is why some systems add checksums and protocol-aware recovery.
+People often call two-phase commit a consensus protocol. Two-phase commit needs every participant to vote yes, and it blocks if the coordinator fails at the wrong moment. Consensus needs only a majority and keeps working when a minority fails, which is why distributed databases replicate each two-phase-commit participant with consensus.
+quiz: How many nodes do you need to tolerate f crash faults, and how many for f Byzantine faults? || 2f + 1 nodes for crash faults, so that a majority of f + 1 is always reachable and any two majorities overlap. 3f + 1 nodes for Byzantine faults, because lying nodes can be in both quorums.
+Why must a new Paxos leader propose the highest-ballot value reported in phase 1 instead of its own value? || That value may already be chosen by a majority. Any majority of promises overlaps that majority, so at least one promise reports it, and proposing it again keeps the decision the same. Proposing a different value could create a second, conflicting decision.
+How do practical consensus protocols live with the FLP impossibility result? || They make safety independent of timing: ballot or term numbers and quorums never allow two different decisions. Timing is used only for liveness: elections may fail or repeat while the network is chaotic, but once delays stay bounded long enough, one leader wins and progress resumes.
+A 5-node group has its leader in zone A. Round trips from the leader are 0.5 ms to the second node in zone A, 2 ms to the two nodes in zone B and 30 ms to the node in zone C; fsync takes 1 ms everywhere. What is the commit latency, and what happens if zone B fails? || The leader needs 2 acknowledgements besides itself: zone A's node at about 1.5 ms and the first zone B node at about 3 ms, so a commit takes about 3 ms. If zone B fails, the second acknowledgement must come from zone C, and commits rise to about 31 ms.
+When would you serve consensus reads with a leader lease instead of a read-index check? || A lease lets the leader answer from local state with no round trip, but it is only safe if clock drift is bounded. A read-index check costs one heartbeat round to a majority but needs no clock assumption. Choose leases when clocks are well managed and read latency matters most; choose read-index when correctness must not depend on clocks.
+ref: paper | The Weakest Failure Detector for Solving Consensus | Chandra, Hadzilacos & Toueg, JACM 1996 |
+ref: paper | Viewstamped Replication: A New Primary Copy Method to Support Highly-Available Distributed Systems | Oki & Liskov, PODC 1988 |
+
+@@+ raft
+terms: Term — a numbered period of time with at most one leader; every Raft message carries the sender's term.
+Follower, candidate, leader — the three roles of a Raft node; followers only answer, candidates ask for votes, the leader accepts client commands.
+Election timeout — how long a follower waits without hearing from a leader before it starts an election; chosen at random from a range so that nodes rarely time out together.
+RequestVote — the message a candidate sends to ask for votes; it carries the term and index of the candidate's last log entry.
+AppendEntries — the message the leader uses to copy log entries to followers; with no entries, it serves as a heartbeat.
+Commit index — the highest log index that is known to be committed and so safe to apply to the state machine.
+nextIndex — for each follower, the next log index the leader will send to it.
+Log Matching Property — if two logs contain an entry with the same index and term, the two logs are identical up to that index.
+Snapshot — a saved copy of the state machine at some log index, which lets a node discard the log entries before it.
+Pre-vote — a trial election in which a node first checks that it could win before it increases its term.
+how: "At least as up to date" has an exact meaning: compare the term of the last log entry first, and only if the terms are equal, compare log length. A log that ends with an entry from term 5 beats a longer log that ends with term 4. This rule and the overlap of majorities give the proof of Leader Completeness. A committed entry is stored on a majority. A winning candidate got votes from a majority. The two majorities share at least one node, and that node voted only because the candidate's log was at least as up to date as its own; an induction over terms shows that the candidate's log then contains the committed entry too. The proof needs a second invariant, the Log Matching Property. It holds because a leader creates at most one entry per index in its term and never moves entries, and because a follower accepts AppendEntries only if its entry just before the new ones has the same index and term as the leader's.
+The leader keeps a nextIndex for each follower, starting just after its own last entry. When a follower rejects AppendEntries because the previous entry does not match, the leader lowers nextIndex and tries again. Lowering by one entry per round trip is slow for a follower that is thousands of entries behind, so implementations let the follower reply with the term of its conflicting entry and the first index it holds for that term; the leader then skips the whole term in one step. Once a match is found, the follower deletes everything after it and appends the leader's entries. Entries flow only from leader to followers, and a leader never deletes or overwrites its own log. This is a deliberate simplification of Viewstamped Replication, Raft's closest ancestor. In VR, a new primary may need to fetch missing entries from other replicas during a view change; in Raft, the voting rule guarantees that the new leader already has them.
+fsync decides which state is safe. Before it replies to any message, a node must make three things durable: its current term, the candidate it voted for in that term, and its log entries. If the vote were lost in a crash, the node could restart and vote again in the same term, and two candidates could each collect a majority: two leaders in one term. If a follower acknowledged entries before flushing them, the leader could count a replica that later loses the entry, and "commit" data that only a minority really holds. Many real Raft bugs and data-loss reports come from skipping these flushes for speed.
+Raft's timing requirement is broadcastTime ≪ electionTimeout ≪ MTBF: one round trip including fsync must be much shorter than the election timeout, which must be much shorter than the mean time between node failures. The paper suggests timeouts drawn at random from 150–300 ms. etcd defaults to a 100 ms heartbeat and a 1,000 ms election timeout and advises an election timeout of at least 10 round-trip times, because shared cloud disks and networks have pauses of hundreds of milliseconds. Finally, a new leader cannot know which entries from earlier terms are committed until it commits something in its own term, so it appends an empty no-op entry as soon as it is elected.
+diagram:
+         timeout: start election        votes from majority
+  Follower -----------------> Candidate -----------------> Leader
+     ^  ^                      |     |                       |
+     |  +-- sees a leader or --+     +-- timeout: new term,  |
+     |      a higher term                try again           |
+     +----------------- sees a higher term -------------------+
+
+  log index:      1  2  3  4  5  6  7     (numbers are entry terms)
+  leader S1 (t5): 1  1  1  4  4  5  5
+  follower S2:    1  1  1  4  4  5        missing 7 -> send entry 7
+  follower S3:    1  1  1  2  2  2  2     stale entries from term 2
+
+  repairing S3:
+   AppendEntries(prev = index 6, term 5)  -> reject: S3 has term 2
+   S3 replies: conflict term 2, first index of term 2 = 4
+   AppendEntries(prev = index 3, term 1, entries 4..7) -> accept
+   S3 deletes its entries 4..7 and copies the leader's
+mistakes: People often think a client timeout means the command did not happen. The leader may have committed the entry and crashed before replying, so a blind retry can apply the command twice. Raft's paper solves this with client IDs and sequence numbers: the state machine remembers the last sequence number applied for each client and ignores duplicates.
+People often think a new leader can immediately serve reads from its state machine. It has every committed entry, but it does not yet know which of its entries from earlier terms are committed, and it might already have been replaced. That is why it first commits a no-op in its own term, and why each linearizable read needs a heartbeat round (read-index) or a lease.
+People often think Raft gives different guarantees from Paxos. It solves the same problem under the same model: crash faults, 2f + 1 nodes, safety always, progress only when a majority can communicate. It is close to Multi-Paxos with a strong leader; the differences are in structure, such as the voting rule that lets log entries flow only from leader to followers. Neither tolerates nodes that lie.
+People often think only log entries must be written to disk. The current term and the vote must also be durable before replying; otherwise a restarted node can vote twice in one term and allow two leaders.
+People often change membership by editing the node list everywhere at once. During such a switch, the old and new configurations can form two separate majorities and elect two leaders. Raft uses joint consensus or adds and removes one server at a time, and new servers should first join as non-voting learners, so that a slow, empty node does not stall commits while it catches up.
+quiz: When does a Raft node consider a candidate's log "at least as up to date" as its own? || When the candidate's last entry has a higher term, or the same last term and an index at least as large. The term is compared first, so a shorter log ending in a newer term wins.
+Why does the voting rule guarantee that a new leader already has every committed entry? || A committed entry is on a majority, and the winner needs votes from a majority, so at least one voter holds the entry. That voter refuses any candidate whose log is less up to date than its own, and an induction over terms shows the winner's log therefore contains the entry.
+How does a leader repair a follower whose log has diverged? || AppendEntries carries the index and term of the entry before the new ones. If they do not match, the follower rejects, and the leader moves nextIndex back, one entry or one whole term at a time, until it finds a match. The follower then deletes everything after that point and copies the leader's entries.
+Election timeouts are random in 150–300 ms, and the leader crashes right after a heartbeat. With 4 followers, 1 ms round trips and 1 ms fsyncs, roughly how long are writes unavailable? || The first of 4 uniform timers fires on average at 150 + 150/5 = 180 ms. The candidate then persists its term and vote and needs 2 votes, each one round trip plus the voter's fsync, about 2–3 ms. So writes stop for roughly 185 ms, plus the new leader's no-op commit.
+What do you gain and lose by shortening the election timeout? || You gain faster failover after a real crash. You lose stability: garbage-collection pauses, fsync stalls or network jitter longer than the timeout start needless elections, and each one briefly stops writes. Keep the timeout around ten or more round trips plus worst normal disk latency, as etcd advises.
+ref: docs | etcd tuning guide (heartbeat interval and election timeout) | etcd | https://etcd.io/docs/v3.5/tuning/
+
+@@+ exactlyonce
+terms: At-most-once — each event is handled zero or one time; nothing is retried, so events can be lost.
+At-least-once — events are retried until acknowledged, so none are lost, but some are handled twice.
+Effectively-once — events may be handled more than once inside the system, but each one affects the visible results exactly once.
+Idempotent operation — an operation with the same effect whether it runs once or twice, such as an upsert by key or "set x = 5".
+Producer ID and sequence number — numbers Kafka attaches to every batch so that a broker can recognise and drop a retried duplicate.
+Transactional ID — a stable name for a producer across restarts; together with an epoch number, it lets Kafka shut out an older copy of the same producer.
+Fencing — rejecting writes from an old instance of a process (a "zombie") that still runs after a newer instance has taken over.
+Checkpoint barrier — a numbered marker that flows with the records in Flink; an operator snapshots its state when the barrier has arrived on all its inputs.
+read_committed — the Kafka consumer isolation level that returns only records from committed transactions.
+Last stable offset — the position in a partition before which every transaction has finished; read_committed consumers do not read past it.
+how: The three ingredients come from two lower concepts. ACID transactions contribute atomicity and isolation: the output records, the new state and the new input position are three writes that must all happen or none, and readers must never see a half-finished set. Crash recovery in the ARIES style contributes the restart rule: go back to the last consistent point, redo what is recorded as committed, and make everything after it invisible. In a stream processor, the input offset plays the role of ARIES's log sequence number, a checkpoint plays the role of an ARIES checkpoint, and aborting an open transaction plays the role of undo.
+Kafka's idempotent producer works per partition. When a producer starts, it gets a producer ID and an epoch. Every batch it sends to a partition carries a sequence number that grows by one. The partition leader remembers the last five batch sequences for each producer; a batch with a sequence it has already written is acknowledged but not written again, and a batch that skips a number is rejected as out of order. This is why idempotence allows at most five requests in flight per connection. Current Kafka producers (3.2 and later) turn on idempotence and acks=all by default. Idempotence removes only duplicates caused by the producer's own retries within one session; if the application restarts and sends the same record again under a new producer ID, the broker cannot tell.
+Transactions extend this across partitions and restarts. A transactional producer has a stable transactional.id, which maps to a transaction coordinator: a broker that records transaction state in the internal __transaction_state topic. When the producer starts, the coordinator increases the epoch for that ID, which fences any older instance, and finishes or aborts whatever transaction the old instance left open. During a transaction, the producer tells the coordinator every partition it writes to, including the partition of __consumer_offsets that will hold its input offsets. To commit, the coordinator first writes PREPARE_COMMIT to its own log, which is the point of no return, then writes a COMMIT marker into every partition involved, then writes COMPLETE_COMMIT. This is two-phase commit, but the coordinator's state is a replicated Kafka log, so a coordinator crash does not block forever: the next coordinator reads the log and finishes the job. Consumers in read_committed mode read only up to the last stable offset and skip records of aborted transactions using a per-partition index of aborted transactions.
+Flink gets the same effect with distributed snapshots, a variant of the Chandy–Lamport snapshot algorithm. The checkpoint coordinator injects barrier n into every source. Barriers flow with the data; an operator with several inputs waits until barrier n has arrived on all of them (alignment), writes a snapshot of its state to durable storage in the background, and forwards the barrier. When every operator, including the sinks, has acknowledged, checkpoint n is complete. A transactional sink opens a new external transaction for each checkpoint period, pre-commits it when the barrier arrives, and commits it only after it is told that checkpoint n is complete. Unaligned checkpoints (Flink 1.11 and later) skip the waiting by also saving the records still in flight, which keeps checkpoints fast under backpressure at the cost of larger snapshots.
+Spark Structured Streaming works in micro-batches. Before running batch N, the driver writes the offset range of batch N to the offsets log in the checkpoint directory; after the sink has committed the batch, it writes N to the commits log. On restart, a batch that has offsets but no commit entry is run again with exactly the same offsets. The sink must therefore accept the same batch twice. The file sink and the Delta Lake sink record the batch ID in their own transaction log and ignore a batch they have already committed; foreachBatch writers can get the same behaviour from Delta with the txnAppId and txnVersion write options.
+All of this costs latency. Output becomes visible only at commit time, so end-to-end latency is at least the commit interval. For this reason Kafka Streams lowers its default commit interval from 30 seconds to 100 ms when exactly-once is on, while a Flink job with one-minute checkpoints shows new results to read_committed readers up to about a minute late.
+diagram:
+  Kafka read-process-write transaction (transactional.id "app-0")
+
+  clicks-p0 --read 500..599--> [ app: count per campaign ]
+                                  |  writes, each batch tagged
+                                  |  with producer ID, epoch, seq
+                                  v
+                  counts-p3   changelog-p0   __consumer_offsets
+                  (results)   (state)        (next offset = 600)
+                         ^          ^            ^
+                         +---- COMMIT markers ---+
+                                  |
+                 transaction coordinator (__transaction_state)
+   1. register partitions    2. app writes records
+   3. log PREPARE_COMMIT  <-- point of no return
+   4. write COMMIT markers into all three partitions
+   5. log COMPLETE_COMMIT
+
+  crash before 3: transaction aborted, offset stays 500, replay
+  crash after 3:  coordinator finishes steps 4 and 5 by itself
+  read_committed readers see all of it, or none of it
+mistakes: People often think turning on producer idempotence gives exactly-once processing. It only removes duplicates created by the producer's own retries within one session. A crashed and restarted application that re-reads its input and writes again needs transactions (or an idempotent sink), because the broker sees a new producer ID and cannot recognise the repeat.
+People often expect Kafka transactions to protect every reader automatically. The consumer default is isolation.level = read_uncommitted, which also returns records from transactions that later abort. And read_committed has its own cost: one long open transaction holds back the last stable offset of its partitions, so committed readers stall behind it until it commits, aborts or times out.
+People often think "exactly once" means the code runs once per event. Under replay, the processing code runs again for every event since the last checkpoint. Only the committed results are protected; log lines, metrics, in-memory caches and any external calls inside the job happen again.
+People often assume transactional sinks cannot lose data. A pre-committed Kafka transaction waits for the next completed checkpoint, and the broker aborts it if it stays open longer than its timeout. The broker caps that timeout with transaction.max.timeout.ms, 15 minutes by default, so a Flink job that takes longer than the timeout to checkpoint or to restart can lose the output of that period. Flink's documentation asks for a timeout larger than the maximum checkpoint duration plus the maximum restart time.
+quiz: What is the difference between at-most-once, at-least-once and effectively-once? || At-most-once never retries, so events can be lost. At-least-once retries until acknowledged, so nothing is lost but duplicates appear. Effectively-once may process events several times internally, but duplicates never reach the visible results.
+Why must the consumed offsets be committed in the same transaction as the output? || If they are committed separately, a crash between the two writes breaks the result. Output committed but offsets not means the input is replayed and the output duplicated; offsets committed but output not means those events are lost.
+How does a Kafka broker detect a duplicate batch from an idempotent producer? || Each batch carries the producer ID, the epoch and a per-partition sequence number. The partition leader remembers the last five sequences for each producer, so a retried batch with a known sequence is acknowledged without being written again.
+A Flink job checkpoints every 60 seconds; a checkpoint takes about 10 seconds; it writes to Kafka with transactions. How late do read_committed readers see a record, and what happens if the job is down for 20 minutes with the broker's default timeout cap? || A record written early in a checkpoint period becomes visible only when that checkpoint completes, up to about 70 seconds later. With a 15-minute timeout cap, the broker aborts the pre-committed transaction during the 20-minute outage, so on restart that output cannot be committed and is lost unless the timeout cap was raised.
+When would you choose at-least-once delivery with an idempotent upsert sink instead of transactions? || When the sink is an external database or service that cannot join a Kafka or Flink transaction, when results must appear with low latency, and when every record has a stable key so that a repeat simply overwrites the same row. You give up atomic updates across several outputs, and readers may briefly see partial or repeated intermediate states.
+ref: blog | Transactions in Apache Kafka | Apurva Mehta & Jason Gustafson (Confluent), 2017 | https://www.confluent.io/blog/transactions-apache-kafka/
+ref: paper | Lightweight Asynchronous Snapshots for Distributed Dataflows | Carbone, Fóra, Ewen, Haridi & Tzoumas, 2015 | https://arxiv.org/abs/1506.08603
+
+@@+ wal
+terms: Log record — a description of one change, with enough information to redo it and often to undo it.
+LSN (log sequence number) — the position of a record in the log; it only grows, and each data page stores the LSN of the last change applied to it (the page LSN).
+Commit record — the log record whose arrival on stable storage makes a transaction committed.
+Group commit — one flush that makes the commit records of many concurrent transactions durable at once.
+Checkpoint — a recorded point from which recovery may start, because every change before it is known to be in the data files.
+Redo and undo — redo reapplies logged changes that may be missing from data pages; undo removes changes of transactions that never committed.
+Steal and no-force — buffer policies: steal allows uncommitted changes to be written to data files; no-force allows a commit to finish without writing its data pages.
+Torn page — a database page that was only partly written when power failed, because the device writes in smaller units than the page.
+Full-page write — a whole copy of a page placed in the log the first time the page changes after a checkpoint, so that a torn page can be rebuilt.
+fsync and fdatasync — system calls that force a file's data (and, for fsync, all its metadata) from the page cache to stable storage.
+how: The buffer policies decide what the log must contain. A no-force policy lets a transaction commit without writing its data pages, so after a crash some committed changes may exist only in the log: recovery needs redo. A steal policy lets the buffer pool write a dirty page to disk before the transaction that changed it commits, so after a crash the data files may hold uncommitted changes: recovery needs undo. ARIES chooses steal and no-force, the most flexible pair for the buffer pool, and so logs both. Restart has three passes. Analysis reads forward from the last checkpoint to find which transactions were active and which pages were dirty. Redo replays history from the oldest change that might be missing, and skips any record whose LSN is not greater than the page LSN already stored on the page, which makes redo safe to repeat. Undo then rolls back the transactions that never committed and logs each undo step as a compensation record, so a crash during recovery does not undo the same change twice. PostgreSQL needs less: because its MVCC keeps old row versions in the table, changes of uncommitted transactions are simply invisible, and its recovery is mostly redo.
+The storage device decides what a single write can promise. A device or file system guarantees atomic writes only for small units, typically 512 bytes or 4 KB, while database pages are 8 KB (PostgreSQL) or 16 KB (InnoDB). A power cut in the middle of writing a page can leave a torn page, half old and half new, that no redo record can fix, because redo records describe changes to an intact page. PostgreSQL therefore writes a full copy of each page into the WAL the first time it changes after a checkpoint (full_page_writes, on by default), and recovery starts from that copy. InnoDB solves the same problem differently, by writing pages first to a doublewrite buffer and only then to their real place.
+The page cache and the file system decide when bytes are really safe. A write() call only copies bytes into the kernel's page cache; they reach the device later, in the background, unless the program calls fsync or fdatasync, or opens the file with O_DSYNC. fdatasync is cheaper because it skips metadata such as timestamps, but if an append makes the file longer, the new file length is metadata and must be flushed too, which costs an extra file-system journal write. PostgreSQL avoids this by using fixed-size 16 MB WAL segment files that are created at full size and recycled, so a log flush never changes a file's length. Errors also need care. In 2018 PostgreSQL developers found that on Linux a failed fsync could drop the unwritten pages from the page cache, so a retried fsync reported success although the data was gone. Since the early-2019 releases, PostgreSQL treats a failed data-file flush as fatal by default: it crashes and recovers from the WAL instead of retrying.
+The cost of the flush is set by the device. A drive with power-loss protection has capacitors that can finish writing its internal cache after a power cut, so it can acknowledge a flush as soon as the data is in that cache: tens of microseconds. A drive without it must program the flash cells before answering, which takes milliseconds, and network block storage adds a network round trip. Group commit hides much of this: while one flush is running, other transactions append their commit records, and the next flush makes all of them durable together.
+Checkpoints bound recovery time. PostgreSQL starts a checkpoint every 5 minutes by default, or earlier when about 1 GB of WAL (max_wal_size) has been written since the last one. A checkpoint is fuzzy: it does not stop writes. It records a redo point, writes out all pages that were dirty at that moment, and then records that recovery may start from the redo point. Older WAL segments can then be recycled, unless a replica or an archive still needs them.
+diagram:
+  memory                          disk
+  +--------------------+   (1)    +--------------------------------+
+  | WAL buffer         |  append  | WAL: 100 upd A (T7)            |
+  |                    | -------> |      180 upd B (T7)            |
+  |                    |          |      200 COMMIT T7             |
+  |                    |          |      260 upd C (T8)            |
+  | shared buffers     |          +--------------------------------+
+  |  page A, LSN 100   |   (3)    +--------------------------------+
+  |  page B, LSN 180   |  later   | table files: pages A, B, C     |
+  |  page C, LSN 260   | -------> |                                |
+  +--------------------+          +--------------------------------+
+  (2) at COMMIT of T7: fsync the WAL up to LSN 200, then reply "OK"
+  (3) a page may be written only after the WAL up to its page LSN
+      is durable
+
+  recovery after a crash
+  last checkpoint redo point --> replay every record --> end of WAL
+         (LSN 080)              redo only if page LSN < record LSN
+                                T7 has a COMMIT record -> keep
+                                T8 has none -> invisible or undone
+mistakes: People often think a successful write() means the data is on disk. It means the data is in the kernel's page cache, which is lost on a power cut. Durability needs fsync, fdatasync or O_DSYNC, and even O_DIRECT is not enough on its own, because it bypasses the page cache but not the drive's volatile cache.
+People often think write-ahead logging halves write performance because everything is written twice. The log write is small and sequential, and the data pages are written later in bulk: a hot page changed a thousand times between checkpoints is written once, not a thousand times. Without the log, every commit would have to force its scattered data pages to disk, which costs far more.
+People often treat fsync = off as a stronger version of a speed setting. It can corrupt the database after an operating-system crash or power loss, because pages may reach disk before the log that describes them. PostgreSQL's synchronous_commit = off is the safe alternative: after a crash it may lose commits from the last moments (at most three times wal_writer_delay, 600 ms by default), but the database stays consistent.
+People often think a failed fsync can simply be retried. On Linux, after a write-back error the kernel may already have dropped the unwritten pages, so the retry can report success for data that is lost. The only safe reaction is to crash and recover from the log, which is what PostgreSQL does by default.
+People often treat a WAL-fed replica as a backup. It replays every change, including a mistaken DELETE or DROP TABLE, within milliseconds. Protection against mistakes needs base backups plus archived WAL, so that you can restore to a point in time just before the error.
+quiz: Which two ordering rules does write-ahead logging impose? || A data page may be written to disk only after the log records describing its changes are durable. A transaction may be reported as committed only after its commit record is durable.
+Why does ARIES need both redo and undo? || It uses no-force, so committed changes may exist only in the log after a crash and must be redone. It also uses steal, so uncommitted changes may already be in the data files and must be undone.
+How does recovery avoid applying the same change twice when it replays the log? || Every page stores the LSN of the last change applied to it. During redo, a log record is applied only if its LSN is greater than the page LSN, so changes that already reached the page are skipped, and replaying again after a second crash is safe.
+A database's log flush takes 2 ms on network block storage. How many commits per second can one log sustain without group commit, and with 50 transactions sharing each flush? || Without group commit, one flush per commit allows at most about 1 / 2 ms = 500 commits per second. With 50 commit records per flush, the limit from flushing rises to about 25,000 per second, and other costs become the bottleneck.
+A telemetry table can lose the last second of data after a crash, but a payments table cannot lose anything. How do you set durability? || Keep normal synchronous commit for payments, so each commit waits for its flush. Use asynchronous commit (synchronous_commit = off in PostgreSQL) for the telemetry transactions only: they skip the wait and risk losing well under a second of data, but the database never becomes inconsistent. Never use fsync = off for either.
+ref: book | Transaction Processing: Concepts and Techniques | Jim Gray & Andreas Reuter, 1992 |
+ref: docs | PostgreSQL: Asynchronous Commit | PostgreSQL | https://www.postgresql.org/docs/current/wal-async-commit.html
+
+@@+ lsm
+terms: Memtable — the sorted in-memory buffer, often a skip list, that receives every new write.
+SSTable (SST file) — an immutable file of key-value pairs sorted by key, with an index and usually a Bloom filter.
+Flush — writing a full memtable to disk as one new SSTable.
+Compaction — background merging of SSTables that keeps the newest version of each key and drops overwritten and deleted entries.
+Level — a group of SSTables; in leveled compaction the files inside one level (except level 0) do not overlap, and each level is about 10 times larger than the one above.
+Tombstone — a marker written by a delete that hides older values of the key until compaction removes both.
+Sequence number — a counter stamped on every write; when several versions of a key meet, the one with the highest number wins.
+Write amplification — bytes written to the device divided by bytes written by the application.
+Read amplification — the number of files or blocks one lookup must read.
+Space amplification — bytes stored on disk divided by the size of the live data.
+how: The external-memory model gives the costs in a few formulas. Let T be the size ratio between levels and L the number of levels; L is about log_T(N / M), where N is the data size and M the size of the first level. Under leveled compaction each level holds one sorted run, so a point lookup checks at most one file per level, but a byte is rewritten up to about T times per level as it moves down, so write amplification grows as T × L. Under tiered compaction each level may hold up to T runs, which are merged together only when the level is full, so a byte is written about once per level (L in total), while a lookup may have to check up to T × L runs. Space amplification follows the same split. With leveled compaction and T = 10, the last level holds about 90% of the data, so obsolete versions in the upper levels add only about 11%; tiered compaction can briefly need twice the live data size during a large merge. A bigger T means fewer levels but more rewriting per level, and T = 10 is the common default.
+Inside an SSTable, the layout is designed so that one lookup reads one block. RocksDB writes key-value pairs in sorted data blocks of about 4 KB before compression. Inside a block, keys are prefix-compressed: each key stores only the bytes that differ from the previous key, and a full key is stored every 16 entries (a restart point) so the block can still be binary-searched. An index block holds a separator key for every data block, a filter block holds the Bloom filter, and a footer at the end of the file points to both. A lookup reads the index and filter once (they are then cached), checks the filter, binary-searches the index to find the one data block that may hold the key, and reads only that block.
+Every write gets a sequence number. RocksDB appends it to the user key as an 8-byte trailer, together with a type byte (put, delete or merge), and sorts entries by user key ascending and then sequence number descending. So the memtable and every SSTable keep all versions of a key next to each other, newest first. The memtable is a skip list because a skip list keeps keys sorted while many threads insert at the same time, so a flush is a single sequential scan. Compaction is the merge step of external merge sort: a k-way merge over the input files, with a min-heap of their current keys, costs O(n log k) comparisons and reads and writes every file sequentially once. When versions of the same key meet, the merge keeps the newest one, plus any older version that an open snapshot still needs. This is how RocksDB offers consistent snapshots without locks.
+The file system contributes cheap, all-or-nothing file creation and deletion. SSTables are never modified, so the set of files that forms the tree at one moment (a "version") is described in a small separate log, the MANIFEST. A flush or compaction first writes its new files completely, then appends one record to the MANIFEST that adds the new files and removes the old ones; the switch takes effect at once. Readers still using an old version keep its files alive until they finish, and then the files are deleted. After a crash, recovery reads the MANIFEST to find the live files and replays the WAL into a new memtable.
+diagram:
+  write path                               read path for Get(k)
+  put(k, v) --> WAL (append + fsync)       1. active memtable
+           \--> memtable (skip list)       2. immutable memtables
+                 | full (64 MB):           3. L0 files, newest first
+                 v flush                   4. one file per level,
+  L0  [sst] [sst] [sst] [sst]  overlap        Bloom filter first
+          \   compaction = k-way merge
+  L1  [a-f] [g-m] [n-s] [t-z]              256 MB  no overlap
+  L2  [..][..][..][..][..][..][..][..]     2.5 GB  10x per level
+  L3  [.......................................]   25 GB
+  L4  [.......................................]  250 GB
+
+  one SST file:
+  +------------+------------+--------+-------+-------+--------+
+  | data block | data block |  ...   | filter| index | footer |
+  |  ~4 KB     |  ~4 KB     |        | block | block |        |
+  +------------+------------+--------+-------+-------+--------+
+mistakes: People often think an LSM tree is always faster than a B-tree for writes. A burst of writes is fast because it only fills the memtable, but over hours the device must also absorb compaction, which rewrites each byte 10–30 times under leveled compaction. Sustained write throughput is set by how fast compaction can keep up, and on a device that is already busy it can fall to B-tree levels or below.
+People often think Bloom filters make range scans cheap. A Bloom filter answers "is this exact key here?", so it helps point lookups only. A range scan has to open an iterator in the memtable and in every level and merge them, whatever the filters say; only prefix filters, built for keys that share a prefix, help seeks to a prefix.
+People often think the WAL is optional because SSTables are on disk. Until a flush, the newest writes exist only in the memtable, and without the WAL a crash loses them. Systems that turn the WAL off do so because they have another recovery path: Flink, for example, runs its RocksDB state without a WAL and recovers from its own checkpoints instead.
+People often treat write amplification as a fixed cost of the LSM design. It depends on choices: leveled compaction writes about T times per level, tiered compaction about once per level, and key-value separation (WiscKey, RocksDB's BlobDB) keeps large values in a separate log so that compaction moves only keys and small pointers.
+quiz: In what order does a point lookup search an LSM tree, and why can it stop at the first match? || It checks the active memtable, then immutable memtables, then level-0 files from newest to oldest, then at most one file in each deeper level. Data moves down over time, so the first version found is the newest one.
+Why does leveled compaction give cheaper reads but more write amplification than tiered compaction? || Leveled keeps one sorted run per level, so a lookup checks at most one file per level; but keeping that single run means merging new data into a level about T times larger, rewriting each byte up to about T times per level. Tiered lets up to T runs pile up per level and writes each byte about once per level, so lookups must check more runs.
+How does compaction decide which versions of a key to keep, and when can it drop a tombstone? || Entries carry sequence numbers, and the highest one is the newest version; older versions are dropped unless an open snapshot still needs them. A tombstone can be dropped only when no older value of the key can exist below it, which is certain at the bottom level, and no snapshot still needs it.
+A RocksDB database holds 1 TB with L1 = 256 MB and a size ratio of 10. How many levels are there, and what is a rough upper estimate of write amplification? || L1 = 256 MB, L2 = 2.56 GB, L3 = 25.6 GB, L4 = 256 GB, so 1 TB needs a fifth level. At up to about 10 rewrites per level, the upper estimate is about 5 × 10 = 50, plus the WAL write and the flush; real values are often 10–30 because levels are not always full and many keys are overwritten before they reach the bottom.
+For time-series ingestion where data expires after 30 days and queries read recent data, which compaction style fits, and why? || A time-window or FIFO style, a form of tiered compaction, fits best. Files hold data from one time window and are dropped whole when they expire, so there are no tombstones and little rewriting. The cost is more files to check for older ranges, which recent-data queries rarely touch.
+
+@@+ btree
+terms: Page (node) — a fixed-size block that holds one tree node: 8 KB in PostgreSQL, 16 KB in InnoDB.
+Fan-out — the number of children of an internal node; in database B-trees, usually hundreds.
+Separator key — a key in an internal node that marks the boundary between the key ranges of two children.
+B+tree — the variant in which all entries live in the leaves, internal nodes hold only separators, and leaves are linked in key order.
+Page split — dividing a full node into two and adding a new separator key to its parent.
+Latch — a short lock that protects one in-memory page during a single operation, unlike a transaction lock.
+Slotted page — a page layout with an array of small slots that point to variable-length records stored at the other end of the page.
+Fill factor — the fraction of each page that is filled when an index is built or a page is split, leaving room for later inserts.
+Clustered index — an index whose leaves hold the table rows themselves, as InnoDB's primary key does.
+Covering index — an index that contains every column a query needs, so the table itself is not read.
+how: A node is not just a sorted array of fixed-size keys. Keys and rows have different lengths, so most systems use a slotted page: a header, an array of small slots at the front that grows forward, and the records stored from the end of the page backward. Each slot holds the offset and length of one record, and the slots are kept in key order, so a binary search over the slots finds a key in about log₂(400) ≈ 9 comparisons, all inside one page that is already in the CPU cache. Inserting a key moves a few slot entries, not the records. Internal nodes also keep separator keys short. A separator needs only enough bytes to tell its two children apart, so suffix truncation (added to PostgreSQL in version 12) can store "Smi" instead of "Smith, Johnathan", and deduplication (version 13) stores a repeated key once with a list of row pointers. Shorter entries mean more fan-out and fewer levels.
+How full the pages are depends on the order of inserts. A split turns one full page into two half-full pages, which then fill up again at random; Andrew Yao's analysis (1978) shows that under random inserts pages end up about ln 2 ≈ 69% full on average. An index built from random keys is therefore roughly 45% larger than its entries need (1 / 0.69 ≈ 1.45). Sequential inserts behave differently. They always land on the rightmost leaf, so systems detect this and split unevenly: PostgreSQL fills the left page up to the fill factor (90% by default for B-tree indexes) and starts a nearly empty right page, so an index on an increasing key ends up about 90% full. A freshly built index is also packed to the fill factor, because CREATE INDEX sorts all keys first and builds the tree bottom-up, one full leaf after another.
+Lehman and Yao's B-link tree is how PostgreSQL's B-tree avoids latching a whole path. Every node stores a high key (the upper bound of its key range) and a pointer to its right sibling. A split first moves the upper half of the keys to a new right sibling and links it in, and only then adds the separator to the parent. A reader that reached the old node through a parent that is now out of date compares its search key with the high key; if the key is larger, it simply follows the right link. Readers therefore hold at most one page latch at a time, and writers latch only the pages they change.
+Copy-on-write B-trees remove the need for a separate log. LMDB never changes a page in place: an update copies the leaf, then its parent, and so on up to the root, and writes the new pages into free space. After flushing them, it writes the new root's location into one of two meta pages at the start of the file. A crash before that write leaves the old tree intact; after it, the new tree is complete. Readers that started earlier keep using the old root, which gives them a consistent snapshot for free. The price is writing h pages (often 3 or 4) for every change and reclaiming old pages later, so this design suits read-heavy embedded use better than heavy update loads.
+diagram:
+                        [ root:  40 | 80 ]
+                       /         |        \
+           [ 10 | 25 ]      [ 50 | 65 ]      [ 90 | 120 ]
+           /    |    \       /   |   \         /   |   \
+     [1-9] [10-24] [25-39] [40-49] ...       ...  leaves hold keys
+       <->     <->     <->     <->               and row pointers
+     leaves are linked in key order, so a range scan walks along them
+
+  one page, slotted layout (8 KB in PostgreSQL)
+  +--------+--------+--------+---------------+---------+---------+
+  | header | slot 1 | slot 2 |  free space   | tuple 2 | tuple 1 |
+  +--------+--------+--------+---------------+---------+---------+
+    slot array grows -->              <-- tuples grow from the end
+
+  B-link node: [ keys ... | high key 39 | right link --> next node ]
+mistakes: People often think a B-tree is a kind of binary tree. Each node has hundreds of children, not two, so a billion keys need 3 or 4 levels instead of about 30. The design goal is to read as few pages as possible, and each comparison inside a page costs almost nothing compared with a page read.
+People often think an index always makes a query faster. Each row found through an index can cost one random page read, while a table scan reads pages sequentially. If a query returns a large share of the table, for example 20% of the rows, following the index can be slower than scanning everything, and the planner correctly ignores the index.
+People often expect an index to shrink after many deletes. PostgreSQL removes an index page only when it becomes completely empty and never merges half-empty pages, so an index that lost 80% of its entries can keep most of its size until it is rebuilt. InnoDB merges pages that fall below half full, but the file still keeps the freed space for reuse rather than returning it to the operating system.
+People often think an index on (a, b) helps a query that filters only on b. The index is sorted by a first, so rows with a given b are scattered across the whole index. Some databases can still use it through a skip scan, which jumps from one value of a to the next (Oracle, MySQL 8.0.13 and later, PostgreSQL 18), but this works well only when a has few distinct values.
+quiz: What is the difference between a B-tree and a B+tree? || A B-tree stores entries in internal nodes as well as leaves. A B+tree keeps all entries in the leaves and only separator keys in internal nodes, which gives more fan-out, and links the leaves in key order so that range scans walk along the leaf level.
+Why do random inserts leave B-tree pages about 69% full, while sequential inserts can leave them about 90% full? || With random inserts, each split creates two half-full pages that later fill at random, which averages about ln 2 ≈ 69%. With sequential inserts, every insert hits the rightmost leaf, so the system splits unevenly and leaves the old page filled to the fill factor.
+How does a B-link tree let a reader continue safely while another thread splits the node it is about to read? || Every node has a high key and a link to its right sibling, and a split links the new sibling before it updates the parent. A reader that lands on the old node and finds its search key above the high key follows the right link to the node that now holds the key.
+A clustered index uses 16 KB pages; internal nodes have a fan-out of 1,000, and each leaf holds 100 rows. How many levels are needed for 10 billion rows, and how much memory caches every internal node? || There are 10¹⁰ / 100 = 10⁸ leaves, 10⁵ pages above them, 100 pages above those, and one root: four levels. The internal pages number about 100,101, which is about 1.6 GB, so with 1.6 GB of cache each lookup needs only one disk read, for the leaf.
+What do you gain and lose by lowering a B-tree index's fill factor from 90% to 70%? || You gain free space in each page, so inserts into the middle of the key range cause fewer page splits and less fragmentation. You lose density: the index has about 29% more pages, so scans read more and the cache holds a smaller share of it. It helps for random inserts into existing ranges, not for append-only keys.
+ref: paper | On Random 2–3 Trees | Andrew C. Yao, Acta Informatica 1978 |
+ref: docs | PostgreSQL: B-Tree Indexes (implementation) | PostgreSQL | https://www.postgresql.org/docs/current/btree.html
+
+@@+ mvcc
+terms: Version — one stored state of a row, tagged with the transaction that created it and, later, the one that replaced or deleted it.
+Snapshot — the record of which transactions count as committed for a reader; in PostgreSQL it is an xmin, an xmax and a list of transactions still running.
+xmin and xmax (on a tuple) — in PostgreSQL, the IDs of the transaction that created a row version and of the one that deleted or replaced it.
+Version chain — the links between the versions of one row, either from oldest to newest or from newest to oldest.
+Snapshot isolation — each transaction reads from one snapshot taken at its start, and two concurrent writes to the same row conflict.
+Write skew — an anomaly that snapshot isolation allows: two transactions read the same data, update different rows, and together break a rule that each one checked.
+Vacuum — garbage collection that removes versions no running or future transaction can still see.
+Horizon — the oldest snapshot still in use; versions replaced before it can be removed.
+Freezing — marking very old versions as visible to everyone, so that 32-bit transaction IDs can wrap around safely.
+HOT update — a PostgreSQL update that changes no indexed column and puts the new version on the same page, so no index needs a new entry.
+how: PostgreSQL's visibility check shows the mechanism in detail. A snapshot has three parts: xmin, the oldest transaction ID still running when the snapshot was taken; xmax, the first ID not yet assigned; and the list of IDs between them that were still running. A transaction counts as committed for this snapshot if it committed and either its ID is below xmin, or its ID is below xmax and not in the list; any ID at or above xmax started later and is invisible. A row version is visible if its creator counts as committed and its deleter is empty, aborted or does not count as committed. Whether a transaction committed or aborted is stored in a commit log (pg_xact, two bits per transaction). After the first lookup, PostgreSQL caches the answer as hint bits in the tuple header, which is why the first read of freshly written rows can itself cause page writes.
+PostgreSQL transaction IDs are 32-bit numbers compared on a circle: from any ID, about 2.1 billion (2³¹) IDs count as the past and the rest as the future. A version that is never touched would therefore one day seem to be in the future and disappear. Vacuum prevents this by freezing old versions, marking them as visible to every snapshot, and the database forces an aggressive vacuum of a table before its oldest unfrozen ID gets too close to that limit. A table that is not frozen in time is the "wraparound" emergency that the practice section warns about.
+The direction of the version chain decides which reads are cheap. PostgreSQL links versions from old to new, and every index entry points to one specific version, so an update normally adds a new entry to every index. A HOT (heap-only tuple) update avoids this when no indexed column changes and the new version fits on the same page: the index keeps pointing to the old version, and readers follow a short chain inside that page. InnoDB keeps the newest version in place, with a roll pointer to undo records that rebuild older versions, newest to oldest. A current reader finds the latest version in one step, but a reader with an old snapshot must apply one undo record for every later change, and a long-running transaction makes the undo history (InnoDB's history list) grow.
+Write–write conflicts are handled with row locks, not with versions. When a transaction updates a row, PostgreSQL locks the newest version by writing the transaction's ID into its xmax, and a second updater waits for that transaction to end. Under REPEATABLE READ, if the first transaction commits, the second fails with a serialization error, because the version it read is no longer current; under READ COMMITTED, it re-reads the new version and applies its update to that. Serializable Snapshot Isolation adds tracking of reads. SIREAD locks record what each serializable transaction read, without blocking anyone. When another transaction writes something that was read, the system records a read–write dependency, and when one transaction has both an incoming and an outgoing dependency among concurrent transactions (the pattern behind every snapshot-isolation anomaly), one of them is aborted. The check is conservative, so it sometimes aborts transactions that would have been safe, and applications must retry.
+diagram:
+  versions of one row in the PostgreSQL heap (linked old -> new)
+  v1   balance = 100   xmin = 900    xmax = 1001
+   |
+  v2   balance =  70   xmin = 1001   xmax = 1005
+   |
+  v3   balance =  90   xmin = 1005   xmax = 0       (current)
+
+  snapshot S = { xmin 1001, xmax 1004, still running: [1001] }
+    ID < 1001: finished          ID >= 1004: started later, invisible
+    1001 was running when S was taken: invisible
+
+  visible to S?
+    v1: creator 900 committed, deleter 1001 invisible  -> YES
+    v2: creator 1001 invisible                         -> no
+    v3: creator 1005 >= 1004                           -> no
+  a snapshot taken after 1005 commits sees only v3
+mistakes: People often think MVCC means no locks at all. Readers do not block writers and writers do not block readers, but two writers to the same row still conflict through row locks, SELECT ... FOR UPDATE takes row locks on purpose, and schema changes take table locks that can queue behind long reads.
+People often assume every statement in a transaction sees the same data. That is true under REPEATABLE READ and SERIALIZABLE. Under READ COMMITTED, PostgreSQL's default level, each statement takes a new snapshot, so two identical SELECTs in one transaction can return different results if another transaction commits in between.
+People often think an UPDATE in PostgreSQL changes the row in place. It writes a complete new row version and, unless it is a HOT update, a new entry in every index on the table. Updating one column of a row in a table with 10 indexes can therefore write 11 new entries. This write amplification was one of the reasons Uber gave in 2016 for moving a large workload from PostgreSQL to MySQL.
+People often think lakehouse time travel keeps history forever. Old table versions stay readable only while their data files exist. VACUUM in Delta Lake deletes unreferenced files older than the retention period (7 days by default), and snapshot expiry does the same in Iceberg; after that, a query for an older version fails.
+quiz: How does PostgreSQL decide whether a transaction ID counts as committed for a snapshot? || The ID must belong to a committed transaction, and it must be below the snapshot's xmin, or below its xmax and not in its list of running transactions. IDs at or above xmax started after the snapshot and are always invisible.
+Why do readers never block writers under MVCC? || A writer creates a new version instead of overwriting the old one. Each reader picks the version that matches its own snapshot, so readers need no read locks, and a writer never has to wait for them to finish.
+How does Serializable Snapshot Isolation catch write skew without blocking reads? || It records reads with non-blocking SIREAD locks. When a transaction writes data that a concurrent transaction read, it records a read–write dependency. If one transaction ends up with both an incoming and an outgoing dependency, one of the transactions involved is aborted and must be retried.
+A table receives 2,000 updates per second, each creating a 200-byte row version, while a reporting transaction stays open for 3 hours. How much dead data can vacuum not remove during that time? || 2,000 × 3,600 × 3 = 21.6 million dead versions, times 200 bytes, is about 4.3 GB in the table, plus the extra index entries. All of it waits until the long transaction ends.
+What is the trade-off between PostgreSQL's versions-in-the-table design and InnoDB's in-place updates with undo logs? || PostgreSQL makes rollback trivial and reads of old snapshots direct, but tables and indexes bloat and need vacuum. InnoDB keeps tables compact and the newest version easy to find, but old snapshots must rebuild versions from undo records, long transactions grow the undo history, and rolling back a large transaction is slow.
+ref: blog | Why Uber Engineering Switched from Postgres to MySQL | Evan Klitzke (Uber), 2016 |
+ref: docs | PostgreSQL: Concurrency Control (MVCC) | PostgreSQL | https://www.postgresql.org/docs/current/mvcc.html
+
+@@+ columnar
+terms: Row group — a horizontal slice of a Parquet file, often about 128 MB, inside which each column is stored as its own chunk.
+Column chunk — all values of one column within one row group, stored together.
+Page — the unit of encoding and compression inside a column chunk, often around 1 MB.
+Dictionary encoding — replacing each value with a small integer code that points into a table of the distinct values.
+Run-length encoding — storing a value once together with the number of times it repeats in a row.
+Bit-packing — storing integers with only as many bits as the largest of them needs.
+Zone map (min/max statistics) — the minimum and maximum value of each chunk or page, used to skip data that cannot match a filter.
+Vectorized execution — operators process batches of values (thousands at a time) instead of one row at a time.
+Late materialization — keeping columns separate while filtering and building full rows only for the rows that survive.
+Deletion vector — a bitmap of the row positions in a file that are deleted, so that the file does not have to be rewritten.
+how: Information theory says how small a column can get. The compressed size of a column is bounded below by its entropy: the average number of bits needed per value, given how often each value occurs. A country column with 200 possible values needs at most log₂ 200 ≈ 7.6 bits per value, and much less when a few countries dominate. Run-length encoding goes further on sorted data, because what then matters is the number of runs, not the number of values: 30 million rows sorted by country hold only 200 runs, which take a few kilobytes. This is why sort order is the most important physical design choice in a column store. Sorting by a low-cardinality column first and a higher-cardinality column second gives long runs in the first and sorted, delta-friendly values in the second. C-Store and Vertica built their design around this, keeping several copies of the data in different sort orders (projections).
+Encodings also have limits that writers must handle. A Parquet writer builds a dictionary for each column chunk and falls back to plain encoding for the rest of the chunk once the dictionary grows past a limit (1 MB by default in the Java implementation). A column with millions of distinct values, such as a device ID, is therefore stored almost raw and shrinks only through the general-purpose codec. Statistics also exist at several levels: row-group statistics in the footer, an optional page index with min and max per page so readers can skip pages inside a row group, and optional Bloom filters for equality lookups on high-cardinality columns, where min and max are useless.
+The execution side explains the other half of the speed-up. A classic row engine (the Volcano model) passes one row at a time between operators through function calls, which costs tens of nanoseconds of overhead per row per operator, more than the real work of adding one number. A vectorized engine passes a vector of values instead, 2,048 at a time in DuckDB, so this overhead is paid once per vector. A vector of 2,048 eight-byte values is 16 KB, small enough to stay in the CPU's L1 or L2 cache while several operators work on it; this is where the memory hierarchy contributes. The inner loops run over arrays of one type, which compilers turn into SIMD instructions: with AVX-512, one instruction compares or adds 16 values of 32 bits. Filters produce a selection vector (the positions of the rows that passed) instead of copying data, and they are often computed without branches, because a mispredicted branch costs about 15–20 cycles, and a filter that passes half the rows would mispredict all the time.
+Columns are joined back into rows by position, not by stored keys. The fifth value in the country chunk and the fifth value in the revenue chunk belong to the same row, so a column store needs no row identifiers: the row ID is implicit. This is why every column chunk of a row group must hold exactly the same rows in the same order, why a single-row update cannot be done in place (it would shift positions in every column), and why table formats mark deleted rows with deletion vectors instead of rewriting files. A deletion vector for a file of one million rows needs at most 125 KB as a plain bitmap, and compressed bitmaps such as Roaring are usually much smaller.
+diagram:
+  table (id, country, revenue) with rows r1..r4
+  row store:     [1 IN 5] [2 US 9] [3 IN 2] [4 IN 7]     row after row
+  column store:  [1 2 3 4] [IN US IN IN] [5 9 2 7]  column after column
+  SUM(revenue) WHERE country = 'IN' reads 2 of the 3 columns
+
+  Parquet file
+  +------------------------------------------------------------+
+  | row group 1 (~128 MB)                                      |
+  |   column chunk "id"      : page | page | page              |
+  |   column chunk "country" : dictionary page | page | page   |
+  |   column chunk "revenue" : page | page | page              |
+  +------------------------------------------------------------+
+  | row group 2 ...                                            |
+  +------------------------------------------------------------+
+  | footer: schema, min / max / null count per chunk, offsets  |
+  +------------------------------------------------------------+
+
+  country chunk, dictionary + run-length encoding:
+  dictionary 0 = IN, 1 = US   codes 0 1 0 0   runs (0 x1) (1 x1) (0 x2)
+mistakes: People often think a column store is faster for every query. To read one row, it must find and decode a page in every column it needs, often a whole compressed page of about 1 MB per column for a single value. Point lookups and small updates are the job of row stores; column stores win when a query reads many rows and few columns.
+People often think compression always trades CPU for I/O, so it must slow queries once the data is in memory. Lightweight encodings such as dictionary codes, runs and bit-packed integers can be filtered and aggregated without decoding, and they cut the bytes that cross the memory bus, which is usually the real limit. Compressed columns are often faster than uncompressed ones even in RAM.
+People often treat Arrow and Parquet as the same thing. Parquet is a storage format: heavily encoded and compressed, read sequentially, and decoded before use. Arrow is an in-memory format: values sit in plain arrays with fixed offsets, so any value can be read directly and tools can share data without copying or conversion. A typical engine reads Parquet from disk and works on Arrow-like vectors in memory.
+People often expect min/max statistics to skip data for any filter. They help only if the data is sorted or clustered on the filtered column. If dates are spread randomly over files, every row group contains nearly the whole date range, and a filter for one day skips nothing.
+quiz: How is a Parquet file organised, from the largest unit to the smallest? || A file is split into row groups (often about 128 MB). Inside each row group, every column is stored as a column chunk, and each chunk is split into pages, the unit of encoding and compression. A footer holds the schema and per-chunk statistics.
+Why does sorting a table before writing it make columns compress much better? || Sorting puts equal values next to each other, so run-length encoding stores one run instead of many values, and sorted numbers have small differences that delta encoding stores in few bits. The size then depends on the number of runs, not the number of rows.
+How does vectorized execution reduce the per-row cost of a query? || Operators pass batches of thousands of values instead of single rows, so the function-call and interpretation overhead is paid once per batch. Each batch fits in the CPU cache, and the tight loops over one data type compile to SIMD instructions that process 8–16 values at once.
+A table has 1 billion rows and 50 columns of about 8 bytes each. A query reads 2 columns, which compress 4 times, and the disk reads 2 GB/s. Roughly how long does the scan take in a row store and in a column store? || The row store reads 1 billion × 400 bytes = 400 GB, about 200 seconds. The column store reads 2 × 8 bytes × 1 billion = 16 GB before compression, 4 GB after, about 2 seconds: roughly 100 times faster.
+What do you gain and lose with very large row groups (1 GB) compared with small ones (8 MB)? || Large row groups compress better, need fewer footer entries and fewer read requests, and give long sequential reads. But they need more memory to write, give coarser skipping by statistics and fewer units of parallel work. Small row groups skip more precisely but add metadata and compress worse; around 128 MB is the common compromise.
+ref: paper | MonetDB/X100: Hyper-Pipelining Query Execution | Boncz, Zukowski & Nes, CIDR 2005 |
+
+@@+ gd
+terms: Loss — a number that measures how wrong the model is on the data; training tries to make it small.
+Gradient — the vector of partial derivatives of the loss with respect to every parameter; it points in the direction in which the loss rises fastest.
+Learning rate (step size) — the factor that scales the gradient in each update.
+Mini-batch — the small random sample of training examples used to estimate the gradient at one step.
+Epoch — one full pass over the training set.
+Momentum — using a running average of past gradients as the update direction, which smooths noise and speeds up progress in directions that stay consistent.
+Adam — an optimizer that divides a running average of gradients by the square root of a running average of squared gradients, giving each parameter its own step size.
+Weight decay — shrinking every parameter a little toward zero at each step; AdamW applies it separately from the gradient.
+Curvature and condition number — curvature is how sharply the loss bends in a direction; the condition number is the ratio between the sharpest and the flattest curvature.
+Learning-rate schedule — a rule for changing the learning rate during training, such as a short warm-up followed by cosine decay.
+how: Optimization theory explains which learning rates work. Near a minimum, the loss looks like a bowl, and its curvature in each direction is given by the second derivative (for many parameters, by the eigenvalues of the Hessian matrix). For a bowl with curvature λ, one gradient step multiplies the distance to the minimum by (1 − η·λ), where η is the learning rate. If |1 − η·λ| < 1, the error shrinks; if η > 2/λ, it grows at every step and training diverges. In the worked example below, the curvature is (2/3) × 14 ≈ 9.33, so the limit is 2/9.33 ≈ 0.214. A rate of 0.1 multiplies the error by 0.07 per step; a rate of 0.2 zigzags around the minimum and shrinks the error by only about 13% per step; 0.25 diverges. With many parameters, the sharpest direction sets the largest safe learning rate, and the flattest direction then moves slowly. Because of this ratio, the condition number κ, plain gradient descent needs on the order of κ steps for each factor-of-e improvement; momentum methods reduce this to about √κ, which is why momentum matters so much on badly conditioned problems.
+Adam applies this idea per parameter. For each parameter it keeps m, an exponential average of gradients (β₁ = 0.9 by default), and v, an exponential average of squared gradients (β₂ = 0.999 by default; large language models often use 0.95). Both start at zero, so early values are too small, and at step t Adam divides them by (1 − β₁ᵗ) and (1 − β₂ᵗ) to correct this bias. The update is η × m / (√v + ε). Because each gradient is divided by its own typical size, a parameter with a consistent gradient moves about η per step whether that gradient is 10⁻⁶ or 10³. This is why one learning rate works across layers with very different gradient scales, and why Adam is much less sensitive to badly scaled problems than plain SGD, though not immune. AdamW then applies weight decay as a separate step, θ ← θ − η·λ·θ, so that the decay is not divided by √v, as it would be if it were simply added to the gradient.
+Probability explains the mini-batch. A mini-batch gradient is an average over B random examples, so it is an unbiased estimate of the full gradient, and its variance falls as 1/B: doubling the batch halves the variance but doubles the cost of each step. While noise dominates, a batch k times larger allows a learning rate about k times larger. With this "linear scaling rule" and a warm-up, Goyal and colleagues trained ResNet-50 on ImageNet with batches of 8,192 images in one hour (2017). Beyond a critical batch size, which depends on the task and grows as training goes on, the gradient estimate is already accurate, and larger batches stop saving steps; they only spend more compute per step.
+diagram:
+  loss of the worked example: L(w) = (14/3)(w - 2.107)^2 + constant
+  digits 0..3 mark the first steps of gradient descent with lr = 0.2
+    |.
+    | ..                                            .
+    |   ..                                        ..
+    |     ..                                    ..
+    |       .0                                ..
+    |         ..                           .1.
+    |           .2.                     3..
+    |              .....            ....
+    |                   ............
+    +------------------------------------------------
+     -1      0       1       2      3       4       5   w
+
+  lr     factor on (w - w*) each step    behaviour
+  0.10   1 - 0.10 x 9.33 = +0.07         fast, no overshoot
+  0.20   1 - 0.20 x 9.33 = -0.87         zigzags, converges slowly
+  0.25   1 - 0.25 x 9.33 = -1.33         zigzags, diverges
+  stable only while lr < 2 / 9.33 = 0.214
+mistakes: People often think local minima are the main obstacle in training deep networks. In spaces with millions of dimensions, most points where the gradient is zero are saddle points, which are downhill in some direction, and the noise of SGD pushes training off them. Flat plateaus, bad conditioning and unstable learning rates cause far more trouble in practice.
+People often think Adam is always better than SGD. Adam usually makes progress faster with less tuning and is the default for transformers, but SGD with momentum still matches or beats it on some vision models, and it needs one extra number per parameter instead of two. For a model with billions of parameters, that difference is many gigabytes of memory.
+People often read the size of the gradient as the distance to the minimum. The gradient gives the local slope. Near a sharp minimum the gradient can be large while the minimum is close; on a plateau it is tiny while the minimum is far away. The step length is chosen by the learning rate and the optimizer, not by the gradient alone.
+People often reuse a tuned learning rate when they make a model larger. Under the standard way of initializing and scaling layers, the best learning rate usually falls as the model gets wider, so a value tuned on a small model can make a large one unstable. Parametrizations such as μP (Yang and colleagues, 2021) scale layers so that the best learning rate stays nearly the same across widths, which lets teams tune on small models.
+quiz: Write the basic mini-batch gradient descent update and say what each part means. || θ ← θ − η × ∇L_B(θ). θ are the parameters, η is the learning rate, and ∇L_B(θ) is the gradient of the loss computed on a random mini-batch B.
+Why is there an upper limit on the learning rate, and what sets it? || Near a minimum, a step multiplies the distance to the minimum by (1 − η·λ) in each direction with curvature λ. If η is larger than 2/λ for the sharpest direction, that factor is below −1, so the error grows every step. The largest curvature therefore sets the limit.
+How does Adam give each parameter its own step size, and why does it need bias correction? || It divides a running average of the gradient by the square root of a running average of its square, so each parameter's step is scaled by its own gradient size. Both averages start at zero and are too small at first, so Adam divides them by (1 − β₁ᵗ) and (1 − β₂ᵗ) in the early steps.
+Training uses a batch of 256, and the gradient estimate has a noise level (standard deviation) σ. What batch size halves the noise, and what does it cost? || The standard deviation falls as 1/√B, so halving it needs 4 times the batch: 1,024 examples. Each step then costs about 4 times as much compute, which pays off only while noise, not curvature, limits progress.
+For fine-tuning a transformer, when would you choose AdamW over SGD with momentum? || Choose AdamW by default: it handles very different gradient scales across layers with one learning rate and needs less tuning. Choose SGD with momentum when optimizer memory is tight, because it stores one extra value per parameter instead of two, or when experiments show it generalizes better for your model, accepting more careful learning-rate tuning.
+ref: paper | Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour | Goyal et al., 2017 | https://arxiv.org/abs/1706.02677
+
+@@+ attention
+terms: Token embedding — the vector that represents one token as it enters a layer.
+Query, key and value — three vectors computed from each token by learned matrices: the query asks a question, keys are compared with it, and values are what gets mixed into the output.
+Attention score — the dot product of a query and a key, divided by √d.
+Softmax — the function that turns a row of scores s into positive weights that sum to 1: exp(sᵢ) / Σⱼ exp(sⱼ).
+Head — one independent attention computation with its own projection matrices; a layer runs many heads in parallel.
+Causal mask — setting the scores for future positions to −∞, so that each token attends only to itself and earlier tokens.
+Context length — n, the number of tokens that attention can look at.
+Residual stream — the running vector for each token to which every layer adds its output.
+KV cache — the stored keys and values of earlier tokens, reused while generating new tokens.
+Grouped-query attention — several query heads share one key head and one value head, which makes the KV cache smaller.
+how: The division by √d is not cosmetic. If the components of q and k are independent with mean 0 and variance 1, their dot product has variance d, so with d = 128 the scores have a standard deviation of about 11. Softmax over such large numbers puts almost all weight on the single largest score, and the gradient through the other positions becomes nearly zero, so the model stops learning which positions matter. Dividing by √d brings the standard deviation back to about 1, where softmax gives a smooth mix and useful gradients.
+Counting operations shows when the quadratic part really matters, and it explains why tensor cores matter most. With model width d and n tokens, the four projections (Q, K, V and output) cost about 8·n·d² floating-point operations per layer, and a feed-forward block with hidden size 4d costs about 16·n·d². The attention itself, QKᵀ and then the weighted sum of V, costs about 4·n²·d (about half that with a causal mask, if the kernel skips the masked part). The ratio of attention to everything else is roughly n / (6d). For d = 4,096, attention costs as much as the rest of the layer only at about 24,000 tokens; for shorter contexts, the large matrix multiplications of projections and feed-forward layers dominate, and they run on tensor cores at high efficiency.
+Memory traffic is the other cost, and the memory hierarchy decides it. A plain implementation writes the n × n score matrix to the GPU's HBM, reads it back for the softmax, writes the weights, and reads them again for the product with V. FlashAttention instead loads tiles of Q, K and V into the on-chip SRAM of each streaming multiprocessor (up to 228 KB per unit on an H100) and uses an online softmax. For each query row it keeps a running maximum m, a running sum l of exponentials and a running output o. When a new tile of scores arrives, it computes the new maximum, multiplies the old l and o by exp(m_old − m_new), and adds the new tile's contributions. At the end, o / l is exactly the softmax-weighted sum. The result is the same as the plain method up to floating-point rounding, but the n × n matrix never leaves the chip. Subtracting the running maximum also keeps exp() from overflowing, which matters in FP16, where exp(s) is already too large to store when s exceeds about 11.
+diagram:
+  X (n x d) --x Wq--> Q (n x dk)
+            --x Wk--> K (n x dk)
+            --x Wv--> V (n x dv)
+
+  scores   S = Q K^T / sqrt(dk)          n x n
+  mask     S[i][j] = -infinity if j > i  (causal)
+  weights  A = softmax of each row of S  each row sums to 1
+  output   O = A V                       n x dv
+
+  weights A for n = 4 tokens (x = masked):
+             k1     k2     k3     k4
+     q1  [  1.0     x      x      x   ]
+     q2  [  0.3    0.7     x      x   ]
+     q3  [  0.1    0.2    0.7     x   ]
+     q4  [  0.4    0.1    0.2    0.3  ]
+
+  FlashAttention: load Q, K, V tiles from HBM into on-chip SRAM;
+  per query row keep running max m, sum l, output o;
+  for each new K/V tile: rescale l and o by exp(m_old - m_new), add
+  the tile; the n x n matrix is never written to HBM
+mistakes: People often think the n² term dominates the cost of every transformer. For typical context lengths, the projections and feed-forward layers cost more: the attention share is roughly n / (6d), so a model of width 4,096 at 8,000 tokens spends about a quarter of its layer FLOPs on attention itself. The quadratic term takes over only for long contexts, and the KV cache becomes a memory problem before that.
+People often think attention knows word order by itself. Without positional information, attention treats its input as a set: shuffling the tokens shuffles the outputs in the same way and changes nothing else. Order enters only through positional encodings such as RoPE and through the causal mask.
+People often expect each head to learn one clean, interpretable relation. Some heads do, such as previous-token and induction heads, but many heads mix several roles or repeat each other. Michel and colleagues (2019) found that many heads of a trained transformer can be removed at test time with only a small loss in quality.
+People often assume a head can ignore all tokens when none is relevant. Softmax weights must sum to 1, so the weight has to go somewhere. Trained models learn to park it on a few tokens, often the first one, called attention sinks (Xiao and colleagues, 2023); this is why streaming methods with a sliding window keep the first few tokens in the cache.
+quiz: Write the attention formula and the shape of each matrix for n tokens. || Attention(Q, K, V) = softmax(QKᵀ / √d_k) · V. Q and K are n × d_k, V is n × d_v, the score matrix QKᵀ is n × n, and the output is n × d_v.
+Why are attention scores divided by √d_k? || If query and key components have variance 1, their dot product has variance d_k, so for d_k = 128 the scores have a standard deviation of about 11. Softmax then becomes almost one-hot and gradients vanish; dividing by √d_k restores a standard deviation of about 1.
+How can FlashAttention compute an exact softmax when it never holds a full row of scores? || It processes keys tile by tile and keeps, for each query, a running maximum, a running sum of exponentials and a running weighted output. When a new tile raises the maximum, it rescales the old sum and output by exp(old max − new max), then adds the tile. Dividing the output by the sum at the end gives exactly the softmax result.
+For a model of width d = 4,096, compare the FLOPs of attention itself with those of the projections and feed-forward block in one layer at n = 8,192 tokens. || Attention costs about 4·n²·d = 4 × 8,192² × 4,096 ≈ 1.1 × 10¹² FLOPs. The rest costs about 24·n·d² = 24 × 8,192 × 4,096² ≈ 3.3 × 10¹². So attention is about one third of the rest, a quarter of the layer.
+What do you gain and lose with grouped-query attention, 8 key/value heads instead of 64? || The KV cache is 8 times smaller, so a GPU holds 8 times more context or users, and each decoding step reads 8 times fewer bytes. The cost is less freedom: groups of query heads must share the same keys and values, which loses a little quality, usually small enough that most current large models use grouped-query or similar attention.
+ref: paper | Are Sixteen Heads Really Better than One? | Michel, Levy & Neubig, NeurIPS 2019 | https://arxiv.org/abs/1905.10650
+ref: paper | Efficient Streaming Language Models with Attention Sinks | Xiao et al., 2023 | https://arxiv.org/abs/2309.17453
+
+@@+ kvcache
+terms: Prefill — processing the whole prompt in one parallel pass, which computes and stores the keys and values of every prompt token.
+Decode — generating one token per step; each step appends one key and one value per layer and KV head, and reads the whole cache.
+KV head — a key/value head; with grouped-query attention, several query heads share one KV head.
+Bytes per token — the cache size for one token: 2 × layers × KV heads × head dimension × bytes per number.
+Arithmetic intensity — the number of floating-point operations done per byte read from memory; low intensity means the work is limited by memory bandwidth.
+PagedAttention — storing the cache in fixed-size blocks with a block table per request, like pages of virtual memory.
+Prefix caching — reusing the cache blocks of an identical prompt prefix across requests.
+Preemption — removing a running request's cache when memory runs out, then recomputing it or copying it back later.
+KV-cache quantization — storing keys and values with fewer bits (for example FP8 instead of FP16) to save memory and bandwidth.
+Multi-head latent attention — caching one small compressed vector per token and layer, from which the keys and values are rebuilt.
+how: The cache is exact, not an approximation, because of the causal mask. A token's key and value in a layer depend only on that token and the tokens before it, so once they are computed, later tokens can never change them. Without the cache, every step would push the whole sequence through the model again. Generating 1,000 tokens after a 1,000-token prompt would cost about 1,000 + 1,001 + … + 2,000 ≈ 1.5 million token passes instead of about 2,000. With the cache, each step pushes one token through the weight matrices, and only the attention part still grows with the context.
+The roofline model shows why decoding is limited by memory and not by arithmetic. During decode, each cached key or value number (2 bytes in FP16) is read once per step and used in one multiply-add for each query head that shares it. With grouped-query attention and 8 query heads per KV head, that is about 16 floating-point operations per 2 bytes, an arithmetic intensity of about 8 operations per byte. An H100 can do roughly 990 trillion dense BF16 operations per second but read only about 3.35 TB per second from HBM, so it needs about 300 operations per byte to keep its compute units busy. Decode attention sits far below that point, and its speed is simply bytes of cache divided by memory bandwidth. Batching does not change this: batching many users lets them share one read of the weights, but every user has a separate cache, so the cache bytes read per step grow with the number of users. Prefill is different, because thousands of prompt queries use each key and value, which puts it far above the roofline's ridge point, so it is limited by compute.
+DRAM technology sets the two numbers that matter: capacity, which limits how many tokens can be held at all, and bandwidth, which limits how fast they can be read. HBM is DRAM stacked next to the GPU chip: an H100 has 80 GB at about 3.35 TB/s, an H200 141 GB at about 4.8 TB/s. Memory further down the hierarchy is larger but much slower: a PCIe 5.0 x16 link to CPU memory moves about 64 GB/s in each direction, roughly 50 times less than HBM. Offloaded cache blocks are therefore useful for reuse (bring a conversation's cache back instead of recomputing its prefill) but not for blocks that every decode step must read.
+PagedAttention applies the operating system's idea of virtual memory to the cache. Before it, serving systems reserved one contiguous region per request, large enough for the maximum possible length, and the vLLM authors measured that only about 20–38% of the reserved KV memory held real token data. vLLM instead splits each request's cache into blocks of 16 tokens by default, allocates a block only when the previous one is full, and keeps a block table that maps the request's logical blocks to physical blocks anywhere in GPU memory. The waste shrinks to the unused part of each request's last block. Blocks can also be shared: parallel samples from one prompt point to the same prompt blocks and copy a block only when they write to it, and prefix caching finds shared blocks through a hash of each block's tokens combined with the hash of the block before it, so a block matches only when the entire prefix before it matches too.
+Changing the attention design shrinks the cache at its source. The per-token formula multiplies layers, KV heads, head dimension and bytes, so each factor is a lever: grouped-query attention cuts the KV heads (64 to 8 is 8 times smaller), FP8 quantization halves the bytes, and multi-head latent attention replaces per-head keys and values with one compressed vector per token and layer. DeepSeek reports that this made the KV cache of DeepSeek-V2 93.3% smaller than that of its earlier 67B model.
+diagram:
+  one layer, prefill of 6 prompt tokens, then decode steps
+  tokens:   t1 t2 t3 t4 t5 t6 | t7 t8 ...
+  K cache:  k1 k2 k3 k4 k5 k6 | k7   <- one new key per step
+  V cache:  v1 v2 v3 v4 v5 v6 | v7   <- one new value per step
+  step 7:   q7 attends to k1..k7 and mixes v1..v7;
+            nothing about t1..t6 is computed again
+
+  paged layout in GPU memory (block = 4 tokens)
+  +---------+---------+---------+---------+---------+---------+
+  | 0 free  | 1 A:5-8 | 2 free  | 3 B:5-6 | 4 free  | 5 P:1-4 |
+  +---------+---------+---------+---------+---------+---------+
+  block table of request A: [5, 1]    request B: [5, 3]
+  block 5 holds the shared prompt prefix P (tokens 1-4) for both;
+  B's block 3 is half full; a new block is taken only when needed
+
+  bytes per token = 2 (K,V) x layers x KV heads x head dim x bytes
+mistakes: People often think the KV cache grows with the number of model parameters. It grows with layers, KV heads, head dimension and bytes per number. Llama 2 7B, with full multi-head attention (32 layers, 32 KV heads of dimension 128), needs about 512 KB per token in FP16, more than the roughly 320 KB of a 70B-class model with 8 KV heads.
+People often expect prefix caching to reuse any repeated text. It reuses only an exact token prefix that starts at the first token. A token's key and value depend on its position and, through the earlier layers, on every token before it, so the same paragraph placed after a different opening has a completely different cache.
+People often treat dropping cache entries as an ordinary cache miss. Evicting a whole request's blocks and recomputing them later gives exactly the same output, only slower. Dropping individual tokens from the cache to save memory, as some long-context methods do, removes those tokens from attention for good and can change the answers, so it is an approximation that needs quality tests.
+People often assume quantizing the weights also shrinks the KV cache. They are separate: a model with 4-bit weights still stores its cache in FP16 unless KV-cache quantization is turned on separately (for example an FP8 cache type in vLLM). For long contexts and many users, the cache can be larger than the weights, so it is often the bigger saving.
+quiz: How do you compute the KV-cache size of one token? || Multiply 2 (keys and values) × number of layers × number of KV heads × head dimension × bytes per number. For example, 80 layers × 8 KV heads × 128 dimensions in FP16 gives 2 × 80 × 8 × 128 × 2 = 327,680 bytes, about 320 KB.
+Why can the keys and values of earlier tokens be stored and reused without changing the result? || The causal mask means a token's key and value in every layer depend only on that token and the tokens before it. Later tokens cannot change them, so computing them once and reusing them gives exactly the same output as recomputing.
+Why is decoding memory-bound even when a server batches many users together? || Each cached number is read once per step and used for only a few operations, about 8 per byte with 8 query heads per KV head, while a GPU needs about 300 per byte to be compute-bound. Batching lets users share one read of the weights, but each user's cache is separate, so the cache bytes per step grow with the batch.
+A model has 32 layers, 8 KV heads of dimension 128, and an FP16 cache. With 40 GB of free GPU memory, how many concurrent 8,000-token conversations fit, and how many with an FP8 cache? || Each token needs 2 × 32 × 8 × 128 × 2 = 131,072 bytes, 128 KB. 40 GB holds about 305,000 tokens, so about 38 conversations of 8,000 tokens. With FP8 the cache is half the size, so about 76 conversations fit.
+When would you turn on FP8 KV-cache quantization, and what is the risk? || Turn it on when memory or bandwidth for the cache limits concurrency or context length: it doubles the tokens that fit and halves the bytes read per decode step. The risk is a small loss of accuracy, which tends to show first on long-context and reasoning tasks, so test on your own long prompts before using it in production.
+ref: blog | vLLM: Easy, Fast, and Cheap LLM Serving with PagedAttention | Kwon, Li, Zhuang et al. (vLLM team), 2023 | https://blog.vllm.ai/2023/06/20/vllm.html
+ref: paper | Fast Transformer Decoding: One Write-Head is All You Need (multi-query attention) | Noam Shazeer, 2019 | https://arxiv.org/abs/1911.02150
+
+@@+ tcp
+terms: Segment — one TCP packet: a header plus up to one MSS of data.
+MSS (maximum segment size) — the largest payload in one segment, typically 1,460 bytes on Ethernet with a 1,500-byte MTU.
+Sequence number — the position of a segment's first data byte in the stream, counted from a random starting value chosen in the handshake.
+Cumulative acknowledgement — an ACK number that names the next byte expected, which confirms every byte before it.
+SACK (selective acknowledgement) — an option that lets the receiver report blocks of data that arrived after a gap.
+Receive window — the free buffer space the receiver advertises; it is TCP's flow control.
+Congestion window — the sender's own limit on unacknowledged data, set by the congestion-control algorithm.
+RTT and RTO — the round-trip time, and the retransmission timeout that the sender computes from measured RTTs.
+Bandwidth–delay product — bandwidth × RTT: the number of bytes that must be in flight to keep a path full.
+Head-of-line blocking — one lost segment holding back later bytes that have already arrived, because the stream must be delivered in order.
+how: Probability enters through the retransmission timer. Round-trip times vary, so a timer set to the average RTT would fire for every slow packet and resend data that was only delayed. RFC 6298 keeps two running estimates for each new sample R: a smoothed RTT, SRTT ← 7/8 × SRTT + 1/8 × R, and a mean deviation, RTTVAR ← 3/4 × RTTVAR + 1/4 × |SRTT − R|. The timeout is RTO = SRTT + 4 × RTTVAR, far out in the tail of the measured distribution. After each timeout, the RTO doubles (exponential backoff), and RTT samples from retransmitted segments are ignored (Karn's algorithm), because the sender cannot know which copy an acknowledgement belongs to. The RFC sets a minimum RTO of 1 second; Linux uses 200 ms. Inside a data centre with round trips of about 0.1 ms, a single timeout therefore costs about 2,000 round trips, which is why timeouts, not bandwidth, dominate tail latency there.
+Loss also caps throughput in a way that link speed alone does not explain. For loss-based congestion control in steady state, Mathis and colleagues (1997) derived throughput ≈ (MSS / RTT) × 1.22 / √p, where p is the packet loss rate. With 1,460-byte segments, a 100 ms round trip and a loss rate of 0.01% (1 packet in 10,000), this gives about 14 Mbit/s, whatever the link speed; reaching 1 Gbit/s on that path would need a loss rate below about 1 in 50 million. CUBIC grows its window back faster after a loss on long paths, and BBR does not treat each loss as a congestion signal at all, which is why both do much better than classic Reno on long, slightly lossy paths.
+Control theory explains why additive increase and multiplicative decrease (AIMD) is fair. Chiu and Jain (1989) showed that when two flows share a link, additive increase raises both rates by the same amount while multiplicative decrease cuts the larger rate by more, so repeated cycles move the flows toward equal shares while the total stays near capacity. Queueing theory explains the cost. A loss-based sender keeps increasing until a router queue overflows, so it keeps the bottleneck queue full. By Little's law, queueing delay is queue length divided by service rate, so 1 MB of buffer in front of a 10 Mbit/s link adds 0.8 seconds of delay to every packet, a problem known as bufferbloat. BBR aims to keep about one bandwidth–delay product in flight, which fills the link without building a standing queue.
+Selective acknowledgements (RFC 2018) fix the main weakness of cumulative ACKs. With cumulative ACKs alone, the receiver can only say "I have everything up to byte X", so when several segments of one window are lost, the sender discovers them one round trip at a time. With SACK, each duplicate acknowledgement also lists up to three or four blocks that arrived after the gap, and the sender retransmits exactly the missing segments within about one round trip. Almost all modern stacks agree to use SACK during the handshake.
+diagram:
+  client                                          server
+    |--- SYN  seq=100 ------------------------------->|
+    |<-- SYN-ACK  seq=300  ack=101 -------------------|  1 RTT
+    |--- ACK ack=301, data 101-1560 ----------------->|
+    |--- data 1561-3020 ---------X (lost)             |
+    |--- data 3021-4480, 4481-5940, 5941-7400 ------->|
+    |<-- ACK 1561 ------------------------------------|  for 101-1560
+    |<-- ACK 1561, ACK 1561, ACK 1561 ----------------|  3 duplicates
+    |    each with SACK: "I also have 3021-7400"      |
+    |--- resend 1561-3020 --------------------------->|  fast retransmit
+    |<-- ACK 7401 ------------------------------------|  hole filled
+
+  sender may have in flight: min(congestion window, receive window)
+  after this loss CUBIC sets the congestion window to 70% of before
+mistakes: People often think an acknowledgement means the other application has received and processed the data. It means only that the peer's kernel has the bytes in its receive buffer. If the server process crashes before reading them, they are lost although TCP acknowledged them, which is why protocols such as Kafka and HTTP add their own application-level replies.
+People often expect TCP to keep message boundaries. It delivers a stream of bytes: two 100-byte writes can arrive as one 200-byte read, or as three pieces. Every protocol on top of TCP needs its own framing, such as a length prefix (Kafka, gRPC) or a delimiter (HTTP/1.1 headers).
+People often assume small writes leave immediately. Nagle's algorithm holds back a small segment while earlier data is still unacknowledged, and the receiver may delay its ACK (at least 40 ms on Linux) to combine it with a reply. A request written in two small pieces can therefore wait about 40 ms or more for no reason. Latency-sensitive protocols set TCP_NODELAY or write each message in one call.
+People often think a dead peer is noticed quickly. If a host loses power or the network is cut, no FIN or RST arrives. An idle connection then stays open: on Linux, keepalive probes start only after 2 hours by default. With unacknowledged data, the default 15 retries take about 15 minutes before an error. Applications need their own heartbeats and timeouts.
+People often think short connections cost nothing once closed. The side that closes first keeps the connection in TIME_WAIT for 60 seconds on Linux, so a client opening 1,000 connections per second to one server address keeps about 60,000 of them, more than the roughly 28,000 local ports in Linux's default ephemeral range. Connection pooling avoids this.
+quiz: What does the receive window protect, what does the congestion window protect, and which one limits the sender? || The receive window protects the receiver's buffer (flow control); the congestion window protects the network (congestion control). The sender may have at most the smaller of the two windows of unacknowledged data in flight.
+Why does TCP set its retransmission timeout from both the average RTT and its variation? || RTTs vary, so a timeout equal to the average would fire for every slower-than-average packet and resend data that was only delayed. RTO = smoothed RTT + 4 × mean deviation puts the timer far in the tail, so it fires mostly for real losses, and the deviation term adapts when the path becomes jittery.
+How does TCP detect a lost segment before the timeout fires, and what does SACK add? || Segments that arrive after a gap make the receiver repeat the same cumulative ACK. Three duplicate ACKs trigger a fast retransmit of the missing segment. SACK adds the list of blocks received after the gap, so the sender can resend several missing segments in one round trip instead of one per round trip.
+A replication link has a 100 ms RTT and 0.01% packet loss, with 1,460-byte segments and loss-based congestion control. What throughput can one connection expect on a 1 Gbit/s link? || By the Mathis formula, about (1,460 × 8 bits / 0.1 s) × 1.22 / √0.0001 ≈ 117 kbit/s × 122 ≈ 14 Mbit/s, about 1.4% of the link. Use several parallel connections, BBR, or fix the loss.
+When should you turn off Nagle's algorithm with TCP_NODELAY? || Turn it off for request–response protocols and interactive traffic, where waiting tens of milliseconds to merge small writes hurts latency. Keep it, or batch writes in the application, for bulk streams made of many tiny writes, because each segment costs at least 40 bytes of headers plus per-packet CPU work.
+ref: spec | RFC 6298: Computing TCP's Retransmission Timer | Paxson, Allman, Chu & Sargent, IETF, 2011 | https://www.rfc-editor.org/rfc/rfc6298
+ref: paper | The Macroscopic Behavior of the TCP Congestion Avoidance Algorithm | Mathis, Semke, Mahdavi & Ott, CCR 1997 |
