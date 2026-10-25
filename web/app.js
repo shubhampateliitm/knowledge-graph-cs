@@ -9,7 +9,8 @@ const esc = s => String(s==null?"":s).replace(/[&<>"']/g, c => ({"&":"&amp;","<"
 const lc = l => `var(--l${l})`;
 const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const narrow = () => matchMedia("(max-width: 900px)").matches;
-const SECTIONS = ["value","history","how","example","intuition","friction","practice"];
+const SECTIONS = ["value","history","how","example","intuition","mistakes","tradeoffs","friction","practice","interview"];   // text used by the local search
+const DESIGN_SECS = ["summary","requirements","estimates","api","datamodel","design","deepdive","tradeoffs","failures","evolution","followups"];
 const KIND = {paper:"Paper",book:"Book",blog:"Article",docs:"Docs",course:"Course",video:"Video",spec:"Spec"};
 const SIDE = {alt:"Alternative", comp:"Works with", evol:"Evolved from", related:"Related"};
 
@@ -54,6 +55,13 @@ const CUR = DATA.curriculum || {programs:[], courses:[]};
 const COURSE = {}; CUR.courses.forEach(c=>COURSE[c.code]=c);
 const TAUGHT = {}; CUR.courses.forEach(c=>c.concepts.forEach(id=>(TAUGHT[id]=TAUGHT[id]||[]).push(c.code)));
 const courseLabel = code => code.replace(/^([A-Z]+)(\d)/,"$1 $2");
+// system design questions: summaries in server mode (full text from /api/design/<id>), full objects in standalone mode
+const DESIGNS = (DATA.designs||[]).map(d=>{ if(d.rd && d.summary===undefined) d.summary=(d.rd.summary||[""])[0]; return d; });
+const DES = {}, DES_FULL = {}; DESIGNS.forEach(d=>{ DES[d.id]=d; if(d.rd) DES_FULL[d.id]=d; });
+const USES = {}; DESIGNS.forEach(d=>d.concepts.forEach(id=>{ if(N[id]) (USES[id]=USES[id]||[]).push(d.id); }));
+const DES_CATS = ["Web & product","Data & analytics","Infrastructure","Ads & media","AI & ML"];
+const isDes = id => typeof id==="string" && id.startsWith("design/");
+const isJourney = t => /^what happens when/i.test(t.title);
 
 const LSKEY = "dts:user:v1";
 const BOX_DAYS = [0, 1, 3, 7, 21, 60];   // Leitner box -> days until the next review
@@ -75,6 +83,10 @@ const Store = {
     lsSave(u); return now;
   },
   stamp(){ return new Date().toISOString().slice(0,19); },
+  async design(id){
+    if(DES_FULL[id]) return DES_FULL[id];
+    const r = await api("GET","/api/design/"+encodeURIComponent(id)); DES_FULL[id]=r; return r;
+  },
   async read(id){
     if(READS[id]) return READS[id];
     const r = await api("GET","/api/read/"+encodeURIComponent(id)); READS[id]=r; return r;
@@ -133,20 +145,24 @@ const Store = {
 await Store.init();
 
 /* ---------- local fallbacks (standalone) ---------- */
-function readText(id){ const r=READS[id]; return r ? SECTIONS.flatMap(s=>r.rd[s]||[]).join(" ") : ""; }
+function readText(id){
+  if(isDes(id)){ const d=DES_FULL[id.slice(7)]; return d ? DESIGN_SECS.flatMap(s=>d.rd[s]||[]).join(" ") : ""; }
+  const r=READS[id]; return r ? SECTIONS.flatMap(s=>r.rd[s]||[]).join(" ") : ""; }
 function localSearch(q){
   const s=q.trim().toLowerCase(); if(!s) return [];
   const terms = s.split(/\s+/).filter(Boolean);
-  const all = DATA.nodes.map(n=>({id:n.id,label:n.label,l:n.l,m:n.m,cat:n.cat})).concat(DATA.layers.map(l=>({id:l.id,label:"Layer "+l.l+": "+l.n,l:l.l,m:l.d,cat:""})));
+  const all = DATA.nodes.map(n=>({id:n.id,label:n.label,l:n.l,m:n.m,cat:n.cat})).concat(DATA.layers.map(l=>({id:l.id,label:"Layer "+l.l+": "+l.n,l:l.l,m:l.d,cat:""})))
+    .concat(DESIGNS.map(d=>({id:"design/"+d.id,label:d.title,l:0,m:d.summary||"",cat:d.category})));
   const out=[];
   for(const n of all){
     const lab=n.label.toLowerCase();
     let sc = lab===s?0 : lab.startsWith(s)?1 : lab.includes(s)?2 : (n.cat||"").toLowerCase().includes(s)?3 : n.m.toLowerCase().includes(s)?4 : 9;
     let text="";
     if(sc===9){ text=readText(n.id); const tl=text.toLowerCase(); if(tl.includes(s)) sc=5; else if(terms.every(t=>tl.includes(t))) sc=6; }
-    if(sc<9) out.push({id:n.id,label:n.label,score:sc,snippet:sc>=5?snip(text,sc===5?s:terms[0]):"", l:n.l});
+    // more mentions of the phrase rank higher among body matches
+    if(sc<9) out.push({id:n.id,label:n.label,score:sc,snippet:sc>=5?snip(text,sc===5?s:terms[0]):"", l:n.l, hits:sc===5?text.toLowerCase().split(s).length-1:0});
   }
-  return out.sort((a,b)=>a.score-b.score||a.l-b.l).slice(0,14);
+  return out.sort((a,b)=>a.score-b.score||b.hits-a.hits||a.l-b.l).slice(0,14);
 }
 function snip(text, term){
   const i=text.toLowerCase().indexOf(term); if(i<0) return "";
@@ -172,8 +188,8 @@ function aboveByLayer(id){
   while(q.length){ const c=q.shift(); N[c].pars.forEach(e=>{ if(e.k!=="builds"||seen.has(e.s)) return; seen.add(e.s); q.push(e.s); out[N[e.s].l]++; }); }
   return out;
 }
-const label = id => /^L\d$/.test(id) ? "Layer "+id[1]+": "+LAYERS[+id[1]].n : N[id].label;
-const layerOf = id => /^L\d$/.test(id) ? +id[1] : N[id].l;
+const label = id => isDes(id) ? (DES[id.slice(7)]||{title:id}).title : /^L\d$/.test(id) ? "Layer "+id[1]+": "+LAYERS[+id[1]].n : N[id].label;
+const layerOf = id => isDes(id) ? null : /^L\d$/.test(id) ? +id[1] : N[id].l;
 function refURL(r){
   if(r.u) return r.u;
   const who = r.w.replace(/\(.*?\)/g,"").split(/[,;]/)[0].trim();
@@ -183,7 +199,8 @@ function refURL(r){
 const markHTML = id => { const s=Store.status(id); return s==="read"?`<span class="mark" title="Read">✓</span>`:s==="reading"?`<span class="mark reading" title="Started">◐</span>`:""; };
 
 /* ---------------- state ---------------- */
-const state = { program:"bs", course:"CS111", view:"explore", start:0, path:["kafka","commitlog","wal"], sel:"wal", tour:0, tstep:0, filter:"", expand:{}, libKind:"all", libQ:"", libN:120 };
+const firstJourney = DATA.tours.findIndex(isJourney);
+const state = { algo:{tab:"viz", viz:"bubble", prob:null}, program:"bs", course:"CS111", view:"explore", start:0, path:["kafka","commitlog","wal"], sel:"wal", tour:Math.max(0, firstJourney), tstep:0, filter:"", expand:{}, libKind:"all", libQ:"", libN:120 };
 
 /* ---------------- strip ---------------- */
 function renderStrip(){
@@ -283,6 +300,7 @@ function renderPanel(){
   h += `<h3>Used by · ${ups.length} directly, ${upTot} in total</h3>` + (ups.length ? relList(ups, e=>`<button type="button" data-sel="${e.s}"><span class="bar${e.k==="inspired"?" dash":""}" style="--c:${lc(N[e.s].l)}"></span><span><span class="rn">${esc(N[e.s].label)}</span><span class="kind">L${N[e.s].l}</span><span class="rw">${esc(e.r)}</span></span></button>`) : `<p class="empty">Nothing in this map is built on it yet: it is a top-level product.</p>`);
   if(n.side.length) h += `<h3>Related · ${n.side.length}</h3>` + relList(n.side, s=>`<button type="button" data-sel="${s.o}"><span class="bar" style="--c:${lc(N[s.o].l)}"></span><span><span class="rn">${esc(N[s.o].label)}</span><span class="kind">${SIDE[s.t]||s.t}</span><span class="rw">${esc(s.r)}</span></span></button>`);
   if(TAUGHT[n.id]) h += `<h3>Taught in · Stanford</h3><div class="chips">${TAUGHT[n.id].map(code=>`<button type="button" class="chip" style="--c:var(--fg)" data-course="${code}"><span class="sw"></span>${esc(courseLabel(code))} ${esc(COURSE[code].title)}</button>`).join("")}</div>`;
+  if(USES[n.id]) h += `<h3>Appears in design questions · ${USES[n.id].length}</h3><div class="chips">${USES[n.id].map(did=>`<button type="button" class="chip" style="--c:var(--fg)" data-design="${did}"><span class="sw"></span>${esc(DES[did].title)}</button>`).join("")}</div>`;
   const rd = READS[n.id];
   h += `<h3>Go deeper · ${n.nr} source${n.nr===1?"":"s"}</h3>` + (rd ? `<div class="minirefs">${rd.refs.map(r=>`<a href="${esc(refURL(r))}" target="_blank" rel="noopener noreferrer"><span class="rk">${esc(KIND[r.k]||r.k)}</span><span class="rt">${esc(r.t)}</span> <span style="color:var(--muted)">· ${esc(r.w)}</span></a>`).join("")}</div>` : `<p class="empty">Loading sources…</p>`);
   p.innerHTML = h;
@@ -301,7 +319,9 @@ function introHTML(){
 /* ---------------- tours ---------------- */
 function renderTours(){
   const t = DATA.tours[state.tour];
-  $("v-tours").innerHTML = `<div class="tlist">${DATA.tours.map((x,i)=>{ const done=x.steps.filter(s=>Store.status(s[0])==="read").length; return `<button type="button" class="tcard" data-tour="${i}" aria-pressed="${i===state.tour}"><span class="tt">${esc(x.title)}</span><span class="ts">${esc(x.sub)}${done?` · ${done}/${x.steps.length} read`:""}</span><span class="tl" aria-hidden="true">${x.steps.map(s=>`<span style="--c:${lc(N[s[0]].l)};${Store.status(s[0])==="read"?"":"opacity:.45"}"></span>`).join("")}</span></button>`; }).join("")}</div>
+  const card = i => { const x=DATA.tours[i], done=x.steps.filter(s=>Store.status(s[0])==="read").length; return `<button type="button" class="tcard" data-tour="${i}" aria-pressed="${i===state.tour}"><span class="tt">${esc(x.title)}</span><span class="ts">${esc(x.sub)}${done?` · ${done}/${x.steps.length} read`:""}</span><span class="tl" aria-hidden="true">${x.steps.map(s=>`<span style="--c:${lc(N[s[0]].l)};${Store.status(s[0])==="read"?"":"opacity:.45"}"></span>`).join("")}</span></button>`; };
+  const idx = DATA.tours.map((x,i)=>i), jr = idx.filter(i=>isJourney(DATA.tours[i])), rest = idx.filter(i=>!isJourney(DATA.tours[i]));
+  $("v-tours").innerHTML = `<div class="tlist">${jr.length?`<div class="cat tgrp">Journeys: what happens when…</div>${jr.map(card).join("")}<div class="cat tgrp">More tours</div>`:""}${rest.map(card).join("")}</div>
   <div class="tsteps"><h2>${esc(t.title)}</h2><p class="sub">${esc(t.sub)} · ${t.steps.length} steps from L${N[t.steps[0][0]].l} to L${N[t.steps[t.steps.length-1][0]].l}</p><div class="btnrow" style="margin:-4px 0 14px"><button type="button" class="btn primary" data-rtour="0">Read the tour · ${t.steps.reduce((s,x)=>s+N[x[0]].rm,0)} min</button></div>
   ${t.steps.map((s,i)=>{ const n=N[s[0]]; return `<button type="button" class="step" style="--c:${lc(n.l)}" data-tstep="${i}" aria-pressed="${i===state.tstep}"><span class="rail"><span class="dot"></span></span><span class="body"><span class="sl"><span class="sn">${esc(n.label)}</span><span class="tag">L${n.l} · ${esc(LAYERS[n.l].n)}</span>${markHTML(n.id)}</span><span class="sx">${esc(s[1])}</span></span></button>`; }).join("")}</div>`;
 }
@@ -432,6 +452,51 @@ function termsHTML(list){ return list&&list.length ? `<dl class="terms">${list.m
 function diagramHTML(list){ return list&&list.length ? `<figure class="diagram"><pre>${esc(list.join("\n"))}</pre></figure>` : ""; }
 function mistakesHTML(list){ return list&&list.length ? `<div class="mistakes">${list.map(p=>`<p>${esc(p)}</p>`).join("")}</div>` : ""; }
 function quizHTML(list, id){ const inDeck = id && Store.me.review[id+"#0"]; return list&&list.length ? `<p class="stand-sum">Try to answer each one in your head first, then open it to check. ${id?(inDeck?"These questions are in your review deck; they come back in the You tab when they are due.":`<button type="button" class="btn" data-enroll="${id}" style="margin-left:4px">Add to my review deck</button>`):""}</p><ol class="quiz">${list.map(q=>{const i=q.indexOf(" || "); return `<li><details><summary>${esc(q.slice(0,i))}</summary><p>${esc(q.slice(i+4))}</p></details></li>`;}).join("")}</ol>` : ""; }
+function qaHTML(list, note){ return list&&list.length ? `${note?`<p class="stand-sum">${note}</p>`:""}<ol class="quiz qa">${list.map(q=>{const i=q.indexOf(" || "); return `<li><details><summary>${esc(q.slice(0,i))}</summary><p>${esc(q.slice(i+4))}</p></details></li>`;}).join("")}</ol>` : ""; }
+function tradeoffsHTML(list){ return list&&list.length ? `<div class="tradeoffs">${list.map(p=>`<p>${esc(p)}</p>`).join("")}</div>` : ""; }
+
+/* step-by-step animation: "== caption" starts a frame, the following lines are its drawing */
+const ANIM = {}; let animSeq = 0, animObs = null;
+function animHTML(lines){
+  if(!lines||!lines.length) return "";
+  const frames=[]; lines.forEach(l=>{ if(l.startsWith("== ")) frames.push({c:l.slice(3).trim(), d:[]}); else if(frames.length) frames[frames.length-1].d.push(l.replace(/\s+$/,"")); });
+  if(!frames.length) return "";
+  const ind = Math.min(...frames.flatMap(f=>f.d.filter(x=>x.trim()).map(x=>x.match(/^ */)[0].length)).concat([99]));
+  const rows = Math.max(...frames.map(f=>f.d.length));
+  frames.forEach(f=>{ f.d = f.d.map(x=>x.slice(Math.min(ind, x.match(/^ */)[0].length))); while(f.d.length<rows) f.d.push(""); });
+  const id = "anim"+(++animSeq); ANIM[id] = {frames, k:0, t:null, seen:false};
+  return `<figure class="anim" id="${id}" tabindex="0" aria-label="Step-by-step animation, ${frames.length} frames. Left and right arrow keys step through it."><figcaption class="an-cap" aria-live="polite"><span class="an-no mono">1</span>${esc(frames[0].c)}</figcaption><div class="an-stage"><pre>${esc(frames[0].d.join("\n"))}</pre></div><div class="an-ctl"><button type="button" class="btn" data-anim="prev" disabled>← Back</button><button type="button" class="btn primary" data-anim="play" aria-pressed="false">Play</button><button type="button" class="btn" data-anim="next">Next →</button><button type="button" class="btn" data-anim="restart">Restart</button><span class="an-k mono">frame 1 of ${frames.length}</span></div><div class="an-dots" aria-hidden="true">${frames.map((f,i)=>`<span${i===0?' class="on"':""}></span>`).join("")}</div></figure>`;
+}
+function animShow(id, k){
+  const a=ANIM[id], el=document.getElementById(id); if(!a||!el) return;
+  a.k = Math.max(0, Math.min(a.frames.length-1, k)); const f=a.frames[a.k];
+  el.querySelector(".an-cap").innerHTML = `<span class="an-no mono">${a.k+1}</span>${esc(f.c)}`;
+  el.querySelector(".an-stage pre").textContent = f.d.join("\n");
+  el.querySelector(".an-k").textContent = `frame ${a.k+1} of ${a.frames.length}`;
+  el.querySelector('[data-anim="prev"]').disabled = a.k===0;
+  el.querySelector('[data-anim="next"]').disabled = a.k===a.frames.length-1;
+  el.querySelectorAll(".an-dots span").forEach((s,i)=>s.classList.toggle("on", i===a.k));
+}
+function animStop(id){ const a=ANIM[id]; if(!a) return; clearInterval(a.t); a.t=null; const b=document.querySelector(`#${id} [data-anim="play"]`); if(b){ b.textContent="Play"; b.setAttribute("aria-pressed","false"); } }
+function animPlay(id){
+  const a=ANIM[id]; if(!a) return; animStop(id);
+  if(a.k>=a.frames.length-1) animShow(id, 0);
+  const b=document.querySelector(`#${id} [data-anim="play"]`); if(b){ b.textContent="Pause"; b.setAttribute("aria-pressed","true"); }
+  a.t = setInterval(()=>{ if(!document.getElementById(id)){ clearInterval(a.t); return; } if(a.k>=a.frames.length-1) return animStop(id); animShow(id, a.k+1); }, 1600);
+}
+function animAct(id, act){
+  const a=ANIM[id]; if(!a) return;
+  if(act==="play") return a.t ? animStop(id) : animPlay(id);
+  animStop(id);
+  if(act==="prev") animShow(id, a.k-1); else if(act==="next") animShow(id, a.k+1); else if(act==="restart") animShow(id, 0);
+}
+function animStopAll(){ Object.keys(ANIM).forEach(id=>{ clearInterval(ANIM[id].t); if(!document.getElementById(id)) delete ANIM[id]; }); if(animObs){ animObs.disconnect(); animObs=null; } }
+function animWatch(root){
+  // autoplay once when an animation scrolls into view, unless the reader asked for reduced motion
+  const els = root.querySelectorAll(".anim"); if(!els.length || reduced || !("IntersectionObserver" in window)) return;
+  animObs = new IntersectionObserver(es=>es.forEach(e=>{ const a=ANIM[e.target.id]; if(e.isIntersecting && a && !a.seen){ a.seen=true; animPlay(e.target.id); } }), {threshold:0.6});
+  els.forEach(el=>animObs.observe(el));
+}
 function sec(id, no, title, body){ return body ? `<section class="rd-sec" id="rs-${id}"><h2><span class="no">${no}</span>${title}</h2>${body}</section>` : ""; }
 function srow(id, reason, dash, meta){ const m=N[id]; return `<button type="button" class="srow" style="--c:${lc(m.l)}" data-read="${id}"><span class="bar${dash?" dash":""}"></span><span><span class="sn">${esc(m.label)}</span><span class="sm">${meta||"L"+m.l}</span>${markHTML(id)}<span class="sr">${esc(reason)}</span></span></button>`; }
 function groupByLayer(list, key){
@@ -465,22 +530,25 @@ function nodeRead(n, r, ctx){
   h += actionsHTML(n.id, lc(n.l));
   if(ctx) h += `<div class="rd-ctx"><b>${esc(ctx.k)}</b>${esc(ctx.t)}</div>`;
   h += ladderHTML(n);
+  if(USES[n.id]) h += `<p class="ladder-cap">Appears in design questions: ${USES[n.id].map(did=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-design="${did}">${esc(DES[did].title)}</button>`).join(", ")}.</p>`;
   if(TAUGHT[n.id]) h += `<p class="ladder-cap">Taught in Stanford ${TAUGHT[n.id].map(code=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-course="${code}">${esc(courseLabel(code))}</button>`).join(", ")}.</p>`;
-  const toc = [["value","Why it exists"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How it works"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],rd.quiz&&["quiz","Check yourself"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
+  const toc = [["value","Why it exists"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How it works"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],rd.tradeoffs&&["tradeoffs","It depends: trade-offs"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],rd.interview&&["interview","In the interview"],rd.quiz&&["quiz","Check yourself"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
   h += `<nav class="toc" aria-label="Sections">${toc.map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
   let no=0; const NO=()=>String(++no).padStart(2,"0");
   h += sec("value", NO(), "Why it exists", P(rd.value,"lead"));
   if(rd.terms) h += sec("terms", NO(), "Key terms", termsHTML(rd.terms));
   if(rd.history) h += sec("history", NO(), "How we got here", P(rd.history));
-  h += sec("how", NO(), "How it works", P(rd.how) + diagramHTML(rd.diagram));
+  h += sec("how", NO(), "How it works", P(rd.how) + diagramHTML(rd.diagram) + animHTML(rd.animation));
   if(rd.example) h += sec("example", NO(), "A worked example", `<div class="example">${P(rd.example)}</div>`);
   if(downs.length||insp.length) h += sec("stands", NO(), "What it stands on",
     `<p class="stand-sum">${esc(n.label)} rests directly on ${downs.length} idea${downs.length===1?"":"s"}. Counting everything beneath those, it stands on ${tot} concepts across ${lays.length} layer${lays.length===1?"":"s"} (${lays.map(l=>"L"+l).join(", ")}). Each line says what that lower layer contributes.</p>` +
     groupByLayer(downs,"t") + (insp.length?`<div class="sgrp" style="--c:var(--muted)"><div class="sh"><span class="sw"></span>Borrowed ideas (analogies, not mechanisms)</div>${insp.map(e=>srow(e.t,e.r,true)).join("")}</div>`:""));
   h += sec("intuition", NO(), "Why it makes sense", (rd.intuition&&rd.intuition.length?`<p class="rd-quote">${esc(rd.intuition[0])}</p>`+P(rd.intuition.slice(1)):""));
   if(rd.mistakes) h += sec("mistakes", NO(), "Common misunderstandings", mistakesHTML(rd.mistakes));
+  if(rd.tradeoffs) h += sec("tradeoffs", NO(), "It depends: trade-offs", tradeoffsHTML(rd.tradeoffs));
   h += sec("friction", NO(), "Where it still hurts", P(rd.friction));
   if(rd.practice) h += sec("practice", NO(), "In practice", P(rd.practice));
+  if(rd.interview) h += sec("interview", NO(), "In the interview", qaHTML(rd.interview, "Questions a staff-level interviewer asks about this. Say your answer out loud first, then open it to compare."));
   if(rd.quiz) h += sec("quiz", NO(), "Check yourself", quizHTML(rd.quiz, n.id));
   if(ups.length) h += sec("built", NO(), "What's built on it", `<p class="stand-sum">${ups.length} concept${ups.length===1?"":"s"} use ${esc(n.label)} directly.</p>` + groupByLayer(ups,"s"));
   if(n.side.length) h += sec("side", NO(), "Neighbours", n.side.map(s=>srow(s.o, s.r, false, SIDE[s.t]||s.t)).join(""));
@@ -494,17 +562,19 @@ function essayRead(l, r){
   let h = `<div class="rd-eye"><span class="lpill" style="--c:${lc(l)}"><span class="sw"></span>Layer ${l} of 5</span><span class="mono">${LAYERS[l].rm} min read</span><span>${byLayer[l].length} concepts</span></div>
   <h1>${esc(LAYERS[l].n)}</h1><p class="rd-sub">${esc(LAYERS[l].d)}</p>${actionsHTML("L"+l, lc(l))}
   <div class="ladder" aria-hidden="true">${LAYERS.map((L,i)=>`<div class="${i===l?"on":""}" style="--c:${lc(i)}"><span class="ln">L${i}<i>${byLayer[i].length}</i></span><span class="bar" style="width:${Math.round(100*byLayer[i].length/150)}%"></span></div>`).join("")}</div>
-  <nav class="toc" aria-label="Sections">${[["value","What this layer adds"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How the layers below support it"],rd.example&&["example","A worked example"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],["friction","Where it still hurts"],rd.practice&&["practice","How to use this layer"],rd.quiz&&["quiz","Check yourself"],["here","What lives here"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean).map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
+  <nav class="toc" aria-label="Sections">${[["value","What this layer adds"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How the layers below support it"],rd.example&&["example","A worked example"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],rd.tradeoffs&&["tradeoffs","It depends: trade-offs"],["friction","Where it still hurts"],rd.practice&&["practice","How to use this layer"],rd.interview&&["interview","In the interview"],rd.quiz&&["quiz","Check yourself"],["here","What lives here"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean).map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
   let no=0; const NO=()=>String(++no).padStart(2,"0");
   h += sec("value",NO(),"What this layer adds", P(rd.value,"lead"));
   if(rd.terms) h += sec("terms",NO(),"Key terms", termsHTML(rd.terms));
   if(rd.history) h += sec("history",NO(),"How we got here", P(rd.history));
-  h += sec("how",NO(),"How the layers below support it", P(rd.how) + diagramHTML(rd.diagram));
+  h += sec("how",NO(),"How the layers below support it", P(rd.how) + diagramHTML(rd.diagram) + animHTML(rd.animation));
   if(rd.example) h += sec("example",NO(),"A worked example", `<div class="example">${P(rd.example)}</div>`);
   h += sec("intuition",NO(),"Why it makes sense", rd.intuition&&rd.intuition.length?`<p class="rd-quote">${esc(rd.intuition[0])}</p>`+P(rd.intuition.slice(1)):"");
   if(rd.mistakes) h += sec("mistakes",NO(),"Common misunderstandings", mistakesHTML(rd.mistakes));
+  if(rd.tradeoffs) h += sec("tradeoffs",NO(),"It depends: trade-offs", tradeoffsHTML(rd.tradeoffs));
   h += sec("friction",NO(),"Where it still hurts", P(rd.friction));
   if(rd.practice) h += sec("practice",NO(),"How to use this layer", P(rd.practice));
+  if(rd.interview) h += sec("interview",NO(),"In the interview", qaHTML(rd.interview));
   if(rd.quiz) h += sec("quiz",NO(),"Check yourself", quizHTML(rd.quiz));
   h += sec("here",NO(),"What lives here", `<p class="stand-sum">The most depended-on concepts in this layer, then everything by area. Each opens its own read.</p><div class="sgrp" style="--c:${lc(l)}"><div class="sh"><span class="sw"></span>Most depended-on</div>${top.map(n=>srow(n.id, n.m, false, n.indeg+" use it")).join("")}</div>` +
     cats.map(c=>`<div class="agrp"><h3>${esc(c)}</h3><div class="chips">${byLayer[l].filter(n=>n.cat===c).sort(byLabel).map(n=>`<button type="button" class="chip${hubSet.has(n.id)?" hub":""}" style="--c:${lc(l)}" data-read="${n.id}"><span class="sw"></span>${esc(n.label)}${markHTML(n.id)}</button>`).join("")}</div></div>`).join(""));
@@ -512,6 +582,76 @@ function essayRead(l, r){
   h += notesSec("L"+l, NO());
   return h;
 }
+/* ---------------- system design ---------------- */
+function conceptMapSVG(ids){
+  // the design's concepts in rows by layer (L0 at the top), with the map's links between them
+  const set = new Set(ids), PER = 3, BW = 168, BH = 26, GX = 12, LBL = 30, W = LBL + PER*BW + (PER-1)*GX + 8, RG = 22, SG = 12;
+  const pos = {}; let y = 12, nodes = "", labels = "";
+  for(let l=0; l<6; l++){
+    const row = ids.filter(id=>N[id].l===l); if(!row.length) continue;
+    labels += `<text x="2" y="${y+17}" class="lt">L${l}</text>`;
+    for(let i=0; i<row.length; i+=PER){
+      const chunk = row.slice(i, i+PER), wid = chunk.length*BW + (chunk.length-1)*GX, x0 = LBL + (W-LBL-8-wid)/2;
+      chunk.forEach((id,j)=>{ const x = x0 + j*(BW+GX); pos[id] = {x, y}; let t = N[id].label; if(t.length>25) t = t.slice(0,24)+"…";
+        nodes += `<g class="nd${Store.status(id)==="read"?" read":""}" style="--c:${lc(l)}" data-gread="${id}" tabindex="0" role="button" aria-label="${esc(N[id].label)}"><title>${esc(N[id].label)} · L${l}</title><rect x="${x}" y="${y}" width="${BW}" height="${BH}" rx="6"/><text x="${x+BW/2}" y="${y+17}" text-anchor="middle">${esc(t)}</text></g>`; });
+      y += BH + SG;
+    }
+    y += RG - SG;
+  }
+  let edges = "";
+  DATA.edges.forEach(e=>{ if(!set.has(e.s)||!set.has(e.t)) return; const a=pos[e.s], b=pos[e.t];
+    if(a.y===b.y){ const x1=a.x+BW/2, x2=b.x+BW/2; edges += `<path class="${e.k==="inspired"?"insp":""}" d="M${x1},${a.y+BH} C${x1},${a.y+BH+16} ${x2},${b.y+BH+16} ${x2},${b.y+BH}"/>`; return; }
+    const [u,d] = a.y<b.y?[a,b]:[b,a], x1=u.x+BW/2, y1=u.y+BH, x2=d.x+BW/2, y2=d.y;
+    edges += `<path class="${e.k==="inspired"?"insp":""}" d="M${x1},${y1} C${x1},${(y1+y2)/2} ${x2},${(y1+y2)/2} ${x2},${y2}"/>`; });
+  const H = y + 4;
+  return `<div class="cmap"><svg class="ego" viewBox="0 0 ${W} ${H}" width="${W}" role="img" aria-label="Concept map: the concepts this design uses, by layer, with the links between them">${edges}${labels}${nodes}</svg></div>`;
+}
+function designConceptsHTML(d){
+  const ids = d.concepts.filter(id=>N[id]), g=[[],[],[],[],[],[]]; ids.forEach(id=>g[N[id].l].push(id));
+  const mins = ids.reduce((s,id)=>s+N[id].rm,0), read = ids.filter(id=>Store.status(id)==="read").length;
+  return `<p class="stand-sum">${ids.length} concepts from the map, grouped by layer${read?` · ${read} already read`:""}. Open one to read it, then come back with Back.</p>` +
+    g.map((a,l)=>a.length?`<div class="ugrp"><div class="uh" style="--c:${lc(l)}"><span class="sw"></span>L${l} · ${esc(LAYERS[l].n)}</div><div class="chips">${a.map(id=>`<button type="button" class="chip" style="--c:${lc(l)}" data-read="${id}"><span class="sw"></span>${esc(N[id].label)}${markHTML(id)}</button>`).join("")}</div></div>`:"").join("") +
+    `<h3 class="cm-h">Concept map</h3><p class="stand-sum">Rows are layers, from tools (top) to first principles (bottom). Lines are the map's "built on" links between these concepts.</p>${conceptMapSVG(ids)}` +
+    `<div class="btnrow" style="margin-top:10px"><button type="button" class="btn primary" data-dstudy="${d.id}">Study these concepts · ${ids.length} reads · ${mins} min</button></div>`;
+}
+function designRead(d){
+  const rd = d.rd, nc = d.concepts.filter(id=>N[id]).length;
+  let h = `<div class="rd-eye"><span class="lpill" style="--c:var(--fg)"><span class="sw"></span>System design</span><span>${esc(d.category)}</span>${d.level?`<span>${esc(d.level)}</span>`:""}<span class="mono">${d.rm} min read</span><span>${nc} concepts</span></div>
+  <h1>${esc(d.title)}</h1>`;
+  h += `<div class="rd-actions" style="--c:var(--fg)"><button type="button" class="btn" data-dstudy="${d.id}">Study these concepts</button><a class="btn" href="#rs-concepts" data-jump="rs-concepts" style="text-decoration:none">Concepts it uses · ${nc}</a></div>`;
+  const toc = [["summary","Summary"],rd.requirements&&["requirements","Requirements"],rd.estimates&&["estimates","Estimates"],rd.api&&["api","API"],rd.datamodel&&["datamodel","Data model"],rd.design&&["design","High-level design"],rd.deepdive&&["deepdive","Deep dives"],rd.tradeoffs&&["tradeoffs","Trade-offs"],rd.failures&&["failures","Failure modes"],rd.evolution&&["evolution","Evolution"],rd.followups&&["followups","Interview follow-ups"],["concepts","Concepts it uses"],d.refs&&d.refs.length&&["deeper","Sources"]].filter(Boolean);
+  h += `<nav class="toc" aria-label="Sections">${toc.map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
+  let no=0; const NO=()=>String(++no).padStart(2,"0");
+  h += sec("summary", NO(), "Summary", P(rd.summary,"lead"));
+  if(rd.requirements) h += sec("requirements", NO(), "Requirements", P(rd.requirements));
+  if(rd.estimates) h += sec("estimates", NO(), "Back-of-the-envelope estimates", `<div class="example estimates">${P(rd.estimates)}</div>`);
+  if(rd.api) h += sec("api", NO(), "API", `<div class="apilist">${rd.api.map(p=>{ const m=p.match(/^((?:GET|POST|PUT|PATCH|DELETE)[^.]*?)\.\s(.*)$/); return m?`<p><code>${esc(m[1])}</code> ${esc(m[2])}</p>`:`<p>${esc(p)}</p>`; }).join("")}</div>`);
+  if(rd.datamodel) h += sec("datamodel", NO(), "Data model", P(rd.datamodel));
+  if(rd.design||rd.diagram||rd.animation) h += sec("design", NO(), "High-level design", P(rd.design) + diagramHTML(rd.diagram) + animHTML(rd.animation));
+  if(rd.deepdive) h += sec("deepdive", NO(), "Deep dives", P(rd.deepdive));
+  if(rd.tradeoffs) h += sec("tradeoffs", NO(), "It depends: trade-offs", tradeoffsHTML(rd.tradeoffs));
+  if(rd.failures) h += sec("failures", NO(), "Failure modes", mistakesHTML(rd.failures));
+  if(rd.evolution) h += sec("evolution", NO(), "Evolution: from 1,000 to 1 billion users", P(rd.evolution));
+  if(rd.followups) h += sec("followups", NO(), "Interview follow-ups", qaHTML(rd.followups, "What the interviewer asks next. Answer out loud first, then open it to compare."));
+  h += sec("concepts", NO(), "Concepts it uses", designConceptsHTML(d));
+  if(d.refs&&d.refs.length) h += sec("deeper", NO(), "Sources", refsHTML(d.refs));
+  return h;
+}
+function renderDesign(){
+  const el = $("v-design");
+  if(!DESIGNS.length){ el.innerHTML = `<h2 class="vh">System design</h2><p class="vsub">No design questions yet. Add files to content/design/ and run python3 tools/build.py.</p>`; return; }
+  const cats = DES_CATS.filter(c=>DESIGNS.some(d=>d.category===c)).concat([...new Set(DESIGNS.map(d=>d.category))].filter(c=>!DES_CATS.includes(c)));
+  const card = d => { const ids=d.concepts.filter(id=>N[id]), g=[0,1,2,3,4,5].map(l=>ids.filter(id=>N[id].l===l).length);
+    return `<button type="button" class="dcard" data-design="${d.id}"><span class="tt">${esc(d.title)}</span><span class="ts">${esc(d.level||"")} · ${d.rm} min · ${ids.length} concepts</span><span class="dsum">${esc(d.summary||"")}</span><span class="under" aria-hidden="true">${g.map((k,l)=>k?`<span style="background:${lc(l)};flex:${k}"></span>`:"").join("")}</span></button>`; };
+  el.innerHTML = `<h2 class="vh">System design</h2><p class="vsub">${DESIGNS.length} interview question${DESIGNS.length===1?"":"s"}, each worked through: requirements, estimates with the arithmetic, API, data model, the design, deep dives, trade-offs, failure modes and the follow-up questions. Every design links to the concepts it uses, so you can study what it stands on.</p>` +
+    cats.map(c=>`<h3 class="ysec">${esc(c)}</h3><div class="dgrid">${DESIGNS.filter(d=>d.category===c).map(card).join("")}</div>`).join("");
+}
+function renderAlgoView(){
+  const el = $("v-algorithms");
+  if(window.DTSAlgo) window.DTSAlgo.render(el, state.algo);
+  else el.innerHTML = `<p class="empty">Loading the algorithms…</p>`;
+}
+
 function pathRead(ids){
   const all = ids.reduce((s,id)=>s+N[id].nr,0);
   let h = `<div class="rd-eye"><span class="lpill" style="--c:var(--fg)"><span class="sw"></span>Reading list</span><span class="mono">${ids.length} concepts · ${all} sources · about ${ids.reduce((s,id)=>s+N[id].rm,0)} min of reads</span></div>
@@ -534,8 +674,9 @@ async function renderReader(){
   const el = $("reader"), c = R.cur;
   let title, col, mins, body;
   try{
-    const need = c.type==="node" ? [c.id] : c.type==="layer" ? ["L"+c.l] : c.ids;
-    if(need.some(id=>!READS[id])){ el.innerHTML = `<div class="rd-bar"><button type="button" class="btn" data-rback>← Back</button><span class="rt">Loading…</span></div><article class="rd-wrap"><p class="empty">Loading…</p></article>`; }
+    animStopAll();
+    const need = c.type==="node" ? [c.id] : c.type==="layer" ? ["L"+c.l] : c.type==="design" ? [] : c.ids;
+    if(need.some(id=>!READS[id]) || (c.type==="design" && !DES_FULL[c.id])){ el.innerHTML = `<div class="rd-bar"><button type="button" class="btn" data-rback>← Back</button><span class="rt">Loading…</span></div><article class="rd-wrap"><p class="empty">Loading…</p></article>`; }
     if(c.type==="node"){ const n=N[c.id]; col=lc(n.l); title=n.label; mins=n.rm;
       el.style.setProperty("--c", col);
       const r = await Store.read(c.id); if(R.cur!==c) return;
@@ -543,6 +684,7 @@ async function renderReader(){
       body = nodeRead(n, r, ctx) + seqNav(); }
     else if(c.type==="layer"){ col=lc(c.l); title="L"+c.l+" · "+LAYERS[c.l].n; mins=LAYERS[c.l].rm; const r = await Store.read("L"+c.l); if(R.cur!==c) return;
       body = essayRead(c.l, r) + `<div class="seqnav">${c.l>0?`<button type="button" data-essay="${c.l-1}"><span class="k">↑ Layer ${c.l-1}</span><span class="t">${esc(LAYERS[c.l-1].n)}</span></button>`:"<span></span>"}${c.l<5?`<button type="button" class="nx" data-essay="${c.l+1}"><span class="k">Layer ${c.l+1} ↓</span><span class="t">${esc(LAYERS[c.l+1].n)}</span></button>`:"<span></span>"}</div>`; }
+    else if(c.type==="design"){ col="var(--fg)"; const d0=DES[c.id]; title=d0.title; mins=d0.rm; const d = await Store.design(c.id); if(R.cur!==c) return; body = designRead(d); }
     else { col="var(--fg)"; title="Reading list"; mins=null; await Promise.all(c.ids.map(id=>Store.read(id))); if(R.cur!==c) return; body = pathRead(c.ids); }
   } catch(e){ body = `<p class="empty">Could not load this read: ${esc(e.message)}</p>`; }
   el.style.setProperty("--c", col);
@@ -550,6 +692,7 @@ async function renderReader(){
   el.scrollTop = 0; updProg();
   const h1 = el.querySelector("h1"); if(h1){ h1.tabIndex=-1; try{ h1.focus({preventScroll:true}); }catch(e){} }
   const id = curId(); if(id) fillNotes(id);
+  animWatch(el);
 }
 function updProg(){
   const el=$("reader"), p=$("rprog"); if(!p) return;
@@ -561,7 +704,8 @@ function updProg(){
     if(spent>=need){ Store.setProgress(id,"read").then(()=>{ toast("Marked as read"); refreshMarks(); }).catch(()=>{}); }
   }
 }
-function hashFor(c){ return c.type==="node" ? "#read/"+c.id : c.type==="layer" ? "#layer/"+c.l : "#reading-list"; }
+function hashFor(c){ return c.type==="node" ? "#read/"+c.id : c.type==="layer" ? "#layer/"+c.l : c.type==="design" ? "#design/"+c.id : "#reading-list"; }
+const viewHash = () => state.view==="algorithms" && window.DTSAlgo ? window.DTSAlgo.hash(state.algo) : "#"+state.view;
 function openRead(c, opts={}){
   flushTime();
   if(R.open && R.cur && !opts.replace) R.hist.push(R.cur);
@@ -573,23 +717,27 @@ function openRead(c, opts={}){
   const id = curId(); if(id && !Store.status(id)) Store.setProgress(id,"reading").catch(()=>{});
   renderReader();
 }
-function closeRead(){ flushTime(); R.t0=0; R.open=false; R.hist=[]; $("reader").hidden=true; document.body.style.overflow=""; try{history.replaceState(null,"","#"+state.view)}catch(e){} render(false); if(R.ret&&R.ret.focus) try{R.ret.focus({preventScroll:true})}catch(e){} }
+function closeRead(){ flushTime(); animStopAll(); R.t0=0; R.open=false; R.hist=[]; $("reader").hidden=true; document.body.style.overflow=""; try{history.replaceState(null,"",viewHash())}catch(e){} render(false); if(R.ret&&R.ret.focus) try{R.ret.focus({preventScroll:true})}catch(e){} }
 function backRead(){ if(R.hist.length){ flushTime(); R.cur=R.hist.pop(); R.secs=0; R.t0=performance.now(); try{history.replaceState(null,"",hashFor(R.cur))}catch(e){} renderReader(); } else closeRead(); }
 $("reader").addEventListener("scroll", updProg, {passive:true});
 const pathSeq = () => ({name:"Your path", ids:state.path.slice()});
 function refreshMarks(){ if(R.open){ const a=$("reader").querySelector(".rd-actions"); const id=curId(); if(a&&id){ a.outerHTML = actionsHTML(id, getComputedStyle($("reader")).getPropertyValue("--c")); } } else render(false); }
 
 /* ---------------- render ---------------- */
-const VIEWS = ["explore","tours","courses","atlas","library","you"];
+const VIEWS = ["explore","tours","courses","design","algorithms","atlas","library","you"];
 function render(scrollCols){
   renderStrip();
   const v = state.view;
   document.querySelectorAll(".tabs button").forEach(b=>b.setAttribute("aria-pressed", String(b.dataset.view===v)));
   $("v-explore").hidden = v!=="explore"; $("cols").hidden = v!=="explore";
+  $("v-design").hidden = v!=="design"; $("v-algorithms").hidden = v!=="algorithms";
+  document.querySelector(".desk").classList.toggle("wide", v==="design"||v==="algorithms");
   $("v-tours").hidden = v!=="tours"; $("v-courses").hidden = v!=="courses"; $("v-atlas").hidden = v!=="atlas"; $("v-library").hidden = v!=="library"; $("v-you").hidden = v!=="you";
   if(v==="explore"){ renderTrail(); renderCols(scrollCols); }
   if(v==="tours") renderTours();
   if(v==="courses") renderCourses();
+  if(v==="design") renderDesign();
+  if(v==="algorithms") renderAlgoView();
   if(v==="atlas") renderAtlas();
   if(v==="library") renderLibrary();
   if(v==="you") renderYou();
@@ -598,14 +746,18 @@ function render(scrollCols){
 function revealPanel(){ if(narrow()) $("panel").scrollIntoView({behavior:reduced?"auto":"smooth",block:"start"}); else $("panel").scrollTop = 0; }
 function select(id, opts={}){ state.sel = id; state.expand = {}; render(false); if(opts.reveal!==false) revealPanel(); }
 function exploreFrom(id){ state.view="explore"; state.start=N[id].l; state.filter=""; state.path=[id]; state.sel=id; state.expand={}; try{history.replaceState(null,"","#explore")}catch(e){} render(true); revealPanel(); }
-function setView(v){ state.view=v; try{history.replaceState(null,"","#"+v)}catch(e){} if(v==="tours"){ state.sel = DATA.tours[state.tour].steps[state.tstep][0]; } if(v==="explore"){ state.sel = state.path[state.path.length-1]||null; } render(v==="explore"); if(v==="library"||v==="you") $("main").scrollTop=0; }
+function setView(v){ state.view=v; try{history.replaceState(null,"",viewHash())}catch(e){} if(v==="tours"){ state.sel = DATA.tours[state.tour].steps[state.tstep][0]; } if(v==="explore"){ state.sel = state.path[state.path.length-1]||null; } render(v==="explore"); if(["library","you","design","algorithms"].includes(v)) $("main").scrollTop=0; }
 
 document.addEventListener("click", async e=>{
   const j = e.target.closest("a[data-jump]"); if(j){ e.preventDefault(); const t=document.getElementById(j.dataset.jump); if(t) t.scrollIntoView({behavior:reduced?"auto":"smooth",block:"start"}); return; }
   const g = e.target.closest("[data-gsel]"); if(g){ return select(g.dataset.gsel); }
+  const gr = e.target.closest("[data-gread]"); if(gr){ return openRead({type:"node", id:gr.dataset.gread}, {seq:null}); }
   const b = e.target.closest("button"); if(!b) return;
   const d = b.dataset;
   try{
+    if(d.anim){ const f=b.closest(".anim"); if(f) animAct(f.id, d.anim); return; }
+    if(d.design) return openRead({type:"design", id:d.design}, {seq:null});
+    if(d.dstudy){ const ds=DES[d.dstudy], ids=ds.concepts.filter(id=>N[id]); return openRead({type:"node", id:ids[0]}, {seq:{name:ds.title, ids}}); }
     if(d.rclose!==undefined) return closeRead();
     if(d.rback!==undefined) return backRead();
     if(d.markread){ const on = Store.status(d.markread)==="read"; await Store.setProgress(d.markread, on?"reading":"read"); toast(on?"Marked as not read":"Marked as read"); return refreshMarks(); }
@@ -638,12 +790,15 @@ document.addEventListener("click", async e=>{
     if(d.expand!==undefined){ state.expand[d.expand]=!state.expand[d.expand]; return renderPanel(); }
     if(d.tour!==undefined){ state.tour=+d.tour; state.tstep=0; state.sel=DATA.tours[state.tour].steps[0][0]; render(false); const ts=$("v-tours").querySelector(".tsteps"); if(ts) ts.scrollTop=0; return; }
     if(d.tstep!==undefined){ state.tstep=+d.tstep; return select(DATA.tours[state.tour].steps[state.tstep][0]); }
-    if(d.pick){ const id=d.pick; if(/^L\d$/.test(id)) return openRead({type:"layer", l:+id[1]}, {seq:null}); if(d.open==="read"){ exploreFrom(id); return openRead({type:"node", id}, {seq:null}); } return exploreFrom(id); }
+    if(d.pick){ const id=d.pick; if(isDes(id)) return openRead({type:"design", id:id.slice(7)}, {seq:null}); if(/^L\d$/.test(id)) return openRead({type:"layer", l:+id[1]}, {seq:null}); if(d.open==="read"){ exploreFrom(id); return openRead({type:"node", id}, {seq:null}); } return exploreFrom(id); }
   } catch(err){ toast("Something went wrong: "+err.message); }
 });
 document.addEventListener("keydown", e=>{
   if(e.key==="Escape" && R.open && document.activeElement!==$("q")){ e.preventDefault(); return backRead(); }
   if(e.key==="Enter" && e.target.closest && e.target.closest("[data-gsel]")){ select(e.target.closest("[data-gsel]").dataset.gsel); }
+  if(e.key==="Enter" && e.target.closest && e.target.closest("[data-gread]")){ openRead({type:"node", id:e.target.closest("[data-gread]").dataset.gread}, {seq:null}); }
+  const an = e.target.closest && e.target.closest(".anim");
+  if(an && (e.key==="ArrowLeft"||e.key==="ArrowRight") && !/INPUT|TEXTAREA/.test(e.target.tagName)){ e.preventDefault(); animAct(an.id, e.key==="ArrowLeft"?"prev":"next"); }
   if(e.key==="/" && !/INPUT|TEXTAREA/.test(document.activeElement.tagName)){ e.preventDefault(); if(R.open) closeRead(); $("q").focus(); }
 });
 
@@ -654,7 +809,8 @@ async function doSearch(){
   const s=q.value.trim(); if(!s){ sres.hidden=true; return; }
   const my = ++sq; const res = await Store.search(s); if(my!==sq) return;
   hits = res; hi=0;
-  sres.innerHTML = hits.length ? hits.map((h,i)=>{ const l=layerOf(h.id); return `<button type="button" data-pick="${h.id}" class="${i===hi?"hl":""}"><span class="sw" style="width:8px;height:8px;border-radius:2px;margin-top:5px;background:${lc(l)}"></span><span><span>${esc(label(h.id))}</span>${h.snippet?`<span class="snip">${snipHTML(h.snippet)}</span>`:""}</span><span class="lt">L${l}${N[h.id]?" "+markHTML(h.id):""}</span></button>`; }).join("") + `<div class="hint">↵ explore · ⇧↵ read · ${STANDALONE?"searching in the page":"full-text search (SQLite FTS5)"}</div>` : `<div class="none">Nothing matches "${esc(s)}".</div>`;
+  hits = hits.filter(h=>isDes(h.id) ? DES[h.id.slice(7)] : (N[h.id] || /^L\d$/.test(h.id)));
+  sres.innerHTML = hits.length ? hits.map((h,i)=>{ const l=layerOf(h.id); return `<button type="button" data-pick="${h.id}" class="${i===hi?"hl":""}"><span class="sw" style="width:8px;height:8px;border-radius:2px;margin-top:5px;background:${l===null?"var(--fg)":lc(l)}"></span><span><span>${esc(label(h.id))}</span>${h.snippet?`<span class="snip">${snipHTML(h.snippet)}</span>`:""}</span><span class="lt">${l===null?"Design":"L"+l}${N[h.id]?" "+markHTML(h.id):""}</span></button>`; }).join("") + `<div class="hint">↵ explore · ⇧↵ read · ${STANDALONE?"searching in the page":"full-text search (SQLite FTS5)"}</div>` : `<div class="none">Nothing matches "${esc(s)}".</div>`;
   sres.hidden=false;
 }
 let st0; q.addEventListener("input", ()=>{ clearTimeout(st0); st0=setTimeout(doSearch, STANDALONE?40:90); });
@@ -662,7 +818,7 @@ q.addEventListener("keydown", e=>{
   if(e.key==="Escape"){ sres.hidden=true; q.blur(); return; }
   if(sres.hidden||!hits.length) return;
   if(e.key==="ArrowDown"||e.key==="ArrowUp"){ e.preventDefault(); hi=(hi+(e.key==="ArrowDown"?1:hits.length-1))%hits.length; [...sres.querySelectorAll("button")].forEach((c,i)=>c.classList.toggle("hl",i===hi)); }
-  if(e.key==="Enter"){ e.preventDefault(); sres.hidden=true; q.blur(); const id=hits[hi].id; if(/^L\d$/.test(id)) return openRead({type:"layer", l:+id[1]}, {seq:null}); exploreFrom(id); if(e.shiftKey) openRead({type:"node", id}, {seq:null}); }
+  if(e.key==="Enter"){ e.preventDefault(); sres.hidden=true; q.blur(); const id=hits[hi].id; if(isDes(id)) return openRead({type:"design", id:id.slice(7)}, {seq:null}); if(/^L\d$/.test(id)) return openRead({type:"layer", l:+id[1]}, {seq:null}); exploreFrom(id); if(e.shiftKey) openRead({type:"node", id}, {seq:null}); }
 });
 document.addEventListener("click", e=>{ if(!e.target.closest(".search")) sres.hidden=true; else if(e.target.closest("[data-pick]")){ sres.hidden=true; q.value=""; } });
 
@@ -672,15 +828,21 @@ function route(initial){
   const m = h.match(/^read\/(.+)$/), ml = h.match(/^layer\/([0-5])$/);
   if(m && N[m[1]]){ if(R.open && curId()===m[1]) return; if(initial) render(true); exploreFrom(m[1]); return openRead({type:"node", id:m[1]}, {seq:null}); }
   if(ml){ if(R.open && curId()==="L"+ml[1]) return; if(initial) render(true); return openRead({type:"layer", l:+ml[1]}, {seq:null}); }
+  const md = h.match(/^design\/(.+)$/);
+  if(md && DES[md[1]]){ if(R.open && R.cur.type==="design" && R.cur.id===md[1]) return; if(initial){ state.view="design"; render(true); } return openRead({type:"design", id:md[1]}, {seq:null}); }
+  const ma = h.match(/^(algo|practice)\/(.+)$/);
+  if(ma){ if(R.open) closeRead(); state.view="algorithms"; if(ma[1]==="algo"){ state.algo.tab="viz"; state.algo.viz=ma[2]; } else { state.algo.tab="practice"; state.algo.prob=ma[2]; } render(true); return; }
   if(VIEWS.includes(h) || initial){
     if(R.open) closeRead();
     if(VIEWS.includes(h)) state.view = h;
     if(state.view==="tours") state.sel=DATA.tours[state.tour].steps[state.tstep][0];
-    if(initial && ["atlas","library","you"].includes(state.view)) state.sel=null;
+    if(initial && ["atlas","library","you","design","algorithms"].includes(state.view)) state.sel=null;
     render(true);
   }
 }
+// hooks for web/algo.js (set before the first render, which may already show the Algorithms tab)
+window.__dts = { state, Store, N, R, DATA, LAYERS, STANDALONE, api, esc, lc, toast, reduced, openRead, closeRead, select, setView,
+  algoReady(){ if(state.view==="algorithms" && !R.open) renderAlgoView(); } };
 window.addEventListener("hashchange", ()=>route(false));
 route(true);
-window.__dts = { state, Store, N, R, openRead, closeRead, select, setView };
 })();

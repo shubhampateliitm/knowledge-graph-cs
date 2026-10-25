@@ -4,8 +4,10 @@
   dist/down-the-stack.html      one self-contained page (same app, data embedded) for sharing
 
 Usage: python3 tools/build.py [--check] [--no-html]
+Environment: DTS_CONTENT_DB=path   write the database somewhere else (tests use a temp file)
+             DTS_PRACTICE_FIXTURE=1 also load tests/fixtures/problems_sample.json (UI tests)
 """
-import json, os, re, sqlite3, sys, time
+import glob, json, os, re, sqlite3, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kg
 
@@ -34,6 +36,13 @@ CREATE TABLE program_groups (program_id TEXT NOT NULL REFERENCES programs(id), o
 CREATE TABLE courses (code TEXT PRIMARY KEY, title TEXT NOT NULL, url TEXT NOT NULL, term TEXT NOT NULL, material TEXT NOT NULL, ord INTEGER NOT NULL);
 CREATE TABLE course_concepts (code TEXT NOT NULL REFERENCES courses(code), ord INTEGER NOT NULL, node_id TEXT NOT NULL REFERENCES nodes(id), PRIMARY KEY (code, ord));
 CREATE INDEX course_concepts_node ON course_concepts(node_id);
+CREATE TABLE designs (id TEXT PRIMARY KEY, title TEXT NOT NULL, category TEXT NOT NULL, level TEXT NOT NULL, concepts TEXT NOT NULL,
+  words INTEGER NOT NULL, read_min INTEGER NOT NULL, ord INTEGER NOT NULL);
+CREATE TABLE design_paragraphs (design_id TEXT NOT NULL REFERENCES designs(id), section TEXT NOT NULL, ord INTEGER NOT NULL, text TEXT NOT NULL, PRIMARY KEY (design_id, section, ord));
+CREATE TABLE design_sources (design_id TEXT NOT NULL REFERENCES designs(id), ord INTEGER NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, who TEXT NOT NULL, url TEXT NOT NULL, PRIMARY KEY (design_id, ord));
+-- practice problems: one JSON object per row (statement, tests, starter, solution, ...), in file order
+CREATE TABLE practice (id TEXT PRIMARY KEY, ord INTEGER NOT NULL, pattern TEXT NOT NULL, difficulty TEXT NOT NULL, body TEXT NOT NULL);
+-- search owners: node ids, layer essays 'L0'..'L5' and design questions 'design/<id>'
 CREATE VIRTUAL TABLE search USING fts5(owner UNINDEXED, label, mechanism, body, tokenize = 'porter unicode61');
 """
 
@@ -75,6 +84,14 @@ def write_db(data, path):
     for i, c in enumerate(cur["courses"]):
         db.execute("INSERT INTO courses VALUES (?,?,?,?,?,?)", (c["code"], c["title"], c["url"], c["term"], c["text"], i))
         db.executemany("INSERT INTO course_concepts VALUES (?,?,?)", [(c["code"], j, n) for j, n in enumerate(c["concepts"])])
+    for i, d in enumerate(data["designs"]):
+        db.execute("INSERT INTO designs VALUES (?,?,?,?,?,?,?,?)", (d["id"], d["title"], d["category"], d["level"], ",".join(d["concepts"]), d["w"], d["rm"], i))
+        db.executemany("INSERT INTO design_paragraphs VALUES (?,?,?,?)", [(d["id"], sec, j, p) for sec, ps in d["rd"].items() for j, p in enumerate(ps)])
+        db.executemany("INSERT INTO design_sources VALUES (?,?,?,?,?,?)", [(d["id"], j, x["k"], x["t"], x["w"], x["u"]) for j, x in enumerate(d["refs"])])
+        db.execute("INSERT INTO search VALUES (?,?,?,?)", ("design/" + d["id"], d["title"], d["category"] + " · " + (d["rd"].get("summary") or [""])[0],
+                                                           "\n".join(p for sec, ps in d["rd"].items() if sec not in ("diagram", "animation") for p in ps)))
+    for i, p in enumerate(data["practice"]):
+        db.execute("INSERT INTO practice VALUES (?,?,?,?,?)", (p["id"], i, p.get("pattern", ""), p.get("difficulty", ""), json.dumps(p, ensure_ascii=False)))
     db.execute("INSERT INTO search(search) VALUES ('optimize')")
     db.commit(); db.execute("VACUUM"); db.close()
     os.replace(tmp, path)
@@ -85,15 +102,38 @@ def standalone(data, out):
     html = open(os.path.join(web, "index.html"), encoding="utf-8").read()
     css = open(os.path.join(web, "app.css"), encoding="utf-8").read()
     js = open(os.path.join(web, "app.js"), encoding="utf-8").read()
+    algo = open(os.path.join(web, "algo.js"), encoding="utf-8").read()
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
     html = html.replace('<link rel="stylesheet" href="app.css">', "<style>\n" + css + "\n</style>")
     html = html.replace('<script src="app.js"></script>', "<script>window.DATA=" + payload + ";</script>\n<script>\n" + js + "\n</script>")
-    assert "window.DATA" in html and "<style>" in html, "index.html placeholders changed"
+    html = html.replace('<script src="algo.js"></script>', "<script>\n" + algo.replace("</script", "<\\/script") + "\n</script>")
+    assert "window.DATA" in html and "<style>" in html and 'src="algo.js"' not in html, "index.html placeholders changed"
     # the hosted page gets its own document shell, so drop ours
     html = re.sub(r"(?is)<!doctype html>\s*|</?html[^>]*>\s*|</?head>\s*|</?body>\s*", "", html)
     html = re.sub(r'<meta charset="utf-8">\s*', "", html)
     open(out, "w", encoding="utf-8").write(html)
     return len(html)
+
+PRACTICE_KEYS = ("id", "title", "pattern", "difficulty", "statement", "fn", "params", "tests", "starter", "solution")
+FIXTURE = os.path.join(ROOT, "tests", "fixtures", "problems_sample.json")
+
+def load_practice():
+    """All content/practice/*.json files (each a JSON list), concatenated in file order. When DTS_PRACTICE_FIXTURE is set,
+    the sample problems in tests/fixtures/problems_sample.json are added too (for UI tests); content problems win on id clashes."""
+    files = sorted(glob.glob(os.path.join(ROOT, "content", "practice", "*.json")))
+    if os.environ.get("DTS_PRACTICE_FIXTURE"): files.append(FIXTURE)
+    out, seen, errs = [], set(), []
+    for f in files:
+        try: items = json.load(open(f, encoding="utf-8"))
+        except (OSError, ValueError) as e: errs.append(f"{os.path.relpath(f, ROOT)}: {e}"); continue
+        if not isinstance(items, list): errs.append(f"{os.path.relpath(f, ROOT)}: must be a JSON list"); continue
+        for p in items:
+            miss = [k for k in PRACTICE_KEYS if k not in p] if isinstance(p, dict) else ["object"]
+            if miss: errs.append(f"{os.path.relpath(f, ROOT)}: problem {p.get('id') if isinstance(p, dict) else p!r} missing {', '.join(miss)}"); continue
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(p["id"])): errs.append(f"{os.path.relpath(f, ROOT)}: bad problem id {p['id']!r}"); continue
+            if p["id"] in seen: continue
+            seen.add(p["id"]); out.append(p)
+    return out, errs
 
 def main():
     args = sys.argv[1:]
@@ -102,12 +142,16 @@ def main():
         data = kg.load()
     except kg.ContentError as e:
         print("CONTENT ERRORS:\n  " + str(e).replace("\n", "\n  "), file=sys.stderr); sys.exit(1)
+    data["practice"], perrs = load_practice()
+    for e in perrs: print("practice: skipped " + e, file=sys.stderr)
+    data["stats"]["practice"] = len(data["practice"])
     st = data["stats"]
     print(f"content ok: {st['nodes']} concepts {st['per_layer']}, {st['edges']} links, {st['side']} side links, "
-          f"{st['tours']} tours, {st['courses']} courses, {st['words']:,} words, {st['refs']} sources ({st['urls']} with direct links), {st['deep']} deep reads")
+          f"{st['tours']} tours, {st['courses']} courses, {st['words']:,} words, {st['refs']} sources ({st['urls']} with direct links), {st['deep']} deep reads, "
+          f"{st['designs']} design questions, {st['practice']} practice problems")
     if "--check" in args: return
     os.makedirs(os.path.join(ROOT, "data"), exist_ok=True); os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)
-    db = os.path.join(ROOT, "data", "content.db")
+    db = os.environ.get("DTS_CONTENT_DB") or os.path.join(ROOT, "data", "content.db")
     write_db(data, db)
     print(f"wrote {os.path.relpath(db, ROOT)} ({os.path.getsize(db)//1024} KB)")
     if "--no-html" not in args:

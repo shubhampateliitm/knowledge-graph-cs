@@ -14,6 +14,9 @@ Serves the web app from web/ and a JSON API:
   PUT|DELETE /api/bookmarks/<id>
   GET  /api/notes?node=<id>   POST /api/notes {"node","body"}   PUT|DELETE /api/notes/<note_id>
   POST /api/time/<id>                  body {"seconds": n}  (time spent reading, capped)
+  GET  /api/design/<id>                full system design question (summaries are in /api/graph -> designs)
+  GET  /api/practice                   your saved code and solved marks per practice problem (problems are in /api/graph -> practice)
+  PUT|DELETE /api/practice/<id>        body {"code": "...", "solved": true|false} (either or both)
   GET  /api/export                     all your data as JSON
 
 Content lives in data/content.db (rebuilt by tools/build.py); your own data lives in data/user.db and survives rebuilds.
@@ -25,10 +28,15 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB = os.path.join(ROOT, "web")
-CONTENT_DB = os.path.join(ROOT, "data", "content.db")
+CONTENT_DB = os.environ.get("DTS_CONTENT_DB") or os.path.join(ROOT, "data", "content.db")
 USER_DB = os.environ.get("DTS_USER_DB") or os.path.join(ROOT, "data", "user.db")
 MAX_BODY = 64 * 1024
-SECTIONS = ("value", "terms", "history", "how", "diagram", "example", "intuition", "mistakes", "friction", "practice", "quiz")
+# same order as tools/kg.py SECTIONS (reading order)
+SECTIONS = ("value", "terms", "history", "how", "diagram", "animation", "example", "intuition", "mistakes", "tradeoffs", "friction",
+            "practice", "interview", "quiz")
+DESIGN_SECTIONS = ("summary", "requirements", "estimates", "api", "datamodel", "design", "diagram", "animation", "deepdive",
+                   "tradeoffs", "failures", "evolution", "followups")
+MAX_CODE = 60000
 
 USER_SCHEMA = [
     # migration 1
@@ -42,6 +50,10 @@ USER_SCHEMA = [
     # migration 2: spaced review of self-check questions (Leitner boxes 1-5, due date YYYY-MM-DD)
     """
     CREATE TABLE review (node_id TEXT NOT NULL, q INTEGER NOT NULL, box INTEGER NOT NULL CHECK (box BETWEEN 1 AND 5), due TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (node_id, q));
+    """,
+    # migration 3: practice problems (your code and whether all tests passed)
+    """
+    CREATE TABLE practice (problem_id TEXT PRIMARY KEY, code TEXT NOT NULL, solved INTEGER NOT NULL DEFAULT 0 CHECK (solved IN (0,1)), solved_at TEXT, updated_at TEXT NOT NULL);
     """,
 ]
 
@@ -89,9 +101,25 @@ class Content:
         for c in db.execute("SELECT * FROM courses ORDER BY ord").fetchall():
             ids = [r[0] for r in db.execute("SELECT node_id FROM course_concepts WHERE code=? ORDER BY ord", (c["code"],))]
             curriculum["courses"].append(dict(code=c["code"], title=c["title"], url=c["url"], term=c["term"], text=c["material"], concepts=ids))
+        self.designs, design_list = {}, []
+        has = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "designs" in has:
+            dp, ds = {}, {}
+            for r in db.execute("SELECT design_id, section, text FROM design_paragraphs ORDER BY design_id, section, ord"):
+                dp.setdefault(r[0], {}).setdefault(r[1], []).append(r[2])
+            for r in db.execute("SELECT design_id, kind, title, who, url FROM design_sources ORDER BY design_id, ord"):
+                ds.setdefault(r[0], []).append(dict(k=r[1], t=r[2], w=r[3], u=r[4]))
+            for r in db.execute("SELECT * FROM designs ORDER BY ord").fetchall():
+                rd = {s_: dp[r["id"]][s_] for s_ in DESIGN_SECTIONS if s_ in dp.get(r["id"], {})}
+                base = dict(id=r["id"], title=r["title"], category=r["category"], level=r["level"], concepts=[c for c in r["concepts"].split(",") if c],
+                            rm=r["read_min"], w=r["words"])
+                self.designs[r["id"]] = dict(base, rd=rd, refs=ds.get(r["id"], []))
+                design_list.append(dict(base, summary=(rd.get("summary") or [""])[0]))
+        practice = [json.loads(r[0]) for r in db.execute("SELECT body FROM practice ORDER BY ord")] if "practice" in has else []
+        self.practice_ids = {p["id"] for p in practice}
         db.close()
         self.ids = set(self.reads)
-        self.graph = dict(nodes=nodes, edges=edges, side=side, tours=tours, layers=layers, curriculum=curriculum, stats=self.stats, built_at=self.built_at, mode="server")
+        self.graph = dict(nodes=nodes, edges=edges, side=side, tours=tours, layers=layers, curriculum=curriculum, designs=design_list, practice=practice, stats=self.stats, built_at=self.built_at, mode="server")
         self.graph_json = json.dumps(self.graph, ensure_ascii=False, separators=(",", ":")).encode()
         self.graph_gz = gzip.compress(self.graph_json, 6)
         self.local = threading.local()
@@ -167,13 +195,18 @@ class UserData:
                 notes={r[0]: r[1] for r in c.execute("SELECT node_id, count(*) FROM notes GROUP BY node_id")},
                 time={r[0]: r[1] for r in c.execute("SELECT node_id, seconds FROM reading_time")},
                 review={f"{r[0]}#{r[1]}": [r[2], r[3]] for r in c.execute("SELECT node_id, q, box, due FROM review")},
+                practice={r[0]: bool(r[1]) for r in c.execute("SELECT problem_id, solved FROM practice")},
                 recent=[dict(id=r[0], at=r[1]) for r in c.execute("SELECT node_id, max(at) AS at FROM (SELECT node_id, updated_at AS at FROM progress UNION ALL SELECT node_id, last_at FROM reading_time) GROUP BY node_id ORDER BY at DESC LIMIT 12")],
             )
 
     def export(self):
         with self.lock:
             c = self.conn
-            return {t: [dict(r) for r in c.execute(f"SELECT * FROM {t}")] for t in ("progress", "bookmarks", "notes", "reading_time", "review")}
+            return {t: [dict(r) for r in c.execute(f"SELECT * FROM {t}")] for t in ("progress", "bookmarks", "notes", "reading_time", "review", "practice")}
+
+    def practice(self):
+        with self.lock:
+            return {r[0]: dict(code=r[1], solved=bool(r[2]), solved_at=r[3], at=r[4]) for r in self.conn.execute("SELECT problem_id, code, solved, solved_at, updated_at FROM practice")}
 
 
 class App:
@@ -247,6 +280,12 @@ def make_handler(app, allowed_hosts):
             try:
                 if p == "/api/health": return self.send(200, {"ok": True, "built_at": c.built_at, "concepts": c.stats["nodes"]})
                 if p == "/api/graph": return self.send(200, c.graph_json, gz=c.graph_gz)
+                m = re.fullmatch(r"/api/design/([A-Za-z0-9-]+)", p)
+                if m:
+                    d = c.designs.get(m.group(1))
+                    if not d: return self.err(404, f"unknown design {m.group(1)!r}")
+                    return self.send(200, d)
+                if p == "/api/practice": return self.send(200, app.user.practice())
                 m = re.fullmatch(r"/api/read/([A-Za-z0-9-]+)", p)
                 if m:
                     if not self.known(m.group(1)): return
@@ -305,6 +344,23 @@ def make_handler(app, allowed_hosts):
                     secs = max(0, min(secs, 1800))
                     U.q("INSERT INTO reading_time VALUES (?,?,?) ON CONFLICT(node_id) DO UPDATE SET seconds=seconds+excluded.seconds, last_at=excluded.last_at", (nid, secs, now()))
                 return self.send(200, U.me())
+            m = re.fullmatch(r"/api/practice/([A-Za-z0-9-]+)", p)
+            if m:
+                pid = m.group(1)
+                if pid not in app.content.practice_ids: return self.err(404, f"unknown problem {pid!r}")
+                if method == "PUT":
+                    code, solved = body.get("code"), body.get("solved")
+                    if code is not None and (not isinstance(code, str) or len(code) > MAX_CODE): return self.err(400, f"code must be a string of at most {MAX_CODE} characters")
+                    if solved is not None and not isinstance(solved, bool): return self.err(400, "solved must be true or false")
+                    if code is None and solved is None: return self.err(400, "send code and/or solved")
+                    t = now()
+                    U.q("INSERT INTO practice (problem_id, code, solved, solved_at, updated_at) VALUES (?,?,?,?,?) ON CONFLICT(problem_id) DO UPDATE SET "
+                        "code=COALESCE(?, code), solved=COALESCE(?, solved), solved_at=CASE WHEN ?=1 THEN COALESCE(solved_at, ?) WHEN ?=0 THEN NULL ELSE solved_at END, updated_at=?",
+                        (pid, code or "", int(bool(solved)), t if solved else None, t,
+                         code, None if solved is None else int(solved), None if solved is None else int(solved), t, None if solved is None else int(solved), t))
+                elif method == "DELETE": U.q("DELETE FROM practice WHERE problem_id=?", (pid,))
+                else: return self.err(405, "use PUT or DELETE")
+                return self.send(200, U.practice())
             m = re.fullmatch(r"/api/review/([A-Za-z0-9-]+)/(\d{1,2})", p)
             if m:
                 nid, qi = m.group(1), int(m.group(2))

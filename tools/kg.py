@@ -20,8 +20,11 @@ import glob, os, re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REQUIRED = ("value", "how", "intuition", "friction")
-OPTIONAL = ("terms", "history", "diagram", "example", "mistakes", "practice", "quiz")
-SECTIONS = ("value", "terms", "history", "how", "diagram", "example", "intuition", "mistakes", "friction", "practice", "quiz")
+OPTIONAL = ("terms", "history", "diagram", "animation", "example", "mistakes", "tradeoffs", "practice", "interview", "quiz")
+SECTIONS = ("value", "terms", "history", "how", "diagram", "animation", "example", "intuition", "mistakes", "tradeoffs", "friction",
+            "practice", "interview", "quiz")
+RAW = ("diagram", "animation")          # sections whose lines are kept as drawn (leading spaces matter)
+QA = ("quiz", "interview", "followups") # sections made of "question || answer" lines
 SEC_RE = re.compile(r"^(" + "|".join(SECTIONS) + r"|ref):\s*(.*)$")
 TERM_SEP, QUIZ_SEP = " — ", " || "
 REF_KINDS = {"paper", "book", "blog", "docs", "course", "video", "spec"}
@@ -59,7 +62,76 @@ def _file_lines(path):
             yield path, ln, line.rstrip("\n")
 
 
-def load(root=None, extra=()):
+def check_animation(lines):
+    """An animation is a list of frames; each frame starts with '== caption' and has at least one drawing line."""
+    if not lines: return []
+    errs, frames = [], []
+    for l in lines:
+        if l.startswith("== "): frames.append([l[3:].strip(), 0])
+        elif not frames: errs.append("animation must start with '== caption'"); break
+        else: frames[-1][1] += 1
+    if len(frames) < 2: errs.append("animation needs at least 2 frames")
+    errs += [f"animation frame {c!r} has no drawing" for c, n in frames if n == 0]
+    return errs
+
+
+DESIGN_SECTIONS = ("summary", "requirements", "estimates", "api", "datamodel", "design", "diagram", "animation", "deepdive",
+                   "tradeoffs", "failures", "evolution", "followups")
+DESIGN_REQUIRED = ("summary", "requirements", "estimates", "design", "deepdive", "tradeoffs", "failures", "followups")
+DESIGN_RE = re.compile(r"^(" + "|".join(DESIGN_SECTIONS) + r"|ref|title|category|level|concepts):\s*(.*)$")
+
+
+def load_designs(nodes, errs, extra=()):
+    """content/design/*.txt: '@@ id' then title:, category:, level:, concepts: id, id, ... and the design sections."""
+    designs, cur, sec, cur_file = [], None, None, None
+    lines = list(_lines("content/design/*.txt")) + [x for e in extra for x in _file_lines(e)]
+    for f, ln, line in lines:
+        if f != cur_file: cur_file, cur, sec = f, None, None
+        raw = line.rstrip(); line = line.strip(); where = f"{f}:{ln}"
+        if not line or line.startswith("# "): continue
+        if line.startswith("@@ "):
+            cur = dict(id=line[3:].strip(), title="", category="", level="", concepts=[], rd={s: [] for s in DESIGN_SECTIONS}, refs=[])
+            designs.append(cur); sec = None; continue
+        if cur is None: errs.append(f"{where} text outside a design"); continue
+        m = None if (sec in RAW and raw[:1] in (" ", "\t")) else DESIGN_RE.match(line)
+        if m:
+            key, val = m.groups()
+            if key in ("title", "category", "level"): cur[key] = val.strip(); sec = None; continue
+            if key == "concepts":
+                for c in [x.strip() for x in val.split(",") if x.strip()]:
+                    if c not in nodes: errs.append(f"{where} design {cur['id']} uses unknown concept {c!r}")
+                    elif c not in cur["concepts"]: cur["concepts"].append(c)
+                sec = None; continue
+            if key == "ref":
+                p = [x.strip() for x in val.split("|")]
+                while len(p) < 4: p.append("")
+                if p[0] not in REF_KINDS: errs.append(f"{where} unknown ref kind {p[0]!r}")
+                cur["refs"].append(dict(k=p[0], t=p[1], w=p[2], u="|".join(p[3:]).strip())); continue
+            sec = key
+            if val: cur["rd"][sec].append(val)
+            continue
+        if sec is None: errs.append(f"{where} paragraph before any section"); continue
+        if sec in RAW:
+            if len(raw) > 72: errs.append(f"{where} {sec} line longer than 72 columns")
+            cur["rd"][sec].append(line if line.startswith("== ") else raw); continue
+        cur["rd"][sec].append(line)
+    seen = set()
+    for d in designs:
+        if d["id"] in seen: errs.append(f"duplicate design {d['id']}")
+        seen.add(d["id"])
+        if not d["title"]: errs.append(f"design {d['id']} has no title")
+        for s_ in DESIGN_REQUIRED:
+            if not d["rd"][s_]: errs.append(f"design {d['id']} missing section {s_}")
+        if len(d["concepts"]) < 5: errs.append(f"design {d['id']} lists fewer than 5 concepts")
+        for q in d["rd"]["followups"]:
+            if q.count(QUIZ_SEP) != 1: errs.append(f"design {d['id']}: followups line needs one ' || '")
+        errs.extend(f"design {d['id']}: {e}" for e in check_animation(d["rd"]["animation"]))
+        d["rd"] = {k: v for k, v in d["rd"].items() if v}
+        d["w"] = sum(words(p) for ps in d["rd"].values() for p in ps); d["rm"] = max(1, round(d["w"] / WPM))
+    return designs
+
+
+def load(root=None, extra=(), extra_designs=()):
     """Return a dict with nodes, edges, side, tours, layers, stats. Raises ContentError listing every problem.
     extra: paths of additional long-read files (used by tools/checkread.py to check a draft before it is merged)."""
     global ROOT
@@ -121,7 +193,7 @@ def load(root=None, extra=()):
         idx[(s_, t_)]["r"] = r_.strip()
 
     tours, cur = [], None
-    for f, ln, line in _lines("content/graph/tours.txt"):
+    for f, ln, line in _lines("content/graph/tours*.txt"):
         if not line.strip(): continue
         if line.startswith("## "):
             title, sub = (line[3:].split(" | ", 1) + [""])[:2]
@@ -165,6 +237,8 @@ def load(root=None, extra=()):
     for c in courses:
         if not c["concepts"]: errs.append(f"course {c['code']} has no concepts")
 
+    designs = load_designs(nodes, errs, extra_designs)
+
     # reads
     reads, long_keys = {}, set()
     files = [(f, ln, l, False) for f, ln, l in _lines("content/reads/*.txt")] + \
@@ -191,7 +265,7 @@ def load(root=None, extra=()):
             continue
         if rd is None: errs.append(f"{where} text outside a read"); continue
         # inside a diagram, indented lines are drawing, even if they look like "value: ..."
-        m = None if (sec == "diagram" and raw[:1] in (" ", "\t")) else SEC_RE.match(line)
+        m = None if (sec in RAW and raw[:1] in (" ", "\t")) else SEC_RE.match(line)
         if m and m.group(1) == "ref":
             p = [x.strip() for x in m.group(2).split("|")]
             while len(p) < 4: p.append("")
@@ -203,12 +277,12 @@ def load(root=None, extra=()):
         if m:
             sec = m.group(1)
             if m.group(2): rd["rd"][sec].append(m.group(2))
-            elif sec != "diagram": errs.append(f"{where} empty {sec}: line")
+            elif sec not in RAW: errs.append(f"{where} empty {sec}: line")
             continue
         if sec is None: errs.append(f"{where} paragraph before any section"); continue
-        if sec == "diagram":
-            if len(raw) > 72: errs.append(f"{where} diagram line longer than 72 columns")
-            rd["rd"][sec].append(raw); continue
+        if sec in RAW:
+            if len(raw) > 72: errs.append(f"{where} {sec} line longer than 72 columns")
+            rd["rd"][sec].append(line if line.startswith("== ") else raw); continue
         rd["rd"][sec].append(line)
 
     layer_reads = []
@@ -226,8 +300,10 @@ def load(root=None, extra=()):
         if not r["refs"]: errs.append(f"read {k} has no sources")
         for t in r["rd"]["terms"]:
             if TERM_SEP not in t: errs.append(f"read {k}: term line needs ' — ': {t[:50]!r}")
-        for q in r["rd"]["quiz"]:
-            if q.count(QUIZ_SEP) != 1: errs.append(f"read {k}: quiz line needs one ' || ': {q[:50]!r}")
+        for qs in QA:
+            for q in r["rd"].get(qs, []):
+                if q.count(QUIZ_SEP) != 1: errs.append(f"read {k}: {qs} line needs one ' || ': {q[:50]!r}")
+        errs.extend(f"read {k}: {e}" for e in check_animation(r["rd"].get("animation", [])))
         for s in OPTIONAL:
             if not r["rd"][s]: del r["rd"][s]
 
@@ -281,5 +357,7 @@ def load(root=None, extra=()):
                  deep=sum(1 for v in nodes.values() if v["deep"]),
                  per_layer=[sum(1 for v in nodes.values() if v["l"] == L) for L in range(6)])
     stats["courses"] = len(courses)
+    stats["designs"] = len(designs)
+    stats["words"] += sum(d["w"] for d in designs)
     return dict(nodes=[nodes[i] for i in order], edges=edges, side=side, tours=tours, layers=layer_reads, stats=stats,
-                curriculum=dict(programs=programs, courses=courses))
+                curriculum=dict(programs=programs, courses=courses), designs=designs)

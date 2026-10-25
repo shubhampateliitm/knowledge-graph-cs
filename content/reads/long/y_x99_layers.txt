@@ -1,0 +1,48 @@
+@@+ L0
+terms: Product — a packaged, versioned implementation of several patterns and techniques that you install, run or call, such as Kafka or PostgreSQL.
+Managed service — a product that the vendor operates for you; you pay per request, byte or compute-second and give up control of the machines.
+Operational surface — everything around the core engine: configuration, metrics, logs, upgrade paths, client libraries, documentation and community.
+Configuration knob — a setting that the designers left to you because no single value suits every workload, such as Kafka's acks.
+Default — the value a knob has until you change it, chosen for the workload the designers expected; it can change between versions.
+Leaky abstraction — a lower-level detail that a product hides in normal operation but that shows up under load, skew or failure.
+Uses link — in this map, an edge from one product to another product it is built on, such as Kafka Streams using RocksDB.
+Fork — a copy of an open-source project that a community continues separately, often after a license change (OpenSearch, Valkey, OpenTofu).
+Paper-to-product cycle — the repeating path from a paper about an internal system, to an open-source rebuild, to a company with a managed service, to a commodity that every cloud offers.
+diagram:
+  L0  Kafka Streams ---uses---> RocksDB          knobs left to you:
+            |                                    acks, linger.ms,
+            v uses                               min.insync.replicas
+      Kafka broker ---runs on---> JVM ---> Linux kernel
+            |
+            v implements
+  L1  distributed commit log + publish-subscribe + coordination
+            |
+            v built from
+  L2  partitioning     ISR replication     segments + offset index
+      batching         compression         idempotent producer
+      log compaction   Raft (KRaft controller quorum)
+            |
+            v relies on
+  L3  sequential disk I/O    page cache    sendfile (zero-copy)    TCP
+            |
+            v limited by
+  L4  queueing: delay grows like 1 / (1 - utilization)
+      quorums: any two majorities of the controllers overlap
+            |
+            v
+  L5  light in fibre: about 5 us per km, so cross-region acks cost ms
+example: Follow one query on Databricks: SELECT campaign_id, COUNT(*) FROM impressions WHERE event_date = '2026-10-25' GROUP BY campaign_id. The table is a Delta table of about 18 TB in Amazon S3, partitioned by event_date. One day is about 50 GB in 200 Parquet files of 250 MB each, with 60 columns. The query runs on a SQL warehouse with 64 cores.
+The BI tool sends the SQL over HTTPS (TLS over TCP) to the warehouse. The driver parses it and asks Unity Catalog two questions: may this user SELECT from the table, and where does the table live? Unity Catalog checks the grants, returns the storage path, and gives the engine short-lived cloud credentials for that path only. Governance is a product (Unity Catalog) standing on a Layer 2 technique (signed tokens that expire).
+Next, Delta Lake gives a snapshot. The driver lists the _delta_log directory, loads the latest Parquet checkpoint and applies the few JSON commits written after it. The result is the exact list of files in the current table version, with each file's partition value and min/max statistics. Partition pruning keeps only the 200 files for 2026-10-25. If another job commits a new version during the query, this reader is not affected: it reads the version it picked. That is snapshot isolation from versioned metadata, the MVCC idea from Layer 2.
+Then Photon, the C++ vectorized engine, scans the files. Each Parquet file ends with a footer that says where each column chunk starts. The reader fetches the footer with one ranged GET request to S3, then fetches only the campaign_id column chunks. Suppose that dictionary-encoded column is 3% of the bytes: the query reads about 1.5 GB instead of 50 GB. Each S3 GET waits tens to a couple of hundred milliseconds for its first byte, so the engine sends many requests in parallel and keeps recently read files on local NVMe (the disk cache). Photon decodes values in batches of thousands, and SIMD instructions handle several values per CPU instruction (Layer 3: cache lines and SIMD).
+Each of the 64 tasks builds a small hash table from campaign_id to count. With 1,000 campaigns, each task's partial result is at most 1,000 rows. The shuffle hashes campaign_id to choose a reducer and sends these partial rows over the network: at most 64,000 rows instead of hundreds of millions. Reducers add the partial counts, and the driver returns 1,000 rows to the BI tool. On a warehouse that is already running, the whole query takes a few seconds.
+Now count what was used. Layer 0: Databricks SQL, Unity Catalog, Delta Lake, Photon, Parquet and S3, each one using the next. Layer 1: the lakehouse, the MPP query engine, the data catalog and object storage. Layer 2: tokens, snapshot isolation, partition pruning, zone maps, columnar encoding, vectorized execution, hash aggregation and the shuffle. Layer 3: HTTP, TLS, TCP, hashing, cache lines and SIMD. Layer 4: entropy, which explains why a column with only 1,000 distinct values compresses to a small fraction of its raw size. Every setting you might tune here (file size, partition column, warehouse size, disk cache) is one of these lower decisions left to you.
+mistakes: People often think a managed service removes the need to understand internals. In fact the internals come back as limits and prices. A single DynamoDB partition serves at most about 3,000 read units and 1,000 write units per second, so one hot key is throttled even when the table as a whole has spare capacity. A Kinesis shard accepts about 1 MB/s or 1,000 records/s of writes. You do not run the machines, but partitioning still decides your throughput.
+People often think defaults are tuned for production. In fact defaults are chosen for a first run, for compatibility or for an average workload, and they change between versions. Kafka's broker defaults for default.replication.factor and min.insync.replicas are both 1, which is fine on a laptop and unsafe in production. The producer default became acks=all with idempotence enabled only in Kafka 3.0 (2021), so older blog posts describe a different default. Read the defaults of the version you actually run.
+People often think that a listed feature works as well as the product's core. In fact features added later sit on a core built for something else. Elasticsearch can aggregate, but a terms aggregation over many shards can return approximate top-N counts, because each shard sends only its own top terms to the coordinating node. PostgreSQL can search vectors with pgvector, but an HNSW index is fast only while it fits in memory, and every insert must update the graph. Check how a feature maps onto the core techniques before you depend on it.
+People often compare products by feature lists or vendor benchmarks. In fact two products of the same pattern differ mainly in which lower-layer trade-off they chose, and a benchmark shows only the workload it ran. Kafka and Redpanda both implement the commit log: Kafka uses the JVM, the page cache and leader plus in-sync replicas; Redpanda uses a C++ thread-per-core design with one Raft group per partition. Which one is better depends on your hardware, partition count and team skills, not on a chart from either vendor.
+quiz: What are the four stages of the paper-to-product cycle on Layer 0? || A large company publishes a paper about an internal system; an open-source project rebuilds the idea; a company forms around the project and sells a managed service; finally the idea becomes a commodity that every cloud offers.
+Why can Kafka acknowledge an acks=all write before the data is forced to disk? || The write is in the page cache of every in-sync replica, on different machines. Durability comes from those copies: one machine crashing does not lose the record, and avoiding an fsync per batch keeps writes fast.
+How does a knob such as spark.sql.shuffle.partitions expose a lower-layer trade-off? || It sets how many tasks the shuffle creates. More partitions give more parallelism and smaller tasks, but more files, more scheduling overhead and more small network transfers; fewer partitions give large tasks that may spill to disk. The designers cannot know your data size, so they left the choice to you (adaptive query execution now adjusts it at run time).
+A query reads one day of a Delta table: 200 Parquet files, 50 GB in total, but it needs one column that is about 3% of the bytes. Roughly how much does it read, and what makes that possible? || About 1.5 GB plus the file footers. Partition values and min/max statistics in the Delta log select the 200 files, and Parquet's columnar layout and footer let the reader fetch only the needed column chunks with ranged requests.
+When would you choose a managed service over running the open-source product yourself, and what do you give up? || Choose it when the team's time is worth more than control: a small team, a standard workload, no need for unusual tuning. You give up visibility into the internals (latency spikes and throttling are harder to explain), some knobs, and often cost efficiency at large scale, because pricing per request, byte or compute-second can dominate.

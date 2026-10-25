@@ -10,10 +10,11 @@ def free_port():
 class API(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        subprocess.run([sys.executable, os.path.join(ROOT, "tools", "build.py"), "--no-html"], check=True, capture_output=True)
         cls.tmp = tempfile.mkdtemp()
+        # build into a temp content DB, with the sample practice problems, so tests never touch data/
+        env = dict(os.environ, DTS_QUIET="1", DTS_USER_DB=os.path.join(cls.tmp, "user.db"), DTS_CONTENT_DB=os.path.join(cls.tmp, "content.db"), DTS_PRACTICE_FIXTURE="1")
+        subprocess.run([sys.executable, os.path.join(ROOT, "tools", "build.py"), "--no-html"], check=True, capture_output=True, env=env)
         cls.port = free_port()
-        env = dict(os.environ, DTS_QUIET="1", DTS_USER_DB=os.path.join(cls.tmp, "user.db"))
         cls.proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "server", "server.py"), "--port", str(cls.port)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         for _ in range(100):
             try: cls.get("/api/health"); break
@@ -92,6 +93,70 @@ class API(unittest.TestCase):
         self.assertGreaterEqual(len(r["rd"]["terms"]), 6)
         self.assertTrue(r["rd"]["diagram"][0].startswith("  "))   # leading spaces kept in diagrams
         self.assertEqual(list(r["rd"]).index("terms"), 1)          # sections come back in reading order
+
+    def test_sections_match_parser(self):
+        sys.path.insert(0, os.path.join(ROOT, "tools")); sys.path.insert(0, os.path.join(ROOT, "server"))
+        import kg, server
+        self.assertEqual(tuple(kg.SECTIONS), tuple(server.SECTIONS))
+        self.assertEqual(tuple(kg.DESIGN_SECTIONS), tuple(server.DESIGN_SECTIONS))
+        # every new section that exists in the content comes back from the API, in reading order
+        data = kg.load()
+        for sec in ("tradeoffs", "interview", "animation"):
+            n = next((x for x in data["nodes"] if sec in x["rd"]), None)
+            if not n: continue
+            s, r = self.get("/api/read/" + n["id"]); self.assertEqual(s, 200)
+            self.assertEqual(r["rd"][sec], n["rd"][sec])
+            self.assertEqual(list(r["rd"]), [k for k in kg.SECTIONS if k in r["rd"]])
+
+    def test_design(self):
+        s, g = self.get("/api/graph")
+        d = {x["id"]: x for x in g["designs"]}
+        self.assertIn("url-shortener", d)
+        u = d["url-shortener"]
+        self.assertEqual(u["title"], "Design a URL shortener")
+        self.assertTrue(u["summary"].startswith("Build a service like bit.ly"))
+        self.assertGreaterEqual(len(u["concepts"]), 8); self.assertGreater(u["rm"], 5)
+        self.assertNotIn("rd", u)                                         # the graph carries summaries only
+        ids = {n["id"] for n in g["nodes"]}
+        for x in g["designs"]: self.assertTrue(set(x["concepts"]) <= ids, x["id"])
+        s, full = self.get("/api/design/url-shortener"); self.assertEqual(s, 200)
+        for sec in ("summary", "requirements", "estimates", "api", "datamodel", "design", "diagram", "animation", "deepdive", "tradeoffs", "failures", "evolution", "followups"):
+            self.assertTrue(full["rd"].get(sec), sec)
+        self.assertEqual(list(full["rd"]), [k for k in ("summary", "requirements", "estimates", "api", "datamodel", "design", "diagram", "animation", "deepdive", "tradeoffs", "failures", "evolution", "followups") if k in full["rd"]])
+        self.assertTrue(full["rd"]["animation"][0].startswith("== "))
+        self.assertTrue(all(" || " in q for q in full["rd"]["followups"]))
+        self.assertTrue(full["refs"])
+        self.assertEqual(self.get("/api/design/nope")[0], 404)
+        s, r = self.get("/api/search?q=shortener%20redirect")
+        self.assertIn("design/url-shortener", [x["id"] for x in r["results"]])
+
+    def test_practice(self):
+        s, g = self.get("/api/graph")
+        ids = [p["id"] for p in g["practice"]]
+        self.assertIn("sample-valid-brackets", ids)
+        p = next(x for x in g["practice"] if x["id"] == "sample-valid-brackets")
+        for k in ("statement", "tests", "starter", "solution", "fn", "params", "hint", "approach"): self.assertIn(k, p)
+        s, mine = self.get("/api/practice"); self.assertEqual((s, mine), (200, {}))
+        s, mine = self.req("PUT", "/api/practice/sample-valid-brackets", {"code": "function validBrackets(s) { return true; }"})
+        self.assertEqual(s, 200); self.assertFalse(mine["sample-valid-brackets"]["solved"])
+        s, mine = self.req("PUT", "/api/practice/sample-valid-brackets", {"solved": True})
+        self.assertTrue(mine["sample-valid-brackets"]["solved"]); self.assertTrue(mine["sample-valid-brackets"]["solved_at"])
+        self.assertIn("return true", mine["sample-valid-brackets"]["code"])          # code kept when only solved changes
+        s, me = self.get("/api/me"); self.assertTrue(me["practice"]["sample-valid-brackets"])
+        s, mine = self.req("PUT", "/api/practice/sample-valid-brackets", {"solved": False}); self.assertIsNone(mine["sample-valid-brackets"]["solved_at"])
+        self.assertEqual(self.req("PUT", "/api/practice/sample-valid-brackets", {"solved": "yes"})[0], 400)
+        self.assertEqual(self.req("PUT", "/api/practice/sample-valid-brackets", {"code": "x" * 70000})[0], 400)
+        self.assertEqual(self.req("PUT", "/api/practice/sample-valid-brackets", {})[0], 400)
+        self.assertEqual(self.req("PUT", "/api/practice/nope", {"code": "x"})[0], 404)
+        self.assertEqual(self.req("PUT", "/api/practice/sample-valid-brackets", {"code": "x"}, ctype="text/plain")[0], 415)
+        s, ex = self.get("/api/export"); self.assertEqual(ex["practice"][0]["problem_id"], "sample-valid-brackets")
+        s, mine = self.req("DELETE", "/api/practice/sample-valid-brackets"); self.assertEqual(mine, {})
+
+    def test_algo_js_served(self):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5); c.request("GET", "/algo.js")
+        r = c.getresponse(); body = r.read().decode()
+        self.assertEqual(r.status, 200); self.assertIn("javascript", r.getheader("Content-Type")); self.assertIn("window.DTSAlgo", body)
 
     def test_security(self):
         self.assertEqual(self.req("PUT", "/api/progress/raft", {"status": "read"}, ctype="text/plain")[0], 415)   # forces CORS preflight from other sites
