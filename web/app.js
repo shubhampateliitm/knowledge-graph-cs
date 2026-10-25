@@ -50,6 +50,10 @@ const byLayer = [0,1,2,3,4,5].map(l=>DATA.nodes.filter(n=>n.l===l));
 const hubs = DATA.nodes.filter(n=>n.l>=1).sort((a,b)=>b.indeg-a.indeg).slice(0,24);
 const hubSet = new Set(hubs.map(n=>n.id));
 const deepList = DATA.nodes.filter(n=>n.deep).sort((a,b)=>a.l-b.l||byLabel(a,b));
+const CUR = DATA.curriculum || {programs:[], courses:[]};
+const COURSE = {}; CUR.courses.forEach(c=>COURSE[c.code]=c);
+const TAUGHT = {}; CUR.courses.forEach(c=>c.concepts.forEach(id=>(TAUGHT[id]=TAUGHT[id]||[]).push(c.code)));
+const courseLabel = code => code.replace(/^([A-Z]+)(\d)/,"$1 $2");
 
 const LSKEY = "dts:user:v1";
 function lsLoad(){ try{ return JSON.parse(localStorage.getItem(LSKEY))||null; }catch(e){ return null; } }
@@ -125,8 +129,8 @@ function localSearch(q){
     const lab=n.label.toLowerCase();
     let sc = lab===s?0 : lab.startsWith(s)?1 : lab.includes(s)?2 : (n.cat||"").toLowerCase().includes(s)?3 : n.m.toLowerCase().includes(s)?4 : 9;
     let text="";
-    if(sc===9){ text=readText(n.id); const tl=text.toLowerCase(); if(terms.every(t=>tl.includes(t))) sc=5; }
-    if(sc<9) out.push({id:n.id,label:n.label,score:sc,snippet:sc>=5?snip(text,terms[0]):"", l:n.l});
+    if(sc===9){ text=readText(n.id); const tl=text.toLowerCase(); if(tl.includes(s)) sc=5; else if(terms.every(t=>tl.includes(t))) sc=6; }
+    if(sc<9) out.push({id:n.id,label:n.label,score:sc,snippet:sc>=5?snip(text,sc===5?s:terms[0]):"", l:n.l});
   }
   return out.sort((a,b)=>a.score-b.score||a.l-b.l).slice(0,14);
 }
@@ -165,7 +169,7 @@ function refURL(r){
 const markHTML = id => { const s=Store.status(id); return s==="read"?`<span class="mark" title="Read">✓</span>`:s==="reading"?`<span class="mark reading" title="Started">◐</span>`:""; };
 
 /* ---------------- state ---------------- */
-const state = { view:"explore", start:0, path:["kafka","commitlog","wal"], sel:"wal", tour:0, tstep:0, filter:"", expand:{}, libKind:"all", libQ:"", libN:120 };
+const state = { program:"bs", course:"CS111", view:"explore", start:0, path:["kafka","commitlog","wal"], sel:"wal", tour:0, tstep:0, filter:"", expand:{}, libKind:"all", libQ:"", libN:120 };
 
 /* ---------------- strip ---------------- */
 function renderStrip(){
@@ -264,6 +268,7 @@ function renderPanel(){
   if(insp.length) h += `<h3>Inspired by (analogy)</h3>` + relList(insp, e=>`<button type="button" data-sel="${e.t}"><span class="bar dash" style="--c:${lc(N[e.t].l)}"></span><span><span class="rn">${esc(N[e.t].label)}</span><span class="kind">L${N[e.t].l}</span><span class="rw">${esc(e.r)}</span></span></button>`);
   h += `<h3>Used by · ${ups.length} directly, ${upTot} in total</h3>` + (ups.length ? relList(ups, e=>`<button type="button" data-sel="${e.s}"><span class="bar${e.k==="inspired"?" dash":""}" style="--c:${lc(N[e.s].l)}"></span><span><span class="rn">${esc(N[e.s].label)}</span><span class="kind">L${N[e.s].l}</span><span class="rw">${esc(e.r)}</span></span></button>`) : `<p class="empty">Nothing in this map is built on it yet: it is a top-level product.</p>`);
   if(n.side.length) h += `<h3>Related · ${n.side.length}</h3>` + relList(n.side, s=>`<button type="button" data-sel="${s.o}"><span class="bar" style="--c:${lc(N[s.o].l)}"></span><span><span class="rn">${esc(N[s.o].label)}</span><span class="kind">${SIDE[s.t]||s.t}</span><span class="rw">${esc(s.r)}</span></span></button>`);
+  if(TAUGHT[n.id]) h += `<h3>Taught in · Stanford</h3><div class="chips">${TAUGHT[n.id].map(code=>`<button type="button" class="chip" style="--c:var(--fg)" data-course="${code}"><span class="sw"></span>${esc(courseLabel(code))} ${esc(COURSE[code].title)}</button>`).join("")}</div>`;
   const rd = READS[n.id];
   h += `<h3>Go deeper · ${n.nr} source${n.nr===1?"":"s"}</h3>` + (rd ? `<div class="minirefs">${rd.refs.map(r=>`<a href="${esc(refURL(r))}" target="_blank" rel="noopener noreferrer"><span class="rk">${esc(KIND[r.k]||r.k)}</span><span class="rt">${esc(r.t)}</span> <span style="color:var(--muted)">· ${esc(r.w)}</span></a>`).join("")}</div>` : `<p class="empty">Loading sources…</p>`);
   p.innerHTML = h;
@@ -285,6 +290,23 @@ function renderTours(){
   $("v-tours").innerHTML = `<div class="tlist">${DATA.tours.map((x,i)=>{ const done=x.steps.filter(s=>Store.status(s[0])==="read").length; return `<button type="button" class="tcard" data-tour="${i}" aria-pressed="${i===state.tour}"><span class="tt">${esc(x.title)}</span><span class="ts">${esc(x.sub)}${done?` · ${done}/${x.steps.length} read`:""}</span><span class="tl" aria-hidden="true">${x.steps.map(s=>`<span style="--c:${lc(N[s[0]].l)};${Store.status(s[0])==="read"?"":"opacity:.45"}"></span>`).join("")}</span></button>`; }).join("")}</div>
   <div class="tsteps"><h2>${esc(t.title)}</h2><p class="sub">${esc(t.sub)} · ${t.steps.length} steps from L${N[t.steps[0][0]].l} to L${N[t.steps[t.steps.length-1][0]].l}</p><div class="btnrow" style="margin:-4px 0 14px"><button type="button" class="btn primary" data-rtour="0">Read the tour · ${t.steps.reduce((s,x)=>s+N[x[0]].rm,0)} min</button></div>
   ${t.steps.map((s,i)=>{ const n=N[s[0]]; return `<button type="button" class="step" style="--c:${lc(n.l)}" data-tstep="${i}" aria-pressed="${i===state.tstep}"><span class="rail"><span class="dot"></span></span><span class="body"><span class="sl"><span class="sn">${esc(n.label)}</span><span class="tag">L${n.l} · ${esc(LAYERS[n.l].n)}</span>${markHTML(n.id)}</span><span class="sx">${esc(s[1])}</span></span></button>`; }).join("")}</div>`;
+}
+
+/* ---------------- courses ---------------- */
+function renderCourses(){
+  const prog = CUR.programs.find(p=>p.id===state.program) || CUR.programs[0];
+  if(!prog){ $("v-courses").innerHTML = `<p class="empty">No curriculum loaded.</p>`; return; }
+  const c = COURSE[state.course] || COURSE[prog.groups[0].courses[0]];
+  const done = id => Store.status(id)==="read";
+  const card = code => { const k=COURSE[code]; if(!k) return ""; const d=k.concepts.filter(done).length; return `<button type="button" class="tcard" data-course="${code}" aria-pressed="${c&&c.code===code}"><span class="tt">${esc(courseLabel(code))} · ${esc(k.title)}</span><span class="ts">${k.concepts.length} concepts${d?` · ${d} read`:""}</span><span class="tl" aria-hidden="true">${k.concepts.map(id=>`<span style="--c:${lc(N[id].l)};${done(id)?"":"opacity:.45"}"></span>`).join("")}</span></button>`; };
+  const lays = c ? [0,1,2,3,4,5].map(l=>c.concepts.filter(id=>N[id].l===l).length) : [];
+  $("v-courses").innerHTML = `<div class="tlist"><div class="filters" role="group" aria-label="Program" style="margin:0 0 4px">${CUR.programs.map(p=>`<button type="button" data-program="${p.id}" aria-pressed="${p.id===prog.id}">${esc(p.id.toUpperCase())}</button>`).join("")}</div>
+    <p class="ts" style="font-size:12px;color:var(--muted);margin:0 0 6px">${esc(prog.name)} · ${esc(prog.year)}. ${esc(prog.summary)} <a href="${esc(prog.url)}" target="_blank" rel="noopener noreferrer" style="color:var(--muted)">Requirements ↗</a></p>
+    ${prog.groups.map(g=>`<div class="cat" style="position:static;padding:8px 0 2px" title="${esc(g.note)}">${esc(g.name)}</div>${g.courses.map(card).join("")}`).join("")}</div>
+  <div class="tsteps">${c?`<h2>${esc(courseLabel(c.code))}: ${esc(c.title)}</h2><p class="sub">${c.concepts.length} concepts in this map · ${esc(c.text)}${c.term&&c.term!=="—"?` · latest public term: ${esc(c.term)}`:""}${c.url?` · <a href="${esc(c.url)}" target="_blank" rel="noopener noreferrer" style="color:inherit">course site ↗</a>`:" · course site not verified"}</p>
+    <div class="under" role="img" aria-label="Concepts by layer" style="margin:0 0 6px">${lays.map((k,l)=>k?`<span style="background:${lc(l)};flex:${k}" title="L${l}: ${k}"></span>`:"").join("")}</div>
+    <div class="btnrow" style="margin:6px 0 14px"><button type="button" class="btn primary" data-rcourse="${c.code}">Study this course · ${c.concepts.reduce((s,id)=>s+N[id].rm,0)} min</button></div>
+    ${c.concepts.map((id,i)=>{ const n=N[id]; return `<button type="button" class="step" style="--c:${lc(n.l)}" data-sel="${id}" aria-pressed="${state.sel===id}"><span class="rail"><span class="dot"></span></span><span class="body"><span class="sl"><span class="sn">${i+1}. ${esc(n.label)}</span><span class="tag">L${n.l} · ${esc(LAYERS[n.l].n)}</span>${markHTML(id)}</span><span class="sx">${esc(n.m)}</span></span></button>`; }).join("")}`:""}</div>`;
 }
 
 /* ---------------- atlas ---------------- */
@@ -387,6 +409,7 @@ function nodeRead(n, r, ctx){
   h += actionsHTML(n.id, lc(n.l));
   if(ctx) h += `<div class="rd-ctx"><b>${esc(ctx.k)}</b>${esc(ctx.t)}</div>`;
   h += ladderHTML(n);
+  if(TAUGHT[n.id]) h += `<p class="ladder-cap">Taught in Stanford ${TAUGHT[n.id].map(code=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-course="${code}">${esc(courseLabel(code))}</button>`).join(", ")}.</p>`;
   const toc = [["value","Why it exists"],rd.history&&["history","How we got here"],["how","How it works"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
   h += `<nav class="toc" aria-label="Sections">${toc.map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
   let no=0; const NO=()=>String(++no).padStart(2,"0");
@@ -493,15 +516,16 @@ const pathSeq = () => ({name:"Your path", ids:state.path.slice()});
 function refreshMarks(){ if(R.open){ const a=$("reader").querySelector(".rd-actions"); const id=curId(); if(a&&id){ a.outerHTML = actionsHTML(id, getComputedStyle($("reader")).getPropertyValue("--c")); } } else render(false); }
 
 /* ---------------- render ---------------- */
-const VIEWS = ["explore","tours","atlas","library","you"];
+const VIEWS = ["explore","tours","courses","atlas","library","you"];
 function render(scrollCols){
   renderStrip();
   const v = state.view;
   document.querySelectorAll(".tabs button").forEach(b=>b.setAttribute("aria-pressed", String(b.dataset.view===v)));
   $("v-explore").hidden = v!=="explore"; $("cols").hidden = v!=="explore";
-  $("v-tours").hidden = v!=="tours"; $("v-atlas").hidden = v!=="atlas"; $("v-library").hidden = v!=="library"; $("v-you").hidden = v!=="you";
+  $("v-tours").hidden = v!=="tours"; $("v-courses").hidden = v!=="courses"; $("v-atlas").hidden = v!=="atlas"; $("v-library").hidden = v!=="library"; $("v-you").hidden = v!=="you";
   if(v==="explore"){ renderTrail(); renderCols(scrollCols); }
   if(v==="tours") renderTours();
+  if(v==="courses") renderCourses();
   if(v==="atlas") renderAtlas();
   if(v==="library") renderLibrary();
   if(v==="you") renderYou();
@@ -534,6 +558,9 @@ document.addEventListener("click", async e=>{
     if(d.rseq!==undefined) return openRead({type:"node", id:SEQ().ids[+d.rseq]});
     if(d.rmap){ closeRead(); return exploreFrom(d.rmap); }
     if(d.view){ if(R.open) closeRead(); return setView(d.view); }
+    if(d.program){ state.program=d.program; const p=CUR.programs.find(x=>x.id===d.program); state.course=p.groups[0].courses[0]; return render(false); }
+    if(d.course){ if(R.open) closeRead(); state.course=d.course; state.program = CUR.programs.find(p=>p.groups.some(g=>g.courses.includes(d.course)) && p.id===state.program) ? state.program : (CUR.programs.find(p=>p.groups.some(g=>g.courses.includes(d.course)))||{id:state.program}).id; if(state.view!=="courses") setView("courses"); else render(false); const ts=$("v-courses").querySelector(".tsteps"); if(ts) ts.scrollTop=0; return; }
+    if(d.rcourse){ const c=COURSE[d.rcourse]; return openRead({type:"node", id:c.concepts[0]}, {seq:{name:courseLabel(c.code), ids:c.concepts.slice()}}); }
     if(d.layer!==undefined){ state.view="explore"; state.start=+d.layer; state.path=[]; state.sel=null; state.filter=""; return render(true); }
     if(d.col!==undefined){ const c=+d.col; state.path = state.path.slice(0,c).concat([d.id]); state.sel=d.id; state.expand={}; render(true); if(!narrow()) $("panel").scrollTop=0; return; }
     if(d.crumb!==undefined){ state.path = state.path.slice(0,+d.crumb+1); state.sel = state.path[state.path.length-1]; return render(true); }

@@ -11,6 +11,8 @@ Every concept has a read with the same shape:
 - **Where it still hurts**: the friction that remains
 - **Go deeper**: papers, books, articles, courses and docs
 
+A **Courses** view maps the Stanford BS and MS curriculum (CS 103 to CS 336) onto the graph: pick a course and study its concepts in order.
+
 Long "deep reads" (about 10 minutes) add **How we got here** and **In practice**.
 
 ## Run it
@@ -28,6 +30,7 @@ Needs only Python 3.9+ (standard library: `http.server`, `sqlite3` with FTS5). N
 content/graph/        nodes*.txt, edges*.txt, tours.txt      the graph (plain text, easy to diff)
 content/reads/        *.txt                                   one read per concept (and L0..L5 layer essays)
 content/reads/long/   *.txt                                   long reads: "@@ id" replaces, "@@+ id" extends
+content/curriculum/   *.txt                                   Stanford BS/MS programs and courses mapped to concepts
 tools/kg.py           parser + validator (every node has a read, every edge has a reason, every node reaches L5)
 tools/build.py        content -> data/content.db (SQLite + FTS5) and dist/down-the-stack.html (single shareable file)
 server/server.py      local API + static web server (Python standard library only)
@@ -44,6 +47,7 @@ data/                 content.db (rebuilt) and user.db (your progress, bookmarks
 | GET | `/api/read/<id>` | full read for a concept or layer essay (`L0`..`L5`) |
 | GET | `/api/search?q=` | full-text search over every read (FTS5, BM25; phrase hits first) |
 | GET | `/api/library` | every source, grouped by work, with the concepts that cite it |
+| GET | `/api/graph` → `curriculum` | Stanford BS/MS programs, course groups and the concepts each course teaches |
 | GET | `/api/me` | your progress, bookmarks, notes counts, reading time |
 | PUT/DELETE | `/api/progress/<id>` | `{"status":"read"|"reading"}` |
 | PUT/DELETE | `/api/bookmarks/<id>` | save / unsave |

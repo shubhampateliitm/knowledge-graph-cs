@@ -1,0 +1,252 @@
+@@ declpipelines
+value: Declarative pipelines let data engineers describe the tables they want (raw events, cleaned events, daily aggregates) and how each is derived, instead of writing jobs, schedules, retries and dependency logic by hand. The engine works out the order, runs only what changed, recovers from failure and keeps the results fresh. Spark 4.1 added this as Spark Declarative Pipelines (from Databricks' Delta Live Tables, now Lakeflow Declarative Pipelines); dbt, Materialize and Flink's materialized tables follow the same idea.
+how: Each dataset is declared as a query over other datasets: a streaming table (appended incrementally from a stream) or a materialized view (kept equal to its query's result). The engine parses all declarations into a dependency graph, validates it (a dry run catches missing tables and cycles before anything runs), then executes flows in topological order with parallelism, checkpoints and retries. Incremental refresh uses change feeds and row tracking to process only new or changed rows when the query allows it; otherwise it recomputes. Data quality rules (expectations) can drop or fail rows that break constraints.
+intuition: A spreadsheet: you write formulas that say how each cell depends on others, and the sheet recalculates whatever is affected when an input changes.
+friction: Not every query can be maintained incrementally (some joins and window functions force full recomputes); debugging is harder because the engine decides execution; vendor features differ; it is not a general scheduler for non-data tasks.
+ref: docs | Spark Declarative Pipelines programming guide | Apache Spark 4.1 | https://spark.apache.org/docs/4.1.0/declarative-pipelines-programming-guide.html
+ref: paper | Materialized Views | Rada Chirkova & Jun Yang, Foundations and Trends in Databases 2012 |
+ref: blog | Turning the database inside-out | Martin Kleppmann, 2015 | https://martin.kleppmann.com/2015/03/04/turning-the-database-inside-out.html
+
+@@ sharegroups
+value: Share groups (KIP-932, 'queues for Kafka') let many consumers cooperatively read the same partitions, with each record handed to one consumer and acknowledged individually. Classic consumer groups cap parallelism at the number of partitions and force in-order processing per partition; share groups suit work-queue jobs where order does not matter and the number of workers should scale freely. They arrived as early access in Kafka 4.0, preview in 4.1, and were declared production-ready in Kafka 4.2 (February 2026).
+how: The broker's share coordinator tracks, per partition, a window of in-flight records. When a consumer fetches, records are 'acquired' under a time-limited lock. The consumer then acknowledges each record as ACCEPT (done), RELEASE (give back for another consumer), REJECT (unprocessable) or RENEW (extend the lock, added in 4.2). If the lock expires, the record becomes available again and its delivery count rises; after a limit it is archived as failed. The log itself is unchanged: records stay in order on disk, and ordinary consumer groups can still read the same topic.
+intuition: A ticket counter on top of a ledger: the ledger keeps every entry in order, but any free clerk can take the next ticket.
+friction: No ordering guarantees within a share group; processing is at-least-once, so consumers must be idempotent; there is no built-in dead-letter topic yet; redelivery and lock timeouts need tuning.
+ref: docs | KIP-932: Queues for Kafka | Apache Kafka | https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka
+ref: blog | Apache Kafka 4.2.0 release announcement | Apache Kafka, Feb 2026 | https://kafka.apache.org/blog/2026/02/17/apache-kafka-4.2.0-release-announcement/
+
+@@ rowlineage
+value: Row lineage gives every row in a table a stable identity and records the version that last changed it. With that, engines can answer 'what changed since version N?' without diffing whole tables, which is what incremental pipelines, materialized views and downstream change data capture need.
+how: In Iceberg v3, each row has a row ID (assigned from a per-snapshot range when the file is written) and a last-updated sequence number; when a row is rewritten by an update, it keeps its ID and gets the new sequence number. Delta Lake's row tracking does the same with row IDs and commit versions, and its change data feed can also write explicit change records (insert, update_preimage, update_postimage, delete). A reader asking for changes between two versions selects rows whose sequence number falls in that range, plus deletion information.
+intuition: Every row gets a passport with an entry stamp, so you can list exactly who arrived or changed since last Tuesday.
+friction: Extra metadata per row; updates through some delete mechanisms can lose lineage; engines must support the table feature, and enabling it may be a one-way protocol upgrade.
+ref: spec | Apache Iceberg table spec (v3: row lineage) | Apache Iceberg | https://iceberg.apache.org/spec/
+ref: docs | Delta Lake change data feed | Delta Lake | https://docs.delta.io/latest/delta-change-data-feed.html
+
+@@ vr
+value: Viewstamped Replication (Oki and Liskov, 1988) was one of the first practical protocols for replicating a service so that it survives crashes while staying consistent. Its design, a primary ordering operations with numbered views for leadership changes, is the direct ancestor of Raft and is taught (with Paxos) as the clearest model of consensus in practice.
+how: Replicas are numbered; in each view, one is the primary. Clients send requests to the primary, which assigns each a sequence number and sends it to backups; once a majority (including the primary) has it, the operation commits and the primary replies. If backups stop hearing from the primary, they start a view change: replicas send their logs to the next primary, which takes the most complete log from a majority and starts the new view. The 2012 'VR Revisited' paper also covers recovery and reconfiguration.
+intuition: A meeting with a chair who numbers every decision; if the chair disappears, the next person in line collects everyone's notes, adopts the most complete record and carries on.
+friction: Same costs as other consensus protocols (majority round trips, leader bottleneck); fewer production libraries than Raft; recovery after total power loss needs careful handling.
+ref: paper | Viewstamped Replication Revisited | Barbara Liskov & James Cowling, MIT 2012 | https://pmg.csail.mit.edu/papers/vr-revisited.pdf
+ref: paper | Viewstamped Replication: A New Primary Copy Method to Support Highly-Available Distributed Systems | Oki & Liskov, PODC 1988 |
+ref: course | CS 244B: Distributed Systems | David Mazières, Stanford | https://www.scs.stanford.edu/24sp-cs244b/
+
+@@ lsh
+value: Locality-sensitive hashing finds similar items (near-duplicate documents, similar images, matching fingerprints, close embedding vectors) without comparing every pair. With billions of items, all-pairs comparison is impossible; LSH turns similarity search into hash lookups.
+how: Choose a family of hash functions where similar items are likely to get the same hash and dissimilar ones are not. For Jaccard similarity of sets, MinHash takes the minimum hashed element; for cosine similarity, a random hyperplane gives one bit (which side the vector is on). Combine r hashes into a band and use b bands: two items become candidates if they match on all hashes of at least one band. Tuning b and r shapes an S-curve of collision probability around a chosen similarity threshold.
+intuition: Similar things share buckets; to find a near twin, look only in your own buckets.
+friction: Needs many hash tables for good recall, using memory; parameter tuning is fiddly; graph indexes like HNSW usually beat it for dense vectors, though LSH remains strong for deduplication at scale.
+ref: book | Mining of Massive Datasets, ch. 3 | Leskovec, Rajaraman & Ullman | http://www.mmds.org/
+ref: paper | Similarity Estimation Techniques from Rounding Algorithms | Moses Charikar, STOC 2002 |
+ref: course | CS 246: Mining Massive Data Sets | Stanford | https://cs246.stanford.edu/
+
+@@ suffixarrays
+value: Suffix arrays and suffix trees let you search for any substring in a large text, find repeats and compute longest common substrings, in time proportional to the pattern rather than the text. They power genome analysis (read alignment), data compression (the Burrows–Wheeler transform in bzip2 and FM-indexes) and code or log search tools.
+how: A suffix array lists the starting positions of all suffixes of the text in sorted order. Any occurrence of a pattern is a prefix of some suffix, so binary search finds the range of matches. An LCP array stores the longest common prefix of neighbouring suffixes, enabling many queries with range-minimum structures. Linear-time constructions exist (SA-IS). A suffix tree is the compressed trie of all suffixes, more powerful but much larger in memory.
+intuition: An index of every ending of the book, alphabetized; any phrase is the beginning of some ending.
+friction: Building them for huge texts needs a lot of memory; updates require rebuilding; FM-indexes compress them at the cost of complexity.
+ref: course | CS 166: Data Structures | Keith Schwarz, Stanford | https://www.keithschwarz.com/cs166/
+ref: paper | Suffix Arrays: A New Method for On-Line String Searches | Manber & Myers, SIAM J. Computing 1993 |
+
+@@ unionfind
+value: Union–find keeps track of which items belong to the same group as groups merge. It answers 'are these two connected?' almost instantly, and it is the engine behind connected components, Kruskal's minimum spanning tree, identity resolution (merging IDs into people or households) and type inference.
+how: Each set is a tree whose root is its representative. find(x) follows parent pointers to the root; union(a, b) links one root under the other. Two tricks make it fast: union by rank (attach the shorter tree under the taller) and path compression (point every visited node straight at the root). Together they give amortized time per operation of the inverse Ackermann function, which is at most 4 for any realistic input. Distributed versions (for example in Spark) iterate label propagation or use specialized algorithms.
+intuition: Everyone points toward the club president; asking 'are we in the same club?' means comparing presidents.
+friction: Does not support splitting sets; in a distributed setting, connected components need several rounds of communication; one wrong link merges large groups (a known problem in identity graphs).
+ref: paper | Efficiency of a Good But Not Linear Set Union Algorithm | Robert Tarjan, JACM 1975 |
+ref: book | Algorithms, 4th ed., section 1.5 | Sedgewick & Wayne | https://algs4.cs.princeton.edu/15uf/
+
+@@ cuckoo
+value: Cuckoo hashing gives hash tables with guaranteed constant-time lookups (check two places, done), and cuckoo filters give a compact 'maybe in the set' structure that, unlike a Bloom filter, supports deletion. They are used in networking hardware, caches and storage engines.
+how: Each key has two candidate slots from two hash functions. To insert, place the key in a free candidate slot; if both are full, evict an occupant and move it to its other slot, which may evict another, and so on. If a cycle forms, rehash with new functions. A cuckoo filter stores short fingerprints instead of keys, with the alternate slot computed from the fingerprint (partial-key cuckoo hashing). XOR filters are a newer static alternative with even less space.
+intuition: Musical chairs where every guest has exactly two allowed seats; a newcomer may bump someone to their other seat.
+friction: Inserts slow down sharply as the table fills (often kept below about 50% for two choices, or higher with buckets); rehashing is costly; filters have a capacity limit.
+ref: paper | Cuckoo Hashing | Pagh & Rodler, ESA 2001 |
+ref: paper | Cuckoo Filter: Practically Better Than Bloom | Fan, Andersen, Kaminsky & Mitzenmacher, CoNEXT 2014 |
+ref: course | CS 166: Data Structures | Keith Schwarz, Stanford | https://www.keithschwarz.com/cs166/
+
+@@ rangeq
+value: Range-query structures answer questions about intervals (the minimum in positions 100–5,000, the sum of sales between two dates) in logarithmic or constant time instead of scanning the range. They are the building blocks for LCP queries in suffix arrays, for time-series rollups and for many competitive-programming and analytics tricks.
+how: A sparse table precomputes minimums for every power-of-two-length range, so any range is covered by two overlapping blocks: O(1) queries after O(n log n) work. A segment tree stores an answer for each node's interval in a binary tree; queries and point updates touch O(log n) nodes. A Fenwick (binary indexed) tree stores prefix sums compactly using the binary representation of indexes. The Fischer–Heun structure achieves O(n) preprocessing and O(1) range-minimum queries.
+intuition: Keep running totals at several zoom levels, so any stretch can be assembled from a few precomputed pieces.
+friction: Each structure suits specific operations (sums versus minimums, static versus updatable); memory grows with precomputation; on disk or in distributed settings they become more complex.
+ref: course | CS 166: Data Structures, lecture on range minimum queries | Keith Schwarz, Stanford | https://www.keithschwarz.com/cs166/
+ref: paper | A New Data Structure for Cumulative Frequency Tables | Peter Fenwick, Software: Practice and Experience 1994 |
+
+@@ workstealing
+value: Work stealing balances parallel work across CPU cores with very little coordination. It is how Cilk, Java's ForkJoinPool (behind parallel streams), Rust's Rayon and Tokio, Go's scheduler and many task runtimes keep all cores busy when tasks are uneven.
+how: Each worker thread has its own double-ended queue. It pushes and pops new tasks at one end (cheap, no contention, cache-friendly). When its deque is empty, it picks another worker at random and steals a task from the other end, usually an older, larger piece of work. Blumofe and Leiserson proved that this schedules a computation with work T1 and critical path T∞ on P processors in about T1/P + O(T∞) expected time.
+intuition: Finish your own pile; when you are done, quietly take the oldest item from a busy colleague's pile.
+friction: Stealing loses cache locality; tasks must be divisible; blocking I/O inside tasks stalls workers; fairness and priorities are hard to add.
+ref: paper | Scheduling Multithreaded Computations by Work Stealing | Blumofe & Leiserson, JACM 1999 |
+ref: course | CS 149: Parallel Computing | Kayvon Fatahalian & Kunle Olukotun, Stanford | https://gfxcourses.stanford.edu/cs149/fall25/
+
+@@ lockfree
+value: Lock-free data structures let many threads update shared queues, stacks and maps without locks, so a thread that is paused or slow never blocks the others. High-throughput systems (the LMAX Disruptor, Java's ConcurrentLinkedQueue, memory allocators, Linux's RCU-protected structures) rely on them.
+how: Updates are built from atomic compare-and-swap (CAS): read the current value, compute the new one, and swap only if nothing changed in between; otherwise retry. The ABA problem (a value changes and changes back, fooling the CAS) and safe memory reclamation (a node may still be read by another thread after removal) are solved with tagged pointers, hazard pointers, epoch-based reclamation or RCU. Correctness depends on the memory model's ordering guarantees.
+intuition: Instead of locking the door, write your change on a note and swap it in only if nobody else changed the page meanwhile; if they did, try again.
+friction: Very hard to design and verify; contention still causes cache-line bouncing and retry storms; lock-free does not mean faster for every workload; memory reclamation is the hardest part.
+ref: book | The Art of Multiprocessor Programming, 2nd ed. | Herlihy, Shavit, Luchangco & Spear, 2020 |
+ref: paper | Wait-Free Synchronization | Maurice Herlihy, ACM TOPLAS 1991 |
+ref: course | CS 149: Parallel Computing | Stanford | https://gfxcourses.stanford.edu/cs149/fall25/
+
+@@ regression
+value: Linear and logistic regression are the simplest useful machine-learning models and the baselines everything else is measured against. Logistic regression powered click-through-rate prediction in ad systems for years; linear models remain the right choice when data is limited, interpretability matters or features are already good.
+how: Linear regression predicts y as a weighted sum of features and chooses weights that minimize squared error, solvable in closed form (the normal equations) or by gradient descent. Logistic regression passes the weighted sum through a sigmoid to get a probability and maximizes the likelihood of the observed labels (cross-entropy loss), which is convex. Generalized linear models unify these: pick a distribution from the exponential family (Gaussian, Bernoulli, Poisson) and a link function. Regularization (L2, L1) controls overfitting; feature hashing and crosses let them scale to billions of sparse features.
+intuition: Draw the best straight line (or S-curve) through the data, with each feature's weight saying how much it pushes the prediction.
+friction: Cannot learn interactions unless features encode them; sensitive to correlated features and outliers; probabilities need calibration under class imbalance.
+ref: course | CS 229: Machine Learning lecture notes (linear models, GLMs) | Andrew Ng et al., Stanford | https://cs229.stanford.edu/
+ref: paper | Ad Click Prediction: a View from the Trenches | McMahan et al. (Google), KDD 2013 |
+ref: book | The Elements of Statistical Learning, ch. 3–4 | Hastie, Tibshirani & Friedman | https://hastie.su.domains/ElemStatLearn/
+
+@@ svm
+value: Support vector machines and kernel methods were the strongest general classifiers before deep learning, and the ideas they introduced (maximum margin, convex training, the kernel trick, duality) still appear across machine learning, including in how attention can be seen as a kernel.
+how: An SVM finds the separating hyperplane with the largest margin to the nearest training points (the support vectors); soft margins allow some errors via hinge loss. The optimization is convex, and its dual depends on data only through inner products. Replacing inner products with a kernel function k(x, y), such as the Gaussian RBF, implicitly maps data into a high- or infinite-dimensional feature space where a linear separator may exist, without ever computing that space.
+intuition: If you cannot separate the points with a line, lift them into a space where a flat sheet can, and pick the sheet with the most room on both sides.
+friction: Training scales roughly quadratically or worse with the number of examples; kernel choice and hyperparameters need tuning; outputs are not probabilities without calibration; deep learning wins on raw images, audio and text.
+ref: paper | Support-Vector Networks | Cortes & Vapnik, Machine Learning 1995 |
+ref: course | CS 229 lecture notes: kernel methods and SVMs | Stanford | https://cs229.stanford.edu/
+ref: book | Learning with Kernels | Schölkopf & Smola, 2002 |
+
+@@ clustering
+value: Clustering finds groups in data without labels: customer segments, audience segments for advertising, topics in documents, anomalies that fit no group. k-means also sits inside other systems, for example IVF vector indexes and product quantization.
+how: k-means picks k centres, assigns every point to its nearest centre, moves each centre to the mean of its points, and repeats until stable; k-means++ chooses smarter starting centres. A Gaussian mixture model instead gives each point a probability of belonging to each cluster, each cluster having its own shape. The expectation–maximization (EM) algorithm fits it: the E-step computes membership probabilities, the M-step re-estimates each Gaussian, and each round never lowers the likelihood (a consequence of Jensen's inequality). Density-based methods (DBSCAN) and hierarchical clustering handle other shapes.
+intuition: Guess the groups, re-centre each group, regroup, and repeat until nothing moves.
+friction: You must choose k; results depend on initialization (local optima); distances lose meaning in very high dimensions; clusters may not match business categories.
+ref: course | CS 229 lecture notes: k-means, mixtures of Gaussians and EM | Stanford | https://cs229.stanford.edu/
+ref: paper | Maximum Likelihood from Incomplete Data via the EM Algorithm | Dempster, Laird & Rubin, JRSS-B 1977 |
+ref: paper | k-means++: The Advantages of Careful Seeding | Arthur & Vassilvitskii, SODA 2007 |
+
+@@ pca
+value: Principal component analysis compresses many correlated features into a few that keep most of the variation. It is used for visualization, noise reduction, speeding up downstream models and understanding embeddings; the same mathematics (the SVD) underlies latent semantic analysis, recommendation and low-rank adaptation.
+how: Centre the data, then find the orthogonal directions along which the data varies most. These are the top eigenvectors of the covariance matrix, or equivalently the top right singular vectors of the data matrix from the singular value decomposition. Projecting onto the first k directions gives the best k-dimensional linear approximation in squared error (Eckart–Young). Randomized SVD algorithms compute it quickly for large matrices.
+intuition: Rotate the cloud of points so its longest axis lines up with the first coordinate, then drop the thinnest axes.
+friction: Only captures linear structure; sensitive to feature scaling; components are hard to interpret; non-linear methods (t-SNE, UMAP, autoencoders) are often better for visualization.
+ref: course | CS 229 lecture notes: principal components analysis | Stanford | https://cs229.stanford.edu/
+ref: course | CS 168: The Modern Algorithmic Toolbox (PCA and SVD lectures) | Tim Roughgarden & Gregory Valiant, Stanford | https://web.stanford.edu/class/cs168/
+ref: paper | Finding Structure with Randomness: Probabilistic Algorithms for Constructing Approximate Matrix Decompositions | Halko, Martinsson & Tropp, SIAM Review 2011 |
+
+@@ vae
+value: Variational autoencoders learn a smooth, compressed latent space from which new data can be generated. Their most important modern role is as the compressor in latent diffusion: Stable Diffusion and many video models run diffusion inside a VAE's latent space to cut compute by orders of magnitude.
+how: An encoder maps an input to the parameters of a distribution over latent codes (usually a Gaussian mean and variance). A latent is sampled, and a decoder reconstructs the input. Training maximizes the evidence lower bound (ELBO): reconstruction quality minus the KL divergence between the encoder's distribution and a simple prior. The reparameterization trick (sample noise, then shift and scale it) lets gradients pass through the sampling step. VQ-VAEs use a discrete codebook instead, producing tokens that language-model-style transformers can generate.
+intuition: Learn to compress to a small, well-organized code and to imagine from it; nearby codes decode to similar things.
+friction: Samples from plain VAEs are often blurry; balancing reconstruction against the prior is tricky (posterior collapse); the bound is not the true likelihood.
+ref: paper | Auto-Encoding Variational Bayes | Kingma & Welling, ICLR 2014 | https://arxiv.org/abs/1312.6114
+ref: course | CS 236: Deep Generative Models | Stefano Ermon, Stanford | https://deepgenerativemodels.github.io/
+ref: paper | Neural Discrete Representation Learning (VQ-VAE) | van den Oord, Vinyals & Kavukcuoglu, NeurIPS 2017 | https://arxiv.org/abs/1711.00937
+
+@@ flows
+value: Normalizing flows are generative models that give exact probabilities for data, not just samples or bounds. Their ideas returned in flow matching and rectified flows, now widely used to train image, video and audio generators with fewer sampling steps than classic diffusion.
+how: Start with a simple distribution (a standard Gaussian) and apply a chain of invertible, differentiable transformations to reach the data distribution. By the change-of-variables formula, the density of a data point equals the base density of its inverse image times the absolute determinant of the Jacobian. Layers are designed so the determinant is cheap: coupling layers (RealNVP, Glow) transform half the dimensions using the other half, giving triangular Jacobians. Continuous normalizing flows define the transformation by an ordinary differential equation; flow matching trains such models by regressing a velocity field, avoiding expensive simulation.
+intuition: Knead a simple ball of dough into the shape of the data, keeping track of how much each region was stretched.
+friction: Invertibility constrains architectures, so classic flows were less expressive than GANs or diffusion; high-dimensional data needs many layers; exact likelihood does not guarantee good samples.
+ref: paper | Density Estimation Using Real NVP | Dinh, Sohl-Dickstein & Bengio, ICLR 2017 | https://arxiv.org/abs/1605.08803
+ref: paper | Flow Matching for Generative Modeling | Lipman et al., ICLR 2023 | https://arxiv.org/abs/2210.02747
+ref: course | CS 236: Deep Generative Models | Stanford | https://deepgenerativemodels.github.io/
+
+@@ gans
+value: Generative adversarial networks produced the first strikingly realistic synthetic images (StyleGAN faces, 2018–2020) and introduced adversarial training, which is still used as an extra loss in image tokenizers, super-resolution and fast distilled diffusion models.
+how: A generator turns random noise into a sample; a discriminator tries to tell real samples from generated ones. They are trained together in a minimax game: the discriminator improves at spotting fakes, and the generator improves by following the discriminator's gradients toward more realistic outputs. At the ideal equilibrium the generator matches the data distribution. Variants changed the loss (Wasserstein GAN), the architecture (DCGAN, StyleGAN) or added conditions (class labels, text).
+intuition: A forger and a detective train each other; the forgeries get better because the detective gets better.
+friction: Training is unstable and sensitive to hyperparameters; mode collapse (the generator produces only a few kinds of output); no likelihood to measure progress; diffusion models replaced GANs for most high-quality generation.
+ref: paper | Generative Adversarial Nets | Goodfellow et al., NeurIPS 2014 | https://arxiv.org/abs/1406.2661
+ref: paper | A Style-Based Generator Architecture for Generative Adversarial Networks | Karras, Laine & Aila, CVPR 2019 | https://arxiv.org/abs/1812.04948
+ref: course | CS 236: Deep Generative Models | Stanford | https://deepgenerativemodels.github.io/
+
+@@ qlearning
+value: Q-learning lets an agent learn how good each action is in each situation purely from experience, without a model of the world. Deep Q-networks (DQN, 2015) combined it with neural networks and learned to play dozens of Atari games from pixels, a landmark for deep reinforcement learning.
+how: Q(s, a) estimates the total future reward of taking action a in state s and acting well afterwards. After each step, the estimate is nudged toward the observed reward plus the discounted best Q-value of the next state (a temporal-difference update derived from the Bellman equation). It is off-policy: it learns the best policy while exploring with another (for example, epsilon-greedy). DQN stabilizes learning with experience replay (training on random past transitions) and a slowly updated target network; Double DQN reduces overestimation.
+intuition: Keep a score for every move in every position, and update it each time you see what the move actually led to.
+friction: Overestimates values; unstable with function approximation; struggles with continuous actions and sparse rewards; needs huge amounts of experience.
+ref: paper | Human-level control through deep reinforcement learning (DQN) | Mnih et al., Nature 2015 |
+ref: book | Reinforcement Learning: An Introduction, 2nd ed., ch. 6 | Sutton & Barto, 2018 | http://incompleteideas.net/book/the-book-2nd.html
+ref: course | CS 234: Reinforcement Learning | Emma Brunskill, Stanford | https://web.stanford.edu/class/cs234/
+
+@@ policygrad
+value: Policy-gradient methods optimize a policy directly by gradient ascent on expected reward. They handle continuous actions and stochastic policies naturally, and, through PPO and its successors (GRPO and others), they are how language models are fine-tuned with reinforcement learning from human feedback and from verifiable rewards.
+how: The policy gradient theorem says the gradient of expected return equals the expectation of the gradient of log π(a|s) times how good the action turned out (the return or advantage). REINFORCE estimates this from sampled episodes; subtracting a baseline (a learned value function in actor–critic methods) reduces variance. PPO keeps each update close to the previous policy by clipping the probability ratio, which makes training stable. For LLMs, the 'action' is each generated token, the reward comes from a reward model or a checker, and a KL penalty keeps the model near its starting point. GRPO replaces the value network with the average reward of a group of sampled answers.
+intuition: Do more of what worked better than expected and less of what worked worse.
+friction: High variance needs many samples; sensitive to hyperparameters; reward hacking when the reward is imperfect; on-policy methods waste old data.
+ref: paper | Proximal Policy Optimization Algorithms | Schulman et al., 2017 | https://arxiv.org/abs/1707.06347
+ref: paper | Policy Gradient Methods for Reinforcement Learning with Function Approximation | Sutton, McAllester, Singh & Mansour, NeurIPS 1999 |
+ref: blog | Policy Gradient Algorithms | Lilian Weng, 2018 | https://lilianweng.github.io/posts/2018-04-08-policy-gradient/
+
+@@ mcts
+value: Monte Carlo tree search plans by simulating many possible futures and focusing effort on the most promising ones. Combined with neural networks in AlphaGo (2016) and AlphaZero (2017), it beat the best human players at Go, chess and shogi; similar search ideas are explored for reasoning in language models.
+how: Each iteration has four steps: selection (walk down the tree choosing children by a rule like UCT that balances high average value and few visits), expansion (add a new node), simulation or evaluation (play out randomly, or ask a value network), and backpropagation (update visit counts and values along the path). After many iterations, the most-visited move is played. AlphaZero uses a policy network to guide which moves to try and a value network instead of random play-outs, and trains both from self-play.
+intuition: Think ahead mostly along the lines that look good, but keep checking a few that have not been tried much.
+friction: Needs a simulator or model of the environment; expensive per decision; harder with huge or continuous action spaces and hidden information.
+ref: paper | Mastering the game of Go with deep neural networks and tree search | Silver et al., Nature 2016 |
+ref: paper | A Survey of Monte Carlo Tree Search Methods | Browne et al., IEEE TCIAIG 2012 |
+
+@@ bandits
+value: Multi-armed bandits decide, again and again, which option to try when you learn only from the results of what you tried: which ad creative, which headline, which recommendation, which bid. They lose less than fixed A/B tests because they shift traffic toward winners while still learning, which is why ad tech and recommendation systems use them widely.
+how: Each option ('arm') has an unknown reward rate. Epsilon-greedy exploits the best estimate most of the time and explores randomly otherwise. Upper confidence bound (UCB) picks the arm with the highest optimistic estimate (mean plus uncertainty). Thompson sampling keeps a posterior distribution per arm (for click rates, a Beta distribution) and picks the arm whose sampled value is highest, which explores in proportion to uncertainty. Contextual bandits condition choices on user and item features (LinUCB). Regret, the reward lost compared with always picking the best arm, grows only logarithmically for good algorithms.
+intuition: Try the slot machines that might be good; spend most coins on the one that seems best, but keep testing the uncertain ones.
+friction: Rewards that arrive late or change over time break assumptions; bandit-allocated traffic makes post-hoc statistics harder; contextual versions need careful offline evaluation.
+ref: book | Bandit Algorithms | Lattimore & Szepesvári, 2020 | https://tor-lattimore.com/downloads/book/book.pdf
+ref: paper | A Contextual-Bandit Approach to Personalized News Article Recommendation | Li, Chu, Langford & Schapire, WWW 2010 |
+ref: paper | An Empirical Evaluation of Thompson Sampling | Chapelle & Li, NeurIPS 2011 |
+
+@@ pagerank
+value: PageRank ranks nodes in a graph by how much importance flows to them through links. It made Google's search results far better than competitors' in 1998, and the same idea ranks influencers in social graphs, important pages in knowledge graphs and key nodes in fraud and identity graphs.
+how: Imagine a random surfer who follows a random outgoing link with probability d (about 0.85) and jumps to a random page otherwise. A page's PageRank is the long-run fraction of time the surfer spends there: the stationary distribution of a Markov chain, equivalently the principal eigenvector of the modified link matrix. It is computed by power iteration (repeatedly multiplying the rank vector by the matrix), which parallelizes well with MapReduce, Spark or Pregel. Personalized PageRank restarts at a chosen set of nodes, giving relevance relative to a user or a seed.
+intuition: A page is important if important pages link to it.
+friction: Link spam and link farms manipulate it; it ignores content; large graphs need many iterations over billions of edges; modern search uses many other signals.
+ref: paper | The PageRank Citation Ranking: Bringing Order to the Web | Page, Brin, Motwani & Winograd, Stanford 1998 |
+ref: book | Mining of Massive Datasets, ch. 5 | Leskovec, Rajaraman & Ullman | http://www.mmds.org/
+
+@@ matfact
+value: Matrix factorization learns hidden 'taste' factors for users and items from sparse ratings or interactions, and predicts unknown preferences from them. It won the Netflix Prize era (2006–2009) and remains a strong, cheap baseline and a component of many recommendation and audience-modelling systems.
+how: Arrange users × items in a matrix with mostly missing entries. Learn a vector for each user and each item (say 50–200 numbers) so their dot product approximates the known entries, with regularization to avoid overfitting. Train by stochastic gradient descent or alternating least squares (fix items and solve users exactly, then swap; easy to parallelize, as in Spark MLlib). Implicit-feedback versions treat views or clicks as confidence-weighted preferences. Biases for users and items, and time effects, improve accuracy.
+intuition: Explain every rating as a match between a few hidden tastes of the user and a few hidden traits of the item.
+friction: Cold start for new users and items; implicit feedback is noisy and biased by what was shown; dot products miss complex interactions, which deep and two-tower models address.
+ref: paper | Matrix Factorization Techniques for Recommender Systems | Koren, Bell & Volinsky, IEEE Computer 2009 |
+ref: paper | Collaborative Filtering for Implicit Feedback Datasets | Hu, Koren & Volinsky, ICDM 2008 |
+ref: book | Mining of Massive Datasets, ch. 9 | Leskovec, Rajaraman & Ullman | http://www.mmds.org/
+
+@@ chunkedprefill
+value: Chunked prefill and disaggregated serving stop long prompts from stalling everyone else on an LLM server, improving both time to first token and the smoothness of token streaming. They exist because the two phases of inference have opposite bottlenecks.
+how: Prefill (processing the prompt) is compute-bound: many tokens per matrix multiply. Decode (generating one token at a time for each request) is memory-bandwidth-bound. If a server runs a 100,000-token prefill as one step, all decoding requests pause. Chunked prefill splits long prompts into chunks of a few thousand tokens and mixes each chunk into a batch with ongoing decode steps, keeping both phases moving. Disaggregated serving goes further: separate GPU pools handle prefill and decode, and the KV cache is transferred between them over fast links, so each pool can be sized and tuned for its own bottleneck.
+intuition: One huge catering order should not stop the kitchen serving the regular customers; split the big order into pieces or give it its own kitchen.
+friction: Chunk size trades latency against throughput; disaggregation adds KV-cache transfer cost and system complexity; benefits depend on the mix of prompt and output lengths.
+ref: paper | SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills | Agrawal et al., 2023 | https://arxiv.org/abs/2308.16369
+ref: paper | DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving | Zhong et al., OSDI 2024 | https://arxiv.org/abs/2401.09670
+ref: docs | vLLM documentation: optimization and tuning | vLLM | https://docs.vllm.ai/
+
+@@ mlcompilers
+value: ML compilers turn model code into fast GPU or TPU programs automatically, fusing operations and choosing memory layouts, so researchers can write simple Python while getting much of the speed of hand-written kernels. They are also how one model runs well on different hardware.
+how: The compiler captures the model as a graph: PyTorch's torch.compile uses TorchDynamo to trace Python bytecode, AOTAutograd to also capture the backward pass, and TorchInductor to generate code; JAX traces functions into jaxprs and lowers them to XLA's HLO. The compiler then fuses chains of element-wise operations into one kernel (avoiding round trips to memory), plans memory, and generates kernels (Triton for GPUs, or XLA's own backends). Triton lets developers write block-level GPU kernels in Python that compile to efficient code. MLIR provides shared infrastructure for many of these compilers.
+intuition: Instead of carrying each ingredient across the kitchen separately, plan the whole recipe and do as many steps as possible at one bench.
+friction: Graph breaks on dynamic Python code; compile time; debugging generated code is hard; peak performance for new attention or MoE patterns often still needs hand-written kernels.
+ref: paper | PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation | Ansel et al., ASPLOS 2024 |
+ref: paper | Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations | Tillet, Kung & Cox, MAPL 2019 |
+ref: docs | torch.compiler documentation | PyTorch | https://pytorch.org/docs/stable/torch.compiler.html
+
+@@ concgc
+value: Generational and concurrent garbage collectors let managed languages like Java and Scala run with large heaps and short pauses. For JVM data systems such as Kafka, Spark, Flink, Elasticsearch and Cassandra, the collector choice is often the difference between smooth latency and periodic stalls.
+how: Generational collection exploits the observation that most objects die young: new objects go to a small young generation collected often by copying the survivors; long-lived objects are promoted to the old generation, collected rarely. G1 (the default since Java 9) splits the heap into regions, tracks references between regions in remembered sets, and collects the regions with the most garbage first within a pause-time goal. ZGC and Shenandoah mark and move objects concurrently with the application, using load or read barriers that fix up references on access; ZGC uses coloured pointers and multi-mapped virtual memory, is generational since JDK 21, and keeps pauses under a millisecond regardless of heap size.
+intuition: Clean the kitchen while people are still cooking in it, tidying the counters that get messy fastest most often.
+friction: Barriers cost throughput (often a few percent); concurrent collectors need spare CPU and heap headroom; tuning is still workload-specific; large off-heap memory (as in Spark) sits outside the collector's view.
+ref: book | The Garbage Collection Handbook, 2nd ed. | Jones, Hosking & Moss, 2023 |
+ref: paper | Garbage-First Garbage Collection | Detlefs, Flood, Heller & Printezis, ISMM 2004 |
+ref: docs | HotSpot Virtual Machine Garbage Collection Tuning Guide | Oracle | https://docs.oracle.com/en/java/javase/21/gctuning/
+
+@@ interp
+value: Interpretability research tries to understand what is happening inside trained neural networks: which features they represent and which circuits produce a behaviour. As models make more consequential decisions, it matters for safety (detecting deception or dangerous capabilities), debugging and trust.
+how: Methods range from simple to deep. Attribution methods estimate which inputs mattered for an output. Probing trains simple classifiers on activations to test whether information is present. Mechanistic interpretability reverse-engineers circuits: for example, induction heads that implement copying in attention. Because networks pack many more features than they have neurons (superposition), sparse autoencoders and transcoders are trained to decompose activations into many interpretable, sparsely active features, and attribution graphs trace how features connect from input to output. Interventions (steering, ablation) test whether a found feature actually causes the behaviour.
+intuition: Neuroscience for artificial networks, with the advantage that every neuron can be recorded and edited.
+friction: Explanations may be incomplete or misleading; methods are expensive at frontier scale; features found may not be the ones the model 'really' uses; linking low-level circuits to high-level behaviour is still hard.
+ref: paper | Zoom In: An Introduction to Circuits | Olah et al., Distill 2020 | https://distill.pub/2020/circuits/zoom-in/
+ref: paper | Towards Monosemanticity: Decomposing Language Models With Dictionary Learning | Bricken et al. (Anthropic), 2023 | https://transformer-circuits.pub/2023/monosemantic-features/index.html
+ref: paper | Toy Models of Superposition | Elhage et al. (Anthropic), 2022 | https://transformer-circuits.pub/2022/toy_model/index.html
+
+@@ adversarial
+value: Adversarial examples showed that models can be confidently wrong on inputs changed in ways humans cannot see. The same weakness, in language form, is prompt injection and jailbreaking. Understanding it is essential for deploying models where someone may try to fool them.
+how: Gradient-based attacks compute how the loss changes with the input and step in the direction that increases it most, within a small budget (for example, the fast gradient sign method or projected gradient descent with an L-infinity bound). Attacks often transfer between models. Defences include adversarial training (training on attacked examples), certified robustness (proving no perturbation within a radius changes the output, such as randomized smoothing) and input preprocessing, which is often broken by adaptive attacks. For LLMs, attacks are crafted text: optimized suffixes, role-play prompts or instructions hidden in documents, and defences combine training, filtering and system-level permission design.
+intuition: A model draws boundaries in a very high-dimensional space; almost every point is close to some boundary, and an attacker knows which way to push.
+friction: Robustness often costs accuracy; defences are repeatedly broken by stronger attacks; there is no complete fix for prompt injection, so system design must limit what a fooled model can do.
+ref: paper | Intriguing properties of neural networks | Szegedy et al., ICLR 2014 | https://arxiv.org/abs/1312.6199
+ref: paper | Towards Deep Learning Models Resistant to Adversarial Attacks | Madry et al., ICLR 2018 | https://arxiv.org/abs/1706.06083
+ref: paper | Universal and Transferable Adversarial Attacks on Aligned Language Models | Zou et al., 2023 | https://arxiv.org/abs/2307.15043

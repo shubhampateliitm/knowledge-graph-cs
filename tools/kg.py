@@ -97,6 +97,17 @@ def load(root=None):
                         errs.append(f"{where} edge points upward {s}->{t}")
                     edges.append(dict(s=s, t=t, k=kind, r=reason))
 
+    # reason overrides: content/graph/reasons*.txt holds "src > tgt | specific reason" lines for edges already declared
+    # with a shared reason, so every "stands on" line can say exactly what that lower idea contributes.
+    idx = {(e["s"], e["t"]): e for e in edges}
+    for f, ln, line in _lines("content/graph/reasons*.txt"):
+        if not line.strip() or line.startswith("#"): continue
+        m = re.match(r"^\s*([a-z0-9-]+)\s*[>~]\s*([a-z0-9-]+)\s*\|\s*(.+)$", line)
+        if not m: errs.append(f"{f}:{ln} bad reason line"); continue
+        s_, t_, r_ = m.groups()
+        if (s_, t_) not in idx: errs.append(f"{f}:{ln} no edge {s_} -> {t_} to give a reason to"); continue
+        idx[(s_, t_)]["r"] = r_.strip()
+
     tours, cur = [], None
     for f, ln, line in _lines("content/graph/tours.txt"):
         if not line.strip(): continue
@@ -107,6 +118,40 @@ def load(root=None):
         nid, txt = line.split(" | ", 1)
         chk(nid.strip(), f"{f}:{ln}")
         cur["steps"].append([nid.strip(), txt.strip()])
+
+    # curriculum: programs, course groups, courses -> ordered concept ids
+    programs, courses, pending_groups = [], [], []
+    cur_course = None
+    for f, ln, line in _lines("content/curriculum/*.txt"):
+        if not line.strip() or line.startswith("# "): continue
+        where = f"{f}:{ln}"
+        if line.startswith("@program "):
+            p = [x.strip() for x in line[9:].split("|")]
+            if len(p) != 5: errs.append(f"{where} @program needs 5 fields"); continue
+            programs.append(dict(id=p[0], name=p[1], year=p[2], url=p[3], summary=p[4], groups=[])); continue
+        if line.startswith("@group "):
+            p = [x.strip() for x in line[7:].split("|")]
+            if len(p) != 4: errs.append(f"{where} @group needs 4 fields"); continue
+            pending_groups.append((where, p)); continue
+        if line.startswith("## "):
+            p = [x.strip() for x in line[3:].split("|")]
+            if len(p) != 5: errs.append(f"{where} course header needs 5 fields"); cur_course = None; continue
+            cur_course = dict(code=p[0], title=p[1], url=p[2], term=p[3], text=p[4], concepts=[])
+            courses.append(cur_course); continue
+        if cur_course is None: errs.append(f"{where} concept list outside a course"); continue
+        for cid in [x.strip() for x in line.split(",") if x.strip()]:
+            if cid not in nodes: errs.append(f"{where} {cur_course['code']} lists unknown concept {cid!r}")
+            elif cid not in cur_course["concepts"]: cur_course["concepts"].append(cid)
+    codes = {c["code"] for c in courses}
+    progs = {p["id"]: p for p in programs}
+    for where, (pid, name, cl, note) in pending_groups:
+        if pid not in progs: errs.append(f"{where} unknown program {pid}"); continue
+        cl = [x.strip() for x in cl.split(",") if x.strip()]
+        for c in cl:
+            if c not in codes: errs.append(f"{where} unknown course {c}")
+        progs[pid]["groups"].append(dict(name=name, courses=cl, note=note))
+    for c in courses:
+        if not c["concepts"]: errs.append(f"course {c['code']} has no concepts")
 
     # reads
     reads, long_keys = {}, set()
@@ -199,4 +244,6 @@ def load(root=None):
                  urls=sum(1 for v in nodes.values() for x in v["refs"] if x["u"]) + sum(1 for r in layer_reads for x in r["refs"] if x["u"]),
                  deep=sum(1 for v in nodes.values() if v["deep"]),
                  per_layer=[sum(1 for v in nodes.values() if v["l"] == L) for L in range(6)])
-    return dict(nodes=[nodes[i] for i in order], edges=edges, side=side, tours=tours, layers=layer_reads, stats=stats)
+    stats["courses"] = len(courses)
+    return dict(nodes=[nodes[i] for i in order], edges=edges, side=side, tours=tours, layers=layer_reads, stats=stats,
+                curriculum=dict(programs=programs, courses=courses))

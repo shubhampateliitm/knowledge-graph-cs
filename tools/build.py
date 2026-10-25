@@ -29,6 +29,11 @@ CREATE INDEX edges_dst ON edges(dst);
 CREATE TABLE side_links (a TEXT NOT NULL REFERENCES nodes(id), b TEXT NOT NULL REFERENCES nodes(id), type TEXT NOT NULL, reason TEXT NOT NULL);
 CREATE TABLE tours (id INTEGER PRIMARY KEY, title TEXT NOT NULL, subtitle TEXT NOT NULL);
 CREATE TABLE tour_steps (tour_id INTEGER NOT NULL REFERENCES tours(id), ord INTEGER NOT NULL, node_id TEXT NOT NULL REFERENCES nodes(id), note TEXT NOT NULL, PRIMARY KEY (tour_id, ord));
+CREATE TABLE programs (id TEXT PRIMARY KEY, name TEXT NOT NULL, year TEXT NOT NULL, url TEXT NOT NULL, summary TEXT NOT NULL);
+CREATE TABLE program_groups (program_id TEXT NOT NULL REFERENCES programs(id), ord INTEGER NOT NULL, name TEXT NOT NULL, note TEXT NOT NULL, courses TEXT NOT NULL, PRIMARY KEY (program_id, ord));
+CREATE TABLE courses (code TEXT PRIMARY KEY, title TEXT NOT NULL, url TEXT NOT NULL, term TEXT NOT NULL, material TEXT NOT NULL, ord INTEGER NOT NULL);
+CREATE TABLE course_concepts (code TEXT NOT NULL REFERENCES courses(code), ord INTEGER NOT NULL, node_id TEXT NOT NULL REFERENCES nodes(id), PRIMARY KEY (code, ord));
+CREATE INDEX course_concepts_node ON course_concepts(node_id);
 CREATE VIRTUAL TABLE search USING fts5(owner UNINDEXED, label, mechanism, body, tokenize = 'porter unicode61');
 """
 
@@ -63,6 +68,13 @@ def write_db(data, path):
     for i, t in enumerate(data["tours"]):
         db.execute("INSERT INTO tours VALUES (?,?,?)", (i, t["title"], t["sub"]))
         db.executemany("INSERT INTO tour_steps VALUES (?,?,?,?)", [(i, j, s[0], s[1]) for j, s in enumerate(t["steps"])])
+    cur = data["curriculum"]
+    for p in cur["programs"]:
+        db.execute("INSERT INTO programs VALUES (?,?,?,?,?)", (p["id"], p["name"], p["year"], p["url"], p["summary"]))
+        db.executemany("INSERT INTO program_groups VALUES (?,?,?,?,?)", [(p["id"], i, g["name"], g["note"], ",".join(g["courses"])) for i, g in enumerate(p["groups"])])
+    for i, c in enumerate(cur["courses"]):
+        db.execute("INSERT INTO courses VALUES (?,?,?,?,?,?)", (c["code"], c["title"], c["url"], c["term"], c["text"], i))
+        db.executemany("INSERT INTO course_concepts VALUES (?,?,?)", [(c["code"], j, n) for j, n in enumerate(c["concepts"])])
     db.execute("INSERT INTO search(search) VALUES ('optimize')")
     db.commit(); db.execute("VACUUM"); db.close()
     os.replace(tmp, path)
@@ -92,7 +104,7 @@ def main():
         print("CONTENT ERRORS:\n  " + str(e).replace("\n", "\n  "), file=sys.stderr); sys.exit(1)
     st = data["stats"]
     print(f"content ok: {st['nodes']} concepts {st['per_layer']}, {st['edges']} links, {st['side']} side links, "
-          f"{st['tours']} tours, {st['words']:,} words, {st['refs']} sources ({st['urls']} with direct links), {st['deep']} deep reads")
+          f"{st['tours']} tours, {st['courses']} courses, {st['words']:,} words, {st['refs']} sources ({st['urls']} with direct links), {st['deep']} deep reads")
     if "--check" in args: return
     os.makedirs(os.path.join(ROOT, "data"), exist_ok=True); os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)
     db = os.path.join(ROOT, "data", "content.db")

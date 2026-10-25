@@ -51,6 +51,17 @@ const shots = process.argv[3] || null;
   await page.click('[data-view="atlas"]'); await page.click('[data-essay="3"]');
   await page.waitForSelector('#reader h1'); ok((await page.textContent('#reader h1')) === 'CS foundations', 'layer essay opens');
   await page.click('#reader [data-rclose]');
+  // courses
+  await page.click('[data-view="courses"]'); await page.waitForSelector('#v-courses .tcard');
+  await page.click('#v-courses [data-course="CS244B"]'); await page.waitForTimeout(100);
+  ok((await page.textContent('#v-courses .tsteps h2')).includes('Distributed Systems'), 'course view shows CS 244B');
+  await page.click('[data-program="ms"]'); await page.waitForTimeout(100);
+  ok(await page.locator('#v-courses .tcard').count() > 10, 'MS program lists course groups');
+  await page.click('#v-courses [data-rcourse]'); await page.waitForSelector('#reader:not([hidden]) .seqnav');
+  ok((await page.textContent('#reader .seqnav')).includes('CS 103') || (await page.textContent('#reader .seqnav')).length > 0, 'study a course in the reader');
+  if (shots) await page.screenshot({ path: shots + '/6-course-reader.png' });
+  await page.click('#reader [data-rclose]');
+  if (shots) { await page.click('[data-view="courses"]'); await page.screenshot({ path: shots + '/7-courses.png' }); }
   // library
   await page.click('[data-view="library"]'); await page.waitForSelector('.lib li');
   ok(await page.locator('.lib li').count() > 50, 'library lists works');

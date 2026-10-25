@@ -1,0 +1,201 @@
+@@ pagereplace
+value: Demand paging lets programs use more memory than is physically available and start quickly, because pages are loaded only when touched. Page replacement decides which pages to evict when memory runs out; good choices keep the working set in RAM, bad ones cause thrashing, where the machine spends its time moving pages instead of running programs.
+how: Pages start out not present. The first access triggers a page fault; the kernel finds a free frame (or evicts one), reads the page from disk or zero-fills it, updates the page table and resumes the program. Optimal replacement (evict the page used furthest in the future) is impossible to know, so systems approximate LRU. The clock algorithm sweeps a hand over frames, clearing a hardware 'accessed' bit and evicting the first page whose bit is already clear. Linux keeps active and inactive lists (and since 6.1 the multi-generational LRU). Dirty pages must be written back before reuse.
+intuition: Keep on your desk the papers you have touched recently; when the desk is full, put away the one you have not looked at for longest.
+friction: Page faults that hit disk cost milliseconds; containers' memory limits trigger the out-of-memory killer rather than graceful swapping; databases often prefer to manage their own buffer pools.
+ref: book | Operating Systems: Three Easy Pieces, ch. 21–22 (swapping mechanisms and policies) | Arpaci-Dusseau | https://pages.cs.wisc.edu/~remzi/OSTEP/
+ref: course | CS 111: Operating Systems Principles | Stanford | https://cs111.stanford.edu/
+ref: book | Operating Systems: Principles and Practice, 2nd ed. | Anderson & Dahlin, 2014 |
+
+@@ fsjournal
+value: Journaling makes a file system survive crashes without a long check of the whole disk. Before journaling, a power cut during an update could leave directories and free-block maps inconsistent, and fsck could take hours on large disks; with a journal, recovery takes seconds.
+how: An operation such as creating a file changes several blocks (the directory, the inode, the free-space bitmap). The file system first writes all those changes, plus a commit record, to a log area (the journal), waits for them to be durable, then writes them to their real locations (checkpointing) and frees the journal space. After a crash, it replays committed transactions in the journal and ignores incomplete ones. Most systems journal only metadata by default (ext4's ordered mode writes data blocks before committing the metadata that points to them); full data journaling writes everything twice. Copy-on-write file systems (ZFS, Btrfs) avoid a journal by never overwriting live blocks.
+intuition: Write a note of what you are about to rearrange before you start, so if you are interrupted you can finish or undo it.
+friction: Writes happen twice for journaled blocks; applications still need fsync for their own data; ordering bugs between data and metadata have caused real data loss.
+ref: book | Operating Systems: Three Easy Pieces, ch. 42 (crash consistency: fsck and journaling) | Arpaci-Dusseau | https://pages.cs.wisc.edu/~remzi/OSTEP/file-journaling.pdf
+ref: course | CS 111: Operating Systems Principles (crash recovery and journaling) | Stanford | https://cs111.stanford.edu/
+
+@@ condvars
+value: Condition variables and monitors let threads wait efficiently until something they need becomes true (a queue has items, a buffer has space, a request is done) without burning CPU in a loop. Every producer–consumer queue, thread pool and blocking API is built on them or on equivalent primitives.
+how: A condition variable is always paired with a mutex. A waiting thread holds the lock, checks the condition, and if it is false calls wait(), which atomically releases the lock and sleeps. Another thread that changes the state signals (wakes one waiter) or broadcasts (wakes all). The woken thread re-acquires the lock and must re-check the condition in a while loop, because of spurious wake-ups and because another thread may have acted first (Mesa semantics). A monitor packages data, its lock and its conditions together, as in Java's synchronized methods with wait() and notify().
+intuition: Leave your phone number with the receptionist and nap; they call when your table is ready, and you check it really is before sitting down.
+friction: Lost wake-ups when signalling without holding the lock or checking state incorrectly; easy to deadlock; higher-level tools (channels, futures, concurrent queues) are usually safer.
+ref: book | Operating Systems: Three Easy Pieces, ch. 30 (condition variables) | Arpaci-Dusseau | https://pages.cs.wisc.edu/~remzi/OSTEP/threads-cv.pdf
+ref: paper | Monitors: An Operating System Structuring Concept | C. A. R. Hoare, CACM 1974 |
+ref: paper | Experience with Processes and Monitors in Mesa | Lampson & Redell, CACM 1980 |
+
+@@ roofline
+value: The roofline model tells you, from two numbers, whether a computation is limited by arithmetic or by memory bandwidth, and therefore which optimizations can help. It explains why LLM decoding is slow even on huge GPUs, why operator fusion and FlashAttention matter, and why batching changes everything in inference.
+how: Arithmetic intensity is the number of floating-point operations per byte moved from memory. Attainable performance is the minimum of peak compute and memory bandwidth × arithmetic intensity. Plotted on log–log axes, this gives a sloped 'roof' (memory-bound region) meeting a flat roof (compute-bound region) at the ridge point. For example, a GPU with about 1,000 TFLOP/s and 3 TB/s needs over 300 FLOPs per byte to be compute-bound. Decoding one token with batch size 1 performs about 2 FLOPs per weight byte (in 8-bit), far below the ridge, so it is memory-bound; batching many users raises intensity.
+intuition: A kitchen is limited either by how fast the cooks work or by how fast ingredients arrive from the pantry; adding cooks does not help if the pantry is slow.
+friction: Ignores caches, latency and communication; real kernels rarely hit either roof; multiple memory levels need multiple rooflines.
+ref: paper | Roofline: An Insightful Visual Performance Model for Multicore Architectures | Williams, Waterman & Patterson, CACM 2009 |
+ref: course | CS 149: Parallel Computing | Stanford | https://gfxcourses.stanford.edu/cs149/fall25/
+ref: blog | Making Deep Learning Go Brrrr From First Principles | Horace He, 2022 | https://horace.io/brrr_intro.html
+
+@@ rpc
+value: Remote procedure calls make calling another machine look like calling a function, which is how almost every distributed system and microservice talks. Serialization formats (Protobuf, Thrift, Avro, JSON) decide how data is encoded, how fast it is, and whether old and new versions can still understand each other.
+how: An interface definition describes methods and message types; a code generator produces client stubs and server skeletons. The client stub serializes arguments, sends them over a connection (TCP, HTTP/2 in gRPC), and waits; the server deserializes, runs the method and sends back the result or an error. Real RPC systems add deadlines, retries, load balancing, authentication, streaming and cancellation. Birrell and Nelson's 1984 paper set the pattern; the classic warning ('A Note on Distributed Computing', 1994) is that remote calls are not local calls: they add latency, partial failure and unknown outcomes.
+intuition: A phone call to a colleague who does the work and tells you the answer, except sometimes the line drops and you do not know whether they did it.
+friction: Timeouts leave results unknown, so operations must be idempotent or deduplicated; versioning messages needs compatibility rules; chatty interfaces multiply latency.
+ref: paper | Implementing Remote Procedure Calls | Birrell & Nelson, ACM TOCS 1984 |
+ref: paper | A Note on Distributed Computing | Waldo, Wyant, Wollrath & Kendall, Sun Labs 1994 |
+ref: docs | gRPC: core concepts | gRPC | https://grpc.io/docs/what-is-grpc/core-concepts/
+
+@@ bgp
+value: BGP is the protocol that glues the internet's tens of thousands of independent networks together. Every route from your laptop to a cloud region, every CDN's anycast address and every major internet outage caused by a bad route announcement passes through it.
+how: Each autonomous system (an ISP, a cloud, a large company) announces to its neighbours which IP prefixes it can reach, with the path of autonomous systems the route has passed through (path-vector routing, which prevents loops). Each router chooses among routes using local policy first (business relationships: prefer customers over peers over providers) and then path length and other tie-breakers, and passes its choices on. Changes propagate incrementally. RPKI lets owners sign which networks may originate their prefixes, so routers can reject hijacks.
+intuition: Neighbouring post offices tell each other which towns they can deliver to and via whom; each chooses routes by its own contracts as much as by distance.
+friction: Built on trust: misconfigurations and hijacks can redirect large parts of the internet (Facebook's 2021 outage, leaks through small ISPs); convergence after failures can take minutes; RPKI adoption is still incomplete.
+ref: docs | RFC 4271: A Border Gateway Protocol 4 (BGP-4) | IETF, 2006 | https://www.rfc-editor.org/rfc/rfc4271
+ref: course | CS 144: Introduction to Computer Networking | Stanford | https://cs144.github.io/
+ref: blog | Understanding How Facebook Disappeared from the Internet | Cloudflare, 2021 | https://blog.cloudflare.com/october-2021-facebook-outage/
+
+@@ nat
+value: Network address translation lets many devices share one public IPv4 address, which is how the internet survived running out of IPv4 addresses. It also acts as a crude firewall, which is why most home, mobile and cloud-private networks sit behind it.
+how: When an inside host opens a connection, the NAT device rewrites the source address and port to its public address and a chosen port, and records the mapping in a table. Replies to that public port are rewritten back to the inside host. Unsolicited inbound packets match no entry and are dropped. Stateful firewalls track connections the same way and apply rules. Carrier-grade NAT puts whole neighbourhoods behind shared addresses. Peer-to-peer applications use techniques such as STUN, TURN and ICE (used by WebRTC) to get through NATs.
+intuition: An office switchboard: outsiders see one main number, and the operator remembers which internal extension made each outgoing call.
+friction: Breaks the end-to-end principle: inbound connections and peer-to-peer need workarounds; mapping tables can run out of ports; logging and debugging get harder; IPv6 removes the need but adoption is gradual.
+ref: docs | RFC 3022: Traditional IP Network Address Translator | IETF, 2001 | https://www.rfc-editor.org/rfc/rfc3022
+ref: course | CS 144: Introduction to Computer Networking | Stanford | https://cs144.github.io/
+
+@@ maxflow
+value: Network flow algorithms solve a surprising range of allocation problems: matching ads to impressions under budgets, assigning tasks to machines, scheduling, image segmentation and finding bottlenecks in networks. The max-flow min-cut theorem also gives a clean certificate of optimality.
+how: A flow network has a source, a sink and edges with capacities. Ford–Fulkerson repeatedly finds an augmenting path from source to sink in the residual graph (which also allows sending flow back along used edges) and pushes as much as possible; Edmonds–Karp uses breadth-first search for a polynomial bound, and push–relabel and recent near-linear-time algorithms are faster still. When no augmenting path remains, the flow is maximum, and the saturated edges form a minimum cut. Bipartite matching reduces to flow by connecting the source to one side and the other side to the sink.
+intuition: Push water through pipes until no route has spare room; the narrowest set of pipes separating source from sink is the limit.
+friction: Real allocation problems often need integer, multi-commodity or cost constraints that make them harder (linear or integer programming); huge graphs need specialized implementations.
+ref: book | Algorithm Design, ch. 7 | Kleinberg & Tardos, 2005 |
+ref: course | CS 161: Design and Analysis of Algorithms | Stanford | https://web.stanford.edu/class/cs161/
+ref: paper | Maximal Flow Through a Network | Ford & Fulkerson, Canadian Journal of Mathematics 1956 |
+
+@@ randalgo
+value: Randomized algorithms use coin flips to become simpler, faster or more robust than deterministic ones. Randomized quicksort, universal hashing, consistent hashing, Bloom filters, sketches, random sampling, Karger's min-cut and the random choices inside distributed protocols all rely on it.
+how: Las Vegas algorithms are always correct, with random running time (randomized quicksort: expected O(n log n) on every input, because no fixed input can be bad for every choice of pivots). Monte Carlo algorithms run in fixed time and are correct with high probability (primality tests, min-cut, sketches); repeating them makes failure probability tiny. Analysis uses expectation, linearity and concentration bounds. Randomization also defeats adversaries: an attacker cannot craft a worst-case input for hash functions chosen at random.
+intuition: When you cannot know which path is bad, choosing at random makes it very unlikely you always pick the bad one.
+friction: Results can vary between runs, complicating debugging (fix seeds); 'high probability' must be quantified; quality of the random source matters, especially in security.
+ref: book | Probability and Computing, 2nd ed. | Mitzenmacher & Upfal, 2017 |
+ref: book | Randomized Algorithms | Motwani & Raghavan, 1995 |
+ref: course | CS 161: Design and Analysis of Algorithms (randomized quicksort, Karger) | Stanford | https://web.stanford.edu/class/cs161/
+
+@@ streamalgo
+value: Streaming algorithms answer questions about data too large or too fast to store: distinct users, top items, quantiles, frequency of each key. Monitoring systems, OLAP engines, network devices and ad platforms use their sketches (HyperLogLog, count-min, t-digest, KLL, reservoir samples) to get approximate answers in kilobytes of memory.
+how: The algorithm sees each item once and keeps a small summary whose size is sublinear (often logarithmic) in the stream length. Random hashing makes summaries unbiased; concentration inequalities bound their error. Key examples: reservoir sampling (a uniform sample of fixed size), Misra–Gries and count-min (heavy hitters and frequencies), HyperLogLog (distinct counts), Greenwald–Khanna, t-digest and KLL (quantiles). Many sketches are mergeable, so per-shard or per-hour sketches can be combined into totals.
+intuition: Remember the gist of the stream, not every item, and know exactly how wrong the gist can be.
+friction: Answers are approximate; some questions (exact distinct counts, arbitrary joins) provably need linear memory; intersections and deletions are hard for many sketches.
+ref: paper | The Space Complexity of Approximating the Frequency Moments | Alon, Matias & Szegedy, STOC 1996 |
+ref: course | CS 166: Data Structures (count-min, HyperLogLog) | Stanford | https://www.keithschwarz.com/cs166/
+ref: book | Small Summaries for Big Data | Cormode & Yi, 2020 |
+
+@@ regalloc
+value: Register allocation decides which program values live in the CPU's few fast registers and which go to memory. Because registers are much faster than memory, it is one of the most important optimizations in every compiler and JIT, from LLVM and GCC to the JVM, V8 and GPU compilers.
+how: The compiler computes each variable's live range (where its value may still be used). Variables whose ranges overlap 'interfere' and need different registers, forming an interference graph. Allocating k registers is colouring the graph with k colours (Chaitin, 1981); since optimal colouring is NP-hard, heuristics simplify the graph, choose variables to spill to memory when needed, and coalesce copies. JIT compilers often use the faster linear-scan algorithm. SSA form makes live ranges simpler and enables efficient allocation.
+intuition: Seat many guests at a few chairs, where guests who are present at the same time cannot share a chair; the rest wait in the hall.
+friction: Spills cost memory traffic; good allocation is slow to compute, which matters for JITs; GPUs trade registers per thread against the number of threads that can run.
+ref: paper | Register Allocation via Coloring | Chaitin et al., Computer Languages 1981 |
+ref: paper | Linear Scan Register Allocation | Poletto & Sarkar, ACM TOPLAS 1999 |
+ref: course | CS 143: Compilers | Stanford | https://web.stanford.edu/class/cs143/
+
+@@ dataflowan
+value: Dataflow analysis lets compilers prove facts about programs (this variable is constant here, this value is never used, this pointer cannot be null) so they can optimize safely. The same framework underlies static analysis tools, linters and verifiers such as the eBPF verifier.
+how: The program is a control-flow graph of basic blocks. For each point, the analysis tracks a fact from a lattice (for example, the set of live variables). Transfer functions describe how each block changes facts; at merge points facts are combined (union or intersection). The analysis iterates until nothing changes, a fixed point that exists because the lattice has finite height and functions are monotone (Kildall, 1973). Forward analyses (reaching definitions, constant propagation) flow with execution; backward analyses (liveness) flow against it. SSA form simplifies many of them.
+intuition: Spread knowledge along every path of the program until every point knows everything that can be known.
+friction: Precision versus cost: analyses must approximate (they may say 'unknown'); pointers, aliasing and calls between functions make analysis much harder; undecidability means no analysis is exact for all programs.
+ref: book | Compilers: Principles, Techniques, and Tools, 2nd ed., ch. 9 | Aho, Lam, Sethi & Ullman, 2006 |
+ref: paper | A Unified Approach to Global Program Optimization | Gary Kildall, POPL 1973 |
+ref: book | Static Program Analysis | Møller & Schwartzbach | https://cs.au.dk/~amoeller/spa/
+
+@@ aead
+value: Authenticated encryption with associated data protects both the secrecy and the integrity of messages in one primitive. It closed a long history of attacks caused by combining encryption and authentication wrongly, and it is what TLS 1.3, QUIC, SSH, WireGuard and disk and cloud encryption use for every record.
+how: AES-GCM encrypts with AES in counter mode and authenticates with GHASH, a polynomial evaluated over GF(2^128); ChaCha20-Poly1305 uses a stream cipher and a polynomial MAC, fast in software. Both take a key, a unique nonce, the plaintext and optional associated data (headers that must not be changed but need not be secret), and produce ciphertext plus a tag. Decryption verifies the tag before releasing anything. Misuse-resistant variants (AES-GCM-SIV) limit damage if a nonce repeats.
+intuition: A sealed, tamper-evident envelope: nobody can read it, and any change breaks the seal.
+friction: Reusing a nonce with the same key can break GCM completely; tags must be checked before using any data; key and nonce management is where systems fail.
+ref: book | A Graduate Course in Applied Cryptography | Dan Boneh & Victor Shoup | https://toc.cryptobook.us/
+ref: docs | RFC 5116: An Interface and Algorithms for Authenticated Encryption | IETF, 2008 | https://www.rfc-editor.org/rfc/rfc5116
+ref: course | CS 255: Introduction to Cryptography | Dan Boneh, Stanford | https://crypto.stanford.edu/~dabo/cs255/
+
+@@ pqcrypto
+value: Post-quantum cryptography replaces RSA and elliptic-curve algorithms with ones believed secure even against large quantum computers. Because encrypted traffic can be recorded now and decrypted later, the migration has already started: browsers and major servers use hybrid post-quantum key exchange, and NIST standardized ML-KEM, ML-DSA and SLH-DSA in 2024.
+how: Most chosen schemes rest on lattice problems such as learning with errors: given many approximate linear equations modulo q (with small random errors added), recovering the secret is hard, with no known efficient quantum algorithm. ML-KEM (Kyber) is a key-encapsulation mechanism; ML-DSA (Dilithium) is a signature scheme; SLH-DSA (SPHINCS+) uses only hash functions. Deployments combine a classical and a post-quantum algorithm (for example X25519 with ML-KEM-768) so security holds if either survives.
+intuition: Hide the secret as the nearest point in a huge, slightly blurred grid of many dimensions, which is hard to find even with quantum tricks.
+friction: Larger keys and signatures (kilobytes) increase handshake sizes; new schemes have less cryptanalysis history; migrating every protocol, device and certificate takes years.
+ref: docs | FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard | NIST, 2024 | https://csrc.nist.gov/pubs/fips/203/final
+ref: paper | On Lattices, Learning with Errors, Random Linear Codes, and Cryptography | Oded Regev, STOC 2005 |
+ref: course | CS 255: Introduction to Cryptography | Stanford | https://crypto.stanford.edu/~dabo/cs255/
+
+@@ zkp
+value: Zero-knowledge proofs let someone prove a statement is true without revealing why: that a computation was done correctly, that a transaction is valid, that a person is over 18, without exposing the data. They power blockchain rollups and private payments, and they are being explored for privacy-preserving identity and verifiable computation.
+how: An interactive proof convinces a verifier through challenges that a cheating prover could answer only by luck; zero-knowledge means the verifier learns nothing beyond the truth of the statement, formalized by a simulator that could produce the same transcript without the secret. The Fiat–Shamir transform replaces the verifier's random challenges with hash outputs, making proofs non-interactive. Modern SNARKs and STARKs encode a computation as polynomial constraints over a finite field and prove it with short proofs that verify in milliseconds; STARKs use only hash functions.
+intuition: Prove you know the password to a door by walking through it, without ever saying the password.
+friction: Proving is computationally heavy (often thousands of times the cost of running the computation); some SNARKs need a trusted setup; writing circuits is specialized and bug-prone.
+ref: paper | The Knowledge Complexity of Interactive Proof Systems | Goldwasser, Micali & Rackoff, STOC 1985 |
+ref: book | Proofs, Arguments, and Zero-Knowledge | Justin Thaler, 2022 | https://people.cs.georgetown.edu/jthaler/ProofsArgsAndZK.html
+ref: course | CS 251: Cryptocurrencies and Blockchain Technologies | Stanford | https://cs251.stanford.edu/
+
+@@ controlhijack
+value: Memory-safety bugs in C and C++ (buffer overflows, use-after-free, out-of-bounds writes) let attackers overwrite data the program uses to decide what to execute. They have been behind most critical security vulnerabilities for decades, which is why memory-safe languages like Rust are now pushed by governments and large companies.
+how: In a classic stack buffer overflow, a function copies input into a fixed-size buffer without checking length; the excess overwrites the saved return address, so when the function returns, execution jumps to code the attacker chose. When the stack is not executable, attackers chain existing code fragments ending in returns (return-oriented programming). Heap bugs corrupt allocator metadata or object pointers, such as virtual-table pointers. Format-string bugs and integer overflows are other routes to the same goal.
+intuition: Overwrite the return address on the program's to-do list, and it will happily go wherever you wrote.
+friction: Mitigations raise the cost but rarely eliminate exploitation; huge existing C and C++ codebases cannot be rewritten quickly; hardware features (memory tagging, CHERI capabilities) are still rolling out.
+ref: paper | Smashing The Stack For Fun And Profit | Aleph One, Phrack 49, 1996 |
+ref: paper | SoK: Eternal War in Memory | Szekeres, Payer, Wei & Song, IEEE S&P 2013 |
+ref: course | CS 155: Computer and Network Security | Stanford | https://cs155.stanford.edu/
+
+@@ exploitmit
+value: Exploit mitigations make memory-safety bugs much harder to turn into working attacks. Together they are why a single overflow rarely means immediate compromise on modern systems, and why real exploits now chain several bugs.
+how: Stack canaries place a random value before the return address and check it before returning. Data execution prevention (non-executable stack and heap pages) blocks injected code. Address space layout randomization places code, stack and heap at random addresses, so attackers must first leak an address. Control-flow integrity restricts indirect calls and returns to valid targets; hardware support includes Intel CET shadow stacks and ARM pointer authentication and memory tagging. Sandboxing (seccomp, browser site isolation) limits what a compromised process can do.
+intuition: Locks, alarms and moving the valuables around every night: none is perfect, but together they make burglary slow and noisy.
+friction: Information leaks defeat ASLR; return-oriented programming defeats DEP; mitigations cost some performance and compatibility; they treat symptoms, not the underlying memory unsafety.
+ref: paper | SoK: Eternal War in Memory | Szekeres, Payer, Wei & Song, IEEE S&P 2013 |
+ref: paper | Control-Flow Integrity | Abadi, Budiu, Erlingsson & Ligatti, CCS 2005 |
+ref: course | CS 155: Computer and Network Security | Stanford | https://cs155.stanford.edu/
+
+@@ websec
+value: Web security rests on the browser's same-origin policy: content from one site must not read or act on another site's data. Most web attacks (cross-site scripting, cross-site request forgery, clickjacking) are ways to get around it, and most defences restore it. Every web application, dashboard and OAuth flow depends on getting this right.
+how: An origin is scheme + host + port. Scripts can read responses only from their own origin unless the server allows others with CORS headers. Cross-site scripting injects attacker script into a trusted page (through unescaped user input), so it runs with that origin's rights; defences are output encoding, templating that escapes by default and Content Security Policy. Cross-site request forgery makes a victim's browser send a request with their cookies to another site; defences are SameSite cookies, CSRF tokens and checking Origin headers. HTTPS with HSTS stops network attackers from injecting content.
+intuition: Each website is a separate room; attacks try to slip a note under the door that the room then trusts as its own.
+friction: Complex rules and exceptions (CORS, iframes, third-party cookies) are easy to misconfigure; one XSS bug can defeat many other defences; new features keep adding surface.
+ref: book | The Tangled Web | Michal Zalewski, 2011 |
+ref: docs | OWASP Top 10 | OWASP Foundation | https://owasp.org/www-project-top-ten/
+ref: course | CS 155: Computer and Network Security (web security) | Stanford | https://cs155.stanford.edu/
+
+@@ lp
+value: Linear programming is the workhorse of practical optimization: logistics, scheduling, resource allocation, ad budget allocation, network design. LP duality gives every solution a certificate of optimality and explains many results in algorithms (max-flow min-cut), economics (prices) and machine learning (SVM duals).
+how: Maximize a linear objective subject to linear inequality constraints; the feasible region is a convex polytope, and an optimum lies at a vertex. The simplex method (Dantzig, 1947) walks along edges between vertices and is fast in practice; interior-point methods (Karmarkar, 1984) cross the interior with polynomial guarantees. Every LP has a dual whose optimum equals the primal's (strong duality); dual variables are 'shadow prices' saying how much each constraint costs. Integer programs add whole-number requirements, making problems NP-hard, and are solved by branch and bound with LP relaxations.
+intuition: Find the highest corner of a many-sided crystal; the dual proves no point is higher by pricing each face.
+friction: Real problems are often non-linear or integer; large models need careful formulation; solvers can be slow on badly scaled or degenerate problems.
+ref: book | Linear Programming | Vašek Chvátal, 1983 |
+ref: book | Convex Optimization, ch. 4–5 | Boyd & Vandenberghe | https://web.stanford.edu/~boyd/cvxbook/
+ref: course | CS 261: Optimization and Algorithmic Paradigms | Stanford |
+
+@@ mdp
+value: Markov decision processes are the mathematical model of sequential decision-making under uncertainty, and the Bellman equation is the principle that makes them solvable. All of reinforcement learning, many operations-research problems and planning for robots and games are framed this way.
+how: An MDP has states, actions, transition probabilities P(s'|s, a), rewards and a discount factor γ. A policy maps states to actions. The value of a state under the best policy satisfies the Bellman optimality equation: V*(s) = max over a of [R(s, a) + γ Σ P(s'|s, a) V*(s')]. Value iteration applies this update repeatedly until convergence (dynamic programming); policy iteration alternates evaluating and improving a policy. When transitions are unknown, reinforcement learning estimates values from experience (temporal-difference learning, Q-learning).
+intuition: The value of where you stand is the best thing you can do now plus the discounted value of where that leads.
+friction: Real problems have enormous or continuous state spaces, needing approximation; states are often only partly observed (POMDPs); choosing rewards is hard.
+ref: book | Dynamic Programming | Richard Bellman, 1957 |
+ref: book | Reinforcement Learning: An Introduction, 2nd ed., ch. 3–4 | Sutton & Barto, 2018 | http://incompleteideas.net/book/the-book-2nd.html
+ref: course | CS 234: Reinforcement Learning | Stanford | https://web.stanford.edu/class/cs234/
+
+@@ concentration
+value: Concentration inequalities say how unlikely it is for a sum or average of many random quantities to be far from its expected value. They are the tool behind almost every guarantee in randomized algorithms, sketches, sampling, load balancing and learning theory.
+how: Markov's inequality bounds tails using only the mean; Chebyshev's uses the variance, giving bounds that fall like 1/k². For sums of independent bounded variables, Chernoff and Hoeffding bounds fall exponentially: the probability that an average deviates by more than t is at most about 2·exp(−2nt²) for values in [0, 1]. That is why a few thousand samples estimate a rate to within a percent with high confidence, why random hashing balances load and why HyperLogLog's error is predictable.
+intuition: One coin flip is unpredictable, but the fraction of heads in ten thousand flips is almost certainly very close to half.
+friction: Independence assumptions often fail in practice (correlated users, bursts); bounds can be loose; heavy-tailed data needs different tools.
+ref: book | Probability and Computing, 2nd ed., ch. 4 | Mitzenmacher & Upfal, 2017 |
+ref: book | Concentration Inequalities | Boucheron, Lugosi & Massart, 2013 |
+
+@@ jl
+value: The Johnson–Lindenstrauss lemma shows that points in a very high-dimensional space can be projected into far fewer dimensions while nearly preserving all pairwise distances. It justifies random projections for compressing embeddings, speeding up nearest-neighbour search, sketching matrices and building LSH functions.
+how: Multiply each point by a random matrix (for example, with Gaussian or ±1 entries) to map it to k dimensions. For n points, k = O(log n / ε²) dimensions suffice to keep every distance within a factor 1 ± ε with high probability, independent of the original dimension. The proof is a concentration bound on the length of a randomly projected vector, followed by a union bound over all pairs. Sparse and fast variants make the projection cheap.
+intuition: A random shadow of a high-dimensional object keeps its proportions surprisingly well, if the shadow has enough dimensions.
+friction: The needed dimension grows as accuracy demands tighten (1/ε²); it preserves distances, not other structure; learned projections (PCA, trained embeddings) often do better on specific data.
+ref: paper | Extensions of Lipschitz mappings into a Hilbert space | Johnson & Lindenstrauss, 1984 |
+ref: course | CS 168: The Modern Algorithmic Toolbox (dimensionality reduction) | Stanford | https://web.stanford.edu/class/cs168/
+
+@@ convexity
+value: Convexity is what makes optimization reliable: a convex problem has no misleading local minima, so any downhill method finds the best solution. Jensen's inequality, its key consequence, underlies EM, variational autoencoders, information-theory inequalities and many bounds in probability and learning.
+how: A set is convex if the segment between any two points stays inside it; a function is convex if its graph lies below every chord (equivalently, its Hessian is positive semidefinite). Sums, maxima and compositions with linear maps preserve convexity, so many losses (squared error, logistic loss, hinge loss) are convex in the parameters. Jensen's inequality states f(E[X]) ≤ E[f(X)] for convex f; applied to the logarithm (concave), it gives the evidence lower bound used by EM and VAEs. Duality theory and the KKT conditions characterize optimal solutions.
+intuition: In a bowl-shaped valley, walking downhill always leads to the bottom.
+friction: Deep networks are not convex, so the guarantees do not apply directly; checking or forcing convexity can be hard; convex relaxations may be loose approximations of the real problem.
+ref: book | Convex Optimization | Boyd & Vandenberghe, 2004 | https://web.stanford.edu/~boyd/cvxbook/
+ref: course | CS 229 lecture notes (EM and Jensen's inequality) | Stanford | https://cs229.stanford.edu/

@@ -78,9 +78,16 @@ class Content:
         for t in db.execute("SELECT id, title, subtitle FROM tours ORDER BY id").fetchall():
             steps = [[s[0], s[1]] for s in db.execute("SELECT node_id, note FROM tour_steps WHERE tour_id=? ORDER BY ord", (t[0],))]
             tours.append(dict(title=t[1], sub=t[2], steps=steps))
+        curriculum = dict(programs=[], courses=[])
+        for p in db.execute("SELECT * FROM programs ORDER BY rowid").fetchall():
+            groups = [dict(name=g["name"], note=g["note"], courses=g["courses"].split(",")) for g in db.execute("SELECT * FROM program_groups WHERE program_id=? ORDER BY ord", (p["id"],))]
+            curriculum["programs"].append(dict(id=p["id"], name=p["name"], year=p["year"], url=p["url"], summary=p["summary"], groups=groups))
+        for c in db.execute("SELECT * FROM courses ORDER BY ord").fetchall():
+            ids = [r[0] for r in db.execute("SELECT node_id FROM course_concepts WHERE code=? ORDER BY ord", (c["code"],))]
+            curriculum["courses"].append(dict(code=c["code"], title=c["title"], url=c["url"], term=c["term"], text=c["material"], concepts=ids))
         db.close()
         self.ids = set(self.reads)
-        self.graph = dict(nodes=nodes, edges=edges, side=side, tours=tours, layers=layers, stats=self.stats, built_at=self.built_at, mode="server")
+        self.graph = dict(nodes=nodes, edges=edges, side=side, tours=tours, layers=layers, curriculum=curriculum, stats=self.stats, built_at=self.built_at, mode="server")
         self.graph_json = json.dumps(self.graph, ensure_ascii=False, separators=(",", ":")).encode()
         self.graph_gz = gzip.compress(self.graph_json, 6)
         self.local = threading.local()
