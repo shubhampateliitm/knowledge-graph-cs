@@ -1,0 +1,232 @@
+@@ isr
+value: The in-sync replica set is Kafka's way of balancing durability and availability without full consensus on every write. Only replicas that are keeping up count toward acknowledging writes, so one slow follower cannot stall the partition, yet acknowledged data survives the loss of the leader.
+how: A follower is in the ISR if it has fetched up to the leader's log end within replica.lag.time.max.ms. With acks=all, the leader confirms a write once all current ISR members have it; min.insync.replicas (often 2 with replication factor 3) rejects writes if the ISR shrinks too far. The high watermark is the offset up to which all ISR members have replicated; consumers only see data below it. On leader failure, the controller elects a new leader from the ISR (unclean election, from outside the ISR, is disabled by default to avoid data loss). Kafka 4 adds an eligible leader replicas mechanism (KIP-966) to tighten this further.
+intuition: Count only the runners who are keeping pace; if too few are keeping pace, stop the race rather than risk losing the baton.
+friction: Choosing replication factor and min.insync.replicas trades availability for safety; ISR flapping under load causes produce errors; acks=1 or unclean election silently risks data loss.
+ref: docs | Kafka design: replication | Apache Kafka | https://kafka.apache.org/documentation/#replication
+ref: blog | Hardening Kafka Replication | Confluent |
+
+@@ conshash
+value: Consistent hashing spreads keys across a changing set of servers so that adding or removing a server moves only a small fraction of keys. It made large distributed caches, Dynamo-style databases and CDN routing practical.
+how: Hash both servers and keys onto a ring (for example the range of a 64-bit hash). Each key belongs to the first server clockwise from its position. When a server joins, it takes over only the keys between it and its predecessor; when one leaves, its keys move to its successor. Virtual nodes (each server placed at many ring positions) even out load and spread a failed node's keys across many servers. Variants include rendezvous (highest random weight) hashing and jump consistent hashing.
+intuition: Seats around a round table: each guest sits at the nearest place clockwise, so when a new host joins, only the guests in one section move.
+friction: Uneven load without virtual nodes; hot keys still overload one server; ring changes still cause cache misses; range queries are lost because hashing scatters neighbors.
+ref: paper | Consistent Hashing and Random Trees | Karger et al., STOC 1997 |
+ref: paper | A Fast, Minimal Memory, Consistent Hash Algorithm (jump hash) | Lamping & Veach, 2014 | https://arxiv.org/abs/1406.2294
+
+@@ paxos
+value: Paxos, Leslie Lamport's consensus protocol (submitted 1990, published 1998), was the first practical, proven-correct way for a group of machines to agree despite crashes and message loss. Google's Chubby and Spanner, Microsoft's systems and DynamoDB's partitions use Paxos variants. It is the intellectual ancestor of Raft.
+how: Single-decree Paxos has two phases. Phase 1 (prepare): a proposer picks a ballot number n and asks acceptors to promise not to accept lower ballots; acceptors reply with any value they already accepted. Phase 2 (accept): if a majority promised, the proposer asks them to accept a value, which must be the highest-ballot value reported in phase 1 if any, otherwise its own. A value accepted by a majority is chosen. Multi-Paxos runs many instances for a log and keeps a stable leader so phase 1 is skipped most of the time.
+intuition: Before proposing a decision, ask a majority 'have you already agreed to anything?', and if so, carry that forward. Any two majorities overlap, so a chosen value can never be lost.
+friction: Notoriously hard to understand and to implement fully (leader election, log gaps, membership changes are left to the implementer), which motivated Raft.
+ref: paper | Paxos Made Simple | Leslie Lamport, 2001 | https://lamport.azurewebsites.net/pubs/paxos-simple.pdf
+ref: paper | Paxos Made Live: An Engineering Perspective | Chandra, Griesemer & Redstone, PODC 2007 |
+ref: paper | The Part-Time Parliament | Leslie Lamport, ACM TOCS 1998 |
+
+@@ zab
+value: ZAB (ZooKeeper Atomic Broadcast) is the protocol that keeps ZooKeeper replicas consistent: all servers apply the same updates in the same order, even across leader failures.
+how: A leader assigns each update a zxid (epoch plus counter) and broadcasts it to followers, committing once a majority acknowledges. After a leader failure, a recovery phase elects a new leader with the most up-to-date history, synchronizes followers to it, and starts a new epoch, so updates from the old epoch are either committed everywhere or discarded.
+intuition: Like Raft, a numbered sequence of announcements from one leader, with a careful handover when the leader changes.
+friction: Specific to ZooKeeper; reads are local and may be stale unless clients sync.
+ref: paper | Zab: High-performance broadcast for primary-backup systems | Junqueira, Reed & Serafini, DSN 2011 |
+
+@@ leaderelect
+value: Leader election picks one node to coordinate (accept writes, assign work, run a job) so that work is not duplicated and decisions are consistent. Leases make leadership time-bound so a dead leader is replaced automatically.
+how: Through consensus (Raft terms, Paxos ballots), through a coordination service (create an ephemeral sequential znode in ZooKeeper; acquire a lease key in etcd or a Kubernetes Lease object), or through simpler bully and ring algorithms. A lease grants leadership until an expiry time and must be renewed; others wait until it expires before taking over.
+intuition: Only one person holds the talking stick, and the stick automatically drops if they stop holding it up.
+friction: Leases depend on clocks and timing: a paused leader (GC pause, VM stall) may still act after its lease expired, so storage must use fencing tokens. Too-short leases cause flapping; too-long ones slow failover.
+ref: blog | How to do distributed locking | Martin Kleppmann, 2016 | https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+ref: paper | Leases: An Efficient Fault-Tolerant Mechanism for Distributed File Cache Consistency | Gray & Cheriton, SOSP 1989 |
+
+@@ quorum
+value: Quorums let replicated systems trade consistency, latency and availability with simple arithmetic. With N replicas, if every write reaches W of them and every read asks R of them, and R + W > N, then every read overlaps at least one replica that has the latest write.
+how: Common settings: N = 3, W = 2, R = 2 (balanced); W = N, R = 1 (fast reads, fragile writes); W = 1, R = N (fast writes). Reads compare versions from replicas and return the newest, often repairing stale ones. Sloppy quorums allow writes to temporary nodes during failures (hinted handoff), improving availability but weakening the overlap guarantee.
+intuition: If more than half the committee voted yes, any other majority must include at least one person who knows.
+friction: Quorum overlap alone does not give linearizability: concurrent writes, sloppy quorums, clock-based conflict resolution and partial failures still produce anomalies. Tail latency is set by the slowest of the required replicas.
+ref: book | Designing Data-Intensive Applications, 2nd ed. | Martin Kleppmann & Chris Riccomini, 2026 | https://dataintensive.net/
+ref: paper | Weighted Voting for Replicated Data | David Gifford, SOSP 1979 |
+
+@@ cap
+value: The CAP theorem (Eric Brewer's conjecture in 2000, proved by Gilbert and Lynch in 2002) states that when a network partition splits a distributed system, it cannot be both consistent (every read sees the latest write, linearizably) and available (every request to a non-failed node gets a response). It forced the industry to be explicit about what happens during partitions.
+how: During a partition, a node that cannot reach the others must either refuse requests (choose consistency, like consensus systems: the minority side stops) or answer with possibly stale data (choose availability, like Dynamo-style systems). Without a partition, both are possible.
+intuition: If two offices lose their phone line, either both stop selling seats or they might sell the same seat twice.
+friction: CAP is often misused as 'pick two of three' for databases. Partitions are not optional, the definitions are narrow, and latency trade-offs in normal operation matter more day to day (PACELC). Kleppmann recommends describing guarantees precisely instead of labeling systems CP or AP.
+ref: paper | Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services | Gilbert & Lynch, 2002 |
+ref: blog | CAP Twelve Years Later: How the 'Rules' Have Changed | Eric Brewer, IEEE Computer 2012 |
+ref: blog | Please stop calling databases CP or AP | Martin Kleppmann, 2015 | https://martin.kleppmann.com/2015/05/11/please-stop-calling-databases-cp-or-ap.html
+
+@@ pacelc
+value: PACELC (Daniel Abadi, 2010) extends CAP to normal operation: if there is a Partition, choose Availability or Consistency; Else, choose Latency or Consistency. It captures the trade-off engineers actually feel every day: stronger consistency costs latency even when nothing is broken.
+how: Systems are classified accordingly: DynamoDB and Cassandra are typically PA/EL (available during partitions, low latency otherwise); Spanner and CockroachDB are PC/EC (consistent always, paying latency); some systems offer per-request choices.
+intuition: Even on a sunny day, waiting for confirmation from faraway replicas takes time.
+friction: Still a simplification: real systems offer many intermediate consistency levels and choices per operation.
+ref: paper | Consistency Tradeoffs in Modern Distributed Database System Design | Daniel Abadi, IEEE Computer 2012 |
+
+@@ consmodels
+value: Consistency models define what values reads may return when data is replicated and accessed concurrently. Knowing them prevents bugs like 'I updated my profile and it reverted' or 'two users bought the last item'.
+how: From strongest to weakest: strict serializability (transactions appear to run one at a time in real-time order), linearizability (each single operation appears to take effect instantly at one point between its start and end), sequential consistency (a single order consistent with each client's order, not necessarily real time), causal consistency (operations that are causally related are seen in order by everyone), read-your-writes and monotonic reads (session guarantees), and eventual consistency (replicas converge if writes stop). Stronger models need more coordination and latency.
+intuition: How much does the system behave like a single copy on a single machine?
+friction: Vendors' marketing terms differ; many systems' real guarantees are weaker than claimed (Jepsen has found many such cases). Choosing per-operation consistency requires careful reasoning about application invariants.
+ref: blog | Consistency Models (interactive map) | Kyle Kingsbury, Jepsen | https://jepsen.io/consistency
+ref: paper | Linearizability: A Correctness Condition for Concurrent Objects | Herlihy & Wing, TOPLAS 1990 |
+
+@@ vectorclocks
+value: Vector clocks detect whether two events are causally ordered or concurrent, without synchronized physical clocks. Dynamo-style databases use version vectors (a close relative) to detect conflicting writes that need merging.
+how: Each node keeps a vector of counters, one per node. On a local event it increments its own counter; when sending, it attaches the vector; on receiving, it takes the element-wise maximum and increments its own counter. Event A happened before B if A's vector is less than or equal in every position and smaller in at least one; if neither is less, they are concurrent.
+intuition: Each version carries a summary of every node's history it has seen; compare summaries to know who saw whom.
+friction: Vectors grow with the number of nodes or clients; pruning loses information; concurrent versions still need application-level merging (or CRDTs).
+ref: paper | Timestamps in Message-Passing Systems That Preserve the Partial Ordering | Colin Fidge, 1988 |
+ref: blog | Why Vector Clocks Are Hard | Basho (Riak) engineering blog, 2010 |
+
+@@ lamport
+value: Lamport clocks (1978) give a consistent ordering of events in a distributed system using simple counters, without real clocks. The paper 'Time, Clocks, and the Ordering of Events in a Distributed System' is one of the most cited in computer science and introduced the 'happened-before' relation.
+how: Each process keeps a counter. It increments before each event, attaches the counter to messages, and on receiving a message sets its counter to max(local, received) + 1. If A happened before B, A's timestamp is smaller (though the reverse is not guaranteed). Ties are broken by process ID to get a total order, which Lamport used to build distributed mutual exclusion and replicated state machines.
+intuition: Causality, not wall-clock time, is what matters: if you heard about something, it happened before you reacted.
+friction: Lamport timestamps cannot detect concurrency (vector clocks can) and do not relate to real time (hybrid logical clocks add that).
+ref: paper | Time, Clocks, and the Ordering of Events in a Distributed System | Leslie Lamport, CACM 1978 | https://lamport.azurewebsites.net/pubs/time-clocks.pdf
+
+@@ hlc
+value: Hybrid logical clocks combine physical time and a logical counter, giving timestamps that are close to real time, respect causality, and fit in 64 bits. CockroachDB, YugabyteDB and MongoDB use them to order transactions without special hardware.
+how: Each node tracks the maximum physical time it has seen (from its clock and from messages) plus a logical counter used when physical time has not advanced. Timestamps stay within the clock skew bound of real time. Databases add an uncertainty window: if a read sees a value with a timestamp within the window, it cannot tell the order and restarts at a higher timestamp.
+intuition: Use the wall clock when it helps and a tie-breaking counter when it doesn't.
+friction: Correctness depends on a maximum clock offset; if clocks drift beyond it, anomalies are possible, so nodes monitor skew and shut down if it is exceeded.
+ref: paper | Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases | Kulkarni et al., OPODIS 2014 |
+
+@@ truetime
+value: TrueTime is Google's clock API that returns time as an interval guaranteed to contain the true time. Spanner uses it to give globally consistent transaction ordering that matches real time.
+how: Each data centre has time masters with GPS receivers and atomic clocks; servers poll them and track uncertainty (typically a few milliseconds). TT.now() returns [earliest, latest]. After choosing a commit timestamp, Spanner waits until TT.now().earliest is past it ('commit wait') before making the commit visible, so any later transaction anywhere gets a larger timestamp.
+intuition: If you know your watch is at most 4 ms wrong, wait 4 ms before announcing, and nobody can be confused about order.
+friction: Requires special infrastructure; commit wait adds latency proportional to uncertainty; hard to replicate outside Google (though cloud time services with bounded error now exist).
+ref: paper | Spanner: Google's Globally-Distributed Database | Corbett et al., OSDI 2012 |
+ref: paper | Spanner, TrueTime and the CAP Theorem | Eric Brewer, Google 2017 |
+
+@@ crdt
+value: Conflict-free replicated data types let replicas be updated independently, even offline, and still converge to the same state when they sync, without coordination or conflict-resolution code. They power collaborative editing (Figma-style multiplayer, Automerge, Yjs), active-active databases (Redis Enterprise, Riak) and local-first apps.
+how: State-based CRDTs define a merge function that is commutative, associative and idempotent (a lattice join), so merging in any order, any number of times, gives the same result: for example, a grow-only counter keeps one count per replica and merges by taking maxima. Operation-based CRDTs broadcast operations designed to commute. Rich types exist: sets with add and remove (OR-set), registers, maps, sequences for text.
+intuition: Design the data so that 'merge' never has to choose a winner: everyone's changes fit together like set union.
+friction: Metadata overhead (tombstones, version vectors) can be large; not every invariant can be maintained without coordination (for example, 'balance never negative'); intent can be lost in automatic merges.
+ref: paper | Conflict-free Replicated Data Types | Shapiro, Preguiça, Baquero & Zawirski, SSS 2011 |
+ref: docs | CRDT resources | crdt.tech | https://crdt.tech/
+ref: blog | Local-first software | Kleppmann, Wiggins, van Hardenberg & McGranaghan, 2019 | https://www.inkandswitch.com/local-first/
+
+@@ gossip
+value: Gossip (epidemic) protocols spread information through a large cluster by having each node periodically exchange state with a few random peers. They are simple, robust and scalable: Cassandra uses gossip for membership and failure detection, Consul and Serf use SWIM, and blockchains spread transactions this way.
+how: Every round, each node picks random peers and exchanges digests or updates. Because informed nodes multiply each round, news reaches everyone in about log N rounds with high probability. Anti-entropy gossip compares full state; rumor mongering spreads new updates until they seem old. SWIM combines gossip dissemination with indirect probing for failure detection.
+intuition: Like a rumor at a party: no announcement is made, yet everyone hears quickly.
+friction: Eventual, probabilistic delivery; bandwidth grows with state size; tuning fan-out and intervals trades speed for overhead; convergence time can be unpredictable during churn.
+ref: paper | Epidemic Algorithms for Replicated Database Maintenance | Demers et al., PODC 1987 |
+ref: paper | SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol | Das, Gupta & Motivala, DSN 2002 |
+
+@@ failuredetect
+value: Failure detection decides when to treat a node as dead so the system can fail over, rebalance or stop waiting. In an asynchronous network, a slow node and a dead node look identical, so every detector trades speed against false alarms.
+how: Heartbeats with timeouts are the simplest. Leases let a node act only while its lease is valid. The phi-accrual detector (used by Cassandra and Akka) computes a suspicion level from the statistical distribution of heartbeat arrival times instead of a fixed timeout. SWIM uses indirect probes through other nodes to avoid false positives from a single bad link.
+intuition: How long do you wait for a reply before deciding someone has left the call? Too short and you hang up on slow talkers; too long and you wait forever.
+friction: False positives trigger expensive failovers and split-brain risks; GC pauses and network blips mimic failures; perfect failure detection is impossible in asynchronous systems (a root of the FLP result).
+ref: paper | The φ Accrual Failure Detector | Hayashibara et al., SRDS 2004 |
+ref: paper | Unreliable Failure Detectors for Reliable Distributed Systems | Chandra & Toueg, JACM 1996 |
+
+@@ twopc
+value: Two-phase commit makes a transaction that touches several databases or partitions atomic: either all commit or all abort. Distributed databases (Spanner, CockroachDB) and XA transactions across systems use it.
+how: Phase 1 (prepare): the coordinator asks every participant to prepare; each writes its changes and a 'prepared' record durably and votes yes, or votes no. Phase 2 (commit): if all voted yes, the coordinator durably logs 'commit' and tells everyone to commit; otherwise it tells them to abort. Prepared participants must wait for the decision, holding locks.
+intuition: A wedding: everyone must say 'I do' before the officiant declares it done; once declared, there is no going back.
+friction: Blocking: if the coordinator crashes after participants prepare, they may wait with locks held. Modern systems replicate the coordinator's decision with consensus (as Spanner does) to avoid this. Latency is at least two round trips plus durable writes.
+ref: book | Transaction Processing: Concepts and Techniques | Gray & Reuter, 1992 |
+ref: paper | Notes on Data Base Operating Systems | Jim Gray, 1978 |
+
+@@ idempotence
+value: An idempotent operation has the same effect whether it is applied once or several times. In distributed systems, where retries after timeouts are unavoidable, idempotence is what turns at-least-once delivery into correct results.
+how: Techniques include natural idempotence (SET x = 5 rather than x = x + 1), idempotency keys (the client sends a unique request ID; the server remembers processed IDs and returns the stored result for repeats, as Stripe's API does), upserts by primary key, conditional writes on versions, and Kafka's idempotent producer, which tags batches with a producer ID and sequence number so the broker discards duplicates.
+intuition: Pressing a lift button twice does not call two lifts.
+friction: Storing request IDs costs space and needs expiry; side effects outside the transaction (sending email, charging cards) need their own deduplication; some operations are hard to make idempotent.
+ref: blog | Designing robust and predictable APIs with idempotency | Brandur Leach, Stripe, 2017 | https://stripe.com/blog/idempotency
+ref: blog | Making retries safe with idempotent APIs | AWS Builders' Library | https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/
+
+@@ exactlyonce
+value: Exactly-once processing means each input affects the output exactly one time, even with crashes and retries. Strictly, messages may be delivered more than once; the system makes duplicates invisible, so it is better called 'effectively once'.
+how: Combine three ingredients: replayable sources (Kafka offsets), consistent snapshots of processing state (Flink checkpoints, Kafka Streams changelogs), and outputs that are either transactional (Kafka transactions, two-phase-commit sinks, Delta commits tied to batch IDs) or idempotent (upserts by key). Kafka's transactions atomically write output records and the consumer's offsets, so a restart neither loses nor duplicates results.
+intuition: You can't stop the postman from delivering a letter twice, but you can keep a list of letters already handled.
+friction: Guarantees hold only inside the boundary of cooperating systems; external side effects (emails, API calls) still need idempotence. Transactions add latency and complexity.
+ref: blog | Exactly-once Semantics are Possible: Here's How Kafka Does it | Neha Narkhede, Confluent, 2017 | https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/
+ref: paper | Lightweight Asynchronous Snapshots for Distributed Dataflows | Carbone et al., 2015 | https://arxiv.org/abs/1506.08603
+
+@@ deliverysem
+value: Delivery semantics describe what can go wrong with messages under failure: at-most-once (may lose, never duplicates), at-least-once (never loses, may duplicate), and effectively-once (achieved with idempotence or transactions on top of at-least-once).
+how: The difference is when the consumer records progress. Commit the offset before processing: a crash loses the message (at-most-once). Commit after processing: a crash re-processes it (at-least-once). Producers face the same choice with retries: retrying after a lost acknowledgement may duplicate.
+intuition: Did you tick the task off before or after doing it?
+friction: Most systems default to at-least-once, so downstream consumers must handle duplicates; ordering can also change on retries.
+ref: book | Designing Data-Intensive Applications, 2nd ed. | Martin Kleppmann & Chris Riccomini, 2026 | https://dataintensive.net/
+
+@@ backpressure
+value: Backpressure lets a slow consumer tell faster producers to slow down, so systems degrade gracefully instead of running out of memory or dropping data.
+how: Bounded buffers that block or reject when full; credit-based flow control (the receiver grants credits for how much it can accept, as in Flink's network stack and HTTP/2); pull-based consumption (Kafka consumers fetch when ready); TCP's receive window; reactive streams' request(n) protocol. Load shedding drops low-priority work when backpressure cannot propagate further.
+intuition: A traffic light at a highway on-ramp: let cars in only as fast as the road can take them.
+friction: Backpressure propagates upstream and can stall entire pipelines; unbounded queues hide problems until they explode; deciding what to drop under overload is a business decision.
+ref: blog | Backpressure explained: the resisted flow of data through software | Jay Phelps, 2019 | https://medium.com/@jayphelps/backpressure-explained-the-flow-of-data-through-software-2350b3e77ce7
+ref: docs | Reactive Streams specification | reactive-streams.org | https://www.reactive-streams.org/
+
+@@ watermarks
+value: Watermarks let a stream processor decide when it has (probably) seen all events up to a point in event time, so it can close windows and emit results despite late and out-of-order data.
+how: A watermark W(t) asserts that no more events with event time earlier than t are expected. Sources generate watermarks, for example as the maximum event time seen minus an allowed lateness, or per Kafka partition; operators take the minimum across inputs. When the watermark passes a window's end, the window fires. Events arriving after that are 'late' and can be dropped, sent to a side output, or used to update results within an allowed-lateness period.
+intuition: 'I'll publish the 9:00–9:05 count once I'm fairly sure nobody is still mailing in 9:04 receipts.'
+friction: Watermarks are heuristics: too aggressive loses late data; too conservative delays results. One idle partition can hold back the global watermark (idleness detection helps).
+ref: paper | The Dataflow Model | Akidau et al., VLDB 2015 |
+ref: blog | Streaming 102: The world beyond batch | Tyler Akidau, 2016 | https://www.oreilly.com/radar/the-world-beyond-batch-streaming-102/
+
+@@ windowing
+value: Windowing groups an infinite stream into finite chunks of time so you can compute aggregates: clicks per minute, sessions per user, impressions in the last hour.
+how: Tumbling windows are fixed and non-overlapping (every 5 minutes). Sliding (hopping) windows overlap (5-minute windows every minute). Session windows group events separated by gaps of inactivity. Windows can be in event time or processing time; triggers decide when to emit (at watermark, early speculative results, late updates).
+intuition: Cutting a never-ending ribbon into pieces you can measure.
+friction: Overlapping windows multiply state; session windows merge dynamically; correct event-time windows depend on good watermarks.
+ref: book | Streaming Systems | Akidau, Chernyak & Lax, 2018 |
+
+@@ checkpoint
+value: Distributed snapshots capture a consistent picture of a running distributed computation (all operator state plus in-flight positions) without stopping it. They are how stream processors recover exactly and how systems take consistent backups.
+how: The Chandy–Lamport algorithm (1985): an initiator records its state and sends markers on all channels; each process records its state when it first receives a marker, then records messages arriving on other channels until markers arrive there. Flink's variant injects barriers at sources; operators align barriers from all inputs (or use unaligned checkpoints), snapshot state asynchronously to durable storage, and pass barriers on. Recovery restores the last complete snapshot and rewinds sources.
+intuition: Take a group photo of a dance without stopping the music: everyone freezes their pose as the photographer's signal reaches them.
+friction: Large state makes checkpoints slow and expensive; barrier alignment adds latency under backpressure; incremental checkpoints and changelog state backends trade complexity for speed.
+ref: paper | Distributed Snapshots: Determining Global States of Distributed Systems | Chandy & Lamport, ACM TOCS 1985 |
+ref: paper | Lightweight Asynchronous Snapshots for Distributed Dataflows | Carbone et al., 2015 | https://arxiv.org/abs/1506.08603
+
+@@ statefulops
+value: Stateful operators remember information across events: running counts, joins between streams, deduplication sets, session data, ML features. They turn streams of events into useful aggregates and joins.
+how: State is partitioned by key so each parallel task owns a slice; it lives in memory or in an embedded store such as RocksDB for large sizes; it is made durable through checkpoints or changelog topics; time-to-live and watermarks remove expired state. Rescaling redistributes key groups among tasks.
+intuition: A clerk who keeps a ledger for their own set of customers.
+friction: State size drives memory, disk and recovery time; schema evolution of state across code versions; rescaling large state is slow.
+ref: docs | Flink stateful stream processing concepts | Apache Flink | https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/
+
+@@ wal
+value: The write-ahead log is the single most reused idea in storage systems: before changing data, append a description of the change to a sequential log and make it durable. After a crash, replay the log. PostgreSQL, MySQL, SQLite, RocksDB, etcd, Kafka (whose data is the log), Elasticsearch's translog and Delta's transaction log all rely on it.
+how: Writes become cheap sequential appends; data structures (pages, memtables) are updated in memory and written lazily; group commit batches many transactions into one fsync; checkpoints bound how much log must be replayed. The same log stream feeds replication (ship the log) and change data capture (read the log).
+intuition: Write it in your diary before you rearrange the furniture; if you trip halfway, the diary tells you what you were doing.
+friction: fsync latency bounds commit latency; logs must be truncated after checkpoints; replay after long outages can be slow; misconfigured durability (skipping fsync) silently risks data loss.
+ref: paper | ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging | Mohan et al., ACM TODS 1992 |
+ref: blog | The Log: What every software engineer should know about real-time data's unifying abstraction | Jay Kreps, 2013 | https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying
+
+@@ segments
+value: Splitting a log into segment files makes an infinite log manageable: old data can be deleted or compacted file by file, and any offset can be found quickly.
+how: Kafka writes each partition as a series of segment files named by their base offset, with a sparse offset index (every few KB maps an offset to a byte position) and a time index. Only the active segment is written; closed segments are immutable, so retention deletes whole files, compaction rewrites them, and tiered storage uploads them. Lookup: binary-search the segment by base offset, then the index, then scan a little.
+intuition: A long scroll cut into labeled volumes, each with a small table of contents.
+friction: Many partitions times many segments means many open files; segment size trades retention granularity against file count.
+ref: docs | Kafka design: log | Apache Kafka | https://kafka.apache.org/documentation/#log
+
+@@ cowmor
+value: Copy-on-write and merge-on-read are two strategies for updating immutable files in lakehouses and storage engines. They decide whether you pay for an update when writing or when reading.
+how: Copy-on-write rewrites the affected data files with changes applied, so readers just read files (fast reads, expensive writes). Merge-on-read writes small delta files or deletion vectors, and readers combine base files with deltas (cheap writes, slower reads until compaction merges them). Delta Lake, Iceberg and Hudi support both; deletion vectors are a lightweight merge-on-read for deletes.
+intuition: Reprint the page now, or stick a correction note on it and let readers apply it.
+friction: Wrong choice for the workload causes either write amplification or degraded reads; merge-on-read requires regular compaction.
+ref: docs | Hudi table types: copy-on-write vs merge-on-read | Apache Hudi | https://hudi.apache.org/docs/table_types/
+
+@@ delvec
+value: Deletion vectors mark rows as deleted with a compact bitmap instead of rewriting whole data files, making deletes, updates and merges in lakehouse tables much cheaper.
+how: For each affected data file, the table metadata records a bitmap (usually a Roaring bitmap) of deleted row positions; readers skip those rows; later compaction physically removes them. Delta Lake added them in 2023; Iceberg v3 standardized them (replacing positional delete files).
+intuition: Cross out lines in a printed report instead of reprinting it.
+friction: Reads must apply bitmaps until compaction; many small updates still create overhead; older readers may not support them.
+ref: docs | Delta Lake deletion vectors | Delta Lake | https://docs.delta.io/latest/delta-deletion-vectors.html
+ref: spec | Iceberg spec v3: deletion vectors | Apache Iceberg | https://iceberg.apache.org/spec/
+
+@@ occ
+value: Optimistic concurrency control lets transactions proceed without locks, checking for conflicts only at commit time. It suits workloads where conflicts are rare, and it is how lakehouse tables, many distributed databases and HTTP APIs (ETags) handle concurrent writers.
+how: A transaction reads a version, does its work, and at commit validates that nothing it depended on has changed (or that its write set does not conflict); if valid, it commits atomically (compare-and-swap of a version pointer, put-if-absent of the next log file); otherwise it retries. Lakehouse formats check whether concurrent commits touched the same files or partitions before retrying.
+intuition: Edit freely, and at save time check whether someone else changed the same thing.
+friction: Under high contention, retries waste work and can starve long transactions; requires an atomic primitive in storage.
+ref: paper | On Optimistic Methods for Concurrency Control | Kung & Robinson, ACM TODS 1981 |

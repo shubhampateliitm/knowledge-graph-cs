@@ -1,0 +1,241 @@
+@@ pubsub
+value: Publish–subscribe decouples the senders of messages from the receivers. Producers publish to a topic without knowing who listens; any number of subscribers receive their own copy. It lets one event (an order placed, an ad impression) feed billing, analytics, search and notifications without the producer changing as consumers are added.
+how: A broker or log stores messages per topic. In log-based pub/sub (Kafka, Pulsar), each subscriber group tracks its own position, so groups read independently and can replay. In classic pub/sub (Google Pub/Sub, SNS, MQTT), the broker pushes or tracks per-subscription acknowledgements. Partitioning gives parallelism; consumer groups share partitions among members; delivery guarantees (at-least-once, at-most-once) decide what happens on failure.
+intuition: A radio station: broadcasters don't know who is listening, and new listeners can tune in at any time. Log-based pub/sub adds a recording, so you can rewind.
+friction: Fan-out multiplies load; slow subscribers need backpressure or buffering; ordering is usually per partition only; schema changes must be compatible for every subscriber; debugging 'who consumes this?' needs a catalog of topics and owners.
+ref: book | Enterprise Integration Patterns | Hohpe & Woolf, 2003 | https://www.enterpriseintegrationpatterns.com/
+ref: paper | The Many Faces of Publish/Subscribe | Eugster et al., ACM Computing Surveys 2003 |
+
+@@ mqueue
+value: A message queue distributes work: each message is processed by exactly one consumer, which acknowledges it, after which it is removed. It smooths bursts (the queue absorbs spikes), lets work be spread over many workers, and survives worker crashes through redelivery.
+how: Producers enqueue; consumers dequeue or receive pushes; the broker tracks in-flight messages with visibility timeouts or acknowledgements and redelivers unacknowledged ones. Dead-letter queues hold messages that keep failing. Systems include RabbitMQ, Amazon SQS, ActiveMQ, and now Kafka share groups.
+intuition: A ticket queue at a deli counter: each ticket is served by one clerk, and a ticket returns to the queue if the clerk walks away.
+friction: Redelivery means duplicates, so consumers must be idempotent. Ordering is weak with multiple consumers. Queues hide backlogs until they become huge; monitor age of the oldest message, not just length.
+ref: book | Enterprise Integration Patterns | Hohpe & Woolf, 2003 | https://www.enterpriseintegrationpatterns.com/
+ref: docs | Amazon SQS developer guide | AWS | https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/welcome.html
+
+@@ batchproc
+value: Batch processing runs large computations over a fixed, finite dataset, such as yesterday's logs or a full table, using many machines in parallel. It is the workhorse of data platforms: ETL, reporting, model training data, backfills. Its strength is throughput and simplicity: inputs do not change during the run, so jobs can be retried and results reproduced.
+how: The job becomes a DAG of stages; each stage runs many tasks over partitions of the data; data is exchanged between stages by key (shuffle); failed tasks are re-run using lineage or saved intermediate files; slow tasks get speculative copies. Engines include MapReduce (historical), Spark, Flink (bounded mode), Trino's fault-tolerant mode, and warehouse SQL.
+intuition: Close the shop, count all the stock at once with many people, then reopen. Simple, thorough, but the numbers are only as fresh as the last count.
+friction: Latency is hours, not seconds. Jobs that re-read everything waste compute; incremental processing (only new partitions, MERGE, change data feeds) is the usual improvement. Skew, small files and shuffle spills dominate tuning.
+ref: book | Designing Data-Intensive Applications, 2nd ed. | Martin Kleppmann & Chris Riccomini, 2026 | https://dataintensive.net/
+ref: paper | MapReduce: Simplified Data Processing on Large Clusters | Dean & Ghemawat, 2004 | https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/
+
+@@ lambdakappa
+value: The Lambda architecture (Nathan Marz, around 2011) combined a batch layer (accurate, complete, slow) with a speed layer (fast, approximate) and merged results at query time. The Kappa architecture (Jay Kreps, 2014) argued for a single streaming path: keep the log, and when logic changes, replay it through a new version of the job.
+how: Lambda: raw data goes to both a batch system (Hadoop or Spark recomputing views) and a stream system (Storm, Flink); a serving layer merges the two. Kappa: all data flows through one stream processor reading a durable log; reprocessing means starting a new job from an earlier offset and switching consumers when it catches up.
+intuition: Lambda keeps a fast rough draft and a slow clean copy. Kappa trusts one replayable pipeline.
+friction: Lambda doubles code paths and they drift apart. Kappa needs long log retention and enough capacity to replay quickly. Most modern designs are hybrids: streaming into a lakehouse, with batch backfills on the same tables.
+ref: blog | Questioning the Lambda Architecture | Jay Kreps, 2014 | https://www.oreilly.com/radar/questioning-the-lambda-architecture/
+ref: book | Big Data: Principles and best practices of scalable realtime data systems | Marz & Warren, 2015 |
+
+@@ eventsourcing
+value: Event sourcing stores the history of changes (OrderPlaced, ItemAdded, PaymentReceived) as the source of truth, rather than only the current state. CQRS (command query responsibility segregation) separates the model that handles writes from the models that serve reads. Together they give a full audit trail, the ability to rebuild state, and read models tailored to each query.
+how: Commands are validated against the current state (rebuilt from events, often with snapshots) and produce new events appended to an event store or log. Projections subscribe to events and build read models (tables, search indexes, caches). Rebuilding a projection means replaying events.
+intuition: Accounting ledgers: you never erase entries, you add corrections; balances are computed.
+friction: Event schemas are forever, so versioning is hard. Read models are eventually consistent. Replaying long histories needs snapshots. It adds complexity that many CRUD applications do not need.
+ref: blog | Event Sourcing | Martin Fowler, 2005 | https://martinfowler.com/eaaDev/EventSourcing.html
+ref: blog | CQRS | Martin Fowler, 2011 | https://martinfowler.com/bliki/CQRS.html
+
+@@ cdc
+value: Change data capture streams every insert, update and delete from a database to other systems in near real time, without changing application code and without heavy queries against the source. It keeps caches, search indexes, lakehouses and microservices in sync with the system of record.
+how: Log-based CDC reads the database's own transaction log (Postgres WAL via logical decoding, MySQL binlog, SQL Server CDC tables, MongoDB change streams) and converts entries into change events with before/after images and positions. An initial snapshot loads existing rows. Tools include Debezium, cloud DMS services and vendor connectors; sinks often MERGE changes into Delta or Iceberg tables.
+intuition: Instead of repeatedly asking 'what changed?', listen to the database's own diary.
+friction: Schema changes, large transactions and long outages (log retention) complicate it. Soft deletes and ordering across tables need care. Merging CDC into lakehouse tables creates small files and update-heavy workloads.
+ref: blog | Turning the database inside-out | Martin Kleppmann, 2015 | https://martin.kleppmann.com/2015/03/04/turning-the-database-inside-out.html
+ref: docs | Debezium documentation | Debezium | https://debezium.io/documentation/
+
+@@ datalake
+value: A data lake stores large amounts of raw data, in any format, cheaply in object storage or HDFS, so that many tools can analyze it later. It removed the need to define every schema before collecting data, and cut storage costs dramatically compared with warehouses.
+how: Files (Parquet, ORC, JSON, CSV, images, logs) are written into directory-like prefixes, often partitioned by date or source. Catalogs record schemas and locations. Engines (Spark, Trino, Athena) read the files directly. Object storage provides durability through replication or erasure coding.
+intuition: A huge, cheap warehouse where you can store anything now and decide how to use it later.
+friction: Without transactions and governance, lakes became 'swamps': inconsistent files, failed partial writes, unknown owners, slow listing of millions of files. Lakehouse table formats and catalogs were invented to fix exactly this.
+ref: paper | Lakehouse (CIDR 2021) | Armbrust et al. | https://www.cidrdb.org/cidr2021/papers/cidr2021_paper17.pdf
+ref: book | Fundamentals of Data Engineering | Reis & Housley, 2022 |
+
+@@ warehouse
+value: A data warehouse is a database designed for analytics: curated, integrated, historical data modeled for business questions, with fast SQL. Since Inmon and Kimball in the 1990s, it has been the backbone of reporting and BI. Cloud warehouses (Redshift, BigQuery, Snowflake) made it elastic and managed.
+how: Data is loaded (ETL or ELT) from operational systems, cleaned and modeled (often star schemas), stored in columnar, compressed form, and queried with MPP engines and cost-based optimizers. Modern cloud warehouses separate storage and compute and add materialized views, result caching and data sharing.
+intuition: A well-organized archive designed so that common questions are quick to answer.
+friction: Proprietary storage and cost; latency of batch loading; schema changes require pipeline work. The lakehouse pattern now competes for the same role on open formats.
+ref: book | The Data Warehouse Toolkit, 3rd ed. | Kimball & Ross, 2013 |
+ref: book | Building the Data Warehouse | W. H. Inmon, 1992 |
+
+@@ medallion
+value: The medallion architecture is a simple way to organize lakehouse tables in layers of increasing quality: bronze (raw data as received), silver (cleaned, deduplicated, conformed), gold (business-level aggregates and models). It makes pipelines understandable, debuggable and re-runnable.
+how: Ingestion writes append-only bronze tables (often directly from Kafka or CDC). Transformations read bronze and write silver with validation, type fixes and joins; gold tables are built for specific consumers (dashboards, ML features, APIs). Each step is an idempotent job in a DAG, so any layer can be rebuilt from the one below.
+intuition: Water treatment: raw water, filtered water, drinking water. If something goes wrong downstream, you can always go back upstream.
+friction: Layers multiply storage and compute; 'gold' sprawls without ownership; strict three-layer dogma can add latency where direct paths would do. It is a convention, not a guarantee of quality: tests and contracts are still needed.
+ref: docs | What is the medallion lakehouse architecture? | Databricks | https://docs.databricks.com/en/lakehouse/medallion.html
+
+@@ oltp
+value: OLTP (online transaction processing) systems run the day-to-day operations of applications: placing orders, updating accounts, booking seats. They handle many small reads and writes per second, each needing correctness (ACID) and low latency.
+how: Row-oriented storage with B-tree indexes, write-ahead logging for durability, MVCC or locking for isolation, and normalized schemas to avoid inconsistencies. Replication provides availability; sharding or distributed SQL provides scale.
+intuition: A busy cash register: many quick transactions, each of which must be exactly right.
+friction: Analytics on OLTP databases slow them down, hence separate OLAP systems and CDC. Scaling writes beyond one machine is hard. Isolation levels and anomalies are often misunderstood.
+ref: book | Database System Concepts, 7th ed. | Silberschatz, Korth & Sudarshan, 2019 |
+ref: course | CMU 15-445/645 Database Systems | Andy Pavlo | https://15445.courses.cmu.edu/
+
+@@ htap
+value: HTAP (hybrid transactional/analytical processing) systems run transactions and analytics on the same data at the same time, removing the delay and complexity of copying data into a separate warehouse.
+how: Most keep two physical layouts: a row store for transactions and a column store for analytics, kept consistent by the replication log or by an in-memory columnar copy (TiDB's TiFlash, SingleStore, MySQL HeatWave, Oracle In-Memory, SQL Server columnstore). The optimizer routes each query to the best layout.
+intuition: One set of facts, two ways of shelving them.
+friction: Analytical queries can still interfere with transactional performance; freshness of the columnar side lags slightly; it rarely replaces a full lakehouse for history and heavy batch work.
+ref: paper | TiDB: A Raft-based HTAP Database | Huang et al., VLDB 2020 |
+ref: paper | HTAP Databases: What is New and What is Next | Li & Zhang, SIGMOD 2022 tutorial |
+
+@@ rtanalytics
+value: Real-time analytics serves aggregations over very fresh data (seconds old) with sub-second latency and high concurrency, often directly to end users or applications: ad dashboards, fraud monitors, delivery tracking, observability.
+how: Stream ingestion (usually from Kafka) into columnar, indexed segments; pre-aggregation (rollups, star-trees, materialized views); scatter–gather query execution across shards; careful partitioning by time and key. Engines include Pinot, Druid, ClickHouse and StarRocks.
+intuition: Precompute and index for the questions you know, so answers are instant.
+friction: Index design depends on query patterns; upserts and late data complicate segments; costs rise with retention; it complements rather than replaces a lakehouse.
+ref: paper | Pinot: Realtime OLAP for 530 Million Users | Im et al., SIGMOD 2018 |
+ref: paper | Druid: A Real-time Analytical Data Store | Yang et al., SIGMOD 2014 |
+
+@@ searchengine
+value: A search engine finds the most relevant documents for a query among millions or billions, in milliseconds. It powers web search, e-commerce search, log search and, increasingly, retrieval for RAG.
+how: Documents are analyzed into terms and indexed in an inverted index; queries are parsed and matched against posting lists; candidates are scored (BM25, plus signals like freshness and popularity) and the top results returned; learning-to-rank or neural re-rankers may refine the order. At scale, the index is sharded and replicated, and queries are scattered and gathered. Hybrid search combines keyword and vector retrieval.
+intuition: A library catalogue that ranks books by how well they match your question.
+friction: Relevance tuning is endless and domain-specific; language analysis (stemming, synonyms, multilingual) is hard; index updates trade freshness against cost.
+ref: book | Introduction to Information Retrieval | Manning, Raghavan & Schütze, 2008 | https://nlp.stanford.edu/IR-book/
+ref: book | Relevant Search | Turnbull & Berryman, 2016 |
+
+@@ mpp
+value: Massively parallel processing SQL engines split one query across many machines so that terabytes can be scanned and joined in seconds. They are the engines inside warehouses and lakehouse SQL: Spark SQL, Trino, Snowflake, BigQuery, Redshift, Databricks SQL.
+how: A coordinator parses SQL, builds a logical plan, optimizes it (rule-based rewrites and cost-based join ordering using statistics), and splits it into stages. Workers scan partitions in parallel, apply filters as early as possible, exchange data by hash for joins and aggregations (shuffle) or broadcast small tables, and merge partial results. Execution uses vectorized or compiled operators; adaptive execution re-plans with runtime statistics.
+intuition: Divide the question into many small identical questions, answer them in parallel, and combine the answers.
+friction: Shuffles and skew dominate cost; bad statistics produce bad plans; coordination overhead makes tiny queries relatively slow; concurrency must be managed.
+ref: paper | Access Path Selection in a Relational Database Management System | Selinger et al., SIGMOD 1979 |
+ref: course | CMU 15-721 Advanced Database Systems | Andy Pavlo | https://15721.courses.cmu.edu/
+
+@@ catalog
+value: A data catalog tracks what data exists, where it lives, what it means, who owns it, who may use it, and where it came from. In lakehouses, it also performs the atomic commit that makes table updates safe. It turns a pile of tables into a governed, discoverable data estate.
+how: Technical metadata (schemas, locations, versions) is stored and served to engines; permissions are enforced at table, column and row level; lineage is captured from jobs and queries; business metadata (descriptions, owners, tags, classifications) supports discovery and compliance. Examples: Unity Catalog, Polaris, AWS Glue, Hive Metastore, DataHub, OpenMetadata.
+intuition: The card catalogue and the security desk of a library, combined.
+friction: Metadata goes stale without automation; ownership is a people problem; multiple catalogs across engines create conflicting sources of truth.
+ref: book | Data Management at Scale, 2nd ed. | Piethein Strengholt, 2023 |
+ref: docs | Unity Catalog documentation | Databricks | https://docs.databricks.com/en/data-governance/unity-catalog/index.html
+
+@@ workflow
+value: Workflow orchestration runs pipelines of dependent tasks on schedules or triggers, with retries, alerts and visibility. It is how data platforms make sure 'load raw data, then clean it, then build reports, then train the model' happens correctly every day.
+how: Pipelines are defined as DAGs (Airflow, Dagster, Prefect, Databricks Workflows) or as durable workflow code (Temporal). A scheduler creates runs, tracks task state in a database, and hands ready tasks to executors; failed tasks are retried; backfills rerun history. Asset-based orchestrators track data products instead of only tasks.
+intuition: A conductor who knows the order of the music and restarts a section when a musician misses a note.
+friction: Orchestrators become dumping grounds for business logic; tasks must be idempotent for safe retries; scheduling by time instead of by data availability causes silent failures; observability across tools is uneven.
+ref: book | Data Pipelines with Apache Airflow | Harenslak & de Ruiter, 2021 |
+ref: book | Fundamentals of Data Engineering, ch. 'Orchestration' | Reis & Housley, 2022 |
+
+@@ microservices
+value: Microservices split an application into small, independently deployable services, each owning its data and a business capability. Teams can deploy, scale and choose technology independently, which helps large organizations move faster.
+how: Services communicate over the network with HTTP/JSON, gRPC or events. Each service has its own database. Supporting infrastructure includes service discovery, API gateways, service meshes, distributed tracing, and patterns like circuit breakers, retries with backoff, sagas and the transactional outbox.
+intuition: Many small shops with clear contracts instead of one huge department store.
+friction: Every function call becomes a network call that can fail, time out or be slow. Data consistency across services needs sagas and events. Debugging, testing and operations get harder; many teams later merge services back ('distributed monolith' is a common failure).
+ref: blog | Microservices | Lewis & Fowler, 2014 | https://martinfowler.com/articles/microservices.html
+ref: book | Building Microservices, 2nd ed. | Sam Newman, 2021 |
+
+@@ servicemesh
+value: A service mesh moves networking concerns (encryption, identity, retries, timeouts, load balancing, traffic shifting, telemetry) out of application code into a uniform infrastructure layer.
+how: A proxy runs next to each service (sidecar) or per node (ambient/sidecarless); all traffic passes through it. A control plane distributes configuration and certificates. Examples: Istio, Linkerd, Cilium service mesh.
+intuition: Every service gets a bodyguard and an interpreter who handle the dangerous and tedious parts of communication.
+friction: Resource overhead and extra latency per hop; complex configuration and debugging; may be overkill for small systems.
+ref: blog | What's a service mesh? And why do I need one? | William Morgan (Buoyant), 2017 | https://buoyant.io/service-mesh-manifesto
+
+@@ apigateway
+value: An API gateway is the single entry point for external clients into a set of services. It centralizes authentication, rate limiting, routing, request transformation and analytics.
+how: A reverse proxy (Kong, NGINX, Envoy-based gateways, AWS API Gateway) terminates TLS, validates tokens, applies quotas, routes requests to backend services by path or header, and may aggregate responses.
+intuition: A building's reception desk: check ID, give directions, and stop crowds at the door.
+friction: Can become a bottleneck or a single point of failure; logic creeps into the gateway; latency added per request.
+ref: blog | Pattern: API Gateway / Backends for Frontends | Chris Richardson | https://microservices.io/patterns/apigateway.html
+
+@@ loadbalancing
+value: Load balancing spreads requests across many copies of a service, giving capacity and availability: if one copy fails, others keep serving.
+how: Layer-4 balancers route connections by IP and port; layer-7 balancers route individual HTTP requests by path, header or cookie. Algorithms include round robin, least connections, weighted, and consistent hashing (for cache affinity). Health checks remove failed instances. Global load balancing uses DNS or anycast across regions.
+intuition: Several checkout lanes with a person directing customers to the shortest line.
+friction: Sticky sessions and long-lived connections (gRPC, WebSockets) unbalance load; health checks can be misleading; the balancer itself must be highly available.
+ref: blog | Load Balancing (interactive essay) | Sam Rose | https://samwho.dev/load-balancing/
+ref: book | Site Reliability Engineering, ch. 19–20 | Beyer et al., Google, 2016 | https://sre.google/sre-book/table-of-contents/
+
+@@ cloudcomp
+value: Cloud computing turns infrastructure into rented, elastic services, so teams can provision capacity in minutes, pay for what they use and rely on managed services instead of operating everything themselves.
+how: Large providers virtualize compute (VMs, containers, functions), storage (object, block, file) and networking (VPCs, load balancers) across regions and availability zones, exposed through APIs with identity and access controls and usage-based billing.
+intuition: Infrastructure becomes software: you call an API instead of ordering hardware.
+friction: Cost management (FinOps) is a discipline; managed services create lock-in; shared-responsibility security; outages and quotas outside your control.
+ref: paper | Above the Clouds: A Berkeley View of Cloud Computing | Armbrust et al., 2009 |
+ref: book | Cloud FinOps, 2nd ed. | Storment & Fuller, 2023 |
+
+@@ serverless
+value: Serverless lets developers run code or use services without managing servers: the platform scales automatically, including to zero, and bills per use. It fits spiky, event-driven workloads well.
+how: Functions (AWS Lambda, Cloud Functions, Azure Functions, Cloudflare Workers) run in short-lived sandboxes started on demand; serverless data services (BigQuery, DynamoDB on-demand, Aurora Serverless, serverless Spark/SQL warehouses) scale capacity per request. State lives in external storage.
+intuition: Pay for the taxi ride, not for owning the car.
+friction: Cold starts, execution limits, harder local testing, vendor lock-in, and costs that can exceed dedicated capacity at constant high load.
+ref: paper | Cloud Programming Simplified: A Berkeley View on Serverless Computing | Jonas et al., 2019 | https://arxiv.org/abs/1902.03383
+
+@@ containers
+value: Containers package an application with its dependencies and run it as an isolated process on a shared kernel. They start in milliseconds, use little overhead, and run identically across environments, which made them the unit of modern deployment.
+how: Linux namespaces give each container its own view of process IDs, network interfaces, mounts, hostnames and users; cgroups limit CPU, memory and I/O; layered images with a union file system make images small and shareable; OCI standards define image and runtime formats.
+intuition: A lightweight apartment in a shared building: own rooms and locks, shared foundation and plumbing (the kernel).
+friction: Weaker isolation than VMs (kernel exploits affect all containers); image supply-chain security; resource limits that are too tight cause throttling and OOM kills.
+ref: blog | A brief history of containers | Rani Osnat, Aqua, 2020 |
+ref: docs | Linux namespaces man page | Linux | https://man7.org/linux/man-pages/man7/namespaces.7.html
+
+@@ virtualization
+value: Virtualization runs several complete operating systems on one physical machine, each in its own virtual machine with strong isolation. It made cloud computing possible and lets providers safely share hardware among customers.
+how: A hypervisor (KVM, Xen, VMware ESXi, Hyper-V, AWS Nitro) uses CPU virtualization extensions to run guest kernels directly on the processor while trapping privileged operations, virtualizes memory with nested page tables, and presents virtual devices (often paravirtualized or hardware-offloaded, as with Nitro cards).
+intuition: One physical house divided into fully separate apartments, each with its own front door and utilities meters.
+friction: Overhead and slower startup than containers; noisy neighbors still share caches and memory bandwidth; side-channel attacks (Spectre-class) cross VM boundaries.
+ref: paper | Xen and the Art of Virtualization | Barham et al., SOSP 2003 |
+ref: paper | Formal Requirements for Virtualizable Third Generation Architectures | Popek & Goldberg, 1974 |
+
+@@ orchestration
+value: Container orchestration (Kubernetes above all, earlier Mesos, YARN, Nomad) runs and heals large numbers of containers across many machines from a declarative description, handling placement, scaling, networking, configuration and rolling updates.
+how: A control plane stores desired state in a consistent store; controllers reconcile actual state toward it; a scheduler places workloads based on resource requests, constraints and affinities; node agents run containers and report health.
+intuition: An air-traffic controller for software, constantly steering reality back toward the plan.
+friction: Complexity of the platform; resource requests and limits are hard to set; stateful workloads need operators; upgrade treadmill.
+ref: paper | Borg, Omega, and Kubernetes | Burns et al., ACM Queue 2016 |
+ref: paper | Large-scale cluster management at Google with Borg | Verma et al., EuroSys 2015 |
+
+@@ iac
+value: Infrastructure as code describes infrastructure (networks, clusters, databases, permissions) in version-controlled files that are reviewed and applied automatically, replacing manual console clicks. It makes environments reproducible and changes auditable.
+how: Declarative tools (Terraform/OpenTofu, CloudFormation, Pulumi, Crossplane) compute a plan from the difference between desired configuration and recorded or observed state, then call provider APIs in dependency order. GitOps applies the same idea continuously with controllers watching a Git repository.
+intuition: A recipe that rebuilds the same kitchen every time.
+friction: State drift from manual changes; large blast radius of a bad apply; secrets in code; slow plans for large estates.
+ref: book | Infrastructure as Code, 2nd ed. | Kief Morris, 2020 |
+
+@@ coordination
+value: A coordination service is a small, highly reliable cluster that stores critical shared facts for larger systems: who the leader is, which nodes are alive, configuration, locks and partition assignments. ZooKeeper, etcd, Consul, Chubby and Kafka's KRaft quorum play this role.
+how: A consensus protocol (ZAB, Raft, Paxos) replicates a small key-value or tree store across 3 or 5 nodes; writes commit on a majority; clients use sessions, leases, watches and compare-and-swap operations to build elections and locks.
+intuition: A tiny, extremely trusted committee whose decisions the whole company follows.
+friction: Locks from coordination services are only safe with fencing tokens; overloaded coordination clusters take down everything that depends on them; latency is bounded by consensus round trips.
+ref: paper | The Chubby lock service for loosely-coupled distributed systems | Mike Burrows, OSDI 2006 |
+ref: paper | ZooKeeper: Wait-free coordination for Internet-scale systems | Hunt et al., USENIX ATC 2010 |
+
+@@ cachelayer
+value: A caching layer keeps frequently used data in fast memory in front of a slower store (database, API, object storage), cutting latency and protecting back-ends from load. Redis, Memcached, CDNs and in-process caches all play this role.
+how: Common patterns: cache-aside (application reads cache, on miss reads the database and fills the cache), read-through, write-through and write-behind. Keys are distributed across cache nodes by hashing; eviction policies (LRU, LFU) handle limited memory; TTLs bound staleness; request coalescing prevents stampedes when a hot key expires.
+intuition: Keep the most-asked answers on a sticky note at your desk.
+friction: Cache invalidation is famously hard; stale data, thundering herds, hot keys and cold starts after restarts cause incidents. Caches can hide back-end capacity problems until they fail.
+ref: paper | Scaling Memcache at Facebook | Nishtala et al., NSDI 2013 |
+ref: blog | Caching: what could go wrong? (cache stampede, invalidation) | AWS Builders' Library | https://aws.amazon.com/builders-library/caching-challenges-and-strategies/
+
+@@ cdn
+value: A content delivery network copies content to servers at the edge of the internet, close to users, reducing latency and offloading origin servers. Video streaming, websites and software downloads depend on CDNs (Akamai from 1998, Cloudflare, Fastly, CloudFront).
+how: DNS or anycast directs users to a nearby edge location; edge caches serve objects if fresh (by TTL and cache headers) or fetch from the origin, often through mid-tier caches; consistent hashing spreads content across edge servers; edge compute runs code close to users.
+intuition: Stock popular products in every neighborhood store instead of shipping each one from the central warehouse.
+friction: Cache invalidation and purges; personalized content is hard to cache; costs and configuration complexity; dependence on a few providers.
+ref: paper | The Akamai Network: A Platform for High-Performance Internet Applications | Nygren, Sitaraman & Sun, 2010 |
+
+@@ observability
+value: Observability is the ability to understand a system's internal state from its outputs: metrics (numbers over time), logs (events), traces (the path of a request through services), and increasingly profiles. It turns 'something is wrong' into 'this service, this dependency, since this deploy'.
+how: Services are instrumented (OpenTelemetry); collectors process and sample telemetry; back-ends store metrics (Prometheus), logs (Elasticsearch, Loki, ClickHouse) and traces (Jaeger, Tempo); dashboards and alerts track service-level objectives (SLOs) and error budgets. High-cardinality event analysis (Honeycomb-style) helps answer new questions.
+intuition: Instruments on an aircraft's dashboard, plus a flight recorder.
+friction: Telemetry volume and cost explode; sampling loses rare events; alert fatigue; correlating signals across tools is still hard.
+ref: book | Observability Engineering, 2nd ed. | Majors, Fong-Jones & Miranda, 2026 |
+ref: book | Site Reliability Engineering | Beyer et al., Google, 2016 | https://sre.google/sre-book/table-of-contents/
+
+@@ security
+value: Security architecture protects systems and data from misuse. Modern practice is 'zero trust': no request is trusted because of where it comes from; every request is authenticated, authorized and encrypted, with least privilege and short-lived credentials.
+how: Identity for users (SSO, OIDC, MFA) and for workloads (service accounts, SPIFFE, mutual TLS); fine-grained authorization (RBAC, ABAC, policies); encryption in transit (TLS) and at rest (KMS); secrets management; network segmentation; audit logging; supply-chain security (signed artifacts, SBOMs); privacy controls.
+intuition: Check ID at every door, not just at the building entrance.
+friction: Security adds friction for developers; misconfiguration is the main cause of cloud breaches; legacy systems resist modern identity; AI agents introduce new attack surfaces like prompt injection.
+ref: paper | BeyondCorp: A New Approach to Enterprise Security | Ward & Beyer, ;login: 2014 |
+ref: book | Security Engineering, 3rd ed. | Ross Anderson, 2020 | https://www.cl.cam.ac.uk/~rja14/book.html

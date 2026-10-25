@@ -1,0 +1,275 @@
+@@ mesos
+value: Apache Mesos (UC Berkeley, 2009; used heavily at Twitter) was an early 'data-centre operating system': it pooled the CPU and memory of many machines and shared them among frameworks such as Spark, Marathon and Chronos. It mattered historically and still runs in some older clusters.
+how: Mesos uses two-level scheduling. The Mesos master offers available resources on agents to frameworks; each framework's own scheduler accepts or declines offers and launches tasks in them. This let each framework keep its own scheduling logic. ZooKeeper provided master election.
+intuition: A landlord that advertises free rooms; each tenant decides which rooms to take.
+friction: Kubernetes won the ecosystem and Mesos activity dropped sharply. Spark deprecated Mesos support in 3.2 and removed it in Spark 4.0, so Spark jobs on Mesos must move to Kubernetes or YARN before upgrading.
+ref: paper | Mesos: A Platform for Fine-Grained Resource Sharing in the Data Center | Hindman et al., NSDI 2011 |
+ref: docs | Spark Core migration guide: Mesos removed in 4.0 | Apache Spark | https://spark.apache.org/docs/4.0.0/core-migration-guide.html
+
+@@ yarn
+value: YARN (Yet Another Resource Negotiator, Hadoop 2, 2012) separated resource management from MapReduce, so many engines (Spark, Flink, Tez, Hive) could share one Hadoop cluster.
+how: A ResourceManager tracks cluster capacity and runs schedulers (capacity or fair) with queues; each application has an ApplicationMaster that requests containers; NodeManagers on each machine launch and monitor them.
+intuition: A central booking office for cluster resources, with each job sending its own manager to negotiate.
+friction: Tied to the Hadoop ecosystem; less flexible for long-running services; Kubernetes has replaced it in most new cloud deployments.
+ref: paper | Apache Hadoop YARN: Yet Another Resource Negotiator | Vavilapalli et al., SoCC 2013 |
+
+@@ hive
+value: Apache Hive (Facebook, 2008) brought SQL to Hadoop, letting analysts query huge datasets without writing MapReduce code. Its metastore became the long-lasting standard catalog of the data-lake world.
+how: HiveQL queries are parsed and optimized into DAGs of MapReduce, Tez or Spark jobs. Tables map to directories of files, partitions to subdirectories, and schemas are applied on read. The metastore stores schemas and locations.
+intuition: Put a SQL front door on a file system.
+friction: High latency for interactive use; Spark SQL, Trino and lakehouse engines replaced most Hive execution. Directory-based tables lack atomic commits, which table formats fixed.
+ref: paper | Hive: A Warehousing Solution over a Map-Reduce Framework | Thusoo et al., VLDB 2009 |
+
+@@ velox
+value: Velox (Meta, open-sourced 2022) and Apache DataFusion are reusable execution engines: libraries of fast vectorized operators, expression evaluation and memory management that query engines embed. They reduce the cost of building a new engine and let different systems share one fast core (Velox powers Presto's native engine and Gluten for Spark; DataFusion powers many Rust-based systems).
+how: Columnar vectors in memory (Arrow-compatible), vectorized operators for filters, joins and aggregations, adaptive expression evaluation and spilling, exposed as C++ (Velox) or Rust (DataFusion) libraries.
+intuition: Many databases rewrite the same execution engine; build it once, well, and share it.
+friction: Integration with each host engine's planner and type semantics is hard work; behavior differences between engines (null handling, casting) surface as bugs.
+ref: paper | Velox: Meta's Unified Execution Engine | Pedreira et al., VLDB 2022 |
+ref: docs | Apache DataFusion | Apache Software Foundation | https://datafusion.apache.org/
+
+@@ dbt
+value: dbt (data build tool) made analytics engineering a software practice: transformations are SQL files under version control, with dependencies, tests, documentation and environments. It is how many teams build their warehouse and lakehouse models.
+how: Each model is a SELECT statement; ref() calls declare dependencies, so dbt builds a DAG and runs models in order as tables, views or incremental merges. Tests (unique, not null, relationships, custom) run after builds; docs and lineage are generated automatically. Macros (Jinja templating) add reuse.
+intuition: Treat SQL transformations like code: modular, tested and reviewed.
+friction: Large projects become slow to compile and hard to navigate; Jinja templating can hurt readability; incremental logic is easy to get subtly wrong.
+ref: docs | dbt documentation | dbt Labs | https://docs.getdbt.com/
+
+@@ temporal
+value: Temporal makes long-running business processes reliable: a workflow written as ordinary code (charge card, wait for shipping, send email, retry for days) survives crashes, deploys and outages, continuing exactly where it left off.
+how: Workflow code runs on workers, but every decision and result is recorded as events in a durable history held by the Temporal service. If a worker dies, another worker replays the history to rebuild the workflow's state deterministically and continues. Side effects happen in activities, which have their own retries and timeouts. It descends from Uber's Cadence.
+intuition: Event sourcing for your program's execution: the log of what happened is the program's memory.
+friction: Workflow code must be deterministic (no direct time or random calls); versioning long-running workflows is tricky; the service is another critical system to run or rent.
+ref: docs | Temporal documentation | Temporal Technologies | https://docs.temporal.io/
+
+@@ avro
+value: Apache Avro and Protocol Buffers are compact binary serialization formats with schemas. In streaming systems, they keep messages small and let producers and consumers evolve their data formats safely over years.
+how: A schema defines fields and types. Avro writes data without field names, and readers resolve the writer's schema against their own (so schemas must travel with data or via a registry). Protobuf tags each field with a number, so unknown fields can be skipped and fields can be added without breaking old readers. Both generate code in many languages.
+intuition: Agree on the shape of data once, and send only the values.
+friction: Compatibility rules must be followed (never reuse field numbers, give defaults); schema governance across teams needs process and tooling.
+ref: docs | Apache Avro specification | Apache Avro | https://avro.apache.org/docs/
+ref: docs | Protocol Buffers documentation | Google | https://protobuf.dev/
+ref: book | Designing Data-Intensive Applications, 2nd ed. | Martin Kleppmann & Chris Riccomini, 2026 | https://dataintensive.net/
+
+@@ schemareg
+value: A schema registry stores the schemas of Kafka messages centrally and enforces compatibility, so a producer cannot publish a change that would break consumers.
+how: Each topic subject has versioned schemas (Avro, Protobuf or JSON Schema). Producers register or look up a schema and prefix each message with a small schema ID; consumers fetch the schema by ID. Compatibility modes (backward, forward, full, transitive) are checked on registration.
+intuition: A contract office for data formats.
+friction: Another critical service; compatibility settings must match how teams actually deploy; license varies by vendor (Confluent's is source-available; Apicurio and Karapace are open source).
+ref: docs | Confluent Schema Registry documentation | Confluent | https://docs.confluent.io/platform/current/schema-registry/index.html
+
+@@ tidb
+value: TiDB (PingCAP) is an open-source distributed SQL database that is MySQL-compatible and offers HTAP: transactions and real-time analytics on the same data.
+how: Stateless SQL nodes parse and plan queries. TiKV stores data as key-value ranges, each replicated with Raft, using RocksDB underneath, with Percolator-style distributed transactions. TiFlash keeps columnar replicas, updated asynchronously through Raft learners, which the optimizer uses for analytical queries.
+intuition: One database, two layouts: rows for transactions, columns for analytics, kept in sync by the replication log.
+friction: Many components to run; cross-region latency; analytics freshness depends on replica lag; MySQL compatibility is broad but not complete.
+ref: paper | TiDB: A Raft-based HTAP Database | Huang et al., VLDB 2020 |
+
+@@ scylla
+value: ScyllaDB reimplements Cassandra's data model and protocol in C++ to get much higher throughput and lower tail latency per machine.
+how: Built on the Seastar framework: one thread per core, each owning a shard of data, memory and network queues, communicating by message passing; its own I/O scheduler and cache instead of the OS page cache; LSM storage with tablets for elastic distribution.
+intuition: Remove locks and context switches by giving each core its own private world.
+friction: Source-available license since 2024; fewer ecosystem tools; same data-modeling constraints as Cassandra.
+ref: docs | Seastar | ScyllaDB | https://seastar.io/
+ref: docs | ScyllaDB documentation | ScyllaDB | https://docs.scylladb.com/
+
+@@ fdb
+value: FoundationDB is a distributed, ordered key-value store with strict serializable ACID transactions, used by Apple (CloudKit) and Snowflake (metadata). It is famous for its testing approach: deterministic simulation of the entire cluster.
+how: Transactions use optimistic concurrency with a sequencer that hands out versions and resolvers that detect conflicts; storage servers hold key ranges. Other data models (documents, records) are built as 'layers' on top. The whole system runs in a simulator that controls time, networking and disk faults deterministically, so years of failure scenarios can be explored and any bug replayed.
+intuition: Get one simple thing (transactional sorted keys) perfectly right, and test it harder than anyone else.
+friction: Transactions are limited in size and duration (about 5 seconds); higher-level layers are your responsibility.
+ref: paper | FoundationDB: A Distributed Unbundled Transactional Key Value Store | Zhou et al., SIGMOD 2021 |
+ref: docs | FoundationDB simulation and testing | Apple | https://apple.github.io/foundationdb/testing.html
+
+@@ memcached
+value: Memcached (2003, LiveJournal) is a simple, fast, distributed in-memory cache. Facebook scaled it to thousands of servers to serve its social graph.
+how: Each server is an independent multi-threaded hash table with LRU eviction and slab memory allocation; clients choose a server by hashing the key (often with consistent hashing). There is no replication or persistence; misses go to the database.
+intuition: The simplest possible cache, multiplied.
+friction: No data structures beyond key–value, no persistence, and cache consistency with the database is the application's problem (Facebook's paper describes leases and invalidation pipelines to handle it).
+ref: paper | Scaling Memcache at Facebook | Nishtala et al., NSDI 2013 |
+
+@@ istio
+value: Istio is a service mesh: it adds encryption, identity, traffic control and telemetry to every service-to-service call in Kubernetes without changing application code.
+how: A control plane (istiod) issues certificates and pushes configuration to Envoy proxies running beside each workload (sidecars) or, in ambient mode, to per-node and per-namespace proxies. Policies define mutual TLS, retries, timeouts, traffic splits for canaries, and authorization rules.
+intuition: Move the hard parts of networking out of every app and into a shared, programmable layer.
+friction: Operational complexity, added latency and resource use; debugging requires understanding the mesh; ambient mode reduces sidecar overhead but is newer.
+ref: docs | Istio documentation | CNCF | https://istio.io/latest/docs/
+
+@@ cilium
+value: Cilium provides Kubernetes networking, load balancing, network security and observability using eBPF programs inside the Linux kernel, replacing iptables-based approaches with something faster and more expressive.
+how: eBPF programs attached to network hooks route packets between pods, implement Service load balancing, enforce identity-based policies (including HTTP-aware rules) and export flow logs (Hubble), without the long iptables rule chains of kube-proxy.
+intuition: Program the kernel's network path directly instead of configuring a maze of rules.
+friction: Requires recent kernels and eBPF knowledge to debug; a powerful but complex component in the critical path.
+ref: docs | Cilium documentation | CNCF | https://docs.cilium.io/
+ref: docs | What is eBPF? | eBPF Foundation | https://ebpf.io/what-is-ebpf/
+
+@@ grafana
+value: Grafana is the most popular open-source dashboarding tool for metrics, logs and traces, connecting to Prometheus, Elasticsearch, Loki, Tempo, databases and cloud monitoring.
+how: Dashboards are made of panels that run queries against data sources and visualize the results; alert rules evaluate queries and notify. The Grafana Labs stack adds Loki (logs), Tempo (traces) and Mimir (metrics).
+intuition: One window onto many telemetry stores.
+friction: Dashboards sprawl; expensive queries can overload back-ends; AGPL license matters to some companies.
+ref: docs | Grafana documentation | Grafana Labs | https://grafana.com/docs/
+
+@@ vault
+value: HashiCorp Vault stores and controls access to secrets (API keys, database passwords, certificates) and, more importantly, issues short-lived, dynamic credentials so long-lived secrets do not exist. OpenBao is its open-source fork.
+how: Secrets engines generate or store secrets (dynamic database users, PKI certificates, cloud credentials); auth methods verify clients (Kubernetes service accounts, OIDC); policies decide access; every operation is audited. Storage is encrypted with keys protected by unsealing (Shamir key shares or a cloud KMS); integrated storage uses Raft.
+intuition: Instead of handing out permanent keys, rent temporary ones that expire on their own.
+friction: Critical availability dependency; operational and policy complexity; BSL license change led to the OpenBao fork.
+ref: docs | Vault documentation | HashiCorp | https://developer.hashicorp.com/vault/docs
+
+@@ haproxy
+value: HAProxy (2001) is a fast, reliable TCP and HTTP load balancer and proxy used by many large websites.
+how: Event-driven, multi-threaded processing with health checks, many load-balancing algorithms, stick tables for rate limiting and session persistence, TLS termination and detailed statistics.
+intuition: A traffic controller that never sleeps and counts everything.
+friction: Configuration complexity; dynamic service discovery and mesh features are less native than Envoy's.
+ref: docs | HAProxy documentation | HAProxy Technologies | https://docs.haproxy.org/
+
+@@ lambda
+value: AWS Lambda (2014) popularized serverless computing: upload a function, connect it to events (HTTP requests, S3 uploads, queue messages), and pay only per invocation and duration, with automatic scaling to zero.
+how: Each function runs in a Firecracker micro-VM (a minimal virtual machine that boots in about 125 ms), reused for subsequent invocations while warm. Lambda scales by creating more execution environments in parallel, up to account concurrency limits.
+intuition: Rent computing by the millisecond, triggered by events.
+friction: Cold starts add latency; execution time is capped (15 minutes); state must live elsewhere; debugging distributed event chains is harder; costs can exceed always-on servers at steady high load.
+ref: paper | Firecracker: Lightweight Virtualization for Serverless Applications | Agache et al., NSDI 2020 |
+ref: paper | Cloud Programming Simplified: A Berkeley View on Serverless Computing | Jonas et al., 2019 | https://arxiv.org/abs/1902.03383
+
+@@ cloudflare
+value: Cloudflare runs one of the largest edge networks, providing CDN caching, DDoS protection, DNS, security and serverless compute (Workers) close to users worldwide.
+how: Anycast routing announces the same IP addresses from hundreds of cities, so users reach the nearest data centre. Each server runs the full stack (caching, firewall, Workers runtime based on V8 isolates rather than containers, so code starts in milliseconds).
+intuition: Bring the front door of every website within a few milliseconds of every user.
+friction: Concentration risk: outages affect large parts of the internet; edge compute has limits on runtime and memory.
+ref: docs | Cloudflare learning center: what is a CDN? | Cloudflare | https://www.cloudflare.com/learning/cdn/what-is-a-cdn/
+
+@@ mlflow
+value: MLflow (Databricks, 2018) is the most widely used open-source tool for managing the machine-learning lifecycle: tracking experiments, packaging models, registering versions and deploying them.
+how: The tracking server records parameters, metrics and artifacts for each run; models are saved in a standard format with 'flavors' for many frameworks; the model registry manages versions and stages; newer features cover LLM tracing and evaluation.
+intuition: A lab notebook and a release process for models.
+friction: Many teams use only tracking; governance and deployment often need other tools; server scaling for large organizations needs care.
+ref: docs | MLflow documentation | Linux Foundation / Databricks | https://mlflow.org/docs/latest/
+
+@@ feast
+value: Feast is an open-source feature store: it keeps feature definitions in one place and serves the same values for offline training (point-in-time correct) and online prediction (low latency).
+how: Feature views define how features are computed from sources; offline stores (warehouse, lakehouse) provide historical joins 'as of' each training example's timestamp; materialization jobs load latest values into an online store (Redis, DynamoDB) for serving.
+intuition: Make the model see the same world during training and in production.
+friction: Feature freshness, backfills and consistency between offline and online stores are hard; streaming features need extra pipelines.
+ref: docs | Feast documentation | Feast | https://docs.feast.dev/
+ref: blog | Meet Michelangelo: Uber's Machine Learning Platform | Uber Engineering, 2017 |
+
+@@ llamacpp
+value: llama.cpp (Georgi Gerganov, 2023) and tools built on it, such as Ollama, made it possible to run capable LLMs locally on laptops, phones and CPUs, which opened private, offline and cheap AI use.
+how: Model weights are converted into the GGUF file format and quantized to 2–8 bits per weight with group-wise scales; hand-optimized kernels for CPUs (SIMD), Apple Metal, CUDA and others run inference; the KV cache can also be quantized. Ollama wraps it with a model library and a simple API.
+intuition: Shrink the numbers until the model fits in ordinary memory, then make every cycle count.
+friction: Lower precision costs some quality; local throughput is far below datacenter serving; formats and kernels change rapidly.
+ref: docs | llama.cpp | ggml project | https://github.com/ggerganov/llama.cpp
+ref: docs | Ollama | Ollama | https://ollama.com/
+
+@@ sglang
+value: SGLang (LMSYS, 2023) and NVIDIA's TensorRT-LLM are high-performance LLM serving engines that compete with vLLM. SGLang is known for efficient prefix reuse in agent and multi-turn workloads.
+how: SGLang's RadixAttention keeps KV caches of past prompts in a radix tree so requests sharing a prefix reuse it automatically, plus a fast scheduler and structured-output decoding. TensorRT-LLM compiles models into optimized GPU kernels with in-flight batching and FP8/FP4 quantization.
+intuition: Never compute the same prefix twice, and fuse everything else into tight GPU kernels.
+friction: Rapidly evolving; model support and features differ between engines; tuning for each hardware generation.
+ref: paper | SGLang: Efficient Execution of Structured Language Model Programs | Zheng et al., 2023 | https://arxiv.org/abs/2312.07104
+ref: docs | TensorRT-LLM | NVIDIA | https://github.com/NVIDIA/TensorRT-LLM
+
+@@ a2a
+value: Agent2Agent (A2A), introduced by Google in 2025 and later donated to the Linux Foundation, is a protocol for AI agents built by different vendors to discover each other's capabilities and delegate tasks. It complements MCP, which connects agents to tools and data.
+how: Agents publish an 'agent card' describing skills and endpoints; clients send tasks over HTTP with JSON-RPC, receive status updates and artifacts, and can stream long-running work.
+intuition: MCP is how an agent uses a tool; A2A is how an agent asks another agent for help.
+friction: Early-stage ecosystem; trust, authentication and accountability across agents from different organizations are unsolved in general.
+ref: docs | Agent2Agent protocol | Linux Foundation |
+
+@@ cursor
+value: AI-native code editors such as Cursor and GitHub Copilot (2021 onward) put LLMs directly into the developer's editor: inline completion, chat about the codebase, multi-file edits and agent modes.
+how: The editor indexes the repository (often with embeddings), assembles relevant context for each request, calls models for completions or edits, and applies diffs; agent modes run tools such as terminals and tests.
+intuition: Pair programming with a model that has read your whole codebase.
+friction: Suggestions can be subtly wrong; context selection limits quality on large codebases; security and IP policies need attention.
+ref: paper | Evaluating Large Language Models Trained on Code (Codex) | Chen et al., 2021 | https://arxiv.org/abs/2107.03374
+
+@@ jupyter
+value: Jupyter notebooks (2014, from IPython) are the standard environment for exploratory data science and teaching: code, results, charts and text in one document.
+how: The notebook front end sends code cells to a kernel process (Python or many other languages) over a messaging protocol; the kernel keeps state between cells and returns outputs. Notebooks are saved as JSON (.ipynb).
+intuition: A lab notebook that can run its own experiments.
+friction: Hidden state from out-of-order execution makes notebooks hard to reproduce; JSON diffs are awkward in version control; turning notebooks into production pipelines takes work.
+ref: docs | Project Jupyter documentation | Project Jupyter | https://docs.jupyter.org/
+ref: blog | I don't like notebooks (talk) | Joel Grus, JupyterCon 2018 |
+
+@@ ffmpeg
+value: FFmpeg is the open-source toolkit behind most video and audio processing in the world: transcoding, cutting, scaling, filtering and streaming, used by YouTube, VLC, broadcasters and countless pipelines.
+how: libavformat handles containers (MP4, MKV, MPEG-TS, HLS); libavcodec implements decoders and encoders (or wraps x264, x265, SVT-AV1); libavfilter applies filter graphs; the ffmpeg command line connects them.
+intuition: A universal adapter between every media format.
+friction: Command-line syntax is notoriously complex; hardware acceleration and codec licensing vary by platform.
+ref: docs | FFmpeg documentation | FFmpeg | https://ffmpeg.org/documentation.html
+
+@@ codecs
+value: Video codecs (H.264/AVC 2003, HEVC/H.265 2013, VP9, AV1 2018, VVC) compress video by around 100–1000× so it can be streamed and stored. Every CTV app, video call and streaming service depends on them.
+how: Frames are split into blocks. Intra prediction predicts a block from neighboring pixels; inter prediction (motion compensation) predicts it from a block in a previous or future frame plus a motion vector. The difference (residual) is transformed with a DCT-like integer transform, quantized (where information is thrown away), and entropy-coded (CABAC in H.264/HEVC). Newer codecs use larger and more flexible block shapes and better prediction for 30–50% savings per generation.
+intuition: Send what changes, approximately, in the frequencies the eye cares about.
+friction: Better compression costs much more encoding compute; patent licensing shaped adoption (AV1 is royalty-free); hardware decoder support decides what devices can play.
+ref: paper | Overview of the H.264/AVC Video Coding Standard | Wiegand et al., IEEE TCSVT 2003 |
+ref: docs | Alliance for Open Media (AV1) | AOMedia | https://aomedia.org/
+
+@@ hlsdash
+value: HLS (Apple, 2009) and MPEG-DASH (2012) are how video is streamed over the internet: as many small chunks over ordinary HTTP, so CDNs can cache them and players can adapt quality to the network.
+how: Video is encoded at several bitrates and resolutions (an encoding ladder) and cut into segments of a few seconds. A manifest (an .m3u8 playlist or DASH MPD) lists the segments for each rendition. The player downloads segments one by one and chooses the next segment's rendition with an adaptive bitrate algorithm. Low-latency variants use partial segments; CMAF unifies segment formats; ad insertion stitches ad segments into the playlist (SSAI).
+intuition: Turn a video into a list of small files, and let the player choose the right size for each moment.
+friction: Latency of several seconds by default; manifest and ad-insertion complexity; device fragmentation on CTV platforms.
+ref: spec | RFC 8216: HTTP Live Streaming | IETF, 2017 | https://www.rfc-editor.org/rfc/rfc8216
+
+@@ acr
+value: Automatic content recognition identifies what audio or video is playing by matching a fingerprint of the signal against a reference database. Shazam (audio, 2002–03) made it famous; smart-TV makers use it to know what is on screen, which powers viewership measurement, audience building and TV ad targeting.
+how: The device samples audio or video frames, extracts robust features (spectrogram peak pairs for audio; perceptual hashes or region features for video), hashes them, and sends compact fingerprints to a server, which looks them up in an index of reference content (live channels, ads, shows) and aligns matches in time. Results become viewing events tied to a device.
+intuition: Recognize a song from a few seconds in a noisy room by its pattern of strongest notes, not its exact waveform.
+friction: Matching live broadcasts at scale needs constantly updated references and low-latency indexing; noise, overlays and picture-in-picture hurt accuracy; privacy and consent rules (opt-in viewing data, regulations such as state privacy laws) strongly shape how ACR data may be used.
+ref: paper | An Industrial-Strength Audio Search Algorithm | Avery Wang (Shazam), ISMIR 2003 |
+ref: paper | A Highly Robust Audio Fingerprinting System | Haitsma & Kalker (Philips), ISMIR 2002 |
+
+@@ openrtb
+value: OpenRTB (IAB Tech Lab, first version 2010) is the standard protocol for real-time bidding: when an ad slot becomes available on a site, app or connected TV, an exchange asks many bidders what they would pay and sells the impression to the winner, all within a fraction of a second.
+how: The exchange sends a JSON bid request describing the impression, the device, the user (IDs, consented data) and the context to each bidder; bidders respond within a timeout (often around 100 ms) with a price and creative; the exchange runs an auction (now mostly first-price) and notifies the winner. Supply-chain transparency comes from ads.txt, sellers.json and the schain object.
+intuition: A stock exchange where the stock is a single ad view, and each trade settles in milliseconds.
+friction: Massive request volume (millions per second) with strict latency; bid shading and auction dynamics; fraud; privacy changes (cookie deprecation, mobile ID restrictions) reduce addressability.
+ref: spec | OpenRTB specification | IAB Tech Lab | https://iabtechlab.com/standards/openrtb/
+
+@@ pixels
+value: Tracking pixels and tags are the oldest measurement mechanism on the web: a tiny image or script embedded in a page, email or ad that reports an event (view, click, conversion) to a server. They are how ad impressions, conversions and audience signals are collected.
+how: When the page loads, the browser requests a 1×1 image or runs a JavaScript tag; the request URL carries parameters (campaign, event, page) and the browser attaches cookies for that domain; the server logs the event, often redirecting to partners ('pixel fan-out') for cookie syncing. Server-side tagging and conversion APIs move collection to the advertiser's server.
+intuition: A doorbell that rings on a server every time someone looks.
+friction: Browsers block third-party cookies and trackers; consent laws (GDPR, CCPA, state laws) require permission; fan-out adds latency and data-leak risk; deduplication across pixels and devices is hard.
+ref: docs | MDN: HTTP cookies | Mozilla | https://developer.mozilla.org/en-US/docs/Web/HTTP/Cookies
+
+@@ bitcoin
+value: Bitcoin (Satoshi Nakamoto, 2008 paper, 2009 launch) solved a problem distributed systems research thought impractical: agreement on a shared ledger among anonymous participants who may cheat, with open membership. Ethereum (2015) added programmable smart contracts and moved to proof of stake in 2022.
+how: Transactions are grouped into blocks; each block includes the hash of the previous block (forming a chain) and a Merkle root of its transactions. In proof of work, miners search for a nonce that makes the block's hash below a target; the longest (most-work) chain wins, so rewriting history requires out-computing the honest majority. Proof of stake replaces computation with locked collateral and Byzantine-style voting.
+intuition: Make lying expensive and honesty profitable, and let anyone check the math.
+friction: Proof of work uses large amounts of energy; throughput is low and finality is probabilistic; smart-contract bugs are costly; regulation and speculation dominate public perception.
+ref: paper | Bitcoin: A Peer-to-Peer Electronic Cash System | Satoshi Nakamoto, 2008 | https://bitcoin.org/bitcoin.pdf
+ref: book | Bitcoin and Cryptocurrency Technologies | Narayanan et al., 2016 |
+
+@@ riscv
+value: RISC-V (UC Berkeley, 2010) is an open, royalty-free instruction set architecture. Anyone can design and sell RISC-V chips without licenses, which has made it popular for microcontrollers, accelerators, research and, increasingly, application processors.
+how: A small base integer ISA with optional standard extensions (multiply, atomics, floating point, compressed instructions, vectors), designed cleanly for modern compilers and pipelines.
+intuition: An open standard for the hardware–software contract, like Linux for instruction sets.
+friction: The software ecosystem and high-performance cores are still catching up with ARM and x86; fragmentation across optional extensions.
+ref: docs | RISC-V specifications | RISC-V International | https://riscv.org/specifications/
+ref: book | The RISC-V Reader | Patterson & Waterman, 2017 |
+
+@@ amdgpu
+value: AMD's Instinct accelerators (MI300 series from 2023, and successors) are the main alternative to NVIDIA GPUs for AI and supercomputing, notable for very large HBM capacity.
+how: Chiplet designs combine compute dies with stacked HBM; matrix cores handle low-precision math; Infinity Fabric links GPUs; the open-source ROCm stack and HIP (a CUDA-like language) run PyTorch and other frameworks.
+intuition: Competition on memory size and open software against CUDA's head start.
+friction: Software maturity and library coverage still trail CUDA; fewer engineers know the stack.
+ref: docs | AMD ROCm documentation | AMD | https://rocm.docs.amd.com/
+
+@@ cxl
+value: Compute Express Link (2019) lets CPUs, accelerators and memory devices share memory coherently over PCIe-based links, enabling memory expansion and pooling across servers.
+how: CXL defines three protocols over the PCIe physical layer: CXL.io (device discovery and I/O), CXL.cache (devices caching host memory coherently) and CXL.mem (hosts using device-attached memory as ordinary memory, with added latency). Switches allow pooling memory among hosts.
+intuition: Add a slower but much bigger tier to the memory hierarchy, shared across machines.
+friction: Extra latency compared with local DRAM; software must decide what to place in which tier; ecosystem still early.
+ref: docs | Compute Express Link Consortium | CXL Consortium | https://computeexpresslink.org/
+
+@@ quantumhw
+value: Quantum processors from Google, IBM, Quantinuum, IonQ and others are the first real machines that compute with qubits. Google's 2024 Willow chip demonstrated error rates that fall as more qubits are used for error correction, an important milestone toward useful machines.
+how: Superconducting qubits are tiny circuits cooled near absolute zero and controlled by microwave pulses; trapped-ion qubits are individual ions manipulated by lasers. Gates entangle qubits; measurement collapses states to bits. Quantum error correction encodes one logical qubit in many physical qubits.
+intuition: Use interference between many possibilities at once, then arrange for wrong answers to cancel.
+friction: Qubits are fragile and noisy; useful algorithms (like Shor's factoring) need millions of physical qubits with today's error rates; practical advantage for real problems is not yet established.
+ref: book | Quantum Computation and Quantum Information | Nielsen & Chuang, 2010 |
+ref: paper | Quantum error correction below the surface code threshold | Google Quantum AI, Nature 2024 |

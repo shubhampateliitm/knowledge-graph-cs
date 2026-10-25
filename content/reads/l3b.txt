@@ -1,0 +1,301 @@
+@@ relmodel
+value: The relational model (Codd, 1970) separates what data means from how it is stored: data is a set of tables (relations), and you query it by describing the result you want. This separation, called data independence, is why SQL databases from 1979 still run the same queries on completely different storage engines today, and why Spark SQL, Pinot and Delta all adopted tables.
+how: A relation is a set of tuples with named, typed attributes. Keys identify tuples; foreign keys link relations. Integrity constraints enforce rules. Queries are expressed in relational algebra or calculus, and the system chooses how to execute them. Physical storage (row store, column store, indexes, partitions) can change without changing queries.
+intuition: Say what you want ('customers in Bengaluru who bought twice'), not how to walk the files.
+friction: Mapping objects and nested data to flat tables (the object–relational impedance mismatch); strict schemas slow early development; scaling joins across machines is hard, which drove NoSQL, and then NewSQL brought relations back.
+ref: paper | A Relational Model of Data for Large Shared Data Banks | E. F. Codd, CACM 1970 | https://www.seas.upenn.edu/~zives/03f/cis550/codd.pdf
+ref: paper | What Goes Around Comes Around | Stonebraker & Hellerstein, 2005 |
+ref: paper | What Goes Around Comes Around... And Around... | Stonebraker & Pavlo, SIGMOD Record 2024 | https://db.cs.cmu.edu/papers/2024/whatgoesaround-sigmodrec2024.pdf
+
+@@ relalgebra
+value: Relational algebra is a small set of operators on tables (select, project, join, union, difference, aggregate). Every SQL query becomes an algebra expression, and its algebraic laws are what let optimizers rewrite queries into faster equivalent forms.
+how: Selection (σ) filters rows; projection (π) picks columns; join (⋈) combines tables on a condition; union, intersection and difference combine sets; grouping and aggregation summarize. Laws such as 'selections can move below joins' and 'joins are associative and commutative' justify predicate pushdown and join reordering. Query plans in Spark, Postgres and DuckDB are trees of these operators.
+intuition: Arithmetic for tables: a few operations, combined freely, with rules for rearranging them.
+friction: SQL uses bags (duplicates allowed) and NULLs, which break some clean set laws; ordering, windows and recursion need extensions.
+ref: book | Database Systems: The Complete Book, ch. 2 and 5 | Garcia-Molina, Ullman & Widom |
+ref: course | CMU 15-445/645 Database Systems | Andy Pavlo | https://15445.courses.cs.cmu.edu/
+
+@@ sql
+value: SQL is the most successful declarative language ever: one language used by analysts, engineers and machines across PostgreSQL, Spark, Databricks, Pinot, Snowflake, DuckDB and even Kafka stream processors. Each attempt to replace it has ended up adding SQL back.
+how: SELECT … FROM … WHERE … GROUP BY … HAVING … ORDER BY describes the result; the engine plans it. Joins, subqueries, common table expressions (WITH), window functions (rank, running totals) and recursive queries add power. DDL defines tables; DML changes data; transactions group changes. Dialects differ in details.
+intuition: A precise question in a formal language that the database answers in the fastest way it can find.
+friction: Odd semantics (NULL three-valued logic, duplicate rows); composes awkwardly for large programs (dbt and pipe syntax try to help); dialect differences; performance depends on the optimizer, which can surprise.
+ref: paper | SEQUEL: A Structured English Query Language | Chamberlin & Boyce, 1974 |
+ref: book | SQL Performance Explained (Use The Index, Luke) | Markus Winand | https://use-the-index-luke.com/
+ref: blog | Modern SQL | Markus Winand | https://modern-sql.com/
+
+@@ normalization
+value: Normalization organizes tables so each fact is stored once, preventing update anomalies (changing a customer's address in one row but not another). Knowing when to denormalize, as in star schemas and OLAP, is just as important.
+how: Functional dependencies (A determines B) guide decomposition. First normal form: atomic values. Second and third normal forms: every non-key column depends on the key, the whole key, and nothing but the key. Boyce–Codd normal form tightens this. Analytics systems deliberately denormalize (wide tables, star schemas) to avoid joins at query time.
+intuition: Write each fact in exactly one place, so you never have two versions of the truth.
+friction: Highly normalized schemas need many joins, which are slow at analytic scale; denormalized data must be kept consistent by pipelines.
+ref: paper | Further Normalization of the Data Base Relational Model | E. F. Codd, 1971 |
+ref: book | Database System Concepts, ch. 7 | Silberschatz, Korth & Sudarshan |
+
+@@ acid
+value: ACID transactions let an application treat a group of changes as one safe step: all or nothing, consistent, isolated from other users, and durable. This turns the messy reality of concurrency and crashes into a simple programming model, and Delta Lake and Iceberg brought it to data lakes.
+how: Atomicity: a write-ahead log and undo or redo let partial work be rolled back. Consistency: constraints hold before and after (partly the application's job). Isolation: concurrency control (locking or MVCC) makes concurrent transactions behave as if run one by one, to the chosen isolation level. Durability: the commit record is flushed (fsync) or replicated before success is reported.
+intuition: A bank transfer either moves the money completely or not at all, even if the power fails midway.
+friction: Coordination limits throughput and scale, especially across machines (two-phase commit); weaker isolation levels are the default in many databases and surprise developers; 'C' is the least well-defined letter.
+ref: paper | Principles of Transaction-Oriented Database Recovery | Härder & Reuter, Computing Surveys 1983 |
+ref: book | Transaction Processing: Concepts and Techniques | Jim Gray & Andreas Reuter, 1992 |
+
+@@ isolation
+value: Isolation levels define which anomalies concurrent transactions may see. Picking the right level is a trade-off between correctness and performance, and many production bugs come from not knowing which level a database uses by default (often Read Committed).
+how: Read Uncommitted allows dirty reads. Read Committed prevents dirty reads but allows non-repeatable reads. Repeatable Read (in practice often snapshot isolation) gives each transaction a consistent snapshot but allows write skew (two transactions each read, then write different rows, together violating a rule). Serializable prevents all anomalies; PostgreSQL implements it with Serializable Snapshot Isolation, which detects dangerous patterns and aborts.
+intuition: How much you can see of other people's half-finished work.
+friction: Level names mean different things in different databases; ANSI's definitions were shown to be ambiguous; serializable can abort often under contention.
+ref: paper | A Critique of ANSI SQL Isolation Levels | Berenson et al., SIGMOD 1995 | https://arxiv.org/abs/cs/0701157
+ref: blog | Jepsen consistency models | Kyle Kingsbury | https://jepsen.io/consistency
+ref: paper | Serializable Snapshot Isolation in PostgreSQL | Ports & Grittner, VLDB 2012 |
+
+@@ ccontrol
+value: Concurrency control is the machinery that implements isolation: it lets many transactions run at once while keeping their combined result correct. The choice (locking, timestamps, optimistic validation, MVCC) shapes a database's performance under contention.
+how: Two-phase locking: acquire locks as you go, release none until done; strict 2PL holds them until commit. Timestamp ordering assigns each transaction a timestamp and rejects out-of-order access. Optimistic concurrency control runs without locks and validates at commit (Delta and Iceberg commits work like this). MVCC keeps multiple versions so readers never block writers. Deterministic databases (Calvin) order transactions before executing them.
+intuition: Traffic rules for transactions: stop signs (locks), number tickets (timestamps), or 'go and check at the end' (optimistic).
+friction: Hot rows serialize everything; deadlocks with locking; high abort rates with optimistic schemes under contention.
+ref: book | Concurrency Control and Recovery in Database Systems | Bernstein, Hadzilacos & Goodman, 1987 | https://www.microsoft.com/en-us/research/people/philbe/book/
+ref: paper | Staring into the Abyss: An Evaluation of Concurrency Control with One Thousand Cores | Yu et al., VLDB 2014 |
+
+@@ recovery
+value: Crash recovery brings a database back to a correct state after a failure: every committed transaction present, every uncommitted one gone. It makes durability and atomicity real, and the same log-replay idea powers replication and CDC.
+how: ARIES (1992) is the classic algorithm. During normal operation, log every change with a log sequence number before writing pages (write-ahead logging), and take periodic checkpoints. After a crash: analysis (find active transactions and dirty pages), redo (replay history to restore the exact state at the crash) and undo (roll back uncommitted transactions, logging compensation records). 'Steal' and 'no-force' policies let the buffer manager write pages flexibly for performance.
+intuition: Replay the diary to rebuild the room, then reverse the entries that were never finalized.
+friction: Recovery time grows with time since the last checkpoint; the details are notoriously subtle; testing crash paths is hard.
+ref: paper | ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging | Mohan et al., ACM TODS 1992 |
+
+@@ indexing
+value: Indexes trade extra storage and slower writes for much faster reads: finding rows by value without scanning everything. Choosing indexes is one of the highest-leverage decisions in database design, and every search engine and OLAP store is mainly a set of clever indexes.
+how: B-trees support equality and range lookups in sorted order; hash indexes support equality; inverted indexes map terms to documents; bitmap indexes suit low-cardinality filters; LSM trees index write-heavy data; vector indexes find nearest neighbours; zone maps and Bloom filters skip blocks. Covering indexes include all needed columns so the table isn't read. Composite index column order matters.
+intuition: The index at the back of a book, the tabs on a dictionary, the catalogue in a library.
+friction: Every index slows writes and uses space; too many indexes confuse optimizers; indexes that don't match query patterns are pure cost.
+ref: book | SQL Performance Explained | Markus Winand | https://use-the-index-luke.com/
+ref: book | Database Internals | Alex Petrov, O'Reilly 2019 |
+
+@@ hashtables
+value: Hash tables find any item by key in constant time on average. They are probably the most used data structure in software: caches, Redis, join and aggregation operators, symbol tables, deduplication, and the routing of keys to partitions.
+how: A hash function maps a key to a bucket index. Collisions are handled by chaining (a list per bucket) or open addressing (probe other slots: linear probing, Robin Hood hashing, or SIMD-friendly groups as in Swiss tables). When the table gets too full, it is resized, usually by doubling, which is amortized O(1). Good hash functions spread keys evenly and resist attackers who craft collisions.
+intuition: A coat check: your ticket number tells the attendant exactly which hook to go to.
+friction: Poor hash functions or attacker-chosen keys cause many collisions; resizing pauses; no ordering, so range queries need trees; memory overhead.
+ref: book | The Art of Computer Programming, Vol. 3: Sorting and Searching | Donald Knuth |
+ref: video | Designing a Fast, Efficient, Cache-friendly Hash Table, Step by Step (Swiss tables) | Matt Kulukundis, CppCon 2017 | https://www.youtube.com/watch?v=ncHmEUmJZf4
+
+@@ trees
+value: Search trees keep data sorted for fast lookup, insertion and range queries in O(log n). Balanced trees, B-trees, tries and heaps underlie database indexes, file systems, ordered maps, priority queues and schedulers.
+how: Binary search trees put smaller keys left and larger right; self-balancing variants (red–black, AVL) keep height logarithmic. B-trees use wide nodes matching disk or cache blocks. Tries store strings by prefix. Heaps keep the minimum at the top for priority queues. Skip lists achieve similar bounds with randomized linked lists.
+intuition: A decision game of 'higher or lower' that finds any item in about 20 questions among a million.
+friction: Pointer-heavy trees are cache-unfriendly; concurrent updates need careful locking or lock-free designs; rebalancing has cost.
+ref: book | Introduction to Algorithms (CLRS), ch. 12–13, 18 | Cormen, Leiserson, Rivest & Stein |
+ref: book | Algorithms, 4th ed. | Sedgewick & Wayne | https://algs4.cs.princeton.edu/
+
+@@ graphsalgo
+value: Graph algorithms solve problems about connections: shortest routes, dependency order, connected groups, influence and flow. Schedulers, network routing, identity graphs, recommendation and Kubernetes dependency resolution use them directly.
+how: Breadth-first and depth-first search explore a graph; topological sort orders DAGs; Dijkstra and A* find shortest paths; Bellman–Ford handles negative weights (and is the basis of distance-vector routing); union–find finds connected components; minimum spanning trees connect everything cheaply; PageRank scores importance; max-flow solves matching and capacity problems. Large graphs are processed with systems like Pregel (vertex-centric, 'think like a vertex').
+intuition: Maps of who connects to whom, and recipes for finding your way around them.
+friction: Large graphs don't partition well across machines; many problems (shortest tour, graph colouring) are NP-hard; real graphs have skewed degree distributions (celebrity nodes).
+ref: book | Algorithm Design | Kleinberg & Tardos, 2005 |
+ref: paper | Pregel: A System for Large-Scale Graph Processing | Malewicz et al., SIGMOD 2010 |
+
+@@ sorting
+value: Sorting puts data in order, which makes searching, merging, deduplication, joins and compression easier. It is so central that sort-merge joins, LSM compaction, external sort in Spark and sorted file layouts all depend on it.
+how: Comparison sorts can't beat O(n log n) comparisons. Quicksort is fast in practice; mergesort is stable and suits external and parallel sorting; heapsort uses no extra memory. Modern libraries use hybrids: Timsort (Python, Java objects) exploits existing runs; pdqsort and introsort guard against worst cases. Radix sort avoids comparisons for integer keys. Distributed sorting samples to choose range partitions, then sorts each partition.
+intuition: Order is a form of compression: once things are sorted, you can find anything by halving.
+friction: Large data spills to disk; skewed keys unbalance partitions; stability and key comparison costs matter in practice.
+ref: book | The Art of Computer Programming, Vol. 3: Sorting and Searching | Donald Knuth |
+ref: blog | Sort Benchmark | sortbenchmark.org | http://sortbenchmark.org/
+
+@@ dp
+value: Dynamic programming solves problems by breaking them into overlapping subproblems and storing each answer once. It turns exponential searches into polynomial ones, and it underlies query optimizer join ordering, sequence alignment, edit distance, the Viterbi algorithm and reinforcement learning (Bellman equations).
+how: Identify a recurrence where the optimal solution uses optimal solutions to smaller subproblems (optimal substructure). Compute bottom-up in a table, or top-down with memoization. Examples: shortest paths (Bellman–Ford, Floyd–Warshall), knapsack, longest common subsequence (diff tools), the System R optimizer's search over join subsets.
+intuition: Never solve the same small puzzle twice; write the answer down.
+friction: Tables can be huge (the curse of dimensionality); finding the right subproblem is an art; some problems lack the necessary structure.
+ref: book | Dynamic Programming | Richard Bellman, 1957 |
+ref: book | Algorithms | Dasgupta, Papadimitriou & Vazirani, ch. 6 | https://people.eecs.berkeley.edu/~vazirani/algorithms.html
+
+@@ greedydc
+value: Greedy and divide-and-conquer are two of the most useful algorithm design strategies. Greedy builds a solution one best local step at a time; divide-and-conquer splits a problem into parts, solves them, and combines them. Huffman coding, Dijkstra, mergesort, FFT and MapReduce follow these patterns.
+how: Greedy works when a local best choice can always be extended to a global best (proved with exchange arguments or matroid theory): scheduling by earliest deadline, Huffman codes, minimum spanning trees. Divide-and-conquer recursion is analysed with the master theorem: mergesort O(n log n), Karatsuba multiplication, Strassen matrix multiplication, FFT. MapReduce is divide-and-conquer across machines.
+intuition: Greedy: always take the biggest coin. Divide-and-conquer: split the pile, sort each half, merge.
+friction: Greedy is often wrong without proof (coin systems where the biggest coin first fails); recursion overhead and combining cost can dominate.
+ref: book | Algorithm Design | Kleinberg & Tardos, ch. 4–5 |
+
+@@ bigo
+value: Big-O analysis describes how an algorithm's time or memory grows with input size, ignoring constants. It lets engineers predict whether a design will survive 10× or 1000× more data, and that is often more important than micro-optimization.
+how: O(1) constant, O(log n) halving, O(n) linear, O(n log n) sorting, O(n²) nested loops, O(2^n) exhaustive search. Analyse worst case, average case and amortized cost. Space complexity counts memory. In practice, constants and memory behavior matter: an O(n) scan of sequential memory can beat an O(log n) pointer-chasing tree for small n.
+intuition: Not 'how fast now', but 'how much slower when the problem gets ten times bigger'.
+friction: Hides constants and hardware effects; worst cases may never occur in practice, while average cases may hide bad tails.
+ref: book | Introduction to Algorithms (CLRS), ch. 3 | Cormen, Leiserson, Rivest & Stein |
+ref: book | The Algorithm Design Manual, 3rd ed. | Steven Skiena, 2020 |
+
+@@ amortized
+value: Amortized analysis measures average cost over a sequence of operations, so occasional expensive steps (resizing a hash table, compacting an LSM tree) are paid for by many cheap ones. It explains why dynamic arrays and hash tables are O(1) per operation despite occasional large copies.
+how: Aggregate method: total cost divided by number of operations. Accounting method: charge each cheap operation a little extra 'credit' to pay for later expensive ones. Potential method: define a potential function on the data structure state. Doubling an array on overflow costs O(n) occasionally but O(1) amortized.
+intuition: Saving a little every month to pay for an annual bill.
+friction: Amortized bounds say nothing about individual latency: a single resize or compaction can still cause a latency spike, so real-time systems use incremental versions.
+ref: paper | Amortized Computational Complexity | Robert Tarjan, SIAM J. Algebraic Discrete Methods 1985 |
+
+@@ queuesbuf
+value: Queues, ring buffers and skip lists are small building blocks behind big systems: Kafka's request queues, the LMAX Disruptor, network card rings, RocksDB and Redis's sorted sets (skip lists), and the memtables of LSM trees.
+how: A FIFO queue adds at the tail and removes at the head. A ring buffer is a fixed-size array with head and tail indices that wrap around, avoiding allocation; single-producer single-consumer rings need only atomic index updates. A skip list stores sorted items in layered linked lists where higher layers skip ahead randomly, giving O(log n) search with simpler concurrency than balanced trees (Pugh, 1990).
+intuition: A ring buffer is a circular conveyor belt; a skip list is a local train line with express stops.
+friction: Bounded queues must decide what to do when full (block, drop or backpressure); unbounded queues hide overload until memory runs out; false sharing between producer and consumer indices.
+ref: paper | Skip Lists: A Probabilistic Alternative to Balanced Trees | William Pugh, CACM 1990 |
+ref: blog | LMAX Disruptor: High Performance Inter-Thread Messaging | Thompson, Farley et al., 2011 | https://lmax-exchange.github.io/disruptor/disruptor.html
+
+@@ parsing
+value: Parsing turns text (code, SQL, JSON, config, protocols) into structured trees a program can work with. Every compiler, query engine and data pipeline starts with a parser, and parsing speed matters at data-ingestion scale.
+how: A lexer splits text into tokens; a parser builds a syntax tree according to a grammar. Recursive-descent parsers (hand-written, used by many production compilers and SQL engines) follow the grammar directly; parser generators (yacc, ANTLR) produce LR or LL parsers from grammar files. Pratt parsing handles operator precedence elegantly. Parsing expression grammars and parser combinators are other approaches.
+intuition: Diagramming sentences: work out which words belong together and what role each plays.
+friction: Ambiguous grammars; good error messages are hard; performance for large inputs (simdjson-style approaches help for data formats).
+ref: book | Crafting Interpreters | Robert Nystrom, 2021 | https://craftinginterpreters.com/
+ref: book | Compilers: Principles, Techniques, and Tools ('Dragon Book'), 2nd ed. | Aho, Lam, Sethi & Ullman |
+
+@@ typesys
+value: Type systems catch whole classes of errors before a program runs and document what data looks like. Scala, Rust, TypeScript and Kotlin show that strong types can also make code easier to change, and Rust's ownership types prevent memory and data-race bugs.
+how: Each expression has a type; the compiler checks that operations match (you can't add a string to a socket). Static types are checked at compile time; dynamic types at run time. Type inference (Hindley–Milner) deduces types without annotations. Generics give reusable, type-safe code; algebraic data types and pattern matching model data precisely; ownership and borrowing (Rust) track who may change memory.
+intuition: Shaped holes for shaped pegs, checked before the machine starts.
+friction: Expressive type systems can be complex to learn (Scala implicits, Rust lifetimes); types can't capture every rule; slow compile times.
+ref: book | Types and Programming Languages | Benjamin Pierce, 2002 |
+ref: paper | A Theory of Type Polymorphism in Programming | Robin Milner, 1978 |
+
+@@ gc
+value: Garbage collection reclaims memory that a program can no longer reach, so developers don't free memory by hand. It removes whole classes of bugs (use-after-free, many leaks) and enabled Java, Scala, Go and Python, but its pauses and overhead matter for latency-sensitive systems like Kafka, Elasticsearch and Spark.
+how: Tracing collectors start from roots (stacks, globals) and mark everything reachable, then reclaim the rest. Generational collectors exploit the observation that most objects die young: collect the young generation often and cheaply. Copying and compacting collectors reduce fragmentation. Concurrent collectors (G1, ZGC, Shenandoah in the JVM; Go's collector) do most work while the application runs, with pauses now under a millisecond in ZGC. Reference counting (Python, Swift) frees objects immediately but needs cycle detection.
+intuition: A cleaner who periodically removes anything nobody is holding.
+friction: Pauses and CPU overhead; large heaps; tuning; memory overhead (collectors want spare heap); off-heap memory in Spark and Kafka exists partly to avoid GC.
+ref: book | The Garbage Collection Handbook, 2nd ed. | Jones, Hosking & Moss, 2023 |
+ref: paper | Recursive Functions of Symbolic Expressions and Their Computation by Machine (first GC, in Lisp) | John McCarthy, CACM 1960 |
+
+@@ jit
+value: Just-in-time compilation compiles code to machine code while the program runs, using information about how it actually behaves. It is why Java, JavaScript and Scala can run close to C speed, and it is used in query engines and eBPF.
+how: The runtime starts by interpreting or quickly compiling code, profiles which methods and branches are hot, then compiles hot code with aggressive optimizations based on observed types and paths (inlining, devirtualization, escape analysis). If an assumption breaks, it deoptimizes back to slower code. The JVM's HotSpot has tiered C1 and C2 compilers; V8 has several tiers; GraalVM adds another compiler.
+intuition: A translator who learns which phrases you use most and prepares polished versions of those.
+friction: Warm-up time before peak speed (bad for short jobs and serverless); performance is less predictable; memory used by compiled code; large machine-generated methods may not be compiled.
+ref: paper | A Brief History of Just-In-Time | John Aycock, ACM Computing Surveys 2003 |
+ref: blog | JVM Anatomy Quarks | Aleksey Shipilёv | https://shipilev.net/jvm/anatomy-quarks/
+
+@@ irssa
+value: Intermediate representations, especially static single assignment (SSA) form, give compilers a simplified, uniform view of code where optimizations become simple graph transformations. LLVM, GCC, the JVM's JIT, GPU compilers and ML compilers (XLA, MLIR, Triton) are built on them.
+how: Source code is lowered to an IR of simple instructions in basic blocks connected by a control-flow graph. In SSA form, each variable is assigned exactly once; where control paths merge, φ (phi) functions select the right version. This makes data flow explicit, so constant propagation, dead-code elimination and register allocation are easier. MLIR supports many levels of IR (dialects) for different domains.
+intuition: Rewrite a recipe so each bowl is used for exactly one thing, making it obvious which steps depend on which.
+friction: Converting in and out of SSA has cost; high-level information can be lost in lowering; designing good IRs for new hardware (AI accelerators) is an active research area.
+ref: paper | Efficiently Computing Static Single Assignment Form and the Control Dependence Graph | Cytron et al., ACM TOPLAS 1991 |
+ref: paper | LLVM: A Compilation Framework for Lifelong Program Analysis & Transformation | Lattner & Adve, CGO 2004 |
+
+@@ fp
+value: Functional programming builds programs from pure functions and immutable data. It made distributed data processing safe and simple: Spark transformations, Kafka Streams, MapReduce and React are all functional ideas, because pure functions can be retried, parallelized and cached without surprises.
+how: Pure functions return the same output for the same input and have no side effects. Immutable data is never changed in place; new versions share structure with old ones (persistent data structures). Higher-order functions (map, filter, reduce, flatMap) express data pipelines. Algebraic data types and pattern matching model data. Scala, Haskell, OCaml, F# and Clojure are functional languages; most modern languages borrowed the ideas.
+intuition: Functions like maths formulas: same inputs, same answer, no hidden changes to the world.
+friction: Real programs need side effects (I/O), which must be managed (monads, effect systems); immutability can cost memory and speed; unfamiliar to many teams.
+ref: paper | Can Programming Be Liberated from the von Neumann Style? | John Backus, Turing Award lecture, CACM 1978 |
+ref: paper | Why Functional Programming Matters | John Hughes, 1989 | https://www.cse.chalmers.se/~rjmh/Papers/whyfp.pdf
+ref: book | Functional Programming in Scala, 2nd ed. | Chiusano & Bjarnason (revised by Pilquist), 2023 |
+
+@@ concmodels
+value: Concurrency models are ways of structuring programs that do many things at once. Shared memory with locks, actors (Akka, Erlang), communicating sequential processes (Go channels) and async/await each make different bugs easy or hard.
+how: Shared memory: threads share data, protected by locks or atomics. Actors (Hewitt, 1973): independent entities with private state that communicate only by asynchronous messages, with supervisors restarting failed actors (Erlang's 'let it crash'). CSP (Hoare, 1978): processes communicate through channels that synchronize sender and receiver. Async/await: functions that suspend at I/O points, scheduled on an event loop. Software transactional memory makes memory updates transactional.
+intuition: Shared whiteboard with markers (locks), or everyone in separate rooms passing notes (actors and channels).
+friction: No model removes all hard problems: actors can deadlock on messages; channels can leak goroutines; async 'colours' functions; reasoning about distributed message passing is still hard.
+ref: paper | Communicating Sequential Processes | C. A. R. Hoare, CACM 1978 |
+ref: paper | Making reliable distributed systems in the presence of software errors | Joe Armstrong, PhD thesis 2003 |
+ref: video | Concurrency is not Parallelism | Rob Pike, 2012 | https://go.dev/blog/waza-talk
+
+@@ automata
+value: Finite automata are the simplest model of computation: a machine with a fixed number of states reading input one symbol at a time. They power regular expressions, lexers, network packet filters, protocol state machines and Lucene's fuzzy matching.
+how: A deterministic finite automaton (DFA) moves between states on each input symbol and accepts if it ends in an accepting state. Nondeterministic automata (NFAs) can be converted to DFAs. Regular expressions describe the same languages; Thompson's construction (1968) turns a regex into an NFA, which RE2 and Rust's regex crate simulate in linear time, unlike backtracking engines that can take exponential time.
+intuition: A turnstile: locked or unlocked, and each coin or push moves it to the next state.
+friction: Can't count or match nested structures (balanced parentheses need a stack); DFAs can have exponentially many states; backtracking regex engines with extra features are vulnerable to catastrophic slowdowns (ReDoS).
+ref: paper | Regular Expression Search Algorithm | Ken Thompson, CACM 1968 |
+ref: blog | Regular Expression Matching Can Be Simple And Fast | Russ Cox, 2007 | https://swtch.com/~rsc/regexp/regexp1.html
+ref: book | Introduction to the Theory of Computation, 3rd ed. | Michael Sipser |
+
+@@ turingmachine
+value: The Turing machine (1936) is the standard definition of what it means to compute. Every programming language, CPU and neural network computes no more than it can, which gives computer science a fixed foundation: the question is what is efficient, not what is possible.
+how: A machine with a finite set of states, an unbounded tape of symbols, and a head that reads, writes and moves one cell at a time according to a transition table. A universal Turing machine reads another machine's description from the tape and simulates it, which is the idea behind stored-program computers and interpreters. The Church–Turing thesis states that any effectively computable function can be computed this way.
+intuition: A clerk with a rulebook and an endless strip of paper can do anything any computer can, just slowly.
+friction: A theoretical model, unrelated to real performance; unbounded memory doesn't exist; it says nothing about efficiency, which needs complexity theory.
+ref: paper | On Computable Numbers, with an Application to the Entscheidungsproblem | Alan Turing, 1936 |
+ref: book | The Annotated Turing | Charles Petzold, 2008 |
+
+@@ computability
+value: Computability theory proves that some problems can never be solved by any program, the most famous being the halting problem. This sets permanent limits on tools: no perfect bug finder, virus detector or optimizer can exist, so practical tools must approximate.
+how: Turing (1936) showed by diagonalization that no program can decide, for every program and input, whether it halts. Rice's theorem generalizes this: any non-trivial property of what a program computes is undecidable. Reductions transfer undecidability from one problem to another. Static analyzers therefore are either unsound (miss bugs) or incomplete (false alarms).
+intuition: A program that predicts whether programs finish can be fed a copy of itself that does the opposite.
+friction: The limits are absolute; practical work happens in restricted settings (decidable fragments, bounded checks, heuristics).
+ref: book | Introduction to the Theory of Computation, ch. 4–5 | Michael Sipser |
+ref: book | Gödel, Escher, Bach | Douglas Hofstadter, 1979 |
+
+@@ pnp
+value: P versus NP asks whether every problem whose solution can be checked quickly can also be solved quickly. Most believe not. Many practical problems (scheduling, bin packing, routing, SAT) are NP-complete, which tells engineers to use heuristics, approximations or solvers instead of searching for perfect fast algorithms.
+how: P: problems solvable in polynomial time. NP: problems whose solutions can be verified in polynomial time. NP-complete problems are the hardest in NP: if one is in P, all are (Cook–Levin, 1971; Karp's 21 problems, 1972). Modern SAT and integer programming solvers solve huge practical instances despite worst-case hardness. Cryptography relies on some problems being hard on average.
+intuition: Checking a finished Sudoku is easy; solving one may be fundamentally harder.
+friction: Unproven after 50+ years (a Clay Millennium Prize problem); worst-case hardness doesn't predict real-world instance difficulty.
+ref: paper | The Complexity of Theorem-Proving Procedures | Stephen Cook, STOC 1971 |
+ref: book | The Golden Ticket: P, NP, and the Search for the Impossible | Lance Fortnow, 2013 |
+
+@@ symcrypto
+value: Symmetric encryption uses one shared secret key to encrypt and decrypt data quickly. Almost all encrypted bytes on the internet and on disk (TLS sessions, encrypted S3 objects, disk encryption) use it, with public-key methods only used to set up the key.
+how: Block ciphers like AES (2001) transform 128-bit blocks using rounds of substitution and permutation; modes like GCM turn them into authenticated encryption, which detects tampering. Stream ciphers like ChaCha20 (with Poly1305 authentication) are fast in software. CPUs have AES instructions that encrypt at many GB/s per core. Nonces must never repeat with the same key.
+intuition: A lockbox where the same key locks and unlocks.
+friction: Key distribution and rotation; nonce reuse catastrophically breaks GCM; misuse of modes (ECB) leaks patterns; key management is where real systems fail.
+ref: book | Serious Cryptography, 2nd ed. | Jean-Philippe Aumasson, 2024 |
+ref: book | Cryptography Engineering | Ferguson, Schneier & Kohno, 2010 |
+
+@@ pkcrypto
+value: Public-key cryptography lets two strangers set up a secret over a public channel and prove identities without having shared anything beforehand. It made internet commerce, HTTPS, SSH, code signing and cryptocurrencies possible.
+how: Each party has a key pair: a public key shared openly and a private key kept secret. Diffie–Hellman (1976) key exchange lets both sides compute the same secret from public values; RSA (1977) relies on the difficulty of factoring large numbers; elliptic-curve cryptography (X25519, ECDSA, Ed25519) gives the same security with much smaller keys. Quantum computers could break these, so post-quantum algorithms (ML-KEM, ML-DSA, standardized by NIST in 2024) are being deployed.
+intuition: An open padlock anyone can snap shut, but only you have the key to open.
+friction: Slower than symmetric encryption; trusting that a public key really belongs to someone needs certificates or other infrastructure; the quantum migration is a large, ongoing effort.
+ref: paper | New Directions in Cryptography | Diffie & Hellman, IEEE Trans. Information Theory 1976 |
+ref: paper | A Method for Obtaining Digital Signatures and Public-Key Cryptosystems | Rivest, Shamir & Adleman, CACM 1978 |
+ref: docs | NIST Post-Quantum Cryptography standards (FIPS 203, 204, 205) | NIST, 2024 | https://csrc.nist.gov/projects/post-quantum-cryptography
+
+@@ hashfn
+value: Hash functions map data of any size to a fixed-size value. Fast non-cryptographic hashes (MurmurHash, xxHash) route Kafka keys to partitions and power hash tables, Bloom filters and HyperLogLog; cryptographic hashes (SHA-256, BLAKE3) secure Git, blockchains, password storage and data integrity.
+how: Non-cryptographic hashes aim for speed and an even spread. Cryptographic hashes must also be one-way (you can't find an input for a given output), and collision-resistant (you can't find two inputs with the same output); small input changes flip about half the output bits (avalanche). SHA-1 was broken in practice in 2017 (SHAttered), prompting moves to SHA-256. Passwords use deliberately slow hashes (bcrypt, scrypt, Argon2).
+intuition: A fingerprint for data: tiny, nearly unique, impossible to reverse.
+friction: Using a fast hash where a cryptographic one is needed (or the reverse); hash algorithm migrations are painful; Kafka's partitioner depends on the specific hash (murmur2), so changing it moves keys.
+ref: paper | The First Collision for Full SHA-1 | Stevens et al., CRYPTO 2017 | https://shattered.io/
+ref: book | Serious Cryptography, 2nd ed., ch. 6 | Jean-Philippe Aumasson, 2024 |
+
+@@ signatures
+value: Digital signatures prove that a message came from the holder of a private key and wasn't changed. They secure software updates, TLS certificates, JWT tokens, Git commits, container images and blockchain transactions.
+how: The signer hashes the message and applies a private-key operation to produce a signature; anyone with the public key can verify it. Algorithms include RSA-PSS, ECDSA and Ed25519 (fast and simple). A certificate is a signature by an authority binding a public key to a name. Post-quantum signature schemes (ML-DSA, SLH-DSA) were standardized in 2024.
+intuition: A wax seal that anyone can check but only you can make.
+friction: Key theft breaks everything; revocation is hard; implementation mistakes (reused random numbers in ECDSA) have leaked keys.
+ref: book | Real-World Cryptography | David Wong, Manning 2021 |
+ref: paper | High-speed high-security signatures (Ed25519) | Bernstein et al., 2011 |
+
+@@ swe
+value: Software engineering principles (modularity, information hiding, clear interfaces, testing and continuous delivery) are how large teams build systems that keep working as they change. In long-lived platforms, the cost of change matters more than the cost of first writing the code.
+how: Information hiding (Parnas, 1972): put each design decision likely to change behind an interface. Separation of concerns; low coupling and high cohesion. Automated tests at several levels give confidence to change code. Version control, code review, continuous integration and delivery make change routine. Conway's law: system structure mirrors team structure, so team design is architecture design.
+intuition: Build with replaceable parts and clear contracts, so changing one doesn't break the others.
+friction: Abstractions leak; over-engineering for change that never comes; tests can be slow or brittle; organizational incentives often reward shipping over maintainability.
+ref: paper | On the Criteria to Be Used in Decomposing Systems into Modules | David Parnas, CACM 1972 |
+ref: book | A Philosophy of Software Design, 2nd ed. | John Ousterhout, 2021 |
+ref: book | Accelerate | Forsgren, Humble & Kim, 2018 |
+
+@@ dstheory
+value: Distributed systems theory tells you what is impossible, so you stop trying to build it. FLP shows deterministic consensus cannot be guaranteed in a fully asynchronous network with even one crash; the two generals problem shows agreement over lossy links can't be certain; CAP and Byzantine results set further limits. Every real system's design is a choice of which assumption to relax.
+how: System models define what can go wrong: synchronous, asynchronous or partially synchronous timing; crash-stop, crash-recovery or Byzantine failures; reliable or lossy links. FLP (1985) is escaped by assuming partial synchrony (timeouts eventually work, as Paxos and Raft do) or randomness. Failure detectors formalize timeouts. Safety properties say nothing bad happens; liveness properties say something good eventually happens; FLP means you can always guarantee safety but not always liveness.
+intuition: Physics for networks: first learn the laws you can't break.
+friction: Theory models are idealized; real failures (gray failures, partial partitions, clock jumps) are messier; bridging proofs and code is hard (TLA+ and deterministic simulation help).
+ref: paper | Impossibility of Distributed Consensus with One Faulty Process | Fischer, Lynch & Paterson, JACM 1985 |
+ref: book | Distributed Algorithms | Nancy Lynch, 1996 |
+ref: paper | A Brief Tour of FLP Impossibility | Henry Robinson, 2008 | https://www.the-paper-trail.org/post/2008-08-13-a-brief-tour-of-flp-impossibility/
+
+@@ interpreters
+value: Interpreters and virtual machines run programs by executing them step by step instead of compiling to machine code first. Python, the JVM's first tier, Lua, SQL engines and the eBPF verifier-plus-JIT all start here, and bytecode VMs give portability ('write once, run anywhere').
+how: A tree-walking interpreter evaluates the syntax tree directly (simple, slow). A bytecode VM compiles to a compact instruction set and runs a dispatch loop; stack-based VMs (JVM, CPython) push and pop operands, register-based VMs (Lua 5, Dalvik) name registers. Techniques like threaded code and inline caches speed up dispatch; JIT compilers then compile hot paths.
+intuition: A live translator reading a speech line by line, versus translating the whole book in advance.
+friction: Interpretation overhead (often 10–100× slower than native); the Python global interpreter lock (now optional in 3.13+ free-threaded builds) limited multi-core use.
+ref: book | Crafting Interpreters | Robert Nystrom, 2021 | https://craftinginterpreters.com/
+ref: paper | The Implementation of Lua 5.0 | Ierusalimschy, de Figueiredo & Celes, 2005 |
+
+@@ externalmem
+value: External-memory algorithms are designed for data larger than RAM, counting disk or network block transfers instead of CPU steps. Spark spill-to-disk, external merge sort, LSM trees, B-trees and Parquet layouts all follow from this model.
+how: The I/O model (Aggarwal and Vitter, 1988) assumes memory of size M and blocks of size B, and counts block transfers. Scanning n items costs n/B transfers; sorting costs about (n/B) log_{M/B}(n/B), achieved by external merge sort (sort memory-sized runs, then merge many runs at once). B-trees achieve log_B(n) search. Cache-oblivious algorithms work well at every level of the memory hierarchy without knowing B or M.
+intuition: When you can only carry one box at a time, plan around boxes, not items.
+friction: Real storage has caches, parallelism and different read/write costs that the simple model ignores; tuning block and buffer sizes.
+ref: paper | The Input/Output Complexity of Sorting and Related Problems | Aggarwal & Vitter, CACM 1988 |
+ref: paper | Algorithms and Data Structures for External Memory | Jeffrey Vitter, 2008 |

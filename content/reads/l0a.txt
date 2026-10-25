@@ -1,0 +1,233 @@
+@@ kafka-streams
+value: Kafka Streams lets you build stateful stream processing (joins, aggregations, windowing, deduplication) as an ordinary Java or Scala library inside your own service, without running a separate processing cluster. You deploy it like any microservice, and Kafka itself provides scaling, fault tolerance and exactly-once guarantees.
+how: Your topology reads input topics, transforms records, and writes output topics. Parallelism follows input partitions: each partition becomes a task, and tasks are spread across all running instances of your app through Kafka's consumer-group protocol. State (counts, joined tables) lives in local RocksDB stores, and every change is also written to a compacted 'changelog' topic, so a new instance can rebuild state after a failure. With processing.guarantee=exactly_once_v2, reading input, updating state and writing output happen inside one Kafka transaction. KTables model tables as changelogs, which makes stream–table joins natural.
+intuition: It is stream processing as a library rather than a platform: your service is the processing cluster. If you already run Kafka and microservices, this removes a whole system to operate.
+friction: It only reads from and writes to Kafka. Rebalancing moves tasks and may need to restore large state stores, causing pauses (standby replicas help). Scaling is bounded by the number of input partitions. Repartitioning by a new key writes an internal topic, adding latency and storage. The Scala API was deprecated in Kafka 4.3. For very large state, complex event-time logic, or non-Kafka sources, Flink is usually the better fit.
+ref: docs | Kafka Streams documentation | Apache Kafka | https://kafka.apache.org/documentation/streams/
+ref: book | Mastering Kafka Streams and ksqlDB | Mitch Seymour, 2021 |
+ref: blog | Introducing Kafka Streams: Stream Processing Made Simple | Jay Kreps, 2016 |
+
+@@ kafka-connect
+value: Kafka Connect is a framework for moving data between Kafka and other systems (databases, object stores, search engines, SaaS APIs) using reusable connectors instead of custom code. It gives you scaling, offset tracking, retries and a REST API for configuration, so a new pipeline is a JSON config rather than a project.
+how: Source connectors read from external systems and write to topics; sink connectors read topics and write elsewhere. Work is split into tasks that run on a cluster of workers; worker membership uses Kafka's group protocol, and connector configs, offsets and status are stored in internal Kafka topics. Converters (Avro, Protobuf, JSON with a schema registry) serialize records, and Single Message Transforms do light per-record changes. Debezium runs as a set of Connect source connectors for change data capture.
+intuition: Connect is the standard plug socket for Kafka: connectors are the adapters, and the framework handles the electricity (scaling, fault tolerance and position tracking).
+friction: Connector quality varies widely; many community connectors lack exactly-once guarantees or good error handling. Debugging failed tasks and dead-letter queues takes effort. Heavy transformations do not belong here; use a stream processor. Rebalances in large Connect clusters can pause many connectors at once.
+ref: docs | Kafka Connect documentation | Apache Kafka | https://kafka.apache.org/documentation/#connect
+ref: book | Kafka: The Definitive Guide, ch. 9 | Shapira et al., 2021 |
+
+@@ flink
+value: Apache Flink is the leading engine for low-latency, stateful stream processing at large scale. It processes events one at a time as they arrive, handles event time and late data precisely, and keeps terabytes of state with exactly-once guarantees. Fraud detection, real-time feature computation, streaming ETL and live analytics at companies such as Alibaba, Uber and Netflix run on it.
+how: A job is a dataflow graph of operators running as parallel tasks. Keyed state is partitioned by key and stored in memory or in embedded RocksDB. Flink's checkpoints are based on the Chandy–Lamport snapshot algorithm: the job manager injects barrier markers into the sources; when an operator has received barriers on all inputs, it snapshots its state asynchronously to durable storage. On failure, the job restarts from the last completed checkpoint and the sources rewind. Watermarks track event-time progress so windows can close correctly. Flink SQL and the Table API run the same engine declaratively; Flink 2.x moved state to disaggregated storage options and added AI model functions in SQL.
+intuition: Flink treats batch as a special case of streaming: a bounded stream. Everything is a continuous dataflow whose state is snapshotted consistently, like taking a photo of a running factory without stopping the conveyor belts.
+friction: Operating Flink well needs expertise: checkpoint tuning, state size and backend choice, rescaling (which redistributes key groups), and upgrading jobs without losing state (savepoints, schema evolution of state). Exactly-once to external sinks needs two-phase-commit sinks or idempotence. The learning curve is steeper than Spark's for many data teams.
+ref: paper | Lightweight Asynchronous Snapshots for Distributed Dataflows | Carbone et al., 2015 | https://arxiv.org/abs/1506.08603
+ref: paper | Apache Flink: Stream and Batch Processing in a Single Engine | Carbone et al., IEEE Data Eng. Bull. 2015 |
+ref: docs | Apache Flink documentation | Apache Flink | https://flink.apache.org/
+ref: book | Stream Processing with Apache Flink | Hueske & Kalavri, 2019 |
+
+@@ pulsar
+value: Apache Pulsar is a messaging and streaming system that separates serving from storage. Brokers are stateless and handle clients; data lives in Apache BookKeeper. This makes it easier to scale and rebalance than Kafka's original design, and it supports both streaming (ordered topics) and queue-style consumption, plus built-in multi-tenancy and geo-replication.
+how: A topic is a sequence of ledgers in BookKeeper; each ledger entry is written to several bookies (storage nodes) in parallel and acknowledged by a quorum. Because brokers hold no data, a topic can move to another broker instantly. Subscriptions can be exclusive, failover, shared (queue-like) or key-shared. Tiered storage offloads old ledgers to object stores.
+intuition: Kafka put storage and serving in the same broker; Pulsar split them, so each can scale on its own, like separating a restaurant's kitchen from its dining room.
+friction: More moving parts: brokers, bookies and a metadata store (ZooKeeper or alternatives) to operate. The ecosystem and community are smaller than Kafka's, and many tools assume the Kafka protocol. Kafka has meanwhile added tiered storage and queues, narrowing Pulsar's advantages.
+ref: docs | Apache Pulsar documentation | Apache Pulsar | https://pulsar.apache.org/
+ref: paper | Durability with BookKeeper | Junqueira, Kelly & Reed, 2013 |
+
+@@ redpanda
+value: Redpanda is a Kafka-API-compatible streaming platform written in C++, with no JVM and no ZooKeeper. Existing Kafka clients work unchanged, while the engine aims for lower and more predictable latency and simpler operations as a single binary.
+how: It uses the Seastar framework's thread-per-core design: each CPU core owns its own memory and partitions, and cores talk by message passing, avoiding locks. Each partition is replicated with its own Raft group. It bypasses the page cache with direct I/O and manages its own memory, and it offers tiered storage to object stores.
+intuition: Same log abstraction and wire protocol as Kafka, rebuilt from scratch around modern hardware: many cores, fast NVMe and the cost of crossing between cores.
+friction: Source-available licensing (Business Source License) rather than Apache. Compatibility covers most but not every Kafka feature, and the ecosystem of operators and tooling is smaller. Since Kafka 4.0 also dropped ZooKeeper, the operational gap has narrowed.
+ref: docs | Redpanda documentation | Redpanda | https://docs.redpanda.com/
+ref: docs | Seastar framework | ScyllaDB | https://seastar.io/
+
+@@ rabbitmq
+value: RabbitMQ is a widely used message broker for task queues and service-to-service messaging. Producers send messages to exchanges, which route them into queues; consumers take messages, process them and acknowledge them, and acknowledged messages are deleted. It is ideal for distributing work (emails to send, images to resize) with flexible routing.
+how: It implements the AMQP 0-9-1 protocol (plus MQTT, STOMP and a stream protocol). Exchange types decide routing: direct (by routing key), topic (by pattern), fanout (to all) and headers. Unacknowledged messages are redelivered when a consumer dies. Quorum queues, introduced in 2019, replicate queues with Raft for safety. RabbitMQ Streams add an append-only log type for replay. It is written in Erlang, whose lightweight processes suit many concurrent connections.
+intuition: A post office with sorting rules: letters (messages) arrive at sorting desks (exchanges), go to mailboxes (queues), and are thrown away once the recipient signs for them.
+friction: Classic queues are not designed to keep large backlogs or allow replay, unlike Kafka. Throughput per queue is limited; scaling means many queues. Ordering guarantees weaken with multiple consumers and redelivery. Clustering and network partitions have historically needed care.
+ref: docs | RabbitMQ documentation | Broadcom / RabbitMQ | https://www.rabbitmq.com/docs
+ref: book | RabbitMQ in Depth | Gavin Roy, 2017 |
+
+@@ kinesis
+value: Amazon Kinesis Data Streams is a managed, sharded log on AWS: Kafka-like semantics without running brokers. It suits AWS-native teams that want streaming ingestion with pay-per-use pricing and integration with Lambda, Firehose and AWS analytics.
+how: A stream has shards; each shard is an ordered sequence of records with sequence numbers, and records are routed by partition key hash. Data is replicated across availability zones and retained for 24 hours by default (extendable up to 365 days). Consumers read with iterators or enhanced fan-out push. On-demand mode scales shards automatically.
+intuition: Kafka's partitioned log idea, rented by the hour instead of operated.
+friction: Per-shard throughput limits (about 1 MB/s or 1,000 records/s in, 2 MB/s out) mean careful shard planning in provisioned mode. Fewer ecosystem tools than Kafka, and the API is AWS-specific, so moving away is work. Amazon MSK is the alternative when you want the Kafka API on AWS.
+ref: docs | Amazon Kinesis Data Streams developer guide | AWS | https://docs.aws.amazon.com/streams/latest/dev/introduction.html
+
+@@ debezium
+value: Debezium turns databases into event streams. It reads a database's change log (the PostgreSQL WAL through logical decoding, the MySQL binlog, MongoDB's oplog, and others) and emits an event for every inserted, updated or deleted row into Kafka. Downstream systems such as caches, search indexes, lakehouses and microservices can then react to changes without the application writing extra code.
+how: Connectors first take a consistent snapshot of existing data, then switch to streaming changes from the log position where the snapshot ended. Each event carries before and after row images, source metadata (transaction ID, log position) and an operation type. Offsets are stored by Kafka Connect, so the connector resumes exactly. Debezium also supports the outbox pattern via an event router, and can run without Kafka in Debezium Server.
+intuition: The database already writes down every change in order for its own recovery. Debezium simply reads that diary aloud to everyone else.
+friction: Schema changes, large transactions, initial snapshots of huge tables and log retention (if the connector is down too long, the log may be gone) need careful handling. Ordering is per table key, not global. Deletes and tombstones must be understood by sinks. Connector lag shows up as stale data downstream.
+ref: docs | Debezium documentation | Red Hat / Debezium | https://debezium.io/
+ref: blog | Reliable Microservices Data Exchange With the Outbox Pattern | Gunnar Morling, 2019 | https://debezium.io/blog/2019/02/19/reliable-microservices-data-exchange-with-the-outbox-pattern/
+
+@@ spark-sss
+value: Spark Structured Streaming lets you write a streaming job with the same DataFrame and SQL code as a batch job. Spark treats the stream as an unbounded table and incrementally updates the result as new rows arrive. For teams already on Spark and Databricks, it is the simplest route to streaming ETL into Delta tables.
+how: Each trigger reads new data from sources such as Kafka, runs an incremental version of the query plan, and writes to a sink. Offsets and state are recorded in a checkpoint directory (write-ahead log of offsets, commit log, state store snapshots, often RocksDB-backed). Event-time windows and watermarks bound state. Output modes (append, update, complete) control what is written. Exactly-once results come from replayable sources plus idempotent or transactional sinks such as Delta. Spark 4.1 added a Real-Time Mode for sub-second latency.
+intuition: 'A stream is just a table that keeps growing.' If you can write the batch query, Spark works out how to keep its answer up to date.
+friction: Micro-batch latency is usually seconds, not milliseconds, unless you use the newer real-time mode. Checkpoints tie a query to its plan, so some code changes require a new checkpoint. Stateful jobs need watermark and state tuning to avoid unbounded growth. Small output files from frequent triggers require compaction.
+ref: docs | Structured Streaming Programming Guide | Apache Spark |
+ref: paper | Structured Streaming: A Declarative API for Real-Time Applications in Apache Spark | Armbrust et al., SIGMOD 2018 |
+
+@@ mapreduce
+value: MapReduce (Google, 2004; Hadoop, 2006) made it practical to process petabytes on thousands of cheap, unreliable machines. Programmers wrote two functions, map and reduce, and the framework handled distribution, scheduling and failures. It started the big-data era and taught the industry partitioning, shuffles and re-execution as a recovery strategy.
+how: Input files are split into chunks; map tasks run near the data and emit key–value pairs; the framework partitions them by key, sorts and transfers them (the shuffle), and reduce tasks process all values for each key. Intermediate results are written to disk, and failed or slow tasks are simply re-run elsewhere (speculative execution). Data lives in a distributed file system (GFS or HDFS) with three-way replication.
+intuition: Divide a huge pile of paperwork among many clerks, have each tally their share by category, then send each category to one clerk for the final total. If a clerk falls ill, give their pile to someone else.
+friction: Writing everything to disk between steps made multi-stage and iterative jobs slow, and the two-function model was awkward for real pipelines. Spark, Flink and SQL engines replaced it for nearly all new work. Its ideas live on in every shuffle.
+ref: paper | MapReduce: Simplified Data Processing on Large Clusters | Dean & Ghemawat, OSDI 2004 | https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/
+ref: paper | The Google File System | Ghemawat, Gobioff & Leung, SOSP 2003 |
+
+@@ hdfs
+value: HDFS, the Hadoop Distributed File System, stored huge files across commodity machines with automatic replication, and brought computation to the data. For a decade it was the storage layer of big data. Many enterprises still run it, though cloud object storage has replaced it for most new work.
+how: Files are split into large blocks (128 MB by default), each replicated on three DataNodes, preferably across racks. A NameNode keeps the whole namespace and block map in memory; clients ask it where blocks are, then read directly from DataNodes. High-availability setups run a standby NameNode with a shared edit log. Erasure coding (Hadoop 3) cuts the storage overhead of replication.
+intuition: A library whose catalogue is held by one librarian with a perfect memory, while the books are spread over many shelves with spare copies.
+friction: The NameNode's in-memory metadata limits the number of files, so many small files are a classic problem. Operating Hadoop clusters is heavy, compute and storage scale together, and object storage is cheaper and more elastic.
+ref: paper | The Hadoop Distributed File System | Shvachko, Kuang, Radia & Chansler, MSST 2010 |
+ref: paper | The Google File System | Ghemawat et al., SOSP 2003 |
+
+@@ databricks
+value: Databricks is a managed data and AI platform built by the creators of Apache Spark. It combines Spark, Delta Lake, the Photon engine, Unity Catalog, notebooks, workflows, ML tooling (MLflow, model serving, feature engineering) and SQL warehouses into one lakehouse platform running in your cloud account. Its value is one place for data engineering, analytics and ML on open table formats.
+how: A control plane run by Databricks manages workspaces, jobs and metadata; the compute plane runs clusters or serverless compute that read and write Delta (and Iceberg) tables in object storage. Databricks Runtime bundles a tuned Spark (DBR 18 LTS ships Spark 4.1) with Photon, a vectorized C++ engine for SQL and DataFrame operations. Unity Catalog governs access, lineage and credentials across workspaces. Delta features such as liquid clustering, deletion vectors and predictive optimization automate table maintenance.
+intuition: Databricks packages the whole lakehouse pattern so a team can focus on pipelines and models instead of cluster plumbing.
+friction: Costs are layered (DBUs plus cloud compute) and need active governance: cluster policies, auto-termination, serverless choices and attribution. Some features are proprietary even though formats are open. Spark's own leaks (skew, small files, shuffles) still apply. Version upgrades of the runtime require testing, especially across major Spark versions.
+ref: docs | Databricks documentation | Databricks | https://docs.databricks.com/
+ref: paper | Photon: A Fast Query Engine for Lakehouse Systems | Behm et al., SIGMOD 2022 |
+ref: paper | Lakehouse (CIDR 2021) | Armbrust et al. | https://www.cidrdb.org/cidr2021/papers/cidr2021_paper17.pdf
+
+@@ photon
+value: Photon is Databricks' native query engine, written in C++, that runs SQL and DataFrame operations much faster than Spark's JVM execution for many workloads, without changing user code.
+how: It plugs into Spark's planner: supported operators run in Photon, others fall back to Spark. Photon uses vectorized execution, processing columnar batches of values with tight loops that suit SIMD and caches, instead of Spark's whole-stage code generation. It has specialized kernels for string handling, hashing and Parquet/Delta reading, and adapts at runtime to data properties such as nulls and ASCII strings.
+intuition: Rewrite the hottest inner loops in a language that sits closer to the hardware, and feed them whole columns at a time.
+friction: Proprietary and priced at a premium per unit of compute. Not every operator or UDF is supported, and fallbacks to Spark reduce gains. Benefits are biggest for SQL-heavy scans and joins and smaller for Python-heavy work.
+ref: paper | Photon: A Fast Query Engine for Lakehouse Systems | Behm et al., SIGMOD 2022 |
+
+@@ ray
+value: Ray is a general framework for distributed Python. Unlike Spark's data-parallel model, it lets you run arbitrary functions (tasks) and stateful objects (actors) across a cluster with a few decorators. It is popular for ML: distributed training, hyperparameter tuning, reinforcement learning, batch inference and LLM serving.
+how: A driver submits tasks and actor method calls; a distributed scheduler places them on worker processes. Results go into a shared-memory object store on each node and are passed by reference; objects move between nodes when needed. Ownership-based fault tolerance re-executes lost tasks from lineage. Libraries on top include Ray Data, Train, Tune, Serve and RLlib.
+intuition: Ray makes a cluster feel like one big Python process: call a function remotely and get a future back.
+friction: Flexibility means you design the parallelism yourself. Memory management in the object store, debugging distributed failures and cluster sizing take experience. For SQL-like data processing, Spark or DuckDB are usually simpler.
+ref: paper | Ray: A Distributed Framework for Emerging AI Applications | Moritz et al., OSDI 2018 |
+ref: docs | Ray documentation | Anyscale / Ray | https://docs.ray.io/
+
+@@ dask
+value: Dask scales the familiar Python data stack (pandas, NumPy, scikit-learn) from a laptop to a cluster with similar APIs. Data scientists can work on data larger than memory without learning a new framework.
+how: A Dask DataFrame is a collection of many pandas DataFrames (partitions); operations build a task graph lazily, which a scheduler then runs on threads, processes or a distributed cluster, spilling to disk when memory is short. Dask Array splits NumPy arrays into chunks the same way. A newer query planner optimizes DataFrame graphs.
+intuition: Cut a big table into many small pandas tables and orchestrate them like a to-do list with dependencies.
+friction: Shuffles and joins are costlier than in engines designed around them; some pandas behaviors do not translate. For SQL-style analytics, DuckDB or Polars on one big machine are often faster, and Spark is more mature at very large scale.
+ref: docs | Dask documentation | Dask | https://docs.dask.org/
+ref: paper | Dask: Parallel Computation with Blocked algorithms and Task Scheduling | Matthew Rocklin, SciPy 2015 |
+
+@@ trino
+value: Trino (originally Presto, Facebook, 2012) is a distributed SQL engine for interactive queries across many data sources: lakehouse tables, Hive, relational databases, Kafka, Elasticsearch, and more, even joining across them. It is built for fast, ad-hoc analytics rather than long batch jobs.
+how: A coordinator parses and optimizes the query, then schedules stages on workers. Data flows between stages through in-memory, pipelined exchanges, so results stream back as soon as possible, rather than writing intermediate data to disk. Connectors expose sources as catalogs and push down filters and projections where possible. A fault-tolerant execution mode can spool intermediate data for long queries.
+intuition: Trino is a query router and calculator that never owns the data: it reads where the data already lives.
+friction: Without spooling, a worker failure fails the whole query, and very large joins can run out of memory. Performance depends on connector pushdown and source speed. Large clusters need careful memory and concurrency settings.
+ref: paper | Presto: SQL on Everything | Sethi et al., ICDE 2019 |
+ref: book | Trino: The Definitive Guide, 2nd ed. | Fuller, Moser & Traverso, 2022 |
+ref: docs | Trino documentation | Trino Software Foundation | https://trino.io/docs/current/
+
+@@ duckdb
+value: DuckDB is an embedded analytical database: a single library you link into Python, R, Java or a command line, with no server. It runs fast columnar SQL over local files (Parquet, CSV, JSON), pandas or Arrow data, and remote object storage. It made 'big data on a laptop' practical for datasets up to hundreds of gigabytes.
+how: It uses a columnar, vectorized execution engine with morsel-driven parallelism across all cores, an optimizer, MVCC transactions, and out-of-core operators that spill to disk. It can query Parquet directly with predicate and projection pushdown, and extensions add Iceberg, Delta, spatial and HTTP/S3 access. It came from CWI Amsterdam, the same group behind MonetDB and vectorized execution research.
+intuition: SQLite changed small transactional databases by being embedded; DuckDB does the same for analytics.
+friction: It is single-node: very large datasets or many concurrent writers need other systems. One writer process at a time per database file. Managed and multi-user options (MotherDuck, DuckLake) are newer.
+ref: paper | DuckDB: an Embeddable Analytical Database | Raasveldt & Mühleisen, SIGMOD 2019 |
+ref: docs | DuckDB documentation | DuckDB Foundation | https://duckdb.org/docs/
+
+@@ polars
+value: Polars is a fast DataFrame library written in Rust, with Python bindings, built on Apache Arrow memory. It is a modern alternative to pandas that uses all CPU cores and a query optimizer.
+how: The lazy API builds a query plan that the optimizer improves (predicate and projection pushdown, common subexpression elimination) before execution. Execution is multi-threaded and vectorized over Arrow columns, with a streaming engine for larger-than-memory data. Expressions are composable and avoid Python-level loops.
+intuition: Bring database-engine ideas (lazy plans, columnar vectors, parallelism) to the DataFrame API that data scientists already like.
+friction: API differs from pandas, so migration takes effort; some libraries still expect pandas objects. It is single-machine (a distributed offering exists, but is newer).
+ref: docs | Polars user guide | Polars | https://docs.pola.rs/
+
+@@ beam
+value: Apache Beam is a unified programming model for batch and streaming pipelines that can run on several engines (Google Cloud Dataflow, Flink, Spark). It carries the ideas of Google's Dataflow paper: event time, windowing, triggers and watermarks as first-class concepts.
+how: You build a pipeline of PCollections and PTransforms in Java, Python or Go. Runners translate it to an engine. Windowing decides how events are grouped in event time; triggers decide when results are emitted; accumulation modes decide whether later results replace or add to earlier ones.
+intuition: Write the logic once, choose where to run it later, and separate 'what to compute' from 'where in time' and 'when to emit'.
+friction: Portability comes with abstraction overhead and uneven runner support. Outside Dataflow, most teams use Flink or Spark APIs directly.
+ref: paper | The Dataflow Model | Akidau et al., VLDB 2015 |
+ref: docs | Apache Beam programming guide | Apache Beam | https://beam.apache.org/documentation/programming-guide/
+
+@@ delta
+value: Delta Lake is an open table format that adds ACID transactions, schema enforcement, time travel and fast metadata to Parquet files in object storage. It is the default table format on Databricks and one of the two leading lakehouse formats (with Iceberg). For a data platform team, it turns a bucket of files into reliable tables that streaming and batch jobs can safely write together.
+how: Each table has a _delta_log directory of ordered JSON commit files. Each commit lists actions: add file (with statistics), remove file, metadata and protocol changes. Every 10 commits or so a Parquet checkpoint summarizes the state so readers do not replay everything. Writers commit with optimistic concurrency, creating the next numbered file only if it does not already exist (a mutual-exclusion guarantee that some object stores need a coordination service or conditional writes to provide). Features include MERGE for upserts, deletion vectors, change data feed, liquid clustering, generated columns, VARIANT and type widening; Delta Kernel provides a library so other engines read and write correctly. UniForm writes Iceberg-compatible metadata too.
+intuition: A bank ledger for files: the table's state is whatever the ordered list of commits says, and nobody edits old pages.
+friction: Concurrent writers to the same files conflict and retry. Small files and log growth need OPTIMIZE and VACUUM (or predictive optimization). Some features change the table protocol version, which can lock out older readers. Cross-engine support is good but not uniform, and the Delta versus Iceberg choice often depends on which catalog and engines you use.
+ref: paper | Delta Lake: High-Performance ACID Table Storage over Cloud Object Stores | Armbrust et al., VLDB 2020 | https://www.vldb.org/pvldb/vol13/p3411-armbrust.pdf
+ref: docs | Delta Lake documentation | Linux Foundation / Delta Lake | https://docs.delta.io/
+ref: spec | Delta transaction log protocol | Delta Lake | https://github.com/delta-io/delta/blob/master/PROTOCOL.md
+
+@@ iceberg
+value: Apache Iceberg is an open table format, created at Netflix in 2017, that brings reliable transactions, schema and partition evolution, and fast planning to huge tables in object storage. It has the broadest multi-engine support (Spark, Flink, Trino, Snowflake, BigQuery, Athena, DuckDB, Dremio and more) and has become an industry standard for open lakehouses.
+how: Each table snapshot is described by a metadata.json file pointing to a manifest list, which points to manifests, which list data files with per-column statistics. A commit writes new metadata and then atomically swaps the table's current-metadata pointer in a catalog (REST catalog, Glue, Nessie, Polaris, Unity Catalog). Hidden partitioning derives partitions from column transforms (for example day(ts)), so queries need not mention partition columns, and partition schemes can change without rewriting data. Format v2 added row-level deletes; v3 (adopted 2025) adds deletion vectors, row lineage, VARIANT, geospatial types and nanosecond timestamps; v4 is in development.
+intuition: Instead of listing directories (slow and inconsistent on object stores), Iceberg keeps an explicit, versioned table of contents.
+friction: You need a catalog that supports atomic commits, and catalog choice is now a strategic decision. Metadata files accumulate and need snapshot expiry and manifest rewrites. Equality deletes from streaming writers slow reads until compacted. Feature support differs across engines and versions.
+ref: spec | Apache Iceberg Table Spec | Apache Iceberg | https://iceberg.apache.org/spec/
+ref: book | Apache Iceberg: The Definitive Guide | Shiran, Hughes & Merced, 2024 |
+ref: blog | Iceberg v3 overview | Starburst | https://www.starburst.io/blog/iceberg-v3/
+
+@@ hudi
+value: Apache Hudi (Uber, 2016) was the first lakehouse table format designed around upserts and incremental processing: ingesting change streams into lake tables and letting downstream jobs read only what changed.
+how: A timeline records every action (commits, compactions, cleans). A record-level index maps keys to file groups so updates go to the right files. Copy-on-write tables rewrite files on update; merge-on-read tables append log files and compact them later. Incremental queries read changes since a commit time. Hudi 1.x added secondary indexes, non-blocking concurrency control, and the ability to write other formats.
+intuition: Hudi treats the lake like a database that receives a constant stream of updates.
+friction: Many configuration options and table services to tune. Engine support is narrower than Iceberg's. Industry momentum has gathered around Iceberg and Delta, with Hudi often used where its indexing shines.
+ref: docs | Apache Hudi documentation | Apache Hudi | https://hudi.apache.org/
+ref: blog | Hudi 1.1 release | Apache Hudi | https://hudi.apache.org/releases/release-1.1/
+
+@@ parquet
+value: Apache Parquet is the standard columnar file format for analytics. Almost every data engine reads and writes it, and lakehouse formats store their data in it. It cuts storage size and scan time dramatically compared with row formats like CSV or JSON.
+how: A file contains row groups (often 128 MB); each row group has one column chunk per column; each chunk has pages. Pages are encoded (dictionary, run-length/bit-packing hybrid, delta) and compressed (Snappy, Zstd, Gzip). The footer holds the schema and statistics (min, max, null count) for each column chunk, so readers skip row groups that cannot match. Nested data uses the Dremel record-shredding encoding with repetition and definition levels. Optional page indexes and bloom filters give finer skipping.
+intuition: Store a table the way analytics reads it: column by column, compressed, with a summary on every block so you can skip what you do not need.
+friction: Files are immutable, so updates mean rewriting (or table formats with deletion vectors). Too-small files and row groups waste the benefits. Writers must sort or cluster data for statistics to be selective. Encoding and compression choices trade CPU for size.
+ref: docs | Apache Parquet documentation | Apache Parquet | https://parquet.apache.org/docs/
+ref: paper | Dremel: Interactive Analysis of Web-Scale Datasets | Melnik et al., VLDB 2010 |
+
+@@ orc
+value: Apache ORC (Optimized Row Columnar) is a columnar file format created for Hive at Hortonworks and Facebook. It offers similar benefits to Parquet and remains common in Hive-centric ecosystems.
+how: Files are divided into stripes (often 64–256 MB), each with indexes, column data and a footer. Lightweight indexes record min/max per 10,000 rows, and optional bloom filters help selective lookups. It supports ACID tables in Hive through base and delta files.
+intuition: Parquet's sibling, tuned for Hive's needs.
+friction: Less universal support than Parquet in newer engines; most lakehouse projects choose Parquet.
+ref: docs | Apache ORC specification | Apache ORC | https://orc.apache.org/specification/
+
+@@ arrow
+value: Apache Arrow defines a standard columnar memory format, so different tools (pandas, Polars, DuckDB, Spark, Ray, databases) can share data without converting or copying it. It removed a huge hidden cost in data pipelines: serialization between systems.
+how: Each column is a contiguous buffer of values plus a validity bitmap for nulls, laid out with fixed alignment for SIMD. Record batches group columns. Arrow IPC streams and files move batches between processes; Arrow Flight is an RPC protocol for fast data transfer; ADBC is a database connectivity API. Libraries in many languages implement compute kernels over Arrow data.
+intuition: A common spoken language for in-memory tables, so systems no longer need translators.
+friction: It is a memory format, not a storage format (Parquet is for disk). Mutating Arrow data is awkward because buffers are immutable. Version and type mismatches between libraries occasionally appear.
+ref: docs | Apache Arrow columnar format | Apache Arrow | https://arrow.apache.org/docs/format/Columnar.html
+ref: blog | Apache Arrow and the '10 Things I Hate About pandas' | Wes McKinney, 2017 | https://wesmckinney.com/blog/apache-arrow-pandas-internals/
+
+@@ unity
+value: Unity Catalog is a governance layer for data and AI assets: it gives every table, view, volume, model and function a three-part name (catalog.schema.object), with central permissions, lineage, auditing and secure access from many engines. Databricks open-sourced it in 2024 under the LF AI & Data Foundation.
+how: Engines ask the catalog to resolve a name; the catalog checks permissions and returns the table's location and short-lived, scoped storage credentials (credential vending), so users never hold long-term cloud keys. It records lineage from queries and jobs, and exposes Delta and Iceberg tables through APIs, including an Iceberg REST catalog interface.
+intuition: A single front desk for all data: it knows where everything is, who may see it, and hands out temporary keys.
+friction: The managed Databricks version has more features than the open-source one. Migration from the Hive metastore takes planning. Multi-engine governance depends on each engine supporting the catalog's APIs and enforcement.
+ref: docs | Unity Catalog documentation | Databricks | https://docs.databricks.com/en/data-governance/unity-catalog/index.html
+ref: docs | Unity Catalog open source | LF AI & Data | https://www.unitycatalog.io/
+
+@@ hms
+value: The Hive Metastore stores table schemas and the locations of their files, and became the de facto catalog of the Hadoop and early lakehouse world. Many engines still integrate with it.
+how: A Thrift service backed by a relational database stores databases, tables, partitions, columns and storage locations. Engines query it to plan reads. Partition-level metadata lets engines prune directories.
+intuition: The original phone book for data lakes.
+friction: Tables with huge numbers of partitions overload it; it does not provide atomic multi-file commits; and governance is minimal. Modern catalogs (Unity, Polaris, Glue, Nessie) replace it.
+ref: docs | Hive Metastore administration | Apache Hive | https://hive.apache.org/
+
+@@ druid
+value: Apache Druid is a real-time analytics database for sub-second aggregations over event data, widely used for user-facing dashboards and operational analytics. It is a close relative of Pinot in design and use.
+how: Data is ingested from streams or batch into time-partitioned, immutable segments with columnar storage, dictionary encoding and bitmap indexes. Historical nodes serve segments; brokers scatter queries and merge results; deep storage (S3, HDFS) keeps durable copies. Optional rollup pre-aggregates data at ingestion. A multi-stage query engine adds SQL joins and batch ingestion.
+intuition: Time is the main organizing axis: most questions are 'what happened in this time range, by these dimensions?'
+friction: Many node types to operate. Joins and updates are limited compared with warehouses. Rollup loses raw detail. Choosing between Druid, Pinot and ClickHouse depends on update needs, operations and query patterns.
+ref: paper | Druid: A Real-time Analytical Data Store | Yang et al., SIGMOD 2014 |
+ref: docs | Apache Druid documentation | Apache Druid | https://druid.apache.org/docs/latest/
+
+@@ clickhouse
+value: ClickHouse is a fast open-source columnar database for real-time analytics, built at Yandex for web analytics and open-sourced in 2016. It is known for raw scan speed, efficient compression and a simple single-binary deployment.
+how: The MergeTree family stores data in parts sorted by a primary key, with a sparse index (one entry per granule of 8,192 rows) and per-column compression codecs. Inserts create new parts; background merges combine them (and in variants like ReplacingMergeTree or AggregatingMergeTree, deduplicate or pre-aggregate). Queries run with vectorized execution across all cores. Distributed tables shard data; replication uses ClickHouse Keeper (a Raft-based ZooKeeper replacement).
+intuition: Sort the data well, compress it hard, and scan it with every core.
+friction: Updates and deletes are heavy (mutations) or eventually applied; joins have improved but need care with memory. Small, frequent inserts create too many parts. Consistency across replicas is eventual by default.
+ref: docs | ClickHouse documentation | ClickHouse Inc. | https://clickhouse.com/docs
+ref: paper | ClickHouse - Lightning Fast Analytics for Everyone | Schulze et al., VLDB 2024 |

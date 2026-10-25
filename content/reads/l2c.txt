@@ -1,0 +1,252 @@
+@@ backprop
+value: Backpropagation computes the gradient of a loss with respect to every weight in a network in one backward pass, at about the cost of one or two forward passes. Without it, training models with billions of parameters would be impossible: estimating each gradient separately would cost one forward pass per weight.
+how: The forward pass computes and stores each layer's output. The backward pass starts from the loss and applies the chain rule layer by layer: each layer receives the gradient of the loss with respect to its output, computes the gradient with respect to its weights (to update them) and with respect to its input (to pass back). This is reverse-mode automatic differentiation applied to neural networks. The idea appeared several times (Linnainmaa 1970, Werbos 1974) and became popular after Rumelhart, Hinton and Williams (1986).
+Stored activations are why training uses far more memory than inference. Activation checkpointing trades compute for memory by recomputing some activations during the backward pass.
+intuition: Blame flows backward: if the final answer is wrong, each step learns how much it contributed to the error and adjusts in proportion.
+friction: Vanishing and exploding gradients in deep or recurrent networks (addressed by residual connections, normalization and careful initialization); the memory cost of stored activations; biologically implausible, so the brain probably learns differently.
+ref: paper | Learning representations by back-propagating errors | Rumelhart, Hinton & Williams, Nature 1986 |
+ref: video | Neural Networks: Zero to Hero (micrograd) | Andrej Karpathy, 2022 | https://karpathy.ai/zero-to-hero.html
+ref: blog | Calculus on Computational Graphs: Backpropagation | Christopher Olah, 2015 | https://colah.github.io/posts/2015-08-Backprop/
+
+@@ autodiff
+value: Automatic differentiation computes exact derivatives of any program built from differentiable operations. It is the engine inside PyTorch, JAX and TensorFlow, and it frees researchers from deriving gradients by hand, which is what made fast experimentation on new architectures possible.
+how: Every operation (add, multiply, matmul, exp) knows its local derivative. Forward mode carries derivatives alongside values (cheap when there are few inputs). Reverse mode records a graph or 'tape' of operations during the forward run, then walks it backward accumulating gradients (cheap when there are few outputs, such as one scalar loss, which is why deep learning uses it). PyTorch builds the graph dynamically as code runs; JAX traces functions and transforms them (grad, vmap, jit).
+It is neither symbolic differentiation (which can blow up expression size) nor numerical finite differences (which are approximate and slow).
+intuition: Every small step knows how to pass blame backward; chain the steps and the whole program does.
+friction: Non-differentiable operations (argmax, sampling, control flow on data) need tricks like straight-through estimators or reparameterization; memory for the tape; higher-order derivatives are costly.
+ref: paper | Automatic Differentiation in Machine Learning: a Survey | Baydin, Pearlmutter, Radul & Siskind, JMLR 2018 | https://arxiv.org/abs/1502.05767
+ref: docs | The Autodiff Cookbook | JAX authors | https://docs.jax.dev/en/latest/notebooks/autodiff_cookbook.html
+
+@@ loss
+value: A loss function turns 'how wrong is the model?' into a single number to minimize. Choosing it defines what the model actually learns, so it is the most important design decision after the data.
+how: Regression typically uses mean squared error (which assumes Gaussian noise) or mean absolute error (robust to outliers). Classification uses cross-entropy: the negative log-probability the model assigns to the correct class, which is maximum likelihood estimation in disguise. Language models minimize cross-entropy of the next token; perplexity is its exponential. Ranking uses pairwise or listwise losses; contrastive learning uses InfoNCE; reinforcement learning from feedback uses reward-based objectives.
+intuition: The loss is the teacher's grading rubric; students optimize for exactly what is graded.
+friction: The loss is a proxy for what we really want (helpfulness, revenue, fairness), and optimizing a proxy hard leads to Goodhart's law effects; class imbalance and noisy labels distort it.
+ref: book | Deep Learning, ch. 5–6 | Goodfellow, Bengio & Courville, 2016 | https://www.deeplearningbook.org/
+ref: book | Pattern Recognition and Machine Learning | Christopher Bishop, 2006 |
+
+@@ regularization
+value: Regularization stops models from memorizing training data so they generalize to new data. Every successful model uses some form of it, from L2 penalties in logistic regression to dropout and data augmentation in deep networks.
+how: Penalize large weights (L2 weight decay shrinks them; L1 drives some to zero for sparsity). Dropout randomly zeroes activations during training so the network cannot rely on any single path. Early stopping halts training when validation loss starts rising. Data augmentation creates varied copies of examples. More data is the strongest regularizer of all.
+Large modern networks often generalize well even when they could memorize the data; this is not fully explained (see 'double descent'), and implicit regularization from stochastic gradient descent plays a role.
+intuition: Prefer simple explanations: a rule that fits the data with fewer assumptions is more likely to hold tomorrow (Occam's razor).
+friction: Hyperparameters such as penalty strength and dropout rate need tuning; theory lags practice for over-parameterized models.
+ref: paper | Dropout: A Simple Way to Prevent Neural Networks from Overfitting | Srivastava et al., JMLR 2014 |
+ref: paper | Understanding deep learning requires rethinking generalization | Zhang et al., ICLR 2017 | https://arxiv.org/abs/1611.03530
+
+@@ genetic
+value: Evolutionary algorithms optimize by imitating natural selection, without needing gradients. They work on problems that are discrete, noisy or have no derivative: antenna design, neural architecture search, game strategies, scheduling.
+how: Keep a population of candidate solutions. Evaluate each with a fitness function; select the better ones; create children by crossover (mixing parents) and mutation (random changes); repeat. Variants include genetic algorithms (Holland, 1975), evolution strategies (CMA-ES), and genetic programming. Evolution strategies can be parallelized easily across many machines.
+intuition: Breed many guesses; keep the fittest; let small random changes explore.
+friction: Needs many fitness evaluations, so it is slow when evaluation is expensive; gradient methods usually win when gradients exist; results depend heavily on representation and mutation design.
+ref: book | Adaptation in Natural and Artificial Systems | John Holland, 1975 |
+ref: paper | Evolution Strategies as a Scalable Alternative to Reinforcement Learning | Salimans et al. (OpenAI), 2017 | https://arxiv.org/abs/1703.03864
+
+@@ boosting
+value: Gradient-boosted decision trees are still the best default for tabular data: click prediction, fraud, churn, ranking and bidding models in ad tech. XGBoost, LightGBM and CatBoost win most tabular competitions and run cheaply in production.
+how: Train a sequence of small decision trees, each one fitting the residual errors (more precisely, the negative gradient of the loss) of the ensemble so far, and add it with a small learning rate. Trees split on features to separate examples; histogram-based splitting (LightGBM) and second-order gradients (XGBoost) made it fast. Random forests, by contrast, average many independent trees trained on random subsets.
+intuition: Each new student focuses on the questions the class still gets wrong.
+friction: Needs feature engineering; trees cannot extrapolate beyond the range of training data; sequential training is less parallel than neural networks; deep learning is better for images, text and audio.
+ref: paper | Greedy Function Approximation: A Gradient Boosting Machine | Jerome Friedman, Annals of Statistics 2001 |
+ref: paper | XGBoost: A Scalable Tree Boosting System | Chen & Guestrin, KDD 2016 | https://arxiv.org/abs/1603.02754
+ref: paper | Why do tree-based models still outperform deep learning on tabular data? | Grinsztajn, Oyallon & Varoquaux, NeurIPS 2022 | https://arxiv.org/abs/2207.08815
+
+@@ layernorm
+value: Normalization layers keep the scale of activations stable through deep networks, which makes training faster and much less sensitive to learning rate and initialization. Every transformer uses LayerNorm or RMSNorm.
+how: BatchNorm (2015) normalizes each feature across a mini-batch; it works well for CNNs but depends on batch size. LayerNorm (2016) normalizes across the features of each single example: subtract the mean, divide by the standard deviation, then apply a learned scale and shift. RMSNorm drops the mean subtraction and is cheaper; most current LLMs use it. 'Pre-norm' placement (normalizing before each attention and MLP block) trains more stably than the original post-norm design.
+intuition: Keep every layer's inputs on the same scale, so no layer has to chase a moving target.
+friction: Why normalization helps is still debated (the original 'internal covariate shift' explanation is disputed); adds a little compute and memory traffic; outlier activations still appear in large models and complicate quantization.
+ref: paper | Layer Normalization | Ba, Kiros & Hinton, 2016 | https://arxiv.org/abs/1607.06450
+ref: paper | Root Mean Square Layer Normalization | Zhang & Sennrich, NeurIPS 2019 | https://arxiv.org/abs/1910.07467
+
+@@ residual
+value: Residual (skip) connections let networks grow to hundreds of layers and still train. ResNet (2015) introduced them for images; every transformer layer uses them. They are probably the single most important architectural trick in deep learning.
+how: Each block computes output = input + F(input), so the block only learns a correction. Gradients flow backward through the identity path unchanged, so they don't vanish across many layers. In transformers, the sum of all block outputs is called the 'residual stream', a shared channel that each layer reads from and writes to.
+intuition: Each layer edits a draft instead of rewriting it from scratch; if a layer has nothing useful to add, it can pass the draft through untouched.
+friction: Activation scale grows with depth unless normalized; the residual stream becomes a crowded shared space, which interpretability research tries to untangle.
+ref: paper | Deep Residual Learning for Image Recognition | He, Zhang, Ren & Sun, CVPR 2016 | https://arxiv.org/abs/1512.03385
+ref: paper | A Mathematical Framework for Transformer Circuits | Elhage et al. (Anthropic), 2021 | https://transformer-circuits.pub/2021/framework/index.html
+
+@@ conv
+value: Convolution builds the assumption that 'a pattern means the same thing wherever it appears' into a network. Convolutional networks made computer vision work (AlexNet, 2012), and convolution is still used in vision, audio, video codecs and efficient models.
+how: A small filter (say 3×3) slides over the image, computing a weighted sum at each position; the same weights are reused everywhere (weight sharing), so the number of parameters stays small. Stacking layers grows the receptive field: early layers detect edges, later ones textures, parts and objects. Pooling or strided convolution reduces resolution. LeNet (LeCun, 1989) pioneered it; vision transformers now rival CNNs at large scale.
+intuition: Scan a magnifying glass over the picture, looking for the same shapes everywhere.
+friction: Fixed local receptive fields make long-range relationships hard; less flexible than attention given enough data; convolutions are less efficient on some accelerators than plain matrix multiplies.
+ref: paper | Gradient-Based Learning Applied to Document Recognition | LeCun, Bottou, Bengio & Haffner, 1998 |
+ref: paper | ImageNet Classification with Deep Convolutional Neural Networks | Krizhevsky, Sutskever & Hinton, NeurIPS 2012 |
+ref: course | CS231n: Deep Learning for Computer Vision | Stanford | https://cs231n.github.io/
+
+@@ gqa
+value: Multi-query and grouped-query attention shrink the KV cache by sharing key and value heads across many query heads. A smaller cache means more concurrent users per GPU and longer context, at almost no quality cost. Most current open models (Llama 2 70B and later, Mistral, Qwen) use GQA.
+how: Standard multi-head attention has separate K and V projections for each head. Multi-query attention (Shazeer, 2019) uses one shared K and V for all heads. Grouped-query attention (Ainslie et al., 2023) is the middle ground: groups of query heads share one K/V head, for example 64 query heads with 8 KV heads cuts the cache 8×. DeepSeek's multi-head latent attention goes further, compressing K and V into a small latent vector.
+intuition: Many readers asking different questions can share one copy of the library index.
+friction: Some quality loss compared with full multi-head attention, especially with MQA; converting existing models requires extra training ('uptraining').
+ref: paper | Fast Transformer Decoding: One Write-Head is All You Need | Noam Shazeer, 2019 | https://arxiv.org/abs/1911.02150
+ref: paper | GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints | Ainslie et al., EMNLP 2023 | https://arxiv.org/abs/2305.13245
+
+@@ rope
+value: Rotary position embeddings (RoPE) tell attention where tokens are relative to each other. They are used in nearly all current open LLMs, and they make context-length extension techniques possible.
+how: Attention alone ignores word order. RoPE rotates each query and key vector by an angle proportional to its position, with different frequencies for different dimension pairs. The dot product between a query at position m and a key at position n then depends only on the distance m − n, so attention naturally becomes relative. Context extension methods (position interpolation, NTK scaling, YaRN) adjust the rotation frequencies so a model trained on 8K tokens can handle much longer inputs with little extra training.
+intuition: Each word is a clock hand turned by its position; comparing two hands tells you how far apart they are, not where they are.
+friction: Extrapolation far beyond the trained length still degrades; long-context quality ('lost in the middle') is not guaranteed by position encoding alone.
+ref: paper | RoFormer: Enhanced Transformer with Rotary Position Embedding | Su et al., 2021 | https://arxiv.org/abs/2104.09864
+ref: paper | YaRN: Efficient Context Window Extension of Large Language Models | Peng et al., 2023 | https://arxiv.org/abs/2309.00071
+
+@@ kvcache
+value: The KV cache stores the keys and values of all previous tokens so a language model doesn't recompute them for every new token. It turns generation cost from quadratic to linear per token, and it is the main memory bottleneck of LLM serving.
+how: During prefill, the model processes the prompt and stores each layer's K and V tensors. During decode, each new token computes only its own query, key and value, attends over the cached K and V, and appends its own. Size = 2 × layers × KV heads × head dimension × tokens × bytes per value; for a 70B-class model with GQA at 128K tokens this can be tens of gigabytes per request. That is why GQA, KV quantization, paged memory (vLLM), prefix caching and cache offloading to CPU or SSD all exist.
+intuition: Keep notes on what has been said so far, instead of rereading the whole conversation before every word.
+friction: Memory grows linearly with context and batch size; decode becomes memory-bandwidth bound; eviction or compression of old tokens can lose information.
+ref: blog | LLM Inference Series: KV caching, a deeper look | Pierre Lienhart, 2024 |
+ref: paper | Efficient Memory Management for Large Language Model Serving with PagedAttention | Kwon et al., SOSP 2023 | https://arxiv.org/abs/2309.06180
+
+@@ embeddings
+value: Embeddings represent words, products, users, images or documents as dense vectors so that similar things are close together. They are the basis of semantic search, recommendations, RAG, clustering and the first layer of every language model.
+how: Train vectors so that items appearing in similar contexts end up nearby: word2vec (2013) predicted neighboring words; modern sentence embedding models are trained with contrastive learning on pairs of related texts. Similarity is measured by cosine similarity or dot product. In an LLM, the embedding table maps each token ID to a vector, and the model's internal hidden states are themselves contextual embeddings.
+intuition: Place every item on a map where distance means 'how different'; meaning becomes geometry.
+friction: Vectors capture whatever the training data emphasized, including bias; different models' vectors are not comparable; dimensions are not human-interpretable; re-embedding a whole corpus when the model changes is expensive.
+ref: paper | Efficient Estimation of Word Representations in Vector Space (word2vec) | Mikolov et al., 2013 | https://arxiv.org/abs/1301.3781
+ref: paper | Sentence-BERT | Reimers & Gurevych, EMNLP 2019 | https://arxiv.org/abs/1908.10084
+ref: blog | The Illustrated Word2vec | Jay Alammar, 2019 | https://jalammar.github.io/illustrated-word2vec/
+
+@@ bpe
+value: Byte-pair encoding tokenization splits text into subword pieces, so a model has a fixed vocabulary (often 32K–200K tokens) yet can represent any word, name or code. The tokenizer decides how many tokens a text costs, which drives price, latency and context usage.
+how: Start from bytes or characters. Repeatedly find the most frequent adjacent pair in the training corpus and merge it into a new token, until reaching the target vocabulary size. Common words become single tokens; rare words split into pieces. Byte-level BPE (GPT-2) guarantees no unknown characters. SentencePiece and unigram language model tokenizers are related alternatives.
+intuition: Give frequent letter combinations their own shorthand symbol, like a stenographer.
+friction: Tokens don't match human units, which causes oddities in spelling, counting letters and arithmetic; non-English languages often need more tokens per word, making them costlier; tokenizer changes require retraining.
+ref: paper | Neural Machine Translation of Rare Words with Subword Units | Sennrich, Haddow & Birch, ACL 2016 | https://arxiv.org/abs/1508.07909
+ref: video | Let's build the GPT Tokenizer | Andrej Karpathy, 2024 | https://www.youtube.com/watch?v=zduSFxRajkE
+
+@@ moe
+value: Mixture of experts lets a model have many more parameters than it uses for each token, giving the quality of a large model at the compute cost of a smaller one. Many frontier and open models (Mixtral, DeepSeek-V3, Qwen3 MoE, Llama 4) use it.
+how: The dense MLP block in each transformer layer is replaced by many expert MLPs plus a small router. For each token, the router picks the top-k experts (often 2 out of 8, or 8 out of 256) and combines their outputs. A load-balancing loss or bias keeps experts evenly used. Experts are spread across GPUs (expert parallelism), so tokens are sent to the GPUs holding their chosen experts and back, using all-to-all communication.
+intuition: A hospital with many specialists and a triage nurse; each patient sees only the doctors they need.
+friction: All parameters must still fit in memory; all-to-all communication is costly; routing can collapse onto a few experts; serving small batches is inefficient because each expert sees few tokens.
+ref: paper | Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer | Shazeer et al., ICLR 2017 | https://arxiv.org/abs/1701.06538
+ref: paper | Switch Transformers | Fedus, Zoph & Shazeer, JMLR 2022 | https://arxiv.org/abs/2101.03961
+ref: paper | DeepSeek-V3 Technical Report | DeepSeek-AI, 2024 | https://arxiv.org/abs/2412.19437
+
+@@ rlhf
+value: Reinforcement learning from human feedback turns a model that predicts text into an assistant that follows instructions and avoids harmful outputs. It, and its successors, are why chat models feel helpful rather than like autocomplete.
+how: Classic RLHF (InstructGPT, 2022): (1) supervised fine-tuning on demonstration answers; (2) collect human comparisons of pairs of answers and train a reward model to predict which is preferred; (3) optimize the policy with PPO to maximize reward, with a KL penalty to stay close to the original model. Direct preference optimization (DPO, 2023) skips the separate reward model and trains directly on preference pairs. Constitutional AI and RLAIF use AI feedback guided by written principles. Reasoning models add reinforcement learning with verifiable rewards (correct maths answers, passing tests), using methods like GRPO.
+intuition: Show people two answers, learn which they prefer, then nudge the model toward preferred answers.
+friction: Reward hacking (the model exploits flaws in the reward model); sycophancy (telling raters what they want to hear); human labels are expensive and inconsistent; it shapes behavior more than it adds knowledge.
+ref: paper | Training language models to follow instructions with human feedback (InstructGPT) | Ouyang et al., NeurIPS 2022 | https://arxiv.org/abs/2203.02155
+ref: paper | Direct Preference Optimization | Rafailov et al., NeurIPS 2023 | https://arxiv.org/abs/2305.18290
+ref: paper | Constitutional AI: Harmlessness from AI Feedback | Bai et al. (Anthropic), 2022 | https://arxiv.org/abs/2212.08073
+
+@@ lora
+value: LoRA fine-tunes a large model by training a tiny number of extra parameters (often under 1%), so one GPU can adapt a model that would otherwise need a cluster to fine-tune, and many task adapters can share a single base model in serving.
+how: Freeze the original weight matrix W. Add a low-rank update B·A, where A and B are thin matrices (rank r such as 8 or 16). Only A and B are trained. At inference, the update can be merged into W (no extra latency) or kept separate so a server can swap adapters per request. QLoRA combines it with a 4-bit quantized base model to cut memory further.
+intuition: Fine-tuning changes are 'simple': instead of rewriting a whole book, add a few pages of margin notes.
+friction: Can underperform full fine-tuning for large shifts in knowledge or domain; rank and target layers need tuning; adapters are tied to one base model version.
+ref: paper | LoRA: Low-Rank Adaptation of Large Language Models | Hu et al., ICLR 2022 | https://arxiv.org/abs/2106.09685
+ref: paper | QLoRA: Efficient Finetuning of Quantized LLMs | Dettmers et al., NeurIPS 2023 | https://arxiv.org/abs/2305.14314
+
+@@ distill
+value: Knowledge distillation trains a small 'student' model to imitate a large 'teacher', producing models that are much cheaper to serve but keep much of the teacher's quality. Most small production models today are distilled.
+how: Instead of training only on hard labels, the student matches the teacher's full output probability distribution (soft targets, often 'softened' with a temperature), which carries information about which wrong answers are nearly right. For LLMs, students are also trained on large volumes of teacher-generated text, including reasoning traces.
+intuition: Learning from a teacher's explanation, not only the answer key.
+friction: The student is capped by the teacher and by its own capacity; terms of service may forbid distilling from some commercial models; reasoning traces can teach style without real capability.
+ref: paper | Distilling the Knowledge in a Neural Network | Hinton, Vinyals & Dean, 2015 | https://arxiv.org/abs/1503.02531
+ref: paper | DistilBERT | Sanh et al., 2019 | https://arxiv.org/abs/1910.01108
+
+@@ quant
+value: Quantization stores weights (and sometimes activations and the KV cache) in fewer bits, such as 8 or 4 instead of 16. Memory and bandwidth drop 2–4×, so models run faster, on fewer GPUs, and even on laptops and phones.
+how: Map floating-point values to a small set of levels using a scale (and sometimes a zero point) per tensor, per channel or per small group of values. Post-training methods (GPTQ, AWQ) choose rounding to minimize output error using a little calibration data; outlier-aware schemes protect a few large values. Hardware formats like FP8 and FP4 (MXFP4, NVFP4 on recent GPUs) support low precision natively. Quantization-aware training simulates rounding during training for better accuracy.
+intuition: Describe each number with fewer digits; for most purposes the picture stays the same.
+friction: Accuracy loss grows below 4 bits, especially on reasoning and long-context tasks; activation outliers make activation quantization hard; kernels and hardware support vary.
+ref: paper | GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers | Frantar et al., ICLR 2023 | https://arxiv.org/abs/2210.17323
+ref: paper | LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale | Dettmers et al., NeurIPS 2022 | https://arxiv.org/abs/2208.07339
+ref: blog | A Visual Guide to Quantization | Maarten Grootendorst, 2024 | https://newsletter.maartengrootendorst.com/p/a-visual-guide-to-quantization
+
+@@ ann
+value: Approximate nearest-neighbor search finds the vectors most similar to a query among millions or billions in milliseconds, by giving up a small amount of accuracy. It powers vector databases, semantic search, RAG retrieval and recommendation candidate generation.
+how: HNSW (2016) builds a multi-layer 'small world' graph: search starts at a sparse top layer and greedily moves to closer neighbors, dropping down layers for finer search. IVF clusters vectors with k-means and searches only the nearest clusters. Product quantization compresses vectors into short codes so distances can be estimated quickly in memory. DiskANN keeps a graph on SSD for billion-scale data. Recall is traded against latency with parameters like efSearch or nprobe.
+intuition: To find the nearest café, ask locals who point you closer each time, instead of measuring the distance to every café in the city.
+friction: HNSW uses a lot of memory and is slow to build; deletes and updates degrade graphs; combining vector search with metadata filters is hard; recall can silently drop.
+ref: paper | Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs | Malkov & Yashunin, 2016 | https://arxiv.org/abs/1603.09320
+ref: paper | Product Quantization for Nearest Neighbor Search | Jégou, Douze & Schmid, TPAMI 2011 |
+ref: docs | Faiss wiki | Meta AI | https://github.com/facebookresearch/faiss/wiki
+
+@@ parallelism
+value: Model parallelism splits training and serving of models too big for one GPU across many GPUs. Training frontier models uses thousands of GPUs at once, combining several kinds of parallelism.
+how: Data parallelism: each GPU has a full model copy and a different slice of the batch; gradients are averaged with all-reduce. Sharded data parallelism (ZeRO, FSDP) splits weights, gradients and optimizer states across GPUs and gathers them when needed. Tensor parallelism splits individual matrix multiplications across GPUs in one node (Megatron-LM). Pipeline parallelism places different layers on different GPUs and streams micro-batches through them. Expert parallelism spreads MoE experts; sequence or context parallelism splits long sequences. Real systems combine them ('3D' or '4D' parallelism) to match network topology.
+intuition: Split a big job by customers (data), by steps (pipeline), or by cutting each task in pieces (tensor).
+friction: Communication overhead, pipeline 'bubbles' of idle time, load imbalance, and failures at scale (a single GPU failure stops a synchronous job; checkpointing and fast restart are essential).
+ref: paper | Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism | Shoeybi et al., 2019 | https://arxiv.org/abs/1909.08053
+ref: paper | ZeRO: Memory Optimizations Toward Training Trillion Parameter Models | Rajbhandari et al., SC 2020 | https://arxiv.org/abs/1910.02054
+ref: book | The Ultra-Scale Playbook: Training LLMs on GPU Clusters | Hugging Face, 2025 | https://huggingface.co/spaces/nanotron/ultrascale-playbook
+
+@@ allreduce
+value: All-reduce combines values (such as gradients) from every worker and gives every worker the result. It is the core communication step of distributed training, and its efficiency often decides how well training scales.
+how: The naive approach sends everything to one node, which then becomes the bottleneck. Ring all-reduce arranges N workers in a ring; each sends and receives chunks in two phases (reduce-scatter, then all-gather), so each worker transfers about 2× the data size regardless of N, using every link's bandwidth. Tree and hierarchical algorithms cut latency for large clusters. NVIDIA's NCCL implements these over NVLink within a node and InfiniBand or RoCE between nodes. Overlapping communication with backward computation hides much of the cost.
+intuition: Pass partial sums around a circle until everyone holds the total.
+friction: Synchronous: the slowest worker sets the pace; bandwidth between nodes is much lower than within; large clusters need careful topology-aware tuning.
+ref: blog | Bringing HPC Techniques to Deep Learning (ring all-reduce) | Andrew Gibiansky, Baidu, 2017 |
+ref: paper | Horovod: fast and easy distributed deep learning in TensorFlow | Sergeev & Del Balso, 2018 | https://arxiv.org/abs/1802.05799
+
+@@ mixedprec
+value: Mixed-precision training does most computation in 16-bit (or 8-bit) formats while keeping critical values in 32-bit. It roughly doubles throughput and halves memory compared with full FP32 training, with no loss in final quality.
+how: Keep a master copy of the weights in FP32. Run the forward and backward passes in FP16 or BF16 on tensor cores. With FP16, scale the loss up before backward so small gradients don't round to zero (loss scaling). BF16 keeps FP32's exponent range, so it rarely needs loss scaling, which is why it became the default. FP8 training (with per-tensor or per-block scaling) is now used for some frontier models, such as DeepSeek-V3.
+intuition: Do rough work with a pencil, but keep the final ledger in ink.
+friction: Some operations (softmax, normalization, loss) must stay in higher precision; FP8 needs careful scaling and hardware support; numerical bugs are hard to detect.
+ref: paper | Mixed Precision Training | Micikevicius et al., ICLR 2018 | https://arxiv.org/abs/1710.03740
+ref: paper | FP8 Formats for Deep Learning | Micikevicius et al., 2022 | https://arxiv.org/abs/2209.05433
+
+@@ flashattn
+value: FlashAttention computes exact attention several times faster and with memory linear in sequence length, by being careful about the GPU memory hierarchy. It is the reason long-context training and serving are practical, and it shows that 'IO-aware' algorithms can beat 'FLOP-aware' ones.
+how: Naive attention writes the full N×N score matrix to slow GPU high-bandwidth memory (HBM) and reads it back. FlashAttention splits Q, K and V into tiles that fit in fast on-chip SRAM, computes attention for each tile, and combines results using an online softmax (keeping a running maximum and sum), so the N×N matrix is never stored. The backward pass recomputes tiles instead of storing them. FlashAttention-2 and -3 improved parallelism and used newer hardware features (asynchronous copies, FP8 on Hopper GPUs).
+intuition: Don't spread all your papers across the floor; work through them a few at a time on your desk, keeping only running totals.
+friction: Requires hand-written kernels for each GPU generation; still quadratic in compute; custom attention variants need new kernels (which compiler-based approaches like FlexAttention try to fix).
+ref: paper | FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness | Dao et al., NeurIPS 2022 | https://arxiv.org/abs/2205.14135
+ref: paper | FlashAttention-3 | Shah et al., 2024 | https://arxiv.org/abs/2407.08608
+
+@@ pagedattn
+value: PagedAttention manages the KV cache like operating-system virtual memory, eliminating most memory waste so a GPU can serve 2–4× more concurrent requests. It is the core of vLLM and a standard technique in LLM serving.
+how: Before vLLM, servers reserved one contiguous block per request for the maximum possible length, wasting most of it. PagedAttention splits the cache into fixed-size blocks (e.g., 16 tokens), allocated on demand and tracked by a per-request block table, just like page tables map virtual to physical memory. The attention kernel reads blocks through the table. Shared prefixes can point to the same physical blocks with copy-on-write, which enables cheap parallel sampling and prefix caching.
+intuition: Give each request library shelves one at a time as it needs them, instead of reserving a whole aisle up front.
+friction: Indirection adds a little kernel overhead; block size is a trade-off; memory pressure still forces preemption or swapping of requests.
+ref: paper | Efficient Memory Management for Large Language Model Serving with PagedAttention | Kwon et al., SOSP 2023 | https://arxiv.org/abs/2309.06180
+ref: blog | vLLM: Easy, Fast, and Cheap LLM Serving with PagedAttention | vLLM team, 2023 | https://blog.vllm.ai/2023/06/20/vllm.html
+
+@@ contbatch
+value: Continuous batching lets an LLM server add and remove requests from a running batch at every generation step, instead of waiting for a whole batch to finish. It raises GPU utilization and throughput many times over and cuts queueing delay.
+how: Requests produce different numbers of tokens. With static batching, finished requests leave idle slots until the longest one ends. Iteration-level scheduling (Orca, 2022) re-forms the batch at each decode step: finished sequences leave, waiting ones join. Modern servers also mix prefill chunks with decode steps (chunked prefill) and can split prefill and decode onto different GPUs (disaggregated serving) because their bottlenecks differ (compute versus memory bandwidth).
+intuition: A bus that lets passengers on and off at every stop, rather than waiting until everyone reaches the last stop.
+friction: Scheduling policy trades latency against throughput; long prompts can stall decoding unless chunked; memory limits force preemption.
+ref: paper | Orca: A Distributed Serving System for Transformer-Based Generative Models | Yu et al., OSDI 2022 |
+ref: blog | How continuous batching enables 23x throughput in LLM inference | Anyscale, 2023 | https://www.anyscale.com/blog/continuous-batching-llm-inference
+
+@@ denoising
+value: Diffusion models generate images, video, audio and more by learning to remove noise. They replaced GANs for image generation because they train stably and cover the variety of the data well.
+how: Training: take a real image, add a random amount of Gaussian noise, and train a network to predict the noise (or the clean image). Generation: start from pure noise and apply the network repeatedly, removing a little noise each step, until an image appears. Text conditioning comes from a text encoder; classifier-free guidance strengthens how closely the output follows the prompt. Latent diffusion runs the process in a compressed latent space for efficiency (Stable Diffusion). Flow matching and rectified flows learn straighter paths, needing fewer steps, and are now common.
+intuition: A sculptor who learned exactly how dust settles on statues can reverse it, revealing a statue from a block of dust.
+friction: Many network evaluations per sample make generation slower than one-pass models (distillation reduces steps); control over fine details and text in images is hard; training data copyright and consent are contested.
+ref: paper | Denoising Diffusion Probabilistic Models | Ho, Jain & Abbeel, NeurIPS 2020 | https://arxiv.org/abs/2006.11239
+ref: paper | High-Resolution Image Synthesis with Latent Diffusion Models | Rombach et al., CVPR 2022 | https://arxiv.org/abs/2112.10752
+ref: blog | What are Diffusion Models? | Lilian Weng, 2021 | https://lilianweng.github.io/posts/2021-07-11-diffusion-models/
+
+@@ toolcall
+value: Tool calling lets a language model act in the world: query a database, call an API, run code, search the web. It turns a text predictor into the core of an agent, and it connects LLMs to the systems engineers already have.
+how: The application describes available tools to the model (name, description, JSON schema for arguments). When useful, the model outputs a structured tool call instead of a final answer. The application runs the tool, adds the result to the conversation, and calls the model again. Models are fine-tuned to produce well-formed calls; constrained decoding can guarantee valid JSON. Standards like the Model Context Protocol (MCP) let tool servers plug into many applications.
+intuition: The model is a manager who can't touch anything, but can write precise instructions for assistants who can.
+friction: Models choose wrong tools or arguments; tool output can contain prompt injection; each call adds latency; too many tools confuse the model; permissions and safety need careful design.
+ref: paper | Toolformer: Language Models Can Teach Themselves to Use Tools | Schick et al., NeurIPS 2023 | https://arxiv.org/abs/2302.04761
+ref: docs | Model Context Protocol specification | Anthropic & contributors | https://modelcontextprotocol.io/
+
+@@ reactloop
+value: The ReAct loop (reason, act, observe, repeat) is the basic control loop of most AI agents. Interleaving thinking with actions lets a model plan, gather information, recover from errors and finish multi-step tasks.
+how: In a loop: the model writes its reasoning about what to do next, emits an action (a tool call), the environment returns an observation, and everything is appended to the context. The loop stops when the model gives a final answer or hits a step limit. Variants add planning first, reflection on failures, or sub-agents for sub-tasks. Coding agents are ReAct loops with file, shell and test tools.
+intuition: Think, try, look at what happened, think again: how a person debugs.
+friction: Errors compound over long loops; context fills with observations (requiring summarization or context management); loops can get stuck repeating actions; cost and latency grow with each step.
+ref: paper | ReAct: Synergizing Reasoning and Acting in Language Models | Yao et al., ICLR 2023 | https://arxiv.org/abs/2210.03629
+ref: paper | Reflexion: Language Agents with Verbal Reinforcement Learning | Shinn et al., NeurIPS 2023 | https://arxiv.org/abs/2303.11366
+
+@@ contexteng
+value: Context engineering is the practice of deciding exactly what information goes into a model's limited context window at each step: instructions, examples, retrieved documents, tool results, memory. For agents and RAG systems, it often matters more than the choice of model.
+how: Techniques include clear system instructions; retrieving only the most relevant chunks; summarizing or compacting old history; storing notes in files or memory outside the context and loading them on demand; isolating sub-tasks in sub-agents with their own clean context; keeping stable prefixes so prompt caching works; and ordering content so important material isn't lost in the middle.
+intuition: A briefing packet for a very capable but forgetful expert: what you put in, and in what order, decides the quality of their answer.
+friction: Quality degrades as context grows ('context rot'), even within the advertised window; what to keep versus drop is task-specific; it is still more craft than science, and hard to evaluate.
+ref: blog | Effective context engineering for AI agents | Anthropic, 2025 | https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents
+ref: paper | Lost in the Middle: How Language Models Use Long Contexts | Liu et al., TACL 2024 | https://arxiv.org/abs/2307.03172

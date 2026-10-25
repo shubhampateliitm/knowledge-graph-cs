@@ -1,0 +1,260 @@
+@@ lucene
+value: Apache Lucene (Doug Cutting, 1999) is the search library inside Elasticsearch, OpenSearch, Solr and many other products. It provides indexing and querying of text, numbers, geo-points and vectors, with relevance scoring, in a single Java library.
+how: Documents are analyzed into terms; Lucene writes immutable segments, each with an inverted index (term dictionary as an FST, posting lists with doc IDs, frequencies and positions, compressed with delta and block encodings), stored fields, doc values (columnar data for sorting and aggregation), BKD trees for numeric and geo ranges, and HNSW graphs for vectors. New segments are created on flush; a merge policy combines them in the background. Searches run across all segments and combine results; BM25 is the default similarity.
+intuition: Lucene is the textbook index at the back of every book, automated and made incremental: write new small indexes, merge them into big ones later.
+friction: Being a library, it leaves distribution, replication and APIs to systems built on it. Segment merging consumes I/O; many small segments slow searches. Vector search in Lucene is improving quickly but competes with specialized engines.
+ref: docs | Apache Lucene | Apache Software Foundation | https://lucene.apache.org/
+ref: book | Lucene in Action, 2nd ed. | McCandless, Hatcher & Gospodnetić, 2010 |
+ref: book | Introduction to Information Retrieval | Manning, Raghavan & Schütze | https://nlp.stanford.edu/IR-book/
+
+@@ opensearch
+value: OpenSearch is the Apache-licensed fork of Elasticsearch 7.10 and Kibana, started by AWS in 2021 after Elastic changed its license. It now lives in the Linux Foundation's OpenSearch Software Foundation and powers Amazon OpenSearch Service.
+how: Its architecture matches Elasticsearch at the time of the fork (Lucene shards, replicas, near-real-time refresh), and it has since diverged: its own plugins for security, alerting, anomaly detection, vector search (k-NN with several engines) and observability.
+intuition: Same engine family, different governance and license.
+friction: APIs and features have drifted from Elasticsearch, so clients and plugins are not always interchangeable. Choosing between them is now about features, managed offerings and licenses.
+ref: docs | OpenSearch documentation | OpenSearch Project | https://opensearch.org/docs/latest/
+
+@@ snowflake
+value: Snowflake (founded 2012) made the cloud data warehouse simple: load data, write SQL, and let the service handle storage, tuning and scaling. Its key idea is separating storage from compute, so many independent compute clusters can query the same data without competing.
+how: Data is stored in compressed columnar micro-partitions (50–500 MB uncompressed) in cloud object storage, with metadata (min/max per column) kept in a central service for pruning. Virtual warehouses are clusters of compute nodes with local SSD caches; they start, stop and resize in seconds. A cloud services layer handles query optimization, transactions (MVCC on immutable micro-partitions), security and metadata. Features include time travel, zero-copy cloning, data sharing, and support for Iceberg tables.
+intuition: Rent a kitchen per meal, while the pantry stays shared.
+friction: Proprietary storage format (except Iceberg tables), and costs can surprise without warehouse governance. Clustering of large tables needs attention. Fine-grained control over execution is limited.
+ref: paper | The Snowflake Elastic Data Warehouse | Dageville et al., SIGMOD 2016 |
+ref: docs | Snowflake documentation | Snowflake | https://docs.snowflake.com/
+
+@@ bigquery
+value: Google BigQuery is a serverless data warehouse: there are no clusters to size; you run SQL and pay by data scanned or by reserved capacity. It descends from Dremel, Google's internal system for interactive queries over huge datasets.
+how: Data is stored in a columnar format on Google's distributed file system; queries run as trees of workers: leaves scan and filter, intermediate servers aggregate, and a root combines. A separate in-memory shuffle tier moves data between stages. Compute (slots) is allocated dynamically per query. Storage, compute and shuffle are separated and scale independently.
+intuition: Many thousands of workers spring up to scan just the columns you need, then disappear.
+friction: Per-byte-scanned pricing punishes careless SELECT * and unpartitioned tables. Fine-tuning is limited compared with self-managed engines. Moving data out has egress costs.
+ref: paper | Dremel: Interactive Analysis of Web-Scale Datasets | Melnik et al., VLDB 2010 |
+ref: paper | Dremel: A Decade of Interactive SQL Analysis at Web Scale | Melnik et al., VLDB 2020 |
+
+@@ redshift
+value: Amazon Redshift (2012) is AWS's managed data warehouse, a massively parallel columnar database. It brought data warehousing to many companies by making it a rental service.
+how: Data is distributed across compute nodes by a distribution key and sorted by sort keys, stored in compressed columnar blocks with zone maps. A leader node plans queries and coordinates compute nodes. RA3 nodes separate storage onto S3 with local caching, and Redshift Serverless removes cluster sizing. Spectrum queries data in S3 directly.
+intuition: Classic MPP warehouse design, operated by AWS.
+friction: Distribution and sort key choices matter a lot for joins; wrong choices cause data movement. Vacuum and analyze maintenance was historically needed. Concurrency scaling and serverless add cost dimensions.
+ref: paper | Amazon Redshift Re-invented | Armenatzoglou et al., SIGMOD 2022 |
+ref: docs | Amazon Redshift documentation | AWS | https://docs.aws.amazon.com/redshift/
+
+@@ mysql
+value: MySQL is one of the most widely deployed relational databases, especially for web applications (it was the 'M' in LAMP). With its InnoDB engine, it offers ACID transactions, replication, and good performance for simple, high-volume OLTP workloads.
+how: InnoDB stores each table as a clustered B+tree keyed by the primary key; secondary indexes store primary-key values, so lookups via a secondary index do a second tree search. Updates are made in place, with old versions kept in undo logs for MVCC and rollback. The redo log provides crash recovery; the doublewrite buffer protects against torn pages. The binary log records changes for replication and CDC. Group Replication offers Paxos-based multi-node consistency, and HeatWave adds an in-memory analytics engine.
+intuition: Rows are stored inside the primary-key index itself, so primary-key lookups and range scans are very fast.
+friction: Random primary keys (UUIDv4) fragment the clustered index. Replication has historically had lag and consistency pitfalls. Some SQL features arrived later than in PostgreSQL. Licensing and stewardship under Oracle led to forks (MariaDB, Percona).
+ref: docs | MySQL Reference Manual: InnoDB | Oracle | https://dev.mysql.com/doc/refman/8.4/en/innodb-storage-engine.html
+ref: book | High Performance MySQL, 4th ed. | Botros & Tinley, 2021 |
+
+@@ sqlite
+value: SQLite is the most widely deployed database in the world: it ships in every phone, browser and countless apps. It is a full SQL database in a single library and a single file, with no server, and it is extremely reliable and well tested.
+how: The whole database is one file of fixed-size pages; tables and indexes are B-trees. Transactions use either a rollback journal (copy original pages aside before changing them) or write-ahead logging (append changed pages to a WAL file, checkpoint later), giving atomic commits even across power loss. SQL is compiled into bytecode for a small virtual machine. Its test suite has hundreds of times more code than the library itself.
+intuition: A database that behaves like a file, so any program can have one.
+friction: One writer at a time per database; not designed for many concurrent writers or network access. Newer projects (LiteFS, Litestream, libSQL, D1) add replication around it.
+ref: docs | SQLite documentation: architecture and file format | D. Richard Hipp et al. | https://www.sqlite.org/arch.html
+ref: docs | How SQLite is tested | SQLite | https://www.sqlite.org/testing.html
+
+@@ mongodb
+value: MongoDB is the most popular document database. It stores JSON-like documents (BSON) with flexible schemas, which fits application objects directly and lets teams evolve data shapes quickly.
+how: The WiredTiger storage engine stores collections and indexes as B-trees with document-level concurrency control, compression and MVCC snapshots. Replica sets have one primary and secondaries; elections use a Raft-like protocol. Sharding splits collections by a shard key into chunks across shards, with config servers and mongos routers. Multi-document ACID transactions were added in 4.0 (2018) and across shards in 4.2.
+intuition: Store the object the way the application uses it, instead of splitting it across tables.
+friction: Flexible schemas move validation into applications; data can become inconsistent without discipline. Choosing a shard key badly is hard to fix. Joins ($lookup) and multi-document transactions are costlier than in relational databases. Licensing changed to SSPL in 2018.
+ref: docs | MongoDB manual | MongoDB Inc. | https://www.mongodb.com/docs/manual/
+ref: blog | Jepsen analysis of MongoDB 4.2.6 | Kyle Kingsbury, 2020 | https://jepsen.io/analyses/mongodb-4.2.6
+
+@@ cassandra
+value: Apache Cassandra (Facebook, 2008) is a distributed wide-column database designed for very high write throughput and availability across data centres, with no single point of failure. Apple, Netflix and many others run huge clusters of it.
+how: It combines Dynamo's distribution with Bigtable's storage. Nodes form a consistent-hash ring with virtual nodes; each key is replicated to N nodes; any node can coordinate a request. Clients choose consistency per query (ONE, QUORUM, ALL, LOCAL_QUORUM). Each node stores data in an LSM tree: commit log, memtable, SSTables, compaction. Gossip spreads membership; hinted handoff, read repair and anti-entropy repair (with Merkle trees) bring replicas back into agreement. Lightweight transactions use Paxos; Cassandra 5 adds storage-attached indexes and vector search.
+intuition: Every node is equal, writes are always accepted somewhere, and replicas reconcile later.
+friction: Data modeling is query-first: you design tables for each query, and joins don't exist. Tombstones from deletes slow reads. Repairs must be run regularly. Tunable consistency makes it easy to read stale data unintentionally. JVM garbage collection affects tail latency.
+ref: paper | Cassandra: A Decentralized Structured Storage System | Lakshman & Malik, 2010 |
+ref: paper | Dynamo: Amazon's Highly Available Key-value Store | DeCandia et al., SOSP 2007 | https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf
+ref: docs | Apache Cassandra documentation | Apache Cassandra | https://cassandra.apache.org/doc/latest/
+
+@@ dynamodb
+value: Amazon DynamoDB is a fully managed key-value and document database that delivers single-digit-millisecond latency at any scale without servers to run. It powers Amazon's own retail systems and many large applications.
+how: Tables are partitioned by the hash of the partition key; each partition has three replicas across availability zones, replicated with Multi-Paxos and a leader per partition. Partitions split automatically as data or traffic grows. Secondary indexes, streams (change data capture), transactions and global tables (multi-region replication) are built in. On-demand mode charges per request.
+intuition: Give each item a key, and Amazon promises to find it fast no matter how big the table grows.
+friction: Access patterns must be designed up front (single-table design is a learned skill). Hot partition keys are throttled. Scans and complex queries are expensive or awkward. Costs need modeling; moving off AWS is hard.
+ref: paper | Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service | Elhemali et al., USENIX ATC 2022 |
+ref: book | The DynamoDB Book | Alex DeBrie, 2020 |
+
+@@ spanner
+value: Google Spanner (2012) was the first database to offer globally distributed, externally consistent (strictly serializable) SQL transactions at planetary scale. It showed that you can have consistency and scale together if you are willing to engineer time itself.
+how: Data is split into ranges (splits), each replicated across zones and regions as a Paxos group. Transactions take timestamps from TrueTime, an API that returns current time as an interval [earliest, latest], backed by GPS receivers and atomic clocks in each data centre. A transaction commits at a timestamp and then waits until that timestamp is guaranteed to be in the past everywhere ('commit wait'), so timestamp order matches real-time order. Two-phase commit coordinates transactions across Paxos groups. Read-only transactions read consistent snapshots without locks.
+intuition: If you know exactly how uncertain your clock is, you can wait out the uncertainty and get a global order for free.
+friction: Commit wait and cross-region Paxos rounds add latency to writes. TrueTime depends on Google's special hardware, which is why open-source designs use hybrid logical clocks with different trade-offs. Cost and lock-in to Google Cloud.
+ref: paper | Spanner: Google's Globally-Distributed Database | Corbett et al., OSDI 2012 |
+ref: paper | Spanner: Becoming a SQL System | Bacon et al., SIGMOD 2017 |
+
+@@ cockroach
+value: CockroachDB is a distributed SQL database inspired by Spanner, built to survive failures of disks, machines and whole regions while offering serializable transactions and PostgreSQL wire compatibility, without special clock hardware.
+how: The keyspace is divided into ranges (about 512 MB by default), each replicated with its own Raft group, and a leaseholder serves reads. Storage on each node uses Pebble, an LSM engine in Go. Transactions use MVCC with hybrid logical clock timestamps, write intents, and a parallel commit protocol; if clock uncertainty could cause anomalies, transactions restart. Locality settings pin data to regions for latency and compliance.
+intuition: Spanner's architecture, with ordinary clocks plus careful handling of their uncertainty.
+friction: Cross-region transactions are slow by physics. Transaction retries under contention must be handled by clients. It is heavier to operate than a single Postgres. The license changed to an enterprise model in 2024.
+ref: paper | CockroachDB: The Resilient Geo-Distributed SQL Database | Taft et al., SIGMOD 2020 |
+ref: docs | CockroachDB architecture overview | Cockroach Labs | https://www.cockroachlabs.com/docs/stable/architecture/overview
+
+@@ redis
+value: Redis is an in-memory data-structure server: strings, hashes, lists, sets, sorted sets, streams, bitmaps, HyperLogLog and more, served with sub-millisecond latency. It is used as a cache, session store, rate limiter, leaderboard, queue and message broker. Its value is simplicity plus very low latency.
+how: All data lives in RAM. Commands run one at a time on a main thread (since Redis 6, separate threads can handle network I/O), so each command is atomic without locks. Persistence uses RDB snapshots (fork plus copy-on-write) and/or an append-only file of commands. Replication is asynchronous leader–follower; Redis Sentinel handles failover; Redis Cluster shards keys over 16,384 hash slots. Redis 8 (2025) added an AGPL license option and vector sets.
+intuition: A giant hash table of useful data structures, kept in memory and answered from a single queue so every operation is instant and atomic.
+friction: Memory is expensive, so data size is limited. One slow command (KEYS, a huge ZRANGE) blocks everyone. Asynchronous replication can lose recent writes on failover. Cluster mode restricts multi-key operations to one slot. The 2024 license change led to the Valkey fork.
+ref: docs | Redis documentation | Redis Ltd. | https://redis.io/docs/latest/
+ref: book | Redis in Action | Josiah Carlson, 2013 |
+
+@@ valkey
+value: Valkey is the BSD-licensed, Linux Foundation fork of Redis 7.2, created in 2024 after Redis changed its license. Major clouds back it, and it remains compatible with Redis clients and commands.
+how: Same architecture as Redis, with additions such as improved multi-threaded I/O, better memory efficiency and cluster improvements.
+intuition: The open-source continuation of Redis's original model.
+friction: Feature sets are diverging from Redis; modules and newer Redis features may not match.
+ref: docs | Valkey documentation | Linux Foundation | https://valkey.io/
+
+@@ rocksdb
+value: RocksDB is an embeddable, high-performance key-value store from Facebook (2012), forked from Google's LevelDB and optimized for fast SSDs and many cores. It is the storage engine inside many systems: Kafka Streams and Flink state, CockroachDB's ancestors, TiKV, MyRocks, and many services.
+how: It is an LSM tree: writes go to a WAL and an in-memory memtable; full memtables are flushed as sorted SSTable files; background compaction merges files across levels. Bloom filters and block caches speed reads. It supports column families, transactions, snapshots, merge operators, and many tuning knobs for compaction style, compression per level and rate limiting.
+intuition: A fast, local, sorted map on disk that any program can embed.
+friction: Tuning is notoriously complex; defaults rarely fit every workload. Compaction can cause write stalls and latency spikes. Large deletions create tombstone overhead.
+ref: docs | RocksDB wiki | Meta | https://github.com/facebook/rocksdb/wiki
+ref: paper | Evolution of Development Priorities in Key-value Stores Serving Large-scale Applications: The RocksDB Experience | Dong et al., FAST 2021 |
+
+@@ neo4j
+value: Neo4j is the most widely used graph database. It stores data as nodes and relationships with properties, and makes multi-hop questions ('friends of friends who bought X') fast and natural with the Cypher query language.
+how: Records for nodes and relationships are fixed-size, and each relationship stores pointers to its start and end nodes and to the next relationships, so traversals follow pointers instead of joining tables ('index-free adjacency'). Cypher patterns are compiled into traversal plans. Clustering uses Raft for core servers.
+intuition: When the questions are about connections, store the connections themselves.
+friction: Large graphs that do not fit on one machine are hard to partition. Bulk analytics over the whole graph are often better done in Spark or specialized graph engines. GQL, a new ISO standard (2024), is still being adopted.
+ref: book | Graph Databases, 2nd ed. | Robinson, Webber & Eifrem, 2015 |
+ref: docs | Neo4j documentation | Neo4j | https://neo4j.com/docs/
+
+@@ pgvector
+value: pgvector adds vector similarity search to PostgreSQL, so embeddings can live next to the rest of your data, with SQL filters, joins and transactions. For many RAG and recommendation systems, it removes the need for a separate vector database.
+how: It adds a vector column type and distance operators (L2, inner product, cosine), plus two index types: IVFFlat (cluster vectors, search the nearest clusters) and HNSW (a navigable small-world graph). Queries use ORDER BY distance LIMIT k.
+intuition: Your database already handles data and permissions; teach it to compare vectors too.
+friction: HNSW index builds use a lot of memory and time; very large collections may outgrow a single Postgres. Filtered vector search can lose recall when filters are selective. Specialized systems still win at very large scale.
+ref: docs | pgvector | Andrew Kane | https://github.com/pgvector/pgvector
+
+@@ milvus
+value: Milvus is an open-source distributed vector database for billions of embeddings, used for semantic search, recommendations and RAG at large scale.
+how: It separates storage from compute: data is written through a log broker into segments stored on object storage; query nodes load segments and build indexes (HNSW, IVF variants, DiskANN, GPU indexes). Coordinators manage metadata and scheduling. Hybrid queries combine vector similarity with scalar filters.
+intuition: A database where the main query is 'find things similar to this'.
+friction: Many components to run. Index choice and parameters trade recall against speed and memory. Freshness of newly inserted vectors depends on segment sealing and indexing.
+ref: paper | Milvus: A Purpose-Built Vector Data Management System | Wang et al., SIGMOD 2021 |
+ref: docs | Milvus documentation | Zilliz / LF AI & Data | https://milvus.io/docs
+
+@@ pinecone
+value: Pinecone is a managed, serverless vector database: you send vectors and metadata and query by similarity, without operating anything.
+how: Its serverless architecture separates storage (object storage) from compute, organizes vectors into indexes partitioned by namespace, and uses proprietary ANN indexing with metadata filtering.
+intuition: Vector search as a utility.
+friction: Proprietary and usage-priced; data must leave your environment; less control over index internals.
+ref: docs | Pinecone documentation | Pinecone | https://docs.pinecone.io/
+
+@@ zookeeper
+value: Apache ZooKeeper gave the Hadoop generation a reliable coordination service: configuration, leader election, group membership, distributed locks. Kafka (until 4.0), HBase, Hadoop HA, Solr and Pinot (through Helix) depend on it.
+how: It stores a small tree of nodes (znodes) in memory, replicated across an ensemble of servers with ZAB, a leader-based atomic broadcast protocol. Writes go through the leader and are committed by a majority; reads are served locally (and may be slightly stale unless sync is used). Clients hold sessions; ephemeral znodes disappear when a session ends, and sequential znodes plus watches implement locks and elections.
+intuition: A tiny, extremely reliable shared notebook that everyone in the cluster can read and be notified about.
+friction: Not a general database: limited data size, and heavy watch traffic hurts. Operating a separate ensemble is extra work, which is why Kafka moved to its built-in KRaft quorum.
+ref: paper | ZooKeeper: Wait-free coordination for Internet-scale systems | Hunt et al., USENIX ATC 2010 |
+ref: paper | Zab: High-performance broadcast for primary-backup systems | Junqueira, Reed & Serafini, DSN 2011 |
+
+@@ etcd
+value: etcd is a strongly consistent, Raft-replicated key-value store that holds all of Kubernetes' state. It is the canonical modern example of a coordination service.
+how: A small cluster (usually 3 or 5 members) elects a leader with Raft; writes are committed once a majority persists them. Data is stored in a B+tree-based store (bbolt) with MVCC revisions, so clients can watch for changes from a revision and read consistent snapshots. Leases attach TTLs to keys for leader election and liveness.
+intuition: The single source of truth for cluster metadata, designed to be boringly correct.
+friction: Sensitive to disk fsync latency and network latency; large values or many watchers degrade it. Database size limits require compaction and defragmentation.
+ref: docs | etcd documentation | etcd authors | https://etcd.io/docs/
+ref: paper | In Search of an Understandable Consensus Algorithm | Ongaro & Ousterhout | https://raft.github.io/raft.pdf
+
+@@ docker
+value: Docker (2013) made containers easy: package an application and all its dependencies into an image that runs the same on a laptop, a CI server and production. It turned 'works on my machine' into a solved problem and became the unit of deployment for modern infrastructure.
+how: An image is a stack of read-only layers (each Dockerfile step adds one), combined with a union file system (OverlayFS), plus metadata. A container is a process started from an image with Linux namespaces (its own view of processes, network, mounts, users) and cgroups (CPU and memory limits). Images are stored in registries and identified by content hashes. The runtime underneath is containerd and runc, following the OCI standards.
+intuition: A shipping container for software: a standard box that any port (machine) can load, regardless of what is inside.
+friction: Containers share the host kernel, so isolation is weaker than virtual machines. Image size, layer caching, supply-chain security (base images, signatures, SBOMs) and rootless execution need attention.
+ref: docs | Docker documentation | Docker Inc. | https://docs.docker.com/
+ref: spec | Open Container Initiative specifications | OCI | https://opencontainers.org/
+
+@@ terraform
+value: Terraform (HashiCorp, 2014) lets you describe cloud infrastructure (networks, databases, Kubernetes clusters, IAM policies) as code, review it like code, and apply it repeatably. OpenTofu is its open-source fork after a 2023 license change.
+how: You write declarative configuration in HCL. Terraform builds a dependency graph of resources, compares desired configuration against a state file recording what exists, produces a plan of creates, updates and deletes, and applies them in dependency order through provider plugins that call cloud APIs. State is stored remotely with locking for teams.
+intuition: A blueprint plus an inventory: compare them, and do only what is needed to make reality match the blueprint.
+friction: State files are critical and sensitive; drift from manual changes causes surprises. Large monolithic configurations are slow and risky. Some changes force destroy-and-recreate. Licensing changed to BSL, splitting the community.
+ref: docs | Terraform documentation | HashiCorp | https://developer.hashicorp.com/terraform/docs
+ref: docs | OpenTofu | Linux Foundation | https://opentofu.org/
+
+@@ linux
+value: Linux, started by Linus Torvalds in 1991, runs almost every server, every Android phone, most embedded devices and all top supercomputers. Every data system on this map ultimately asks Linux for memory, files, network sockets and CPU time.
+how: It is a monolithic kernel with loadable modules: process and thread scheduling (CFS, and since 6.6 the EEVDF scheduler), virtual memory and the page cache, the virtual file system with ext4, XFS and others, a full network stack, device drivers, namespaces and cgroups for containers, and eBPF for safe in-kernel programs. io_uring provides high-performance asynchronous I/O.
+intuition: Linux is the referee between programs and hardware: it decides who runs, who gets memory, and how bytes reach disks and networks.
+friction: Default settings rarely suit high-performance data systems; tuning (swappiness, transparent huge pages, file descriptor limits, I/O schedulers, network buffers) matters. Kernel upgrades can change performance. Observability requires tools like perf and eBPF.
+ref: docs | The Linux Kernel documentation | kernel.org | https://docs.kernel.org/
+ref: book | Linux Kernel Development, 3rd ed. | Robert Love, 2010 |
+ref: blog | Brendan Gregg's Linux performance pages | Brendan Gregg | https://www.brendangregg.com/linuxperf.html
+
+@@ nginx
+value: NGINX (2004) is a high-performance web server, reverse proxy and load balancer that solved the 'C10K problem': handling tens of thousands of concurrent connections on one machine.
+how: A master process manages a few worker processes; each worker runs an event loop using epoll (or kqueue) to handle many non-blocking connections at once, instead of one thread per connection. It serves static files with sendfile, terminates TLS, proxies and load-balances to upstreams, and caches responses.
+intuition: One waiter handling many tables by only attending to the table that is ready, instead of standing next to each table.
+friction: Configuration is powerful but easy to get wrong; dynamic reconfiguration and service discovery are more limited than in Envoy (the commercial NGINX Plus adds some).
+ref: blog | The C10K problem | Dan Kegel | http://www.kegel.com/c10k.html
+ref: docs | NGINX documentation | nginx.org | https://nginx.org/en/docs/
+
+@@ envoy
+value: Envoy (Lyft, 2016) is a modern layer-4/layer-7 proxy designed for microservices. It is the data plane of most service meshes (Istio and others) and of many API gateways.
+how: It runs a few worker threads, each with its own event loop and connections. Configuration is dynamic through the xDS APIs, so a control plane can push routes, clusters, endpoints and certificates without restarts. It provides load balancing, retries, timeouts, circuit breaking, rate limiting, mutual TLS, and rich telemetry (metrics, tracing).
+intuition: A smart network assistant placed next to every service that handles all the hard parts of talking to other services.
+friction: Running a sidecar per pod costs memory and CPU and adds a hop of latency. Configuration is complex, which is why it is usually driven by a control plane.
+ref: docs | Envoy proxy documentation | Envoy Project | https://www.envoyproxy.io/docs
+
+@@ grpc
+value: gRPC (Google, 2015) is a high-performance RPC framework: define services and messages in Protocol Buffers, generate client and server code in many languages, and call remote functions as if they were local, with streaming support.
+how: Messages are serialized with Protobuf (compact binary). Calls run over HTTP/2 streams, which multiplex many calls over one connection and support bidirectional streaming. It adds deadlines, cancellation, metadata, and pluggable load balancing and authentication.
+intuition: A strongly typed contract between services, compiled into both sides.
+friction: Browsers need gRPC-Web or proxies. Binary payloads are harder to debug than JSON. HTTP/2 connections are long-lived, so load balancing needs per-request awareness (L7 proxies).
+ref: docs | gRPC documentation | CNCF | https://grpc.io/docs/
+ref: docs | Protocol Buffers documentation | Google | https://protobuf.dev/
+
+@@ prometheus
+value: Prometheus (SoundCloud, 2012) is the standard open-source metrics system for cloud-native infrastructure, with a powerful query language (PromQL) and alerting.
+how: The server scrapes HTTP endpoints exposing metrics at regular intervals (pull model), stores samples in a local time-series database with heavy compression (delta-of-delta timestamps and XOR-encoded floats, from Facebook's Gorilla paper), and evaluates alert rules. Service discovery finds targets in Kubernetes and clouds. Long-term storage uses systems like Thanos, Cortex or Mimir.
+intuition: Visit every service every few seconds, write down its numbers, and make it easy to ask how they changed.
+friction: High-cardinality labels (user IDs, request IDs) explode memory. A single server does not scale horizontally or keep data long without add-ons. Pull-based scraping is awkward for short-lived jobs.
+ref: paper | Gorilla: A Fast, Scalable, In-Memory Time Series Database | Pelkonen et al., VLDB 2015 |
+ref: docs | Prometheus documentation | CNCF | https://prometheus.io/docs/
+
+@@ otel
+value: OpenTelemetry is the vendor-neutral standard for generating and collecting telemetry: traces, metrics and logs. Instrument once, send anywhere. It is one of the most active CNCF projects.
+how: SDKs and auto-instrumentation in many languages create spans and metrics. Context propagation (W3C Trace Context headers) passes trace IDs across service calls, so a request can be followed end to end. The Collector receives, processes (batching, sampling, filtering) and exports data to back-ends using the OTLP protocol.
+intuition: A common language for 'what happened during this request', spoken by every service.
+friction: Instrumentation adds overhead and needs sampling decisions. Semantic conventions and some signals are still maturing. Costs of storing telemetry can exceed costs of the systems observed.
+ref: docs | OpenTelemetry documentation | CNCF | https://opentelemetry.io/docs/
+ref: paper | Dapper, a Large-Scale Distributed Systems Tracing Infrastructure | Sigelman et al., Google 2010 |
+
+@@ cloud
+value: Public clouds (AWS from 2006, then Azure and Google Cloud) turned computing, storage and networking into on-demand services. You can rent a thousand machines for an hour, and use managed databases, streaming, ML and analytics without owning hardware. They changed the economics and speed of building systems.
+how: Data centres are grouped into regions and availability zones. Hypervisors (like AWS Nitro) carve physical servers into virtual machines; software-defined networks build private networks (VPCs); object storage, block storage and managed services sit on top, exposed through APIs and billed by use. Identity and access management controls every API call.
+intuition: Electricity from the grid instead of a generator in your basement.
+friction: Costs are easy to lose control of (data egress, idle resources, cross-zone traffic). Each provider's managed services create lock-in. Shared responsibility for security confuses teams. Outages in one region or service can cascade.
+ref: paper | Above the Clouds: A Berkeley View of Cloud Computing | Armbrust et al., 2009 |
+ref: paper | Cloud Programming Simplified: A Berkeley View on Serverless Computing | Jonas et al., 2019 | https://arxiv.org/abs/1902.03383
+
+@@ s3
+value: Amazon S3 (2006) is object storage: a nearly infinite, highly durable key→object store accessible over HTTP. It has become the default storage layer for data lakes and lakehouses, backups, logs and model weights. Its API is copied by almost every storage system.
+how: Objects (up to 5 TB) live in buckets under keys. Data is spread across many devices and availability zones with redundancy (AWS describes the design goal as 11 nines of durability). Since December 2020, S3 provides strong read-after-write consistency for all operations. It supports multipart uploads, versioning, lifecycle rules, and since 2024, conditional writes (if-none-match), which lakehouse formats can use for atomic commits. S3 Express One Zone offers lower latency; S3 Tables provides managed Iceberg tables.
+intuition: An infinite warehouse where every box has a unique label and you can always get it back, but each trip takes a few dozen milliseconds.
+friction: High per-request latency compared with local disk, so many small files are slow and costly. Listing is slow. Request costs and egress fees add up. Rename does not exist; it is copy-and-delete.
+ref: docs | Amazon S3 user guide | AWS | https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html
+ref: blog | Using lightweight formal methods to validate a key-value storage node in Amazon S3 | Bornholt et al., SOSP 2021 |
+
+@@ airflow
+value: Apache Airflow (Airbnb, 2014) is the most widely used workflow orchestrator for data pipelines: define DAGs of tasks in Python, schedule them, retry failures, backfill history and monitor everything from a UI.
+how: DAG files are parsed by a scheduler that creates DAG runs and task instances according to schedules and dependencies, tracks their state in a metadata database, and sends ready tasks to executors (Celery, Kubernetes, local). Operators and providers wrap integrations with external systems. Airflow 3 (2025) added DAG versioning, a task execution API and event-driven scheduling.
+intuition: A train timetable for data jobs: what runs, when, after what, and what to do when something is late.
+friction: It orchestrates but does not process data; heavy work in tasks causes problems. Scheduler performance and DAG parsing at scale need tuning. Data dependencies are implicit compared with asset-based tools.
+ref: docs | Apache Airflow documentation | Apache Airflow | https://airflow.apache.org/docs/
+ref: book | Data Pipelines with Apache Airflow | Harenslak & de Ruiter, 2021 |
+
+@@ dagster
+value: Dagster is a data orchestrator built around software-defined assets: you declare the tables, files and models you want to exist and how each is computed from others, and Dagster schedules, materializes and tracks them with lineage.
+how: Assets are Python functions with declared dependencies; the system derives the graph, tracks materializations and their metadata, and supports partitions, sensors, freshness policies and data quality checks.
+intuition: Describe the data you want, not just the jobs to run.
+friction: Smaller ecosystem than Airflow; adopting the asset model requires rethinking existing pipelines.
+ref: docs | Dagster documentation | Dagster Labs | https://docs.dagster.io/

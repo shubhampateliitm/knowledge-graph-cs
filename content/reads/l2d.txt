@@ -1,0 +1,297 @@
+@@ logcompaction
+value: Log compaction keeps only the latest value for each key in a Kafka topic, so the topic becomes a durable, replayable table of current state. Kafka uses it for consumer offsets and Kafka Streams changelogs; teams use it for CDC tables, configuration and reference data.
+how: A background cleaner thread rewrites old, closed segments, keeping only the most recent record per key (the active segment is never compacted). A record with a null value is a 'tombstone' that marks a delete and is itself removed after delete.retention.ms. Offsets never change, so consumers can still resume where they were. A new consumer reading from the start rebuilds the full current state.
+intuition: An address book where you cross out old addresses and keep only the newest one per person.
+friction: Readers may still see several versions of a key (compaction is lazy); tombstone timing is subtle (a slow consumer can miss deletes); compaction costs disk I/O; ordering only holds per key.
+ref: docs | Kafka log compaction | Apache Kafka | https://kafka.apache.org/documentation/#compaction
+ref: book | Kafka: The Definitive Guide, 2nd ed. | Shapira, Palino, Sivaram & Petty, O'Reilly 2021 |
+
+@@ consumergroups
+value: Consumer groups let many consumers share the work of reading a topic, each partition read by exactly one member, while different groups each get their own full copy of the stream. This one idea gives Kafka both queue semantics (share work) and pub/sub semantics (fan out).
+how: Consumers with the same group.id join a group managed by a broker acting as group coordinator. Partitions are assigned among members; each member commits its offsets to the internal __consumer_offsets topic. When members join or leave, the group rebalances. The classic protocol stopped every member during a rebalance; cooperative incremental rebalancing reduced this, and the new consumer rebalance protocol (KIP-848, generally available in Kafka 4.0) moves assignment to the broker so rebalances are incremental and much faster.
+Kafka 4.0 also added 'share groups' (KIP-932, early access) for queue-like consumption where several consumers can read the same partition.
+intuition: A team splitting a pile of mailbags so each bag has one sorter; another team can sort the same mail independently.
+friction: Parallelism is capped by the number of partitions; rebalances pause processing; slow consumers cause lag; committing offsets at the wrong moment causes duplicates or loss.
+ref: docs | KIP-848: The Next Generation of the Consumer Rebalance Protocol | Apache Kafka | https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
+ref: docs | Kafka consumer configuration | Apache Kafka | https://kafka.apache.org/documentation/#consumerconfigs
+
+@@ tieredstorage
+value: Tiered storage keeps recent data on fast local disks and moves older data to cheap object storage, while clients still read it through the same API. Kafka (KIP-405, production-ready in 3.9), Pinot, ClickHouse and Elasticsearch use it to keep long retention without huge broker disks.
+how: Closed log segments are copied to S3 or similar by a remote storage manager; local copies are deleted after a shorter local retention. Reads of old offsets fetch from remote storage (often with caching). Brokers become lighter, so they rebalance and recover faster because less data lives on them.
+intuition: Keep this month's files on your desk and older ones in the basement archive, with an index of where everything is.
+friction: Reads of old data are slower; object storage request costs; not all features combine with it (compacted topics were not supported in Kafka's first version).
+ref: docs | KIP-405: Kafka Tiered Storage | Apache Kafka | https://cwiki.apache.org/confluence/display/KAFKA/KIP-405%3A+Kafka+Tiered+Storage
+
+@@ zorder
+value: Z-ordering, Hilbert curves and liquid clustering arrange data so rows with similar values in several columns land in the same files. Zone maps can then skip far more files for queries filtering on any of those columns. Delta Lake, Databricks and Iceberg use these layouts.
+how: Sorting by one column helps filters on that column only. A space-filling curve interleaves the bits of several column values into one sort key, keeping points close in multi-dimensional space close in the file order. Delta's OPTIMIZE ZORDER BY rewrites files in that order. Liquid clustering (Databricks, 2023) clusters incrementally and lets you change clustering keys without a full rewrite.
+intuition: Shelving books so that ones close in both topic and year end up on the same shelf.
+friction: Rewrites cost compute; benefit fades with each column added; data must be reclustered as new data arrives.
+ref: docs | Data skipping with Z-order indexes for Delta Lake | Databricks | https://docs.databricks.com/aws/en/delta/data-skipping
+ref: docs | Use liquid clustering for tables | Databricks | https://docs.databricks.com/aws/en/delta/clustering
+
+@@ compaction
+value: Compaction merges many small files or segments into fewer large ones and removes obsolete data. LSM trees, lakehouse tables, search engines and OLAP stores all depend on it to keep reads fast as data streams in.
+how: In LSM trees, sorted runs are merged with leveled, tiered or hybrid strategies. In lakehouses, streaming writes create many small files; OPTIMIZE or rewrite_data_files bin-packs them into files of a target size (hundreds of MB), and merge-on-read deletes get applied. Lucene merges segments with a tiered merge policy.
+intuition: Tidy the many small piles of paper into a few well-sorted binders, throwing away crossed-out pages.
+friction: Write amplification and I/O spikes; competing with live queries for resources; conflicts with concurrent writers in table formats; choosing when to compact is a tuning problem.
+ref: paper | Dostoevsky: Better Space-Time Trade-Offs for LSM-Tree Based Key-Value Stores via Adaptive Removal of Superfluous Merging | Dayan & Idreos, SIGMOD 2018 |
+ref: docs | RocksDB compaction | RocksDB wiki | https://github.com/facebook/rocksdb/wiki/Compaction
+
+@@ schemaevol
+value: Schema evolution lets data formats change (add a field, rename a column) without breaking existing producers, consumers or stored data. In streaming and lakehouse systems, where readers and writers deploy independently, it is what keeps teams decoupled.
+how: Formats like Avro and Protobuf define compatibility rules: backward compatible means new readers can read old data (for example, a new field with a default); forward compatible means old readers can read new data. A schema registry enforces the rules on every new version. Table formats track schema versions and column IDs (Iceberg uses IDs rather than names, so renames are safe); Delta supports column mapping and type widening.
+intuition: Add a new box to a form without making old forms invalid.
+friction: Breaking changes still happen (changing types, removing required fields); many teams lack enforcement; semantic changes (same field, new meaning) pass every check.
+ref: book | Designing Data-Intensive Applications, 2nd ed. | Martin Kleppmann & Chris Riccomini, 2026 |
+ref: docs | Schema evolution and compatibility | Confluent | https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html
+
+@@ volcano
+value: The Volcano (iterator) model is the classic way to execute a query plan: each operator exposes open, next and close, and pulls rows from its children one at a time. Its simplicity made it the standard design for decades (PostgreSQL still uses it), and it is the baseline that vectorized and compiled engines improve on.
+how: The root operator calls next() on its child, which calls next() on its own child, down to the scan, so each row flows up through filters, joins and aggregates. Any operator can be combined with any other. Goetz Graefe also introduced the 'exchange' operator to parallelize such plans.
+intuition: A bucket brigade: each person asks the one behind them for the next bucket.
+friction: One virtual function call per row per operator wastes CPU on modern hardware (poor cache use, branch mispredictions); hence vectorized batches and code generation.
+ref: paper | Volcano — An Extensible and Parallel Query Evaluation System | Goetz Graefe, IEEE TKDE 1994 |
+ref: course | CMU 15-445/645 Database Systems: Query Execution | Andy Pavlo | https://15445.courses.cs.cmu.edu/
+
+@@ retries
+value: Retries with timeouts, exponential backoff and jitter let systems survive brief failures without overwhelming a struggling service. Done wrong, retries multiply load and turn a small problem into an outage.
+how: Set a timeout on every remote call. On a retryable error, wait base × 2^attempt plus a random jitter (to stop clients retrying in sync), up to a maximum number of attempts or a total deadline. Use retry budgets (for example, retries may add at most 10% extra load) and retry only idempotent operations, or use idempotency keys. Retry at one layer only, not at every layer of the stack.
+intuition: If the line is busy, wait a bit longer each time before calling again, and don't all call at the same second.
+friction: Retries at several layers multiply (3 attempts at 3 layers is 27 calls); choosing timeouts is hard; non-idempotent operations can be duplicated.
+ref: blog | Timeouts, retries, and backoff with jitter | Marc Brooker, Amazon Builders' Library | https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/
+ref: book | Site Reliability Engineering, ch. 22 'Addressing Cascading Failures' | Google, 2016 | https://sre.google/sre-book/addressing-cascading-failures/
+
+@@ circuitbreaker
+value: Circuit breakers stop calling a dependency that is failing, so callers fail fast instead of waiting on timeouts, and the dependency gets time to recover. Load shedding and bulkheads are related ways of protecting a system under overload.
+how: A breaker counts failures; above a threshold it 'opens' and rejects calls immediately (or returns a fallback). After a cool-down it goes 'half-open', letting a few test calls through; success closes it again. Bulkheads isolate resources (separate thread pools or connection pools per dependency) so one slow dependency cannot consume everything. Load shedding rejects excess requests early, preferring to serve some users well over all users badly.
+intuition: An electrical breaker trips to protect the house; you reset it after the fault clears.
+friction: Thresholds are hard to tune; breakers in many clients can flap; fallbacks may give users stale or partial data.
+ref: book | Release It!, 2nd ed. | Michael Nygard, 2018 |
+ref: blog | Using load shedding to avoid overload | David Yanacek, Amazon Builders' Library | https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/
+
+@@ fencing
+value: Fencing tokens prevent a node that wrongly believes it still holds a lock or leadership (after a long GC pause or network partition) from corrupting data. Kafka's controller and leader epochs, ZooKeeper zxids and Raft terms are all fencing tokens.
+how: Each time a lock or lease is granted, the lock service returns a strictly increasing number. Every write to storage carries that number; the storage rejects any write with a number lower than one it has already seen. So an old leader that wakes up after a pause is refused.
+intuition: Each new manager gets a higher badge number, and the office only takes orders from the highest badge it has seen.
+friction: The storage system must check tokens, which many don't support; leases with clocks alone are unsafe because pauses and clock jumps happen.
+ref: blog | How to do distributed locking | Martin Kleppmann, 2016 | https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+
+@@ antientropy
+value: Anti-entropy repair makes replicas converge by comparing them and fixing differences in the background. In leaderless databases (Dynamo, Cassandra, Riak) it is how replicas catch up on writes they missed.
+how: Replicas build Merkle trees over key ranges and exchange root hashes; only subtrees whose hashes differ are compared further, so little data moves when replicas mostly agree. Read repair fixes stale replicas noticed during reads; hinted handoff stores writes for a temporarily down node and delivers them later.
+intuition: Two librarians compare catalogue summaries shelf by shelf and only check books on shelves whose summaries differ.
+friction: Full repairs are expensive and must be scheduled; deleted data can come back ('zombies') if tombstones expire before repair runs.
+ref: paper | Dynamo: Amazon's Highly Available Key-value Store | DeCandia et al., SOSP 2007 | https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf
+
+@@ outbox
+value: The transactional outbox and change data capture (CDC) solve the 'dual write' problem: updating a database and publishing an event so that both happen or neither does. They are the standard way to connect services and databases to Kafka reliably.
+how: Outbox: in the same database transaction as the business change, insert an event row into an outbox table; a relay process reads the outbox (often via CDC) and publishes to Kafka. CDC: tools like Debezium read the database's own replication log (PostgreSQL WAL, MySQL binlog) and turn every committed change into an event, in commit order.
+intuition: Write the letter in the same notebook entry as the decision, so the post office (CDC) can never miss it.
+friction: Delivery is at least once, so consumers must deduplicate; schema changes in source tables leak into events unless an outbox defines a clean contract; log retention and replication slots need monitoring.
+ref: blog | Pattern: Transactional outbox | Chris Richardson, microservices.io | https://microservices.io/patterns/data/transactional-outbox.html
+ref: docs | Debezium documentation | Debezium | https://debezium.io/documentation/
+
+@@ pbft
+value: Byzantine fault tolerance lets a system agree on values even when some nodes lie or behave arbitrarily, not just crash. PBFT (1999) made it practical, and its ideas underlie blockchain consensus protocols like Tendermint and HotStuff.
+how: With n ≥ 3f + 1 replicas, the system tolerates f malicious ones. A primary proposes an order for requests; replicas exchange signed pre-prepare, prepare and commit messages, and act once they see 2f + 1 matching messages, so any two quorums overlap in at least one honest node. A view change replaces a faulty primary. HotStuff (2019) made communication linear in the number of nodes.
+intuition: Generals who might include traitors can still agree, as long as more than two thirds are loyal and they check each other's messages.
+friction: Needs more replicas (3f + 1 versus 2f + 1 for crash faults) and more messages; most data-centre systems assume crash faults only, because nodes are under one operator's control.
+ref: paper | Practical Byzantine Fault Tolerance | Castro & Liskov, OSDI 1999 | https://pmg.csail.mit.edu/papers/osdi99.pdf
+ref: paper | The Byzantine Generals Problem | Lamport, Shostak & Pease, TOPLAS 1982 |
+
+@@ pow
+value: Proof of work and proof of stake let anonymous participants on the open internet agree on one history without a trusted authority. They solved the problem that classical BFT could not: open membership, where anyone could create many fake identities (a Sybil attack).
+how: Proof of work (Bitcoin): to add a block, find a nonce such that the block's hash is below a target, which takes huge numbers of hash attempts; the chain with the most cumulative work wins, so rewriting history costs more energy than the honest network spends. Proof of stake (Ethereum since 2022): validators lock up coins as collateral, are chosen to propose and attest blocks, and lose stake ('slashing') if they misbehave.
+intuition: Voting rights by burnt electricity (work) or by money put at risk (stake), so fake identities gain nothing.
+friction: Proof of work uses large amounts of energy; finality is probabilistic or slow; throughput is low compared with centralized databases; stake concentration raises centralization concerns.
+ref: paper | Bitcoin: A Peer-to-Peer Electronic Cash System | Satoshi Nakamoto, 2008 | https://bitcoin.org/bitcoin.pdf
+ref: book | Bitcoin and Cryptocurrency Technologies | Narayanan, Bonneau, Felten, Miller & Goldfeder, 2016 |
+
+@@ dst
+value: Deterministic simulation testing runs an entire distributed system (all nodes, the network and the disks) inside one single-threaded, seeded simulation, injecting failures. Any bug it finds can be replayed exactly from the seed. FoundationDB built its reputation for reliability on it, and TigerBeetle and Antithesis spread the practice.
+how: All sources of non-determinism (time, randomness, thread scheduling, network delivery, disk I/O) are replaced by simulated versions driven by one random seed. The simulator runs millions of hours of simulated time with dropped packets, crashes, slow disks and partitions, checking invariants throughout. When an invariant breaks, the seed reproduces the exact sequence.
+intuition: A flight simulator for your database: crash it a million ways safely, and rewind any crash to watch it again.
+friction: The system must be designed for it from the start (all I/O behind interfaces); third-party libraries and real OS behavior are hard to simulate; simulations are only as good as their fault models.
+ref: video | Testing Distributed Systems w/ Deterministic Simulation | Will Wilson (FoundationDB), Strange Loop 2014 | https://www.youtube.com/watch?v=4fFDFbi3toc
+ref: paper | FoundationDB: A Distributed Unbundled Transactional Key Value Store | Zhou et al., SIGMOD 2021 |
+
+@@ shardpercore
+value: Thread-per-core (shared-nothing) design gives each CPU core its own thread and its own slice of data, so cores never wait on locks or fight over cache lines. ScyllaDB, Redpanda (both on the Seastar framework) and TigerBeetle use it to get very high throughput per machine.
+how: Data is partitioned across cores; each core runs an event loop with its own memory allocator, network queues and storage I/O. When a request needs another core's data, it sends that core a message instead of taking a lock. Asynchronous I/O (io_uring, polling) keeps the core busy.
+intuition: Each chef has their own station and ingredients; they pass plates rather than reach across each other.
+friction: Hot keys overload one core; cross-core operations become message passing; the programming model is more complex; general-purpose libraries assume shared memory threads.
+ref: docs | Seastar: shared-nothing design | ScyllaDB | https://seastar.io/shared-nothing/
+ref: paper | The Scalable Commutativity Rule | Clements et al., SOSP 2013 |
+
+@@ autoscaling
+value: Autoscaling adds or removes capacity automatically as load changes, so systems stay responsive during peaks and cost less during quiet times. Kubernetes HPA, cluster autoscalers, Spark dynamic allocation and serverless platforms all rely on it.
+how: A controller watches a metric (CPU, requests per second, queue lag, GPU utilization), compares it with a target, and adjusts the number of replicas, typically proportionally (desired = current × metric / target), with cool-down periods to avoid oscillation. Predictive autoscaling uses forecasts for regular patterns; event-driven scaling (KEDA) can scale on Kafka consumer lag.
+intuition: A thermostat for servers.
+friction: Scaling takes time (start-up, cache warming, rebalancing), so sudden spikes still hurt; stateful systems are slow to scale; badly tuned loops oscillate; scaling to zero causes cold starts.
+ref: docs | Horizontal Pod Autoscaling | Kubernetes | https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
+ref: paper | Autopilot: workload autoscaling at Google | Rzadca et al., EuroSys 2020 |
+
+@@ oauth
+value: OAuth 2.0 and OpenID Connect let users grant an application limited access to their data on another service, and let applications sign users in, without sharing passwords. 'Sign in with Google', API access tokens and most single sign-on rely on them.
+how: In the authorization code flow, the app redirects the user to the identity provider, the user logs in and consents, and the app receives a short-lived code, which it exchanges (with PKCE proof) for an access token with specific scopes. OpenID Connect adds an ID token (a signed JWT) describing who the user is. Services verify token signatures and expiry; refresh tokens get new access tokens.
+intuition: A hotel key card: limited to your room, for a limited time, issued without telling the door your passport details.
+friction: Many flows and options make it easy to misconfigure; token leakage and redirect attacks; JWTs can't be revoked easily before expiry.
+ref: docs | RFC 6749: The OAuth 2.0 Authorization Framework | IETF, 2012 | https://www.rfc-editor.org/rfc/rfc6749
+ref: book | OAuth 2 in Action | Justin Richer & Antonio Sanso, 2017 |
+
+@@ mtls
+value: Mutual TLS and zero-trust networking authenticate every service-to-service connection with certificates, instead of trusting anything inside the network perimeter. Service meshes, Google's BeyondCorp and SPIFFE-based systems apply this.
+how: In normal TLS only the server shows a certificate; in mTLS both sides do. Each workload gets a short-lived certificate encoding its identity (for example a SPIFFE ID), issued and rotated automatically. Authorization policies then say which identities may call which services. Sidecars or eBPF data planes can handle this transparently.
+intuition: Everyone shows a badge to everyone, even inside the building.
+friction: Certificate issuance and rotation infrastructure; debugging handshake failures; performance overhead; identity is only as good as how workloads are attested.
+ref: paper | BeyondCorp: A New Approach to Enterprise Security | Ward & Beyer, ;login: 2014 |
+ref: docs | SPIFFE concepts | SPIFFE | https://spiffe.io/docs/latest/spiffe-about/spiffe-concepts/
+
+@@ privacytech
+value: Differential privacy, clean rooms and related privacy technologies let organizations share and analyze aggregate data without revealing information about any one person. In ad tech, data clean rooms are how advertisers and publishers match audiences and measure campaigns while third-party cookies and device IDs disappear.
+how: Differential privacy (Dwork, 2006) adds carefully calibrated random noise to query results so that the presence or absence of any single person changes the output distribution by at most a factor set by ε (the privacy budget). Clean rooms let two parties join data inside a controlled environment that allows only approved aggregate queries with minimum group sizes. Other tools: k-anonymity, secure multi-party computation, trusted execution environments.
+intuition: Report the crowd's answer with a little deliberate blur, so no one can pick out an individual voice.
+friction: Noise reduces accuracy, especially for small groups; the privacy budget runs out with repeated queries; clean rooms vary widely in real guarantees; regulation (GDPR, DPDP Act in India) is still evolving.
+ref: book | The Algorithmic Foundations of Differential Privacy | Dwork & Roth, 2014 | https://www.cis.upenn.edu/~aaroth/Papers/privacybook.pdf
+ref: paper | Calibrating Noise to Sensitivity in Private Data Analysis | Dwork, McSherry, Nissim & Smith, TCC 2006 |
+
+@@ scalinglaws
+value: Scaling laws describe how model loss falls predictably, as a power law, with more parameters, data and compute. They turned AI progress from guesswork into planning: labs predict a large model's performance from small runs and decide how to spend compute.
+how: Kaplan et al. (2020) found smooth power laws over many orders of magnitude. Hoffmann et al. (2022, 'Chinchilla') showed that for a fixed compute budget, parameters and training tokens should grow roughly equally, about 20 tokens per parameter, so many earlier models were under-trained. In practice, models are now trained on far more tokens than that, because smaller models are cheaper to serve. Newer work studies scaling of inference-time compute (reasoning) and of reinforcement learning.
+intuition: Doubling effort gives a steady, predictable improvement, like a reliable exchange rate between compute and quality.
+friction: Loss doesn't directly predict specific abilities; high-quality data may run out; laws are empirical, not explained by theory; costs grow exponentially for linear gains.
+ref: paper | Scaling Laws for Neural Language Models | Kaplan et al., 2020 | https://arxiv.org/abs/2001.08361
+ref: paper | Training Compute-Optimal Large Language Models (Chinchilla) | Hoffmann et al., 2022 | https://arxiv.org/abs/2203.15556
+ref: blog | The Bitter Lesson | Rich Sutton, 2019 | http://www.incompleteideas.net/IncIdeas/BitterLesson.html
+
+@@ cot
+value: Chain-of-thought and test-time compute let a model 'think' by generating intermediate reasoning before answering. Accuracy on maths, coding and planning rises sharply, and spending more compute at answer time became a second scaling axis after training.
+how: Prompting a model to show step-by-step reasoning (Wei et al., 2022) improved multi-step problems. Self-consistency samples several reasoning chains and takes the majority answer. Reasoning models (OpenAI o1 in 2024, DeepSeek-R1 in 2025, Claude's extended thinking and others) are trained with reinforcement learning to produce long internal reasoning, check their work and try alternatives, using verifiable rewards.
+intuition: Show your working: writing intermediate steps lets the model use its own output as scratch memory.
+friction: More tokens means more latency and cost; the written reasoning may not reflect what really drives the answer (faithfulness); overthinking simple questions; benefits are biggest in verifiable domains.
+ref: paper | Chain-of-Thought Prompting Elicits Reasoning in Large Language Models | Wei et al., NeurIPS 2022 | https://arxiv.org/abs/2201.11903
+ref: paper | Self-Consistency Improves Chain of Thought Reasoning in Language Models | Wang et al., ICLR 2023 | https://arxiv.org/abs/2203.11171
+ref: paper | DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning | DeepSeek-AI, 2025 | https://arxiv.org/abs/2501.12948
+
+@@ decoding
+value: Decoding strategies decide which token a language model outputs next from its probability distribution. The same model can be precise or creative, repetitive or varied, depending on decoding, and constrained decoding can guarantee valid JSON or code.
+how: Greedy decoding picks the most likely token. Temperature scales logits: lower is sharper, higher is more random. Top-k keeps only the k most likely tokens; top-p (nucleus) keeps the smallest set whose probability sum exceeds p; min-p keeps tokens above a fraction of the top probability. Beam search keeps several candidate sequences (common in translation). Constrained decoding masks tokens that would violate a grammar or JSON schema at each step.
+intuition: The model proposes a ranked list of next words; decoding is the policy for choosing among them.
+friction: Randomness complicates testing and reproducibility; low temperature can loop and repeat; constraints can push the model into unnatural tokens and reduce quality.
+ref: paper | The Curious Case of Neural Text Degeneration (nucleus sampling) | Holtzman et al., ICLR 2020 | https://arxiv.org/abs/1904.09751
+ref: paper | Efficient Guided Generation for Large Language Models (Outlines) | Willard & Louf, 2023 | https://arxiv.org/abs/2307.09702
+
+@@ contrastive
+value: Contrastive learning trains models by pulling matching pairs together and pushing non-matching pairs apart in embedding space. It produced CLIP (images and text in one space), modern text embedding models and self-supervised vision models, all from data without manual labels.
+how: Build a batch of positive pairs (an image and its caption, two augmentations of the same image, a query and its relevant passage). For each item, the loss (InfoNCE) rewards high similarity with its partner and low similarity with all other items in the batch, which act as negatives. Larger batches and 'hard' negatives (similar but wrong) improve results.
+intuition: Learn what matches by seeing many things that don't.
+friction: Needs large batches or memory banks; false negatives (items that are actually related) hurt; the learned space reflects biases in pairing data.
+ref: paper | Learning Transferable Visual Models From Natural Language Supervision (CLIP) | Radford et al., ICML 2021 | https://arxiv.org/abs/2103.00020
+ref: paper | A Simple Framework for Contrastive Learning of Visual Representations (SimCLR) | Chen et al., ICML 2020 | https://arxiv.org/abs/2002.05709
+
+@@ specdecode
+value: Speculative decoding speeds up LLM generation by 2–3× with exactly the same output distribution, by letting a cheap draft model guess several tokens that the big model verifies in one pass.
+how: LLM decoding is memory-bandwidth bound: checking 5 tokens costs about the same as generating 1. A small draft model (or extra prediction heads like Medusa or EAGLE, or n-gram lookups) proposes k tokens; the large model scores all of them in parallel; tokens are accepted left to right using a rejection-sampling rule that preserves the large model's distribution; at the first rejection, the large model's own token is used.
+intuition: A junior writes a draft sentence; the senior approves most of it at a glance and fixes only the first wrong word.
+friction: Speed-up depends on how often the draft is right (worse for creative text); the draft model uses memory; benefits shrink at large batch sizes where the GPU is already compute-bound.
+ref: paper | Fast Inference from Transformers via Speculative Decoding | Leviathan, Kalman & Matias, ICML 2023 | https://arxiv.org/abs/2211.17192
+ref: paper | Accelerating Large Language Model Decoding with Speculative Sampling | Chen et al. (DeepMind), 2023 | https://arxiv.org/abs/2302.01318
+
+@@ promptcache
+value: Prompt (prefix) caching reuses the KV cache for a prompt prefix that was already processed, such as a long system prompt, a document or earlier conversation turns. It cuts latency to first token and cost substantially for agents and chat, which resend the same prefix many times.
+how: The server hashes blocks of tokens; if a new request starts with blocks already cached, their keys and values are reused and only the new suffix is processed. vLLM's automatic prefix caching and SGLang's RadixAttention (a radix tree over cached prefixes) do this inside servers; commercial APIs expose it with lower prices for cached tokens. It works only for exact prefixes, so prompts should put stable content first.
+intuition: Don't reread the whole manual every time; bookmark where you got to.
+friction: Any change early in the prompt invalidates everything after it; cache memory is limited, so entries expire; routing requests to the server holding the cache matters in a cluster.
+ref: paper | SGLang: Efficient Execution of Structured Language Model Programs | Zheng et al., NeurIPS 2024 | https://arxiv.org/abs/2312.07104
+ref: docs | Prompt caching | Anthropic | https://docs.claude.com/en/docs/build-with-claude/prompt-caching
+
+@@ evals
+value: Evaluation tells you whether a model or AI system is good enough and whether a change made it better. For LLM products, evals have become the main engineering discipline: without them, prompt or model changes are guesses.
+how: Public benchmarks (MMLU, GPQA, SWE-bench, HumanEval and others) compare models broadly. Product teams build task-specific eval sets from real cases, graded by exact checks (tests pass, JSON valid), human raters, or LLM-as-judge with a rubric. Online, A/B tests measure real user outcomes. Good practice: hold out test data, track per-category results, and look at failures, not only averages.
+intuition: Unit tests for behavior that can't be specified exactly.
+friction: Benchmark contamination (test data leaking into training); benchmarks saturate quickly; LLM judges are biased (toward length, style or their own outputs); offline scores don't always predict user satisfaction.
+ref: blog | Your AI Product Needs Evals | Hamel Husain, 2024 | https://hamel.dev/blog/posts/evals/
+ref: paper | Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena | Zheng et al., NeurIPS 2023 | https://arxiv.org/abs/2306.05685
+ref: paper | SWE-bench: Can Language Models Resolve Real-World GitHub Issues? | Jimenez et al., ICLR 2024 | https://arxiv.org/abs/2310.06770
+
+@@ crossval
+value: Train/validation/test splits and cross-validation estimate how a model will perform on data it has never seen. They are the basic protection against fooling yourself with a model that only memorized.
+how: Train on one portion, tune hyperparameters on a validation set, and report final results once on a held-out test set. k-fold cross-validation trains k times, each time holding out a different fold, and averages the results; useful for small data. For time-dependent data (ads, fraud), split by time (train on the past, test on the future) to avoid leakage. Group splits keep all rows from one user in the same fold.
+intuition: Don't grade the students on the exact questions they practiced.
+friction: Leakage is easy to introduce (features computed using future data, duplicates across splits); repeated test-set use quietly overfits it; distribution shift after deployment breaks every offline estimate.
+ref: book | The Elements of Statistical Learning, ch. 7 | Hastie, Tibshirani & Friedman, 2009 | https://hastie.su.domains/ElemStatLearn/
+ref: paper | Leakage in Data Mining: Formulation, Detection, and Avoidance | Kaufman, Rosset & Perlich, KDD 2011 |
+
+@@ dct
+value: The discrete cosine transform converts blocks of pixels or audio samples into frequencies, where most of the energy sits in a few coefficients. Throwing away small high-frequency coefficients is the core of JPEG, MP3-style audio coding (via the related MDCT), and video codecs from MPEG-2 to H.264, HEVC and AV1 (which use integer DCT-like transforms).
+how: An 8×8 (or larger) block of pixels becomes 64 coefficients, from the average brightness (DC) to fine patterns. Quantization divides coefficients by step sizes (larger for high frequencies, which human eyes notice less) and rounds, creating many zeros. Entropy coding (Huffman, arithmetic or CABAC) then compresses the result.
+intuition: Describe a picture as 'mostly this colour, with a gentle gradient, plus a little fine detail', then drop most of the fine detail.
+friction: Block artifacts at low bitrates; ringing near sharp edges; transform choice is a trade-off between compression and complexity.
+ref: paper | Discrete Cosine Transform | Ahmed, Natarajan & Rao, IEEE Trans. Computers 1974 |
+ref: paper | The JPEG Still Picture Compression Standard | Gregory Wallace, CACM 1991 |
+
+@@ motioncomp
+value: Motion compensation is why video compresses about 100× or more: most of each frame is predicted from neighbouring frames, so only the motion and small differences are stored.
+how: The encoder divides a frame into blocks and searches reference frames for the best-matching block, recording a motion vector. It then encodes only the residual (difference), using a transform and quantization. Frame types: I-frames are self-contained, P-frames predict from earlier frames, B-frames predict from both earlier and later frames. A group of pictures starts with an I-frame; seeking and streaming segments start there.
+intuition: Instead of redrawing the whole scene, say 'this patch moved two pixels left' and fix what changed.
+friction: Motion search is the most expensive part of encoding; scene cuts and fast motion defeat prediction; errors propagate until the next I-frame; B-frames add latency, which hurts live streaming.
+ref: paper | Overview of the H.264/AVC Video Coding Standard | Wiegand, Sullivan, Bjøntegaard & Luthra, IEEE TCSVT 2003 |
+ref: book | The H.264 Advanced Video Compression Standard, 2nd ed. | Iain Richardson, 2010 |
+
+@@ abr
+value: Adaptive bitrate streaming lets video play smoothly on changing networks by switching between quality levels every few seconds. HLS and DASH, which deliver almost all internet and CTV streaming, are built on it.
+how: The video is encoded at several bitrates and resolutions (a 'ladder') and cut into short segments (2–6 seconds), described by a manifest. The player measures throughput and buffer level and picks the quality for the next segment. Algorithms include throughput-based, buffer-based (BBA, from Netflix research) and hybrid ones like BOLA (used in dash.js). Per-title and per-scene encoding tunes ladders to content.
+intuition: Drive in the highest gear the road allows, shifting down on hills before you stall.
+friction: Quality oscillation annoys viewers; startup and rebuffering trade off against quality; live streaming has small buffers; shared networks make throughput estimates noisy.
+ref: paper | A Buffer-Based Approach to Rate Adaptation: Evidence from a Large Video Streaming Service | Huang et al., SIGCOMM 2014 |
+ref: paper | BOLA: Near-Optimal Bitrate Adaptation for Online Videos | Spiteri, Urgaonkar & Sitaraman, INFOCOM 2016 | https://arxiv.org/abs/1601.06748
+
+@@ fingerprint
+value: Audio and video fingerprinting identifies content from a short sample by matching compact, robust signatures against a reference database. It powers Shazam, YouTube Content ID, broadcast monitoring and automatic content recognition (ACR) on smart TVs.
+how: Audio: compute a spectrogram, pick local peaks (time–frequency landmarks), and hash pairs of nearby peaks with their time gap (Shazam's method). Matching finds reference tracks with many hash hits at a consistent time offset. Video: compute features from frames (for example, average intensities of blocks or their differences, or learned embeddings) and match sequences. Fingerprints must survive noise, compression, scaling, overlays and speed changes.
+intuition: Identify a song by the constellation of its loudest notes, not by every sound.
+friction: Reference databases for live TV must be updated in real time; overlays and picture-in-picture confuse video matching; similar content (re-runs, ads) causes ambiguity; privacy rules for ACR on TVs.
+ref: paper | An Industrial-Strength Audio Search Algorithm | Avery Wang (Shazam), ISMIR 2003 |
+ref: paper | A Highly Robust Audio Fingerprinting System | Haitsma & Kalker (Philips), ISMIR 2002 |
+
+@@ perceptualhash
+value: Perceptual hashes give visually similar images or frames similar short codes, so near-duplicates can be found quickly with Hamming distance. They are used for duplicate detection, content moderation (PhotoDNA, PDQ) and frame matching in ACR.
+how: Downscale the image, convert to greyscale, and compute a feature such as the low-frequency DCT coefficients compared with their median (pHash), or brightness differences between adjacent pixels (dHash), giving a 64-bit or 256-bit code. Similar images differ in only a few bits; search uses multi-index hashing or bit-sampling LSH.
+intuition: A thumbnail sketch so rough that small edits don't change it.
+friction: Rotation, cropping and heavy edits break simple hashes; adversaries can deliberately cause collisions or evade matches; learned embeddings are more robust but heavier.
+ref: docs | PDQ and TMK+PDQF hashing | Meta ThreatExchange | https://github.com/facebook/ThreatExchange/tree/main/pdq
+ref: paper | Fast Search in Hamming Space with Multi-Index Hashing | Norouzi, Punjani & Fleet, CVPR 2012 |
+
+@@ auction
+value: Auction theory explains how ad exchanges set prices for each impression in real-time bidding. Changing auction rules changes how bidders should bid, and the shift from second-price to first-price auctions (around 2017–2019) reshaped programmatic advertising.
+how: In a second-price auction, the winner pays the second-highest bid, so bidding your true value is the best strategy (Vickrey, 1961). Search ads used generalized second-price auctions with quality scores. Header bidding made exchanges compete, and the industry moved to first-price auctions, where the winner pays its own bid; buyers then use bid shading (bidding below value, estimated from win-rate curves). Reserve prices and floors shape publisher revenue.
+intuition: The rules decide whether honesty is the best strategy.
+friction: First-price auctions require bid shading models; auction rules across exchanges are opaque; bidders learn and adapt, so equilibria shift.
+ref: paper | Counterspeculation, Auctions, and Competitive Sealed Tenders | William Vickrey, Journal of Finance 1961 |
+ref: paper | Internet Advertising and the Generalized Second-Price Auction | Edelman, Ostrovsky & Schwarz, AER 2007 |
+ref: book | Twenty Lectures on Algorithmic Game Theory | Tim Roughgarden, 2016 |
+
+@@ pacing
+value: Budget pacing spreads a campaign's spend evenly (or according to a plan) over its flight, instead of spending the whole budget in the first hour. It keeps advertisers reaching audiences all day and avoids overspending.
+how: Throttling-based pacing decides randomly whether to take part in each auction, with a participation probability adjusted by a controller. Bid-modification pacing scales bids up or down. A feedback controller (often PI or PID-like) compares actual spend with the target curve (adjusted for expected traffic patterns) and corrects frequently. Frequency caps limit how often one user sees an ad, which interacts with pacing.
+intuition: Cruise control for spending.
+friction: Traffic forecasts are noisy; delayed spend reporting makes control loops unstable; pacing across many campaigns competing for the same users is hard.
+ref: paper | Smart Pacing for Effective Online Ad Campaign Optimization | Xu et al. (Yahoo), KDD 2015 | https://arxiv.org/abs/1506.05851
+ref: paper | Budget Pacing for Targeted Online Advertisements at LinkedIn | Agarwal et al., KDD 2014 |
+
+@@ idgraph
+value: Identity graphs link the many identifiers of the same person or household (cookies, mobile ad IDs, CTV device IDs, hashed emails, IP addresses) so advertisers can reach and measure audiences across devices.
+how: Deterministic links come from logins or hashed emails seen on several devices. Probabilistic links use signals like shared IP address, location and timing, with models estimating the chance that two devices belong to the same household. The graph is stored as connected components (often computed with union-find or label propagation in Spark) and refreshed regularly.
+intuition: A family tree for devices.
+friction: Accuracy is hard to measure; privacy regulation and platform changes (cookie restrictions, Apple's App Tracking Transparency) limit signals; over-merging (one 'household' becomes a whole office building) corrupts targeting and measurement.
+ref: docs | GraphFrames user guide: connected components | GraphFrames project |
+ref: paper | Cross-Device Tracking: Measurement and Disclosures | Brookman et al., PETS 2017 |
+
+@@ cookies
+value: Cookies and tracking pixels are how the web remembers users and how ad systems record impressions, clicks and conversions. Their decline (browser restrictions, privacy law) is reshaping ad tech toward first-party data, contextual targeting and privacy technologies.
+how: A cookie is a small value a server asks the browser to store and send back on later requests to the same domain. First-party cookies belong to the site you visit; third-party cookies belong to other domains embedded in it (ad servers). A tracking pixel is a tiny image or script request that sends event data (and cookies) to a server. Cookie syncing maps one company's ID to another's. Safari and Firefox block third-party cookies by default; Chrome decided in 2025 to keep them, and in October 2025 Google retired most Privacy Sandbox technologies.
+intuition: A cloakroom ticket the browser shows on each visit.
+friction: Consent requirements (GDPR, ePrivacy); ad blockers; cross-site tracking restrictions; server-side tracking and fingerprinting raise new privacy concerns.
+ref: docs | RFC 6265: HTTP State Management Mechanism | IETF, 2011 | https://www.rfc-editor.org/rfc/rfc6265
+ref: paper | Online Tracking: A 1-million-site Measurement and Analysis | Englehardt & Narayanan, CCS 2016 |

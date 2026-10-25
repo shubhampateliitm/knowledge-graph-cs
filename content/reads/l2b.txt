@@ -1,0 +1,249 @@
+@@ encoding
+value: Encoding and compression shrink data so less of it moves through disks, networks and caches. In analytics, where scans are limited by bandwidth, smaller data means faster queries and lower cost, often by 5–10× or more.
+how: Lightweight encodings exploit structure within a column: dictionary encoding (replace values with small codes), run-length encoding (value × count), delta encoding (store differences between sorted values), frame-of-reference and bit-packing (store small offsets in few bits). General-purpose compressors then remove remaining redundancy: LZ77-family matching plus entropy coding (Snappy and LZ4 for speed, Zstd for balance, Gzip for ratio). Many engines operate directly on encoded data, for example filtering on dictionary codes.
+intuition: Write 'the same as above × 1,000' instead of copying a value a thousand times.
+friction: CPU cost of decompression versus I/O saved; encoding effectiveness depends on data order (sorting helps); random access into compressed blocks is harder.
+ref: paper | Integrating Compression and Execution in Column-Oriented Database Systems | Abadi, Madden & Ferreira, SIGMOD 2006 |
+ref: blog | Zstandard: a fast lossless compression algorithm | Yann Collet & Facebook, 2016 | https://facebook.github.io/zstd/
+
+@@ zonemaps
+value: Zone maps (min/max statistics per block or file) let engines skip data that cannot match a filter. They are cheap to store and often eliminate most of a large scan.
+how: For each block, row group or file, store the minimum and maximum value of each column (plus null counts). A query with WHERE date = '2026-10-25' skips every block whose range excludes that date. Parquet footers, Delta and Iceberg file statistics, Snowflake micro-partition metadata and Oracle and Netezza zone maps all use this.
+intuition: Labels on archive boxes: 'invoices January–March' means you don't open it when looking for June.
+friction: Only effective when data is sorted or clustered on filter columns; randomly ordered data has wide ranges in every block, so nothing is skipped.
+ref: paper | Small Materialized Aggregates: A Light Weight Index Structure for Data Warehousing | Guido Moerkotte, VLDB 1998 |
+
+@@ bloom
+value: A Bloom filter (Burton Bloom, 1970) answers 'is this item in the set?' using very little memory, with no false negatives and a tunable rate of false positives. Databases use them to avoid unnecessary disk reads (RocksDB, Cassandra, Parquet), and networks and caches use them to avoid unnecessary lookups.
+how: Allocate m bits and choose k hash functions. To add an item, set the k bit positions it hashes to. To query, check those k bits: if any is 0, the item is definitely absent; if all are 1, it is probably present. With n items, the false-positive rate is about (1 − e^(−kn/m))^k; about 10 bits per item with k = 7 gives roughly 1%.
+intuition: A guest list where each name ticks a few boxes; if any of your boxes is empty, you're certainly not on the list.
+friction: Items cannot be removed (counting Bloom filters or cuckoo filters can); the size must be planned for the expected number of items; false positives grow quickly if overfilled.
+ref: paper | Space/Time Trade-offs in Hash Coding with Allowable Errors | Burton Bloom, CACM 1970 |
+ref: paper | Network Applications of Bloom Filters: A Survey | Broder & Mitzenmacher, 2004 |
+
+@@ hll
+value: HyperLogLog estimates the number of distinct items (unique users, unique devices, distinct campaigns) in huge streams using only kilobytes of memory, with about 1–2% error. It is built into Redis, Spark, BigQuery, Druid, Pinot, ClickHouse and most analytics systems, and it is central to reach and frequency reporting in ad tech.
+how: Hash each item to a uniform random bit string. The position of the first 1-bit is rare to be large: seeing a hash with k leading zeros suggests about 2^k distinct items. To reduce variance, split items into m buckets by the first bits of the hash, track the maximum leading-zero count per bucket, and combine with a harmonic mean plus bias corrections. Sketches merge by taking element-wise maxima, so per-day or per-shard sketches can be unioned. Standard error is about 1.04/√m.
+intuition: If someone tells you the longest streak of heads they flipped, you can guess roughly how many times they flipped.
+friction: Approximate; intersections (users in A and B) are much less accurate than unions; small cardinalities need special handling (HyperLogLog++).
+ref: paper | HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm | Flajolet, Fusy, Gandouet & Meunier, 2007 | https://algo.inria.fr/flajolet/Publications/FlFuGaMe07.pdf
+ref: paper | HyperLogLog in Practice | Heule, Nunkesser & Hall (Google), EDBT 2013 |
+
+@@ cms
+value: The count-min sketch estimates how often each item appears in a stream (heavy hitters, top keys, frequency caps) in small fixed memory, never underestimating.
+how: Keep d rows of w counters, each row with its own hash function. To add an item, increment one counter in each row. To estimate, take the minimum of the item's d counters. Collisions only add, so the estimate is an upper bound, with error that shrinks as w grows.
+intuition: Several rough tally sheets; the smallest tally is the least polluted by other items.
+friction: Overestimates for rare items; cannot list the items themselves without auxiliary structures.
+ref: paper | An Improved Data Stream Summary: The Count-Min Sketch and its Applications | Cormode & Muthukrishnan, 2005 |
+
+@@ invindex
+value: The inverted index is the core data structure of search: it maps each term to the list of documents containing it, so finding all documents with 'kafka' and 'partition' means intersecting two lists instead of reading every document.
+how: Text is tokenized and normalized; for each term, a posting list stores sorted document IDs, often with term frequencies and positions (for phrase queries). Queries intersect or union lists, using skip pointers or block-max indexes to jump ahead. The same idea serves exact-value filters in OLAP engines (value → bitmap of rows).
+intuition: The index at the back of a book.
+friction: Updates require rebuilding or merging segments; high-frequency terms have huge lists; it captures words, not meaning (hence hybrid search with vectors).
+ref: book | Introduction to Information Retrieval, ch. 1–5 | Manning, Raghavan & Schütze | https://nlp.stanford.edu/IR-book/
+
+@@ postings
+value: Posting-list compression shrinks inverted indexes several times over, so more of the index fits in memory and queries read less data.
+how: Store gaps between sorted document IDs (small numbers) instead of the IDs, then encode gaps with variable-byte codes, Elias–gamma codes, or block schemes like PForDelta and frame-of-reference with bit-packing (Lucene packs blocks of 128 integers). SIMD-friendly decoders keep decompression fast.
+intuition: Instead of house numbers 1001, 1005, 1012, write 'start at 1001, then +4, then +7'.
+friction: Decoding cost on every query; random access within compressed blocks needs skip structures.
+ref: paper | Decoding billions of integers per second through vectorization | Lemire & Boytsov, 2012 | https://arxiv.org/abs/1209.2137
+
+@@ bm25
+value: BM25 is the standard relevance formula for keyword search, used by Lucene, Elasticsearch and most search engines, and still a strong baseline for retrieval in RAG.
+how: For each query term in a document, score grows with term frequency but saturates (controlled by k1), is scaled by inverse document frequency (rare terms count more), and is normalized by document length relative to average (controlled by b). The document's score is the sum over query terms. It comes from the probabilistic relevance framework of Robertson and Spärck Jones.
+intuition: A document mentioning a rare word several times is probably about it; mentioning a common word many times matters less, and long documents shouldn't win just by being long.
+friction: Pure lexical: misses synonyms and paraphrases; needs tuning per corpus; often combined with neural re-ranking or vectors.
+ref: paper | The Probabilistic Relevance Framework: BM25 and Beyond | Robertson & Zaragoza, 2009 |
+
+@@ fst
+value: Finite-state transducers compress a large sorted set of terms (and associated values) into a small automaton that can be searched quickly, including prefix, fuzzy and regex queries. Lucene stores its term dictionary this way.
+how: Build a minimal acyclic automaton where shared prefixes and suffixes are stored once; each transition emits part of an output value (such as a file offset). Lookup walks the automaton character by character; fuzzy search intersects it with a Levenshtein automaton.
+intuition: A trie that also merges common endings, like sharing both 'pre-' and '-tion' among many words.
+friction: Immutable once built (rebuilt per segment); construction requires sorted input.
+ref: blog | Index 1,600,000,000 keys with automata and Rust | Andrew Gallant, 2015 | https://blog.burntsushi.net/transducers/
+
+@@ docvalues
+value: Doc values are Lucene's column store: per-field values stored by document ID in columnar form, used for sorting, aggregations and scripting without loading everything into heap memory.
+how: Written at index time per segment, compressed and memory-mapped from disk; the OS page cache keeps hot columns in memory.
+intuition: Search needs 'which documents contain X' (inverted); aggregations need 'what is X for these documents' (columnar). Lucene keeps both.
+friction: Extra disk space; text fields need keyword copies for aggregation.
+ref: docs | Elasticsearch doc values | Elastic | https://www.elastic.co/guide/en/elasticsearch/reference/current/doc-values.html
+
+@@ startree
+value: The star-tree index (Pinot) pre-aggregates metrics for combinations of dimension values, so group-by and filter queries can be answered by reading a few aggregated records instead of scanning millions of rows, with a configurable cap on how much is pre-computed.
+how: Records are sorted by a chosen dimension order and organized into a tree; at each level, a special 'star' node aggregates over all values of that dimension. Nodes with more than a threshold of records are split further; smaller ones are left to scan. A query walks the tree using filter values or star nodes.
+intuition: A partially pre-computed pivot table, built only where it pays off.
+friction: Extra storage and build time; only helps for configured dimensions and aggregation functions.
+ref: docs | Pinot star-tree index | Apache Pinot | https://docs.pinot.apache.org/basics/indexing/star-tree-index
+
+@@ bitmap
+value: Bitmap indexes represent the set of rows matching each value as a bitmap, so filters with AND, OR and NOT become fast bitwise operations. Roaring bitmaps made them compact and fast for both sparse and dense sets, and they are used in Pinot, Druid, Elasticsearch, Spark, ClickHouse and Lucene.
+how: Roaring splits the 32-bit integer space into chunks of 65,536; each chunk is stored as a sorted array (sparse), a bitset (dense) or runs, whichever is smallest. Set operations work chunk by chunk with SIMD-friendly code.
+intuition: A row of light switches per value: to combine filters, compare switch rows.
+friction: High-cardinality columns need many bitmaps; updates are expensive in immutable segments.
+ref: paper | Better bitmap performance with Roaring bitmaps | Chambi, Lemire, Kaser & Godin, 2016 | https://arxiv.org/abs/1402.6407
+ref: docs | Roaring Bitmaps | roaringbitmap.org | https://roaringbitmap.org/
+
+@@ scattergather
+value: Scatter–gather executes a query by sending it to every relevant shard in parallel and merging the results. It is how search engines, OLAP stores and sharded databases answer queries over data spread across many machines.
+how: A coordinator or broker prunes irrelevant shards (by time range or partition key), sends sub-queries, collects partial results (top-k hits, partial aggregates), merges them, and may fetch additional data. Replicas give the coordinator choices; hedged requests resend to another replica if one is slow.
+intuition: Ask every branch office, then add up their answers.
+friction: Latency is set by the slowest shard (tail at scale); fan-out to many shards multiplies load; merging top-k results correctly may require over-fetching.
+ref: paper | The Tail at Scale | Dean & Barroso, CACM 2013 |
+
+@@ vectorized
+value: Vectorized execution processes data in batches of hundreds or thousands of values per operator call, instead of one row at a time. It cuts function-call overhead and lets CPUs use SIMD instructions and caches effectively, giving large speed-ups for analytics. DuckDB, ClickHouse, Photon, Velox, Snowflake and Vectorwise use it.
+how: Each operator's next() returns a vector (a column chunk plus a selection vector of valid rows). Inner loops are simple, branch-free where possible, and operate on contiguous arrays, which compilers auto-vectorize. Pioneered by MonetDB/X100 (2005).
+intuition: Process a whole tray of cups at once instead of carrying them one by one.
+friction: Intermediate vectors must stay in cache; complex expressions may materialize many intermediates; row-by-row logic (UDFs) breaks the model.
+ref: paper | MonetDB/X100: Hyper-Pipelining Query Execution | Boncz, Zukowski & Nes, CIDR 2005 | https://www.cidrdb.org/cidr2005/papers/P19.pdf
+ref: paper | Everything You Always Wanted to Know About Compiled and Vectorized Queries But Were Afraid to Ask | Kersten et al., VLDB 2018 |
+
+@@ codegen
+value: Whole-stage code generation compiles a pipeline of query operators into one specialized function, removing the per-row overhead of interpreting a plan. Spark's Tungsten and HyPer-style engines use it.
+how: Instead of each operator calling next() on its child for every row, the engine generates code where the scan loop directly contains the filter condition, projection and partial aggregation, keeping values in CPU registers; the code is compiled (by Janino and then the JVM JIT in Spark, or LLVM in HyPer and Umbra) and run.
+intuition: Rather than passing each item down a line of workers, write one worker's instructions that do all steps in a single motion.
+friction: Compilation time hurts short queries; generated code is hard to debug; very large generated methods can exceed JIT limits (Spark falls back).
+ref: paper | Efficiently Compiling Efficient Query Plans for Modern Hardware | Thomas Neumann, VLDB 2011 |
+ref: blog | Apache Spark as a Compiler: Joining a Billion Rows per Second on a Laptop | Databricks, 2016 |
+
+@@ queryopt
+value: Query optimization turns a declarative SQL query into an efficient execution plan. A good optimizer can make the same query thousands of times faster by choosing join order, join algorithms, index use and where to filter.
+how: The parsed query becomes a logical plan of relational operators. Rule-based rewrites apply equivalences (push filters down, prune columns, unnest subqueries). A cost-based optimizer estimates the size of intermediate results from statistics (row counts, histograms, distinct counts) and searches over join orders and physical operators, classically with dynamic programming (System R, 1979) or a memo-based search (Cascades). Adaptive execution corrects estimates at runtime.
+intuition: Planning a road trip: the destination is fixed, but the route choice decides how long it takes.
+friction: Cardinality estimation errors compound across joins and are the main cause of bad plans; optimizing many joins is NP-hard; statistics go stale.
+ref: paper | Access Path Selection in a Relational Database Management System | Selinger et al., SIGMOD 1979 |
+ref: paper | How Good Are Query Optimizers, Really? | Leis et al., VLDB 2015 |
+
+@@ pushdown
+value: Predicate and projection pushdown apply filters and column selection as close to the data as possible, so less data is read, decoded and moved.
+how: The optimizer moves filters below joins and into scans; scans pass them to file readers (skipping Parquet row groups by statistics), to storage systems (S3 Select, database connectors), or to remote sources in federated engines.
+intuition: Ask the warehouse to send only the red shirts in size M, rather than shipping everything and sorting at home.
+friction: Not all predicates can be pushed (UDFs, some casts); pushdown depends on connector support.
+ref: book | Database System Concepts, ch. 'Query Optimization' | Silberschatz et al. |
+
+@@ joins
+value: Join algorithms combine rows from two tables on matching keys; they are often the most expensive part of analytical queries, so choosing the right algorithm matters enormously.
+how: Nested loop join compares each pair (fine for tiny inputs or indexed lookups). Hash join builds a hash table on the smaller input and probes it with the larger (linear time, needs memory). Sort-merge join sorts both inputs by key and merges them (good when data is already sorted or too big for memory). In distributed engines, broadcast join copies a small table to every worker; shuffle hash and sort-merge joins repartition both sides by key.
+intuition: Matching name tags at a conference: look up each guest in an alphabetized list (hash), or line up both groups alphabetically and walk along (merge).
+friction: Skewed keys overload one task; bad size estimates choose the wrong algorithm; spills to disk are slow.
+ref: paper | An Experimental Comparison of Thirteen Relational Equi-Joins in Main Memory | Schuh, Chen & Dittrich, SIGMOD 2016 |
+
+@@ shuffle
+value: The shuffle redistributes data across the cluster by key so that all rows with the same key meet in one task, enabling distributed joins, group-bys and sorts. It is usually the most expensive and failure-prone stage in Spark, MapReduce and Flink jobs.
+how: Each map task partitions its output by hash or range of the key, writes partitioned files (sorted or not) to local disk or a shuffle service, and reduce tasks fetch their partition from every map task over the network. Optimizations include combiners (pre-aggregate before shuffling), push-based shuffle, remote shuffle services, compression, and AQE's partition coalescing and skew splitting.
+intuition: Every clerk sorts their pile into bins by letter; then each letter's clerk collects their bin from everyone.
+friction: All-to-all network traffic; disk spills; skew; many small shuffle files; failures force refetch or recomputation.
+ref: paper | Riffle: Optimized Shuffle Service for Large-Scale Data Analytics | Zhang et al., EuroSys 2018 |
+ref: docs | Spark performance tuning | Apache Spark | https://spark.apache.org/docs/latest/sql-performance-tuning.html
+
+@@ aqe
+value: Adaptive query execution re-optimizes a running query using statistics measured at runtime, fixing the optimizer's estimation mistakes. In Spark (on by default since 3.2) it coalesces small partitions, switches to broadcast joins when one side turns out small, and splits skewed partitions.
+how: At each shuffle boundary, the completed stage reports exact output sizes per partition; the planner revises the rest of the plan before launching the next stage.
+intuition: Re-plan the route at each rest stop based on actual traffic.
+friction: Only acts at stage boundaries; cannot fix everything (skew inside a stage, bad scans).
+ref: blog | Adaptive Query Execution: Speeding Up Spark SQL at Runtime | Databricks, 2020 |
+
+@@ dagsched
+value: DAG scheduling runs each task as soon as all its inputs are ready, maximizing parallelism while respecting dependencies. Spark stages, Airflow pipelines, dbt models, build systems and ML pipelines all use it.
+how: Build a directed acyclic graph of tasks and dependencies; compute a topological order; keep a ready set of tasks whose parents are done; dispatch them to workers, considering locality and resources; on failure, retry the task or recompute ancestors.
+intuition: Cook dishes in parallel, but the sauce can't start until the onions are chopped.
+friction: The critical path limits total time regardless of workers; very fine-grained DAGs add scheduling overhead; cycles must be impossible.
+ref: book | Introduction to Algorithms (topological sort) | Cormen, Leiserson, Rivest & Stein |
+
+@@ lineage
+value: Lineage-based recovery rebuilds lost data by re-running the deterministic computation that produced it, instead of replicating every intermediate result. It made Spark fast (no need to write intermediate data three times) and fault tolerant.
+how: Each RDD or DataFrame partition records its parent partitions and the transformation applied. If a partition is lost, the scheduler recomputes it from its parents, recursively, possibly back to the source. Checkpointing truncates long lineage chains.
+intuition: Keep the recipe, not every intermediate dish; if a dish is dropped, cook it again.
+friction: Long lineages make recovery slow; non-deterministic operations (random sampling without seeds, external calls) break correctness; wide dependencies may force recomputing many partitions.
+ref: paper | Resilient Distributed Datasets | Zaharia et al., NSDI 2012 | https://www.usenix.org/system/files/conference/nsdi12/nsdi12-final138.pdf
+
+@@ speculative
+value: Speculative execution launches a duplicate of a straggling task and uses whichever finishes first. In large jobs, a few slow machines (bad disks, noisy neighbors) can otherwise dominate total runtime.
+how: The scheduler monitors task progress; tasks much slower than the median (Spark's default multiplier became 3× in 4.0) are re-launched elsewhere; the loser is killed. Hedged requests apply the same idea to RPCs: send a second request after a short delay.
+intuition: If one cashier is stuck, open another lane for that customer.
+friction: Wastes resources; tasks with side effects must be idempotent; does not help with skewed data (the copy is just as slow).
+ref: paper | MapReduce: Simplified Data Processing on Large Clusters | Dean & Ghemawat, 2004 | https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/
+ref: paper | The Tail at Scale | Dean & Barroso, CACM 2013 |
+
+@@ eviction
+value: Cache eviction policies decide what to throw out when a cache is full. A good policy keeps hit rates high, which directly lowers latency and back-end load.
+how: LRU evicts the least recently used item (a hash map plus a doubly linked list); LFU evicts the least frequently used; CLOCK approximates LRU cheaply (used by operating systems); ARC and W-TinyLFU (Caffeine) adapt between recency and frequency; Redis uses sampled approximations of LRU and LFU; newer policies like S3-FIFO show that simple FIFO queues with a probation stage do very well.
+intuition: Clear your desk of whatever you haven't touched for longest, or whatever you rarely use.
+friction: Scans can flush a pure-LRU cache; workload shifts change the best policy; metadata overhead per item.
+ref: paper | ARC: A Self-Tuning, Low Overhead Replacement Cache | Megiddo & Modha, FAST 2003 |
+ref: paper | FIFO queues are all you need for cache eviction (S3-FIFO) | Yang et al., SOSP 2023 |
+
+@@ eventloop
+value: An event loop lets one thread handle thousands of concurrent connections by reacting to readiness events instead of blocking on each connection. NGINX, Redis, Node.js, Netty (Kafka's network layer uses NIO selectors) and Envoy are built on it.
+how: The loop asks the kernel (epoll, kqueue, io_uring) which sockets are ready, processes each ready event quickly with non-blocking calls, and goes back to waiting. Long work must be offloaded to worker threads or split into small steps.
+intuition: A waiter who serves whichever table raises a hand, rather than standing beside one table until it finishes.
+friction: One slow handler blocks everything; CPU-heavy work needs other threads; callback-heavy code is hard to read (async/await helps).
+ref: blog | The C10K problem | Dan Kegel | http://www.kegel.com/c10k.html
+
+@@ zerocopy
+value: Zero-copy I/O moves data between files and sockets without copying it through user-space buffers, saving CPU and memory bandwidth. It is a key reason Kafka brokers can serve consumers at very high throughput.
+how: The sendfile() system call tells the kernel to send file data (often already in the page cache) directly to a socket; with DMA-capable network cards, data moves from page cache to the card without CPU copies. mmap maps files into memory to avoid read() copies. Kafka's 2011 paper notes the normal path uses four copies and two system calls, and sendfile removes two copies and one call.
+intuition: Hand the parcel straight from the storeroom to the courier, rather than carrying it through your office first.
+friction: Data cannot be transformed on the way (TLS encryption requires copies unless kernel TLS is used); benefits depend on page cache hits.
+ref: paper | Kafka: a Distributed Messaging System for Log Processing | Kreps et al., 2011 | https://notes.stephenholiday.com/Kafka.pdf
+ref: blog | Efficient data transfer through zero copy | Sathish Palaniappan & Pramod Nagaraja, IBM developerWorks, 2008 |
+
+@@ batching
+value: Batching amortizes fixed per-operation costs (system calls, network round trips, disk syncs, GPU kernel launches) across many items. It is behind Kafka producer throughput, database group commit, bulk indexing and GPU inference.
+how: Accumulate items until a size or time limit (Kafka's batch.size and linger.ms), then process them together; compress whole batches for better ratios.
+intuition: Drive one full truck instead of a hundred cars.
+friction: Adds latency (waiting to fill the batch); larger batches use more memory and make failures affect more items.
+ref: docs | Kafka producer configs: batch.size and linger.ms | Apache Kafka | https://kafka.apache.org/documentation/#producerconfigs
+
+@@ sepstorage
+value: Separating storage from compute keeps data in shared, durable storage (usually object storage) while compute clusters scale up, down or to zero independently. Snowflake, BigQuery, Databricks, lakehouses, and newer Kafka-compatible systems all rely on it.
+how: Data lives in S3 or similar; compute nodes read and write over the network, with local SSD caches for hot data; metadata services coordinate transactions. Elasticity comes from adding stateless compute.
+intuition: A shared library and many reading rooms that open and close as needed.
+friction: Network latency and request costs; cache warm-up after scaling; object storage limits on request rates per prefix.
+ref: paper | The Snowflake Elastic Data Warehouse | Dageville et al., SIGMOD 2016 |
+
+@@ erasurecoding
+value: Erasure coding protects data against device failures with much less storage overhead than full replication. Object stores (S3, Azure, Google Cloud Storage), HDFS 3 and Ceph use it.
+how: Split data into k data fragments and compute m parity fragments (with Reed–Solomon or similar codes over finite fields); any k of the k+m fragments reconstruct the data. For example, 10+4 tolerates 4 failures with 1.4× overhead, versus 3× for triple replication.
+intuition: Keep enough clues spread around that the missing pieces can always be worked out.
+friction: Reconstruction costs CPU and network; small objects are inefficient; writes and degraded reads are slower than replication.
+ref: paper | Erasure Coding in Windows Azure Storage | Huang et al., USENIX ATC 2012 |
+
+@@ reconcile
+value: The reconciliation loop is the control pattern behind Kubernetes, Terraform-style tools, GitOps and many operators: continuously compare desired state with observed state and act to close the difference. It makes systems self-healing and declarative.
+how: Watch for changes (or poll); read desired spec and current status; compute a diff; take an idempotent step toward the desired state; record status; repeat. Level-triggered design (react to the current state, not to individual events) makes it robust to missed events.
+intuition: A thermostat: it doesn't care how the room got cold, only that it is colder than the setting.
+friction: Controllers fighting each other over the same resource; slow convergence for large diffs; debugging why reality differs from intent.
+ref: docs | Kubernetes controllers | Kubernetes | https://kubernetes.io/docs/concepts/architecture/controller/
+
+@@ ratelimit
+value: Rate limiting caps how fast clients can make requests, protecting services from overload and abuse and enforcing fair use or pricing tiers.
+how: The token bucket adds tokens at a fixed rate up to a capacity; each request spends one, allowing bursts up to the capacity. Leaky bucket smooths output; fixed and sliding windows count requests per period. Distributed rate limiting keeps counters in Redis or uses approximate local limits.
+intuition: Tickets dispensed at a steady pace; when they run out, you wait.
+friction: Distributed accuracy versus cost; choosing limits per tenant; clients retrying immediately after rejection.
+ref: blog | Rate limiting strategies and techniques | Google Cloud Architecture Center | https://cloud.google.com/architecture/rate-limiting-strategies-techniques
+
+@@ merkle
+value: Content addressing names data by the hash of its content, and Merkle trees (Ralph Merkle, 1979) hash data in a tree so one root hash verifies an entire structure. Git, blockchains, IPFS, Cassandra and DynamoDB anti-entropy, ZFS, certificate transparency and package managers rely on them.
+how: Each leaf is the hash of a data block; each internal node is the hash of its children; the root summarizes everything. To prove a block belongs, provide the sibling hashes along its path (log n hashes). To compare two replicas, compare roots, then descend only into subtrees whose hashes differ.
+intuition: A fingerprint of fingerprints.
+friction: Any change requires rehashing up to the root; hash algorithm upgrades (SHA-1 to SHA-256) are disruptive.
+ref: paper | A Digital Signature Based on a Conventional Encryption Function | Ralph Merkle, CRYPTO 1987 |
+ref: blog | Git from the Bottom Up | John Wiegley | https://jwiegley.github.io/git-from-the-bottom-up/
+
+@@ sampling
+value: Sampling processes a representative subset instead of everything, cutting the cost of telemetry, analytics and ML training while keeping estimates accurate.
+how: Uniform random sampling, stratified sampling (sample within groups), reservoir sampling (uniform sample from a stream of unknown length), head-based and tail-based trace sampling (keep traces with errors or high latency), and importance sampling.
+intuition: Taste a spoonful to know the soup.
+friction: Rare events may be missed; biased samples mislead; estimates need confidence intervals.
+ref: paper | Random Sampling with a Reservoir | Jeffrey Vitter, ACM TOMS 1985 |
+
+@@ virtualdom
+value: Virtual DOM diffing lets UI code describe the whole interface for the current state and lets a library update the real page efficiently, which made declarative UIs (React) practical.
+how: Render produces a lightweight tree of element objects; the library compares it with the previous tree using heuristics (elements of different types are replaced; lists use keys to match items), producing a minimal set of DOM operations. General tree diff is O(n³); React's heuristics make it O(n).
+intuition: Compare the new blueprint with the old one and renovate only what changed.
+friction: Diffing still costs CPU; unnecessary re-renders; other frameworks (Svelte, Solid) avoid virtual DOM with compile-time or fine-grained reactivity.
+ref: docs | React: Preserving and resetting state (reconciliation) | Meta | https://react.dev/learn/preserving-and-resetting-state

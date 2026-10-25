@@ -1,0 +1,363 @@
+@@ osi
+value: Layered network models (the 7-layer OSI model and the 4-layer TCP/IP model) split networking into independent layers, each solving one problem and hiding it from the layers above. This is why a web app doesn't care whether packets travel over Wi-Fi, fibre or 5G.
+how: Link layer: move frames between neighbours (Ethernet, Wi-Fi). Network layer: route packets between networks (IP). Transport layer: end-to-end delivery between processes (TCP, UDP, QUIC). Application layer: meaning (HTTP, DNS, Kafka's protocol). Each layer wraps the data from the layer above in its own header (encapsulation). The 'end-to-end principle' says to keep the core network simple and put intelligence at the endpoints.
+intuition: A letter inside an envelope inside a mail bag inside a truck; each handler reads only their own label.
+friction: Real protocols blur layers (TLS, QUIC, middleboxes that inspect higher layers); performance tuning often needs cross-layer knowledge; OSI's middle layers barely exist in practice.
+ref: paper | End-to-End Arguments in System Design | Saltzer, Reed & Clark, ACM TOCS 1984 | https://web.mit.edu/Saltzer/www/publications/endtoend/endtoend.pdf
+ref: book | Computer Networking: A Top-Down Approach | Kurose & Ross |
+ref: paper | The Design Philosophy of the DARPA Internet Protocols | David Clark, SIGCOMM 1988 |
+
+@@ ethernet
+value: Ethernet and switching move frames between machines on the same network. Data centres are built from Ethernet switches, so its speed (now 400–800 Gbit/s per port) and design (leaf–spine fabrics) set the limits for every distributed system above it.
+how: Each network card has a MAC address. Switches learn which port each address lives on and forward frames only there. Original Ethernet (1973, Metcalfe at Xerox PARC) shared one cable and detected collisions; modern switched, full-duplex links have none. VLANs divide one physical network into several logical ones. Data-centre fabrics use leaf–spine (Clos) topologies so any two servers are a fixed number of hops apart with many equal paths.
+intuition: A mail room that learns which desk each person sits at.
+friction: Broadcast traffic and large layer-2 domains don't scale; congestion and packet drops at switch buffers (incast) hurt latency-sensitive workloads; lossless Ethernet for RDMA is tricky to operate.
+ref: paper | Ethernet: Distributed Packet Switching for Local Computer Networks | Metcalfe & Boggs, CACM 1976 |
+ref: paper | Jupiter Rising: A Decade of Clos Topologies and Centralized Control in Google's Datacenter Network | Singh et al., SIGCOMM 2015 |
+
+@@ iprouting
+value: IP and routing deliver packets between any two machines on the internet, across thousands of independently run networks. The internet works because IP promises very little (best-effort delivery) and every network agrees on it.
+how: Every device has an IP address (IPv4 32-bit, IPv6 128-bit). Routers look up the destination in a forwarding table using longest-prefix match and send the packet one hop closer. Inside a network, protocols like OSPF compute shortest paths; between networks, BGP lets autonomous systems announce which address blocks they can reach, based on policy. Packets may be lost, duplicated or reordered; higher layers deal with that. NAT lets many devices share one public IPv4 address.
+intuition: Each post office only needs to know which neighbouring office is closer to the destination.
+friction: BGP is trust-based, so misconfigurations and hijacks can redirect traffic (RPKI helps); IPv4 exhaustion and slow IPv6 adoption; NAT breaks end-to-end connectivity.
+ref: paper | A Protocol for Packet Network Intercommunication | Cerf & Kahn, IEEE Trans. Communications 1974 |
+ref: book | Computer Networks: A Systems Approach | Peterson & Davie | https://book.systemsapproach.org/
+
+@@ congestion
+value: Congestion control stops senders from overwhelming the network. Without it, the internet collapsed in 1986 (throughput fell about 1000×); with it, billions of flows share links fairly. The same feedback idea appears in Kafka backpressure and rate limiting.
+how: TCP keeps a congestion window limiting unacknowledged data. Classic AIMD (Jacobson, 1988): grow the window gradually, and halve it on packet loss. CUBIC (Linux default) grows the window with a cubic function for high-bandwidth links. BBR (Google, 2016) instead estimates the bottleneck bandwidth and round-trip time and paces sending to match, rather than waiting for loss. Data centres use ECN marks and protocols like DCTCP for low queueing delay.
+intuition: Drive faster until you see brake lights, then ease off sharply.
+friction: Loss is a poor signal on wireless links; different algorithms competing can be unfair; bufferbloat (large router buffers) adds latency; incast in data centres.
+ref: paper | Congestion Avoidance and Control | Van Jacobson, SIGCOMM 1988 | https://ee.lbl.gov/papers/congavoid.pdf
+ref: paper | BBR: Congestion-Based Congestion Control | Cardwell et al., ACM Queue 2016 | https://queue.acm.org/detail.cfm?id=3022184
+
+@@ quic
+value: QUIC is a newer transport protocol over UDP that combines reliable streams with built-in encryption. It is the base of HTTP/3, now carrying a large share of web traffic, and it fixes TCP problems that couldn't be fixed because middleboxes and kernels made TCP hard to change.
+how: QUIC runs in user space over UDP. It merges the transport and TLS 1.3 handshakes, so new connections need one round trip (zero for resumed ones). It carries many independent streams, so a lost packet only stalls its own stream (no head-of-line blocking across streams, unlike HTTP/2 over TCP). Connection IDs let a connection survive a change of IP address, such as moving from Wi-Fi to mobile data. Almost the whole header is encrypted, so middleboxes can't ossify it.
+intuition: Several independent conveyor belts in one secured tunnel, instead of one belt where a jam stops everything.
+friction: More CPU per byte than kernel TCP; some networks block or throttle UDP; encrypted headers make operator troubleshooting harder.
+ref: paper | The QUIC Transport Protocol: Design and Internet-Scale Deployment | Langley et al. (Google), SIGCOMM 2017 |
+ref: docs | RFC 9000: QUIC | IETF, 2021 | https://www.rfc-editor.org/rfc/rfc9000
+
+@@ dns
+value: DNS maps human names to addresses and is the internet's largest distributed database. It is also a key tool for load balancing, failover and service discovery, and a common cause of outages.
+how: A client asks a recursive resolver, which asks root servers, then the top-level domain servers (for .com), then the domain's authoritative servers, and caches each answer for its time-to-live (TTL). Records include A/AAAA (addresses), CNAME (aliases), MX (mail), TXT and SRV. Low TTLs allow fast failover but increase query load; CDNs and global load balancers answer differently depending on where the client is.
+intuition: A hierarchy of phone books, with everyone keeping a copy of numbers they looked up recently.
+friction: Caching delays changes; plain DNS is unencrypted and spoofable (DNSSEC, DNS over HTTPS help); misconfigurations cause large outages.
+ref: docs | RFC 1034: Domain Names — Concepts and Facilities | Paul Mockapetris, 1987 | https://www.rfc-editor.org/rfc/rfc1034
+ref: blog | How DNS works (comic) | DNSimple | https://howdns.works/
+
+@@ http
+value: HTTP is the request–response protocol of the web and of most APIs. Its simple, stateless design (methods, status codes, headers, caching rules) made it the universal interface between services.
+how: A client sends a method (GET, POST, PUT, DELETE) and path with headers; the server returns a status code, headers and body. HTTP/1.1 reused connections; HTTP/2 (2015) multiplexes many requests over one TCP connection with binary framing and header compression; HTTP/3 runs over QUIC. Caching headers (Cache-Control, ETag) let browsers and CDNs reuse responses. REST and gRPC (over HTTP/2) build APIs on top.
+intuition: A standard order form understood by every shop in the world.
+friction: Statelessness pushes state into cookies, tokens and databases; head-of-line blocking (until HTTP/3); semantics for retries and idempotency are often ignored.
+ref: book | HTTP: The Definitive Guide | Gourley & Totty, O'Reilly 2002 |
+ref: docs | MDN: An overview of HTTP | Mozilla | https://developer.mozilla.org/en-US/docs/Web/HTTP/Overview
+ref: book | High Performance Browser Networking | Ilya Grigorik, 2013 | https://hpbn.co/
+
+@@ tls
+value: TLS encrypts and authenticates connections, so data on the network can't be read or changed and you know which server you're talking to. It protects HTTPS, Kafka and database connections and service-to-service traffic.
+how: In the handshake, client and server agree on keys using Diffie–Hellman key exchange (ephemeral, for forward secrecy), and the server proves its identity with a certificate signed by a trusted certificate authority. Data is then encrypted with a fast symmetric cipher with authentication (AES-GCM or ChaCha20-Poly1305). TLS 1.3 (2018) removed old insecure options and needs one round trip. Let's Encrypt made free certificates the norm; post-quantum key exchange (hybrid ML-KEM) is being deployed in browsers.
+intuition: Agree on a secret code in public without anyone overhearing it, after checking the other side's ID card.
+friction: Certificate management and expiry outages; CPU cost at very high throughput; inspecting encrypted traffic for security is harder; trust depends on certificate authorities.
+ref: docs | RFC 8446: TLS 1.3 | IETF, 2018 | https://www.rfc-editor.org/rfc/rfc8446
+ref: blog | The Illustrated TLS 1.3 Connection | Michael Driscoll | https://tls13.xargs.org/
+
+@@ sockets
+value: Sockets are the operating system's interface to the network: the API every server, client and database driver ultimately calls. Understanding them explains connection limits, buffer tuning and how event loops work.
+how: A server calls socket(), bind() to a port, listen(), then accept() to get a new socket per client; clients call connect(). Data is moved with send() and recv() (or read and write), through kernel buffers. Blocking sockets block the thread; non-blocking sockets with epoll or kqueue let one thread manage many. Options like TCP_NODELAY (disable Nagle's algorithm) and buffer sizes affect latency and throughput.
+intuition: A phone socket in the wall: plug in, dial, talk; the wiring behind is the kernel's job.
+friction: Every byte crosses the kernel boundary (costly at high rates, hence kernel bypass and io_uring); port and file-descriptor limits; subtle half-closed and TIME_WAIT states.
+ref: book | UNIX Network Programming, Vol. 1 | W. Richard Stevens |
+ref: blog | Beej's Guide to Network Programming | Brian Hall | https://beej.us/guide/bgnet/
+
+@@ rdma
+value: RDMA (remote direct memory access) lets one machine read or write another's memory over the network without involving the remote CPU or kernel, with microsecond latency. GPU training clusters (InfiniBand, RoCE), high-performance storage and some databases depend on it.
+how: Network cards implement the transport in hardware. Applications register memory regions and post work requests to queues; the card moves data directly, with zero copies. GPUDirect RDMA moves data between GPUs on different machines without going through the host CPU. InfiniBand is a dedicated fabric; RoCE runs RDMA over Ethernet, needing lossless configuration.
+intuition: Reach into a colleague's filing cabinet without interrupting them.
+friction: Complex programming model; RoCE networks need careful congestion control; security isolation is harder; scaling connection state.
+ref: paper | FaRM: Fast Remote Memory | Dragojević et al., NSDI 2014 |
+ref: paper | RDMA over Commodity Ethernet at Scale | Guo et al. (Microsoft), SIGCOMM 2016 |
+
+@@ process
+value: A process is the operating system's unit of isolation: a running program with its own address space, files and permissions. Isolation means one program's crash or bug can't corrupt another's memory, which is what makes multitasking computers reliable.
+how: The kernel keeps a process control block (registers, memory map, open files, state). New processes are created with fork() (copy-on-write copy of the parent) and exec() (load a new program), or posix_spawn. Processes communicate through pipes, sockets, shared memory and signals. Containers are processes with extra isolation (namespaces and cgroups).
+intuition: Each program gets its own apartment with its own key; the kernel is the building manager.
+friction: Creating and switching processes costs more than threads; IPC is slower than shared memory; isolation is not perfect (side channels).
+ref: book | Operating Systems: Three Easy Pieces, 'Virtualization' part | Remzi & Andrea Arpaci-Dusseau | https://pages.cs.wisc.edu/~remzi/OSTEP/
+ref: paper | The UNIX Time-Sharing System | Ritchie & Thompson, CACM 1974 |
+
+@@ thread
+value: Threads let one process do several things at once, sharing memory. They let servers use all CPU cores and keep working while waiting for I/O, and they are the source of most concurrency bugs.
+how: Threads in a process share the heap and code but each has its own stack and registers. The kernel schedules threads onto cores. Thread pools reuse threads to avoid creation costs. Lighter alternatives multiplex many tasks onto few kernel threads: goroutines in Go, virtual threads in Java 21, async tasks in Rust and Python.
+intuition: Several cooks in one kitchen: faster, as long as they don't grab the same knife.
+friction: Data races, deadlocks and visibility bugs; each kernel thread uses memory for its stack and costs a context switch; debugging is non-deterministic.
+ref: book | Java Concurrency in Practice | Brian Goetz et al., 2006 |
+ref: paper | Why Threads Are A Bad Idea (for most purposes) | John Ousterhout, USENIX 1996 |
+
+@@ scheduling
+value: CPU scheduling decides which thread runs on which core and for how long. It balances fairness, responsiveness and throughput, and it explains latency spikes, CPU throttling in containers and noisy neighbours.
+how: Linux's CFS (2007) gave each thread a share of CPU time proportional to its weight, picking the thread with the least virtual runtime; Linux 6.6 (2023) replaced it with EEVDF, which also considers latency deadlines. Real-time classes preempt normal threads. Schedulers consider cache affinity and NUMA nodes. In containers, cgroup CPU quotas throttle a group when it uses its quota in a period, which can cause latency spikes even at low average CPU. sched_ext (Linux 6.12) lets schedulers be written in eBPF.
+intuition: A fair queue at a single counter, where everyone gets a turn proportional to their ticket.
+friction: Fairness versus latency; CFS-quota throttling surprises; scheduler decisions interact badly with lock holders and garbage collectors.
+ref: book | Operating Systems: Three Easy Pieces, scheduling chapters | Arpaci-Dusseau | https://pages.cs.wisc.edu/~remzi/OSTEP/
+ref: blog | An EEVDF CPU scheduler for Linux | Jonathan Corbet, LWN 2023 | https://lwn.net/Articles/925371/
+
+@@ ctxswitch
+value: A context switch saves one thread's state and loads another's. Each costs microseconds plus cache disruption, so systems that switch too often waste CPU, which is why event loops, thread-per-core designs and batching exist.
+how: On a timer interrupt, system call or block on I/O, the kernel saves registers and the stack pointer, picks the next thread, restores its registers, and (for a different process) switches page tables, which can flush TLB entries. The direct cost is about 1–5 µs; the indirect cost of cold caches can be larger.
+intuition: Switching between books: you lose your place and need time to get back into the story.
+friction: Hard to measure the indirect cost; too many threads cause thrashing; security mitigations (for Meltdown) made switches more expensive.
+ref: paper | Quantifying the Cost of Context Switch | Li, Ding & Shen, ExpCS 2007 |
+
+@@ pagecache
+value: The page cache keeps recently used file data in spare RAM, so repeat reads come from memory instead of disk. Kafka deliberately relies on it instead of its own cache, and databases like PostgreSQL rely on it alongside their buffer pools.
+how: When a program reads a file, the kernel loads 4 KB pages into the cache and serves later reads from there. Writes go to the cache and are marked dirty; background writeback flushes them to disk (or fsync forces it). The kernel evicts pages using an LRU-like policy with active and inactive lists. Read-ahead prefetches sequential data.
+intuition: The operating system keeps your most-used files open on the desk.
+friction: Memory pressure from other processes evicts it; double caching with database buffer pools; dirty-page writeback can cause latency spikes; containers' memory limits count the page cache.
+ref: book | Linux Kernel Development, ch. 16 | Robert Love |
+ref: docs | Kafka design: Don't fear the filesystem | Apache Kafka | https://kafka.apache.org/documentation/#design_filesystem
+
+@@ mmap
+value: Memory-mapped files make a file appear as memory, so reading it is just reading an array, with the kernel loading pages on demand. Lucene, LMDB, MongoDB's original engine and many model loaders (llama.cpp) use it.
+how: mmap() creates a mapping in the process's virtual address space; touching a page that isn't loaded causes a page fault, and the kernel reads that page from the page cache or disk. Changes to shared mappings are written back by the kernel (msync forces it).
+intuition: Open the book directly on the table instead of photocopying the pages you need.
+friction: The database loses control of when data is loaded or evicted, and of I/O errors; page faults stall threads unpredictably; for transactional databases this is risky (see Crotty et al.).
+ref: paper | Are You Sure You Want to Use MMAP in Your Database Management System? | Crotty, Leis & Pavlo, CIDR 2022 | https://db.cs.cmu.edu/mmap-cidr2022/
+ref: blog | Use Lucene's MMapDirectory on 64-bit platforms, please! | Uwe Schindler, 2012 | https://blog.thetaphi.de/2012/07/use-lucenes-mmapdirectory-on-64bit.html
+
+@@ syscalls
+value: System calls are the controlled gateway from user programs into the kernel: every file read, network send and memory allocation passes through them. Their cost and semantics shape how fast I/O-heavy systems can go.
+how: A program places a call number and arguments in registers and executes a special instruction (syscall on x86-64) that switches the CPU to kernel mode. The kernel checks permissions, does the work and returns. Each crossing costs about 100 ns or more, more with security mitigations. Batching interfaces (io_uring, sendmmsg) and the vDSO (for clock_gettime) reduce crossings.
+intuition: A bank teller window: you can't walk into the vault, but you can ask the teller.
+friction: Per-call overhead at very high rates; blocking calls stall threads; a large and subtle API surface.
+ref: book | The Linux Programming Interface | Michael Kerrisk, 2010 |
+ref: paper | FlexSC: Flexible System Call Scheduling with Exception-Less System Calls | Soares & Stumm, OSDI 2010 |
+
+@@ filesystems
+value: File systems organize raw blocks on a disk into named files and directories, and keep them consistent after crashes. Every database, log and data lake ultimately sits on one (or on object storage, which works differently).
+how: Metadata structures (inodes) record each file's size, permissions and block locations; directories map names to inodes. Journaling file systems (ext4, XFS) write metadata changes to a journal first, so a crash leaves them recoverable. Copy-on-write file systems (ZFS, Btrfs) never overwrite blocks in place, which enables snapshots and checksums. Extents and delayed allocation keep large files contiguous.
+intuition: A library catalogue that remembers which shelf holds each part of each book.
+friction: Crash consistency guarantees differ and are often misunderstood by applications; small-file and metadata-heavy workloads are slow; object storage lacks real directories and rename.
+ref: book | Operating Systems: Three Easy Pieces, 'Persistence' part | Arpaci-Dusseau | https://pages.cs.wisc.edu/~remzi/OSTEP/
+ref: paper | A Fast File System for UNIX | McKusick, Joy, Leffler & Fabry, ACM TOCS 1984 |
+
+@@ fsync
+value: fsync forces data from memory caches to stable storage. It is the line between 'written' and 'durable', so it decides both commit latency and whether data survives a power loss.
+how: write() usually only copies data into the page cache. fsync(fd) flushes that file's dirty pages and metadata to the device and asks the device to flush its own cache. Databases call it at commit (often batching many commits into one fsync: group commit). Kafka by default does not fsync per message; it relies on replication across brokers for durability and lets the OS flush.
+intuition: Saying 'it's in the post' versus 'the recipient signed for it'.
+friction: Slow (milliseconds on many devices); error handling is subtle: PostgreSQL found in 2018 that after a failed fsync, Linux could drop the dirty pages, so retrying would falsely succeed ('fsyncgate'); some devices lie about flushing.
+ref: paper | Can Applications Recover from fsync Failures? | Rebello et al., USENIX ATC 2020 |
+ref: paper | All File Systems Are Not Created Equal: On the Complexity of Crafting Crash-Consistent Applications | Pillai et al., OSDI 2014 |
+
+@@ iomodels
+value: I/O models determine how a program waits for disk and network operations: blocking, non-blocking with readiness notification, or fully asynchronous. Choosing the right one decides how many connections or requests a server handles per core.
+how: Blocking I/O: the thread sleeps until done (simple, one thread per connection). Readiness-based (select, poll, epoll on Linux, kqueue on BSD): ask the kernel which sockets are ready, then do non-blocking reads. Completion-based (Windows IOCP, Linux io_uring since 2019): submit operations to a queue shared with the kernel, then collect completions, avoiding a syscall per operation. Direct I/O bypasses the page cache.
+intuition: Wait at the counter (blocking), get a buzzer when your food is ready (readiness), or have it delivered to your table (completion).
+friction: Async code is harder to write and debug; io_uring has had many security bugs and is disabled in some environments; disk I/O with epoll doesn't really work (files are always 'ready').
+ref: blog | Efficient IO with io_uring | Jens Axboe, 2019 | https://kernel.dk/io_uring.pdf
+ref: blog | The C10K problem | Dan Kegel | http://www.kegel.com/c10k.html
+
+@@ locks
+value: Locks and atomic operations coordinate threads that share memory, so updates don't interfere. Every concurrent data structure, from a JVM queue to a database buffer pool, is built on them.
+how: A mutex lets one thread at a time into a critical section; others wait (spinning or sleeping via futex on Linux). Read–write locks allow many readers or one writer. Hardware atomic instructions (compare-and-swap, fetch-and-add) update one word safely and are the base of lock-free structures. Memory barriers order reads and writes between cores.
+intuition: The key to a single bathroom.
+friction: Contention serializes work (Amdahl's law); deadlocks; priority inversion; lock-free code is very hard to get right (the ABA problem, memory reclamation).
+ref: book | The Art of Multiprocessor Programming, 2nd ed. | Herlihy, Shavit, Luchangco & Spear, 2020 |
+ref: book | Is Parallel Programming Hard, And, If So, What Can You Do About It? | Paul McKenney | https://kernel.org/pub/linux/kernel/people/paulmck/perfbook/perfbook.html
+
+@@ deadlock
+value: Deadlock is when two or more parties each wait for something the other holds, so nothing progresses. Understanding its conditions lets you design systems that can't deadlock, or that detect and break deadlocks (as databases do).
+how: Four conditions are all needed (Coffman, 1971): mutual exclusion, hold and wait, no preemption, and circular wait. Break any one to prevent it, most commonly by always acquiring locks in a fixed global order. Databases build a 'waits-for' graph and abort one transaction when they find a cycle, or use timeouts. Livelock is the cousin where parties keep reacting to each other without progress.
+intuition: Two people in a narrow corridor, each politely waiting for the other to step aside.
+friction: Global lock orders are hard to maintain in large codebases; distributed deadlocks are hard to detect; timeouts cause false aborts.
+ref: paper | System Deadlocks | Coffman, Elphick & Shoshani, Computing Surveys 1971 |
+
+@@ nscgroups
+value: Namespaces and cgroups are the Linux kernel features that make containers. Namespaces control what a process can see; cgroups control how much it can use. Docker and Kubernetes are layers on top.
+how: Namespaces give a process its own view of process IDs, network interfaces, mount points, hostnames, users and more. Cgroups (control groups) limit and account CPU, memory, I/O and process counts per group; cgroup v2 offers a unified hierarchy. Combined with a layered root file system image (overlayfs) and security filters (seccomp, capabilities), that's a container.
+intuition: Blinders (namespaces) and a budget (cgroups) for each program.
+friction: Containers share one kernel, so isolation is weaker than virtual machines (gVisor and Firecracker microVMs strengthen it); memory limits trigger the out-of-memory killer; CPU quota throttling causes latency spikes.
+ref: docs | namespaces(7) and cgroups(7) man pages | Linux man-pages project | https://man7.org/linux/man-pages/man7/namespaces.7.html
+ref: blog | Containers from Scratch | Eric Chiang, 2017 | https://ericchiang.github.io/post/containers-from-scratch/
+
+@@ interrupts
+value: Interrupts let hardware get the CPU's attention when something happens (a packet arrives, a disk read finishes, a timer fires), instead of the CPU constantly checking. They are how operating systems stay responsive without wasting cycles.
+how: A device raises an interrupt; the CPU pauses the current work, saves state and jumps to a handler registered by the kernel. Handlers do minimal work and defer the rest (softirqs, threaded handlers). At very high packet rates, interrupt overhead dominates, so network drivers switch to polling under load (Linux NAPI), and kernel-bypass systems like DPDK poll all the time.
+intuition: A doorbell instead of opening the door every minute to check.
+friction: Interrupt storms; latency jitter for other work; balancing interrupts across cores (IRQ affinity) matters for high-throughput servers.
+ref: book | Understanding the Linux Kernel, 3rd ed. | Bovet & Cesati, 2005 |
+
+@@ dma
+value: Direct memory access lets devices (network cards, disks, GPUs) move data to and from memory without the CPU copying each byte. It is what makes high-throughput I/O and zero-copy possible.
+how: The driver gives the device descriptors pointing to memory buffers; the device's DMA engine reads or writes those buffers over PCIe and raises an interrupt when done. An IOMMU translates and restricts device addresses for safety. RDMA and GPUDirect extend the idea across machines and between devices.
+intuition: The delivery truck unloads straight into the warehouse without the manager carrying every box.
+friction: Buffers must be pinned in memory; cache coherence between devices and CPU; security risk from malicious devices without an IOMMU.
+ref: book | Computer Organization and Design | Patterson & Hennessy |
+
+@@ pipeline
+value: Instruction pipelining overlaps the steps of many instructions, like an assembly line, so a CPU completes about one or more instructions per cycle even though each takes many cycles. It is the base of all modern CPU performance.
+how: Classic stages: fetch, decode, execute, memory access, write back. Each cycle, every stage works on a different instruction. Hazards break the flow: data hazards (an instruction needs a result not yet computed; solved with forwarding or stalls), control hazards (branches; solved with prediction), and structural hazards (two instructions need the same unit). Superscalar CPUs issue several instructions per cycle.
+intuition: A laundry line: wash, dry and fold different loads at the same time.
+friction: Deeper pipelines make branch mispredictions costlier; dependent instruction chains can't overlap; this is why code layout and data dependencies affect speed.
+ref: book | Computer Architecture: A Quantitative Approach, 6th ed. | Hennessy & Patterson, 2017 |
+ref: book | Computer Organization and Design, RISC-V edition | Patterson & Hennessy |
+
+@@ ooo
+value: Out-of-order execution lets a CPU run later instructions while earlier ones wait for slow memory, finding parallelism in sequential code automatically. It is a large part of why single-threaded code got faster for decades.
+how: The CPU fetches instructions into a window of hundreds of entries, renames registers to remove false dependencies, issues each instruction when its inputs are ready (Tomasulo's algorithm, 1967), and retires results in original program order through a reorder buffer so exceptions remain precise.
+intuition: A chef starts the soup while waiting for the oven, but still serves courses in the right order.
+friction: Large power and chip-area cost; speculative execution enabled the Spectre and Meltdown attacks (2018); can't hide very long memory stalls, so cache misses still dominate.
+ref: paper | An Efficient Algorithm for Exploiting Multiple Arithmetic Units | R. M. Tomasulo, IBM Journal 1967 |
+ref: paper | Spectre Attacks: Exploiting Speculative Execution | Kocher et al., IEEE S&P 2019 | https://spectreattack.com/spectre.pdf
+
+@@ branchpred
+value: Branch prediction guesses which way each if-statement will go before it is known, so the pipeline keeps running. Modern predictors are right over 95% of the time; each miss costs about 15–20 cycles, which is why sorted data can make loops several times faster.
+how: Predictors record each branch's history: simple two-bit counters, then patterns of global history (gshare), then advanced designs like TAGE and perceptron predictors that combine many history lengths. The CPU speculatively executes the predicted path and discards the work on a misprediction.
+intuition: A driver who knows the route well and takes turns before reading the signs.
+friction: Data-dependent branches (random data) are unpredictable, so branch-free code (conditional moves, SIMD masks) can be faster; prediction state is a side channel for attacks.
+ref: paper | A case for (partially) TAgged GEometric history length branch prediction | Seznec & Michaud, JILP 2006 |
+ref: blog | Why is processing a sorted array faster than an unsorted array? | Stack Overflow, 2012 | https://stackoverflow.com/questions/11227809
+
+@@ cachelines
+value: CPUs move memory in 64-byte cache lines, not single bytes. Data layout that respects this (arrays rather than pointer chains, columnar formats, avoiding false sharing) can make code many times faster without changing the algorithm.
+how: Loading one byte brings its whole line into L1. Sequential access uses every byte loaded and lets hardware prefetchers fetch ahead. Pointer chasing touches a new line per step. False sharing: two threads writing different variables on the same line force the line to bounce between cores; padding fixes it. Structure-of-arrays layout keeps hot fields together.
+intuition: Groceries come in bags; plan meals around what's in each bag.
+friction: High-level languages hide layout (object headers, references in Java); padding wastes memory; layout optimized for one access pattern hurts another.
+ref: paper | What Every Programmer Should Know About Memory | Ulrich Drepper, 2007 | https://people.freebsd.org/~lstewart/articles/cpumemory.pdf
+ref: blog | Gallery of Processor Cache Effects | Igor Ostrovsky | http://igoro.com/archive/gallery-of-processor-cache-effects/
+
+@@ coherence
+value: Cache coherence keeps each core's private cache consistent, so that when one core writes a value, other cores don't keep reading a stale copy. It lets multicore machines look like one shared memory, and its traffic is a hidden cost of sharing data between threads.
+how: Protocols like MESI track each cache line as Modified, Exclusive, Shared or Invalid. Before writing, a core gets exclusive ownership, invalidating other copies; reads of a modified line fetch it from the owner. Implemented by snooping on a shared bus or by directories in larger chips. Coherence traffic is why contended locks and shared counters scale badly.
+intuition: Everyone keeps a photocopy of the notice board; when someone changes the original, all copies are torn up.
+friction: Coherence traffic limits scaling to many cores and sockets; cross-socket latency (NUMA); coherence (one address) is different from consistency (ordering across addresses), a common confusion.
+ref: book | A Primer on Memory Consistency and Cache Coherence, 2nd ed. | Nagarajan, Sorin, Hill & Wood, 2020 |
+
+@@ memmodel
+value: A memory model defines which values a read may return when threads share memory: what orderings of reads and writes are allowed. Without one, it's impossible to write correct concurrent code that also lets compilers and CPUs optimize.
+how: Sequential consistency (Lamport, 1979) means all operations appear in one interleaved order; real hardware is weaker. x86 is fairly strong (total store order); ARM and RISC-V are weaker and reorder more. Languages define their own models (Java 2004, C++11): programs without data races behave as if sequentially consistent; atomics and volatile with acquire/release semantics create ordering ('happens-before'). Compilers and CPUs may reorder anything else.
+intuition: The rules for which gossip can arrive before which, when news travels by different routes.
+friction: Weak orderings are deeply counter-intuitive; bugs appear only on some hardware or under load; code ported from x86 to ARM can break.
+ref: paper | How to Make a Multiprocessor Computer That Correctly Executes Multiprocess Programs | Leslie Lamport, IEEE Trans. Computers 1979 |
+ref: blog | Memory Models (3-part series) | Russ Cox, 2021 | https://research.swtch.com/mm
+
+@@ isa
+value: The instruction set architecture is the contract between software and hardware: the instructions, registers and memory model a CPU promises to implement. It lets the same binary run on many chip designs and lets chip designers innovate underneath.
+how: CISC (x86) has complex, variable-length instructions; modern x86 chips translate them into simpler internal micro-operations. RISC (ARM, RISC-V) uses simple, fixed-length instructions that are easier to decode and pipeline. Extensions add SIMD, cryptography and matrix operations. RISC-V (2010) is an open standard anyone can implement.
+intuition: A language the CPU promises to understand, whatever its internal machinery.
+friction: Backward compatibility accumulates complexity over decades; switching ISAs means recompiling everything; licensing (ARM) versus openness (RISC-V).
+ref: book | Computer Organization and Design, RISC-V edition | Patterson & Hennessy |
+ref: paper | The Case for the Reduced Instruction Set Computer | Patterson & Ditzel, 1980 |
+
+@@ simd
+value: SIMD instructions apply one operation to many values at once (4, 8, 16 or more per instruction). Vectorized query engines, JSON parsers, compression codecs, video encoders and ML inference on CPUs get large speed-ups from them.
+how: Wide registers (128-bit SSE and NEON, 256-bit AVX2, 512-bit AVX-512, scalable SVE on ARM) hold several values; one instruction adds, compares or shuffles all lanes. Compilers auto-vectorize simple loops; libraries use intrinsics for complex patterns (simdjson parses gigabytes of JSON per second). Masks handle conditional work without branches.
+intuition: A stamp that prints eight labels at once.
+friction: Data must be laid out contiguously; branches and irregular access defeat it; instruction set differences across CPUs require multiple code paths; AVX-512 could reduce clock speed on older chips.
+ref: paper | Parsing Gigabytes of JSON per Second | Langdale & Lemire, VLDB Journal 2019 | https://arxiv.org/abs/1902.08318
+ref: docs | Intel Intrinsics Guide | Intel | https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html
+
+@@ simt
+value: SIMT (single instruction, multiple threads) is how GPUs run thousands of threads efficiently: groups of 32 threads (a warp on NVIDIA) execute the same instruction together. It is why GPUs are so much faster than CPUs for parallel arithmetic like deep learning.
+how: A kernel launches a grid of thread blocks; each block runs on a streaming multiprocessor, split into warps. The GPU hides memory latency by switching between many warps instead of using big caches. When threads in a warp take different branches, both paths run with some threads masked off (divergence). Fast shared memory within a block lets threads cooperate. CUDA (2007) made this programmable for general computing.
+intuition: A drill sergeant shouting one command to a platoon; anyone who must do something different waits their turn.
+friction: Divergent code and irregular memory access waste most of the hardware; programming for occupancy and memory coalescing is hard; CUDA lock-in.
+ref: book | Programming Massively Parallel Processors, 4th ed. | Hwu, Kirk & El Hajj, 2022 |
+ref: docs | CUDA C++ Programming Guide | NVIDIA | https://docs.nvidia.com/cuda/cuda-c-programming-guide/
+
+@@ tensorcores
+value: Tensor cores and systolic arrays are hardware units specialized for matrix multiplication, the core operation of neural networks. They deliver most of an AI accelerator's FLOPs, often 10× or more than general-purpose GPU cores.
+how: A systolic array (Kung and Leiserson, 1978; Google's TPU, 2016) passes data through a grid of multiply–accumulate units, each reusing values from its neighbours, so data is read from memory once and used many times. NVIDIA tensor cores (since Volta, 2017) multiply small matrix tiles in one operation, in low precision (FP16, BF16, FP8, FP4) with higher-precision accumulation.
+intuition: A bucket brigade of calculators, each doing a multiply and passing the numbers on.
+friction: Only matrix-shaped work benefits; memory bandwidth becomes the bottleneck (hence FlashAttention); low-precision formats need care.
+ref: paper | In-Datacenter Performance Analysis of a Tensor Processing Unit | Jouppi et al., ISCA 2017 | https://arxiv.org/abs/1704.04760
+ref: paper | Why Systolic Architectures? | H. T. Kung, IEEE Computer 1982 |
+
+@@ dram
+value: DRAM is the main memory of every computer: dense and cheap, but slow compared with the CPU (about 100 ns per access) and limited in bandwidth. Most performance engineering is about avoiding trips to DRAM, and HBM (stacked DRAM) is the most constrained part of AI hardware supply.
+how: Each bit is a tiny capacitor plus a transistor. Capacitors leak, so every row must be refreshed every few tens of milliseconds. Reading opens a row into a row buffer (destroying and rewriting it); accesses to the open row are fast. DDR5 serves CPUs; HBM stacks DRAM dies with through-silicon vias next to the GPU for terabytes per second of bandwidth.
+intuition: A huge warehouse with slow forklifts; fetching a shelf takes time, but grabbing more from the same shelf is quick.
+friction: The 'memory wall': CPU speed grew far faster than DRAM latency improved; refresh costs power; Rowhammer attacks flip bits by hammering neighbouring rows; HBM is expensive and supply-limited.
+ref: paper | Hitting the Memory Wall: Implications of the Obvious | Wulf & McKee, 1995 |
+ref: paper | Flipping Bits in Memory Without Accessing Them (Rowhammer) | Kim et al., ISCA 2014 |
+
+@@ numa
+value: NUMA (non-uniform memory access) means that in multi-socket servers, each CPU socket has its own local memory, and accessing another socket's memory is slower. Ignoring it can cost 30–50% of performance for memory-heavy databases and JVMs.
+how: The operating system exposes NUMA nodes; memory is allocated by default on the node where a thread first touches it. Tools like numactl pin processes and memory to nodes. Databases and Kafka or Spark deployments on large machines can bind processes per socket.
+intuition: Your own kitchen is closer than the neighbour's, even if you're allowed to use both.
+friction: Threads migrating between sockets lose locality; interleaving trades peak speed for predictability; virtual machines can hide the topology.
+ref: blog | The MySQL 'swap insanity' problem and the effects of the NUMA architecture | Jeremy Cole, 2010 | https://blog.jcole.us/2010/09/28/mysql-swap-insanity-and-the-numa-architecture/
+
+@@ storagedev
+value: Storage devices (hard disks and SSDs) decide the cost of persistence. Their very different performance profiles (HDD: about 10 ms per random seek; NVMe SSD: about 100 µs and hundreds of thousands of operations per second) explain why log-structured storage, sequential I/O and caching dominate system design.
+how: Hard disks spin platters and move a head; sequential reads are fast, random reads are slow. SSDs store charge in NAND flash cells, read in pages (a few KB) and erase in large blocks; there's no seek, and many operations run in parallel across flash chips. NVMe uses many deep queues over PCIe to exploit that parallelism.
+intuition: A record player (find the track, then it streams) versus a wall of light switches you can flip in any order.
+friction: SSD write endurance and write amplification; tail latency during garbage collection; the cost per GB still favours HDD for cold data.
+ref: paper | The Unwritten Contract of Solid State Drives | He, Kannan, Arpaci-Dusseau & Arpaci-Dusseau, EuroSys 2017 |
+ref: book | Operating Systems: Three Easy Pieces, 'Hard Disk Drives' and 'Flash-based SSDs' | Arpaci-Dusseau | https://pages.cs.wisc.edu/~remzi/OSTEP/
+
+@@ ftl
+value: The flash translation layer is firmware inside an SSD that makes flash memory look like a simple block device. It hides the fact that flash can't be overwritten in place, and its behavior explains SSD write amplification and latency spikes.
+how: Flash pages can be written once and must be erased in large blocks before reuse. The FTL maps logical block addresses to physical pages, writes every update to a fresh page (log-structured), marks old pages invalid, and runs garbage collection to copy valid pages out of mostly-invalid blocks and erase them. Wear leveling spreads erases evenly. Zoned namespaces (ZNS) expose the zones so applications like RocksDB can manage placement themselves.
+intuition: A notebook you can't erase single lines in, only tear out whole pages, so you keep rewriting and recycling.
+friction: Garbage collection causes latency spikes; random writes amplify wear; the FTL duplicates work done by log-structured databases above it.
+ref: paper | Design Tradeoffs for SSD Performance | Agrawal et al., USENIX ATC 2008 |
+ref: paper | ZNS: Avoiding the Block Interface Tax for Flash-based SSDs | Bjørling et al., USENIX ATC 2021 |
+
+@@ digitallogic
+value: Digital logic builds every computer from gates (AND, OR, NOT) made of transistors. Combinational circuits compute; sequential circuits remember. From these come adders, registers, memory and whole processors.
+how: Boolean functions become gates; gates combine into adders (ripple-carry, carry-lookahead), multiplexers and arithmetic logic units. Flip-flops store one bit, triggered by a clock edge; registers and finite-state machines follow. Chips are designed in hardware description languages (Verilog, VHDL) and synthesized into millions or billions of gates.
+intuition: Lego bricks of logic: a few simple shapes, combined in huge numbers, make anything.
+friction: Gate delays and wire delays limit clock speed; power density; verifying billions of gates is very hard.
+ref: book | Digital Design and Computer Architecture, RISC-V edition | Harris & Harris, 2021 |
+ref: course | Nand to Tetris (The Elements of Computing Systems) | Nisan & Schocken | https://www.nand2tetris.org/
+
+@@ hwclocks
+value: Clocks synchronize every digital circuit (the clock signal) and every distributed system (wall-clock time). Understanding how clocks drift and jump explains why distributed systems can't rely on timestamps for ordering.
+how: Inside a chip, a crystal oscillator drives a phase-locked loop that generates the GHz clock; each tick advances flip-flops. Between machines, clocks drift (typically tens of parts per million, a second or more per day uncorrected), so NTP synchronizes them to milliseconds, PTP to microseconds; GPS and atomic clocks give tighter bounds (Google TrueTime). Operating systems offer wall-clock time (which can jump) and monotonic time (which only increases); timeouts must use monotonic time.
+intuition: Every watch in the room runs slightly fast or slow; agreeing on time needs constant correction.
+friction: Leap seconds and clock jumps have caused real outages; virtual machines' clocks pause; 'last write wins' with skewed clocks silently loses data.
+ref: paper | Time, Clocks, and the Ordering of Events in a Distributed System | Leslie Lamport, CACM 1978 |
+ref: blog | There is No Now | Justin Sheehy, ACM Queue 2015 | https://queue.acm.org/detail.cfm?id=2745385
+
+@@ floatingpoint
+value: Floating-point numbers represent real numbers approximately with a fixed number of bits, covering a huge range. All scientific computing and machine learning use them, and the choice of format (FP64 down to FP4) is now a central lever in AI hardware.
+how: IEEE 754 (1985) stores a sign, an exponent and a mantissa: value = ±1.mantissa × 2^exponent. FP64 has 52 mantissa bits, FP32 23, FP16 10, BF16 7 (with FP32's exponent range), FP8 2–3. Rounding happens on every operation, so addition isn't associative, and 0.1 + 0.2 ≠ 0.3 exactly. Special values include infinity and NaN.
+intuition: Scientific notation with a fixed number of significant digits.
+friction: Rounding errors accumulate; results differ across hardware and summation order (a reproducibility problem for distributed training); never use floats for money.
+ref: paper | What Every Computer Scientist Should Know About Floating-Point Arithmetic | David Goldberg, Computing Surveys 1991 | https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html
+
+@@ binary
+value: Binary encoding represents all information (numbers, text, images, programs) as patterns of bits. Two-state signals are robust to noise, which is why every digital system uses them, and knowing the encodings (two's complement, endianness, bit fields) explains many bugs and performance tricks.
+how: Unsigned integers are sums of powers of two; signed integers use two's complement, so addition circuits work unchanged for negative numbers. Byte order (endianness) differs between machines and network protocols. Bit masks and shifts pack flags compactly; hexadecimal is a human-friendly view of bits. Variable-length encodings (varints in Protobuf and Kafka) use fewer bytes for small numbers.
+intuition: Everything is a long row of light switches; meaning comes from agreeing how to read them.
+friction: Integer overflow; endianness mismatches; signed versus unsigned confusion in comparisons.
+ref: book | Code: The Hidden Language of Computer Hardware and Software, 2nd ed. | Charles Petzold, 2022 |
+ref: book | Computer Systems: A Programmer's Perspective, ch. 2 | Bryant & O'Hallaron |
+
+@@ unicode
+value: Unicode gives every character in every writing system a number, and UTF-8 encodes those numbers as bytes compatibly with ASCII. It is why a system can store English, Hindi, Kannada, Chinese and emoji in the same string, and it is the starting point of every LLM tokenizer.
+how: Unicode assigns code points (U+0041 for 'A', U+0915 for Devanagari 'क'). UTF-8 (Ken Thompson and Rob Pike, 1992) uses 1 byte for ASCII and 2–4 bytes for other characters, with a self-synchronizing design. What users see as one character (a grapheme, such as an Indic syllable or an emoji with a skin tone) may be several code points. Normalization forms make equivalent sequences comparable.
+intuition: A world dictionary of characters, and a compact way to spell each entry in bytes.
+friction: String length is ambiguous (bytes, code points or graphemes); normalization and case folding differ by language; tokenizers often use more tokens for non-Latin scripts.
+ref: blog | The Absolute Minimum Every Software Developer Must Know About Unicode in 2023 | Nikita Prokopov, 2023 | https://tonsky.me/blog/unicode/
+ref: blog | UTF-8 history | Rob Pike, 2003 | https://www.cl.cam.ac.uk/~mgk25/ucs/utf-8-history.txt
+
+@@ allocators
+value: Memory allocators hand out and reclaim memory for programs (malloc and free, or a JVM heap). Their design affects speed, memory overhead and fragmentation, which is why Redis ships jemalloc and many services switch allocators for big wins.
+how: General allocators keep size classes of free blocks, with per-thread caches to avoid locking (tcmalloc, jemalloc, mimalloc). Arena or bump allocators hand out memory sequentially and free everything at once (fast for request-scoped data). Slab allocators keep pools of same-sized objects (Linux kernel, memcached). Fragmentation happens when free memory is split into pieces too small to use.
+intuition: A storekeeper with bins of pre-cut boxes in standard sizes.
+friction: Fragmentation grows over long runs; memory returned to the OS late; allocator behavior differs across platforms and versions.
+ref: paper | A Scalable Concurrent malloc(3) Implementation for FreeBSD (jemalloc) | Jason Evans, BSDCan 2006 |
+ref: paper | Mimalloc: Free List Sharding in Action | Leijen, Zorn & de Moura, 2019 |
+
+@@ ebpf
+value: eBPF lets small, verified programs run safely inside the Linux kernel, attached to events like network packets, system calls or function entries. It enables high-performance networking (Cilium), observability without code changes, and security tools, without writing kernel modules.
+how: Programs are written in restricted C or Rust, compiled to eBPF bytecode, checked by the kernel's verifier (bounded loops, safe memory access), JIT-compiled to machine code and attached to hooks (XDP for packets at the driver, kprobes, tracepoints). Maps share data between kernel programs and user space.
+intuition: Plug-ins for the kernel, with a strict inspector who checks each one before it is allowed in.
+friction: The verifier rejects valid-looking programs and limits complexity; kernel version differences; debugging is difficult; the power to observe everything raises security concerns.
+ref: book | Learning eBPF | Liz Rice, O'Reilly 2023 |
+ref: docs | What is eBPF? | eBPF Foundation | https://ebpf.io/what-is-ebpf/
+ref: book | BPF Performance Tools | Brendan Gregg, 2019 |
