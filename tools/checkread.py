@@ -7,7 +7,8 @@ import kg
 
 path = os.path.abspath(sys.argv[1]); strict = "--strict" in sys.argv
 try:
-    d = kg.load(extra=[path])
+    inlong = path.startswith(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "content", "reads", "long") + os.sep)
+    d = kg.load() if inlong else kg.load(extra=[path])
 except kg.ContentError as e:
     print("FORMAT ERRORS:\n" + str(e)); sys.exit(1)
 ids = []
