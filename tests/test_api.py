@@ -11,8 +11,8 @@ class API(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp()
-        # build into a temp content DB, with the sample practice problems, so tests never touch data/
-        env = dict(os.environ, DTS_QUIET="1", DTS_USER_DB=os.path.join(cls.tmp, "user.db"), DTS_CONTENT_DB=os.path.join(cls.tmp, "content.db"), DTS_PRACTICE_FIXTURE="1")
+        # build into a temp content DB, with the sample practice problems and animated scenes, so tests never touch data/
+        env = dict(os.environ, DTS_QUIET="1", DTS_USER_DB=os.path.join(cls.tmp, "user.db"), DTS_CONTENT_DB=os.path.join(cls.tmp, "content.db"), DTS_PRACTICE_FIXTURE="1", DTS_ANIM_FIXTURE="1")
         subprocess.run([sys.executable, os.path.join(ROOT, "tools", "build.py"), "--no-html"], check=True, capture_output=True, env=env)
         cls.port = free_port()
         cls.proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "server", "server.py"), "--port", str(cls.port)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -151,6 +151,52 @@ class API(unittest.TestCase):
         self.assertEqual(self.req("PUT", "/api/practice/sample-valid-brackets", {"code": "x"}, ctype="text/plain")[0], 415)
         s, ex = self.get("/api/export"); self.assertEqual(ex["practice"][0]["problem_id"], "sample-valid-brackets")
         s, mine = self.req("DELETE", "/api/practice/sample-valid-brackets"); self.assertEqual(mine, {})
+
+    def test_scenes(self):
+        fixture = json.load(open(os.path.join(ROOT, "tests", "fixtures", "anim_sample.json"), encoding="utf-8"))
+        s, g = self.get("/api/graph")
+        summ = {x["id"]: x for x in g["scenes"]}
+        ids = {n["id"] for n in g["nodes"]}
+        for x in g["scenes"]: self.assertIn(x["concept"], ids); self.assertNotIn("steps", x)       # the graph carries summaries only
+        tcp = summ["sample-tcp-handshake"]
+        self.assertEqual((tcp["concept"], tcp["title"], tcp["n"]), ("tcp", fixture[0]["title"], len(fixture[0]["steps"])))
+        s, r = self.get("/api/read/tcp"); self.assertEqual(s, 200)
+        mine = [x for x in r["scenes"] if x["id"] == "sample-tcp-handshake"]
+        self.assertEqual(mine, [fixture[0]])                                                       # full scene, unchanged
+        self.assertTrue(all(x["concept"] == "tcp" for x in r["scenes"]))
+        s, r = self.get("/api/read/kafka"); self.assertIsInstance(r["scenes"], list)
+        s, allsc = self.get("/api/scenes"); self.assertEqual(s, 200)
+        self.assertEqual([x["id"] for x in allsc], [x["id"] for x in g["scenes"]])
+        self.assertTrue(all(x["steps"] for x in allsc))
+        s, ev = self.get("/api/scenes?concept=eviction")
+        self.assertIn("sample-lru-eviction", [x["id"] for x in ev]); self.assertTrue(all(x["concept"] == "eviction" for x in ev))
+        self.assertEqual(self.get("/api/scenes?concept=nope")[0], 404)
+
+    def test_scene_build_validation(self):
+        """build.py fails on an invalid scene, accepts a valid folder, and a missing folder means no scenes"""
+        bad = tempfile.mkdtemp()
+        try:
+            env = dict(os.environ, DTS_ANIM_DIR=bad, DTS_CONTENT_DB=os.path.join(bad, "c.db"))
+            env.pop("DTS_ANIM_FIXTURE", None)
+            sc = json.load(open(os.path.join(ROOT, "tests", "fixtures", "anim_sample.json"), encoding="utf-8"))[1]
+            json.dump([sc], open(os.path.join(bad, "ok.json"), "w"))
+            r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "build.py"), "--check"], capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("1 animated scenes", r.stdout)
+            broken = dict(sc, id="Bad Id", concept="no-such-concept", steps=sc["steps"][:2])
+            json.dump([sc, broken], open(os.path.join(bad, "ok.json"), "w"))
+            r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "build.py"), "--check"], capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 1)
+            for msg in ("unknown concept", "has 2 steps", "bad id"): self.assertIn(msg, r.stderr)
+            env["DTS_ANIM_DIR"] = os.path.join(bad, "missing")
+            r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "build.py"), "--check"], capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("0 animated scenes", r.stdout)
+        finally: shutil.rmtree(bad, ignore_errors=True)
+
+    def test_scene_js_served(self):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5); c.request("GET", "/scene.js")
+        r = c.getresponse(); body = r.read().decode()
+        self.assertEqual(r.status, 200); self.assertIn("javascript", r.getheader("Content-Type")); self.assertIn("window.DTSScene", body)
 
     def test_algo_js_served(self):
         import http.client

@@ -1,0 +1,5360 @@
+[
+ {
+  "id": "wal-commit-crash",
+  "concept": "wal",
+  "title": "Log first, then crash and replay",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "mem",
+    "label": "Memory (buffer pool)",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 110
+   },
+   {
+    "id": "log",
+    "label": "Log on disk (append only)",
+    "x": 20,
+    "y": 145,
+    "w": 680,
+    "h": 100
+   },
+   {
+    "id": "disk",
+    "label": "Data file on disk",
+    "x": 20,
+    "y": 260,
+    "w": 680,
+    "h": 120
+   }
+  ],
+  "actors": [
+   {
+    "id": "cl",
+    "label": "Client",
+    "x": 40,
+    "y": 58,
+    "w": 90,
+    "h": 40,
+    "shape": "box"
+   },
+   {
+    "id": "p7",
+    "label": "page 7",
+    "x": 300,
+    "y": 58,
+    "w": 150,
+    "h": 44,
+    "shape": "cell",
+    "sub": "A=100"
+   },
+   {
+    "id": "p9",
+    "label": "page 9",
+    "x": 500,
+    "y": 58,
+    "w": 150,
+    "h": 44,
+    "shape": "cell",
+    "sub": "B=5"
+   },
+   {
+    "id": "d7",
+    "label": "page 7",
+    "x": 300,
+    "y": 320,
+    "w": 150,
+    "h": 44,
+    "shape": "cell",
+    "sub": "A=100"
+   },
+   {
+    "id": "d9",
+    "label": "page 9",
+    "x": 500,
+    "y": 320,
+    "w": 150,
+    "h": 44,
+    "shape": "cell",
+    "sub": "B=5"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "Client sets A=90. Page 7 changes only in memory, so it is dirty. The copy on disk still says A=100.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "p7",
+      "label": "A=90",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "p7": {
+      "label": "page 7",
+      "tone": "warn",
+      "sub": "A=90 dirty"
+     }
+    }
+   },
+   {
+    "say": "Before anything else, the change goes into the log as LSN 41 (A: 100 to 90). One sequential append, no random write.",
+    "msgs": [
+     {
+      "from": "p7",
+      "to": "l41",
+      "label": "log first",
+      "tone": "accent"
+     }
+    ],
+    "add": [
+     {
+      "id": "l41",
+      "label": "LSN41 A:100>90",
+      "x": 40,
+      "y": 185,
+      "w": 150,
+      "h": 40,
+      "shape": "note"
+     }
+    ]
+   },
+   {
+    "say": "Commit adds LSN 42 and forces the log to disk (fsync). Only then does the client get OK. Page 7 on disk is still old, and that is fine.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "l42",
+      "label": "COMMIT",
+      "tone": "accent"
+     },
+     {
+      "from": "l42",
+      "to": "cl",
+      "label": "OK",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "l42": {
+      "label": "LSN42 COMMIT",
+      "tone": "ok"
+     }
+    },
+    "add": [
+     {
+      "id": "l42",
+      "label": "LSN42 COMMIT",
+      "x": 210,
+      "y": 185,
+      "w": 130,
+      "h": 40,
+      "shape": "note"
+     }
+    ]
+   },
+   {
+    "say": "Another transaction sets B=9 (LSN 43). It has not committed yet.",
+    "msgs": [
+     {
+      "from": "p9",
+      "to": "l43",
+      "label": "log first",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "p9": {
+      "label": "page 9",
+      "tone": "warn",
+      "sub": "B=9 dirty"
+     }
+    },
+    "add": [
+     {
+      "id": "l43",
+      "label": "LSN43 B:5>9",
+      "x": 360,
+      "y": 185,
+      "w": 150,
+      "h": 40,
+      "shape": "note"
+     }
+    ]
+   },
+   {
+    "say": "Power cut. Memory is wiped, with both dirty pages. Disk still holds A=100 and B=5. The log holds LSN 41 to 43.",
+    "set": {
+     "cl": {
+      "label": "Client",
+      "tone": "bad",
+      "sub": "crashed"
+     },
+     "p7": {
+      "label": "page 7",
+      "tone": "bad",
+      "sub": "lost"
+     },
+     "p9": {
+      "label": "page 9",
+      "tone": "bad",
+      "sub": "lost"
+     }
+    },
+    "focus": [
+     "l41",
+     "l42",
+     "l43"
+    ]
+   },
+   {
+    "say": "On restart we read the log from the start. LSN 41 was committed but never reached the data file, so we redo it. Page 7 becomes A=90.",
+    "msgs": [
+     {
+      "from": "l41",
+      "to": "d7",
+      "label": "redo A=90",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "d7": {
+      "label": "page 7",
+      "tone": "ok",
+      "sub": "A=90"
+     }
+    }
+   },
+   {
+    "say": "LSN 43 has no commit record after it, so we skip it. B stays 5. No half-done transaction appears.",
+    "set": {
+     "l43": {
+      "label": "LSN43 skipped",
+      "tone": "muted"
+     },
+     "d9": {
+      "label": "page 9",
+      "tone": "ok",
+      "sub": "B=5"
+     }
+    }
+   },
+   {
+    "say": "A checkpoint notes that page 7 is safe on disk, so the log up to LSN 42 can be deleted. This keeps the next recovery short.",
+    "set": {
+     "cl": {
+      "label": "Client",
+      "tone": "ok",
+      "sub": "running"
+     }
+    },
+    "remove": [
+     "l41",
+     "l42",
+     "l43"
+    ]
+   }
+  ]
+ },
+ {
+  "id": "lsm-write-read",
+  "concept": "lsm",
+  "title": "Writes go to memory, then sorted files",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "mem",
+    "label": "Memory",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 100
+   },
+   {
+    "id": "disk",
+    "label": "Disk: sorted files, never edited",
+    "x": 20,
+    "y": 135,
+    "w": 680,
+    "h": 245
+   }
+  ],
+  "actors": [
+   {
+    "id": "cl",
+    "label": "Client",
+    "x": 580,
+    "y": 56,
+    "w": 100,
+    "h": 40,
+    "shape": "box"
+   },
+   {
+    "id": "mt",
+    "label": "memtable",
+    "x": 40,
+    "y": 56,
+    "w": 200,
+    "h": 44,
+    "shape": "box",
+    "sub": "empty (limit 4 keys)"
+   },
+   {
+    "id": "wal",
+    "label": "WAL",
+    "x": 270,
+    "y": 56,
+    "w": 120,
+    "h": 44,
+    "shape": "note",
+    "sub": "append only"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "Client writes k5=a and k2=b. They go into the memtable, a sorted structure in memory, and into the WAL for safety. No disk seek.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "mt",
+      "label": "put k5, k2",
+      "tone": "accent"
+     },
+     {
+      "from": "mt",
+      "to": "wal",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "mt": {
+      "label": "memtable",
+      "tone": "accent",
+      "sub": "k2=b k5=a"
+     }
+    }
+   },
+   {
+    "say": "Two more writes: k9 and k8. The memtable now holds 4 keys, which is our limit here. Real limit is about 64 MB.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "mt",
+      "label": "put k9, k8",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "mt": {
+      "label": "memtable",
+      "tone": "warn",
+      "sub": "k2 k5 k8 k9 FULL"
+     }
+    }
+   },
+   {
+    "say": "Flush: the memtable is written as one sorted file, sst1, in a single sequential write. Files are never edited after this.",
+    "msgs": [
+     {
+      "from": "mt",
+      "to": "sst1",
+      "label": "flush",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "mt": {
+      "label": "memtable",
+      "tone": "normal",
+      "sub": "empty"
+     }
+    },
+    "add": [
+     {
+      "id": "sst1",
+      "label": "L0 sst1",
+      "x": 40,
+      "y": 185,
+      "w": 150,
+      "h": 50,
+      "shape": "db",
+      "sub": "k2 k5=a k8 k9"
+     }
+    ]
+   },
+   {
+    "say": "More writes follow and make sst2. Key k5 now exists twice: old value a in sst1, new value c in sst2.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "mt",
+      "label": "k5=c, k1, k3, k7",
+      "tone": "accent"
+     },
+     {
+      "from": "mt",
+      "to": "sst2",
+      "label": "flush",
+      "tone": "accent"
+     }
+    ],
+    "add": [
+     {
+      "id": "sst2",
+      "label": "L0 sst2",
+      "x": 230,
+      "y": 185,
+      "w": 150,
+      "h": 50,
+      "shape": "db",
+      "sub": "k1 k3 k5=c k7"
+     }
+    ]
+   },
+   {
+    "say": "Read k5: check memtable, then newest file first. sst2 has it, so the answer is c and we stop early.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sst2",
+      "label": "get k5",
+      "tone": "accent"
+     },
+     {
+      "from": "sst2",
+      "to": "cl",
+      "label": "c",
+      "tone": "ok"
+     }
+    ],
+    "focus": [
+     "sst2"
+    ]
+   },
+   {
+    "say": "Read k4, a key that does not exist: we must look in the memtable and every file. This is read amplification. With 10 files, it is 10 lookups.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sst2",
+      "label": "get k4",
+      "tone": "bad"
+     },
+     {
+      "from": "cl",
+      "to": "sst1",
+      "label": "get k4",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "sst1": {
+      "label": "L0 sst1",
+      "tone": "bad",
+      "sub": "miss"
+     },
+     "sst2": {
+      "label": "L0 sst2",
+      "tone": "bad",
+      "sub": "miss"
+     }
+    }
+   },
+   {
+    "say": "Compaction merges sst1 and sst2 like merge sort. For k5 it keeps c and drops the old a.",
+    "msgs": [
+     {
+      "from": "sst1",
+      "to": "big",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "sst2",
+      "to": "big",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "add": [
+     {
+      "id": "big",
+      "label": "L1 merged",
+      "x": 150,
+      "y": 290,
+      "w": 260,
+      "h": 50,
+      "shape": "db",
+      "sub": "k1 k2 k3 k5=c k7 k8 k9"
+     }
+    ]
+   },
+   {
+    "say": "The two small files are deleted. Reads now check one file. The price: these bytes were written again, so each byte can be rewritten about 10 times as it moves down levels.",
+    "set": {
+     "big": {
+      "label": "L1 merged",
+      "tone": "ok",
+      "sub": "1 file, 7 keys"
+     }
+    },
+    "remove": [
+     "sst1",
+     "sst2"
+    ]
+   }
+  ]
+ },
+ {
+  "id": "btree-split",
+  "concept": "btree",
+  "title": "Insert that splits a full page",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "tree",
+    "label": "B-tree on disk, 4 keys per page",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 255
+   },
+   {
+    "id": "lg",
+    "label": "Log",
+    "x": 20,
+    "y": 290,
+    "w": 680,
+    "h": 90
+   }
+  ],
+  "actors": [
+   {
+    "id": "root",
+    "label": "root page",
+    "x": 270,
+    "y": 52,
+    "w": 180,
+    "h": 44,
+    "shape": "box",
+    "sub": "[ 30 | 60 ]"
+   },
+   {
+    "id": "la",
+    "label": "leaf A",
+    "x": 60,
+    "y": 150,
+    "w": 170,
+    "h": 44,
+    "shape": "cell",
+    "sub": "10 15 20 25"
+   },
+   {
+    "id": "lb",
+    "label": "leaf B",
+    "x": 275,
+    "y": 150,
+    "w": 170,
+    "h": 44,
+    "shape": "cell",
+    "sub": "30 40 45 50"
+   },
+   {
+    "id": "lc",
+    "label": "leaf C",
+    "x": 490,
+    "y": 150,
+    "w": 170,
+    "h": 44,
+    "shape": "cell",
+    "sub": "60 70 80"
+   }
+  ],
+  "links": [
+   {
+    "from": "root",
+    "to": "la",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "root",
+    "to": "lb",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "root",
+    "to": "lc",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "Look up key 45: read the root, then leaf B. Two page reads for any key. With 500 keys per page, 4 levels cover about 60 billion keys.",
+    "msgs": [
+     {
+      "from": "root",
+      "to": "lb",
+      "label": "45 is 30..60",
+      "tone": "accent"
+     }
+    ],
+    "focus": [
+     "lb"
+    ]
+   },
+   {
+    "say": "Insert key 22. It belongs in leaf A, but A already has 4 keys: 10 15 20 25. Adding one more will not fit.",
+    "msgs": [
+     {
+      "from": "root",
+      "to": "la",
+      "label": "insert 22",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "la": {
+      "label": "leaf A",
+      "tone": "warn",
+      "sub": "10 15 20 25 FULL"
+     }
+    }
+   },
+   {
+    "say": "Splitting touches 3 pages, so we log it first. If we crash in the middle, the log can finish the job.",
+    "msgs": [
+     {
+      "from": "la",
+      "to": "lg1",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "add": [
+     {
+      "id": "lg1",
+      "label": "LOG: split A, 22 to A2, parent +22",
+      "x": 40,
+      "y": 325,
+      "w": 400,
+      "h": 40,
+      "shape": "note"
+     }
+    ]
+   },
+   {
+    "say": "Split: A keeps 10 15 20. A new page A2 gets 22 25. Each is half full, so there is room to grow.",
+    "msgs": [
+     {
+      "from": "la",
+      "to": "la2",
+      "label": "move half",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "la": {
+      "label": "leaf A",
+      "tone": "normal",
+      "sub": "10 15 20"
+     }
+    },
+    "add": [
+     {
+      "id": "la2",
+      "label": "leaf A2",
+      "x": 60,
+      "y": 215,
+      "w": 170,
+      "h": 44,
+      "shape": "cell",
+      "sub": "22 25"
+     }
+    ]
+   },
+   {
+    "say": "Crash now, before the parent is updated. The root still says [30|60], so a lookup for 22 goes to leaf A and does not find it.",
+    "set": {
+     "root": {
+      "label": "root page",
+      "tone": "bad",
+      "sub": "[ 30 | 60 ] old"
+     },
+     "la2": {
+      "label": "leaf A2",
+      "tone": "bad",
+      "sub": "not linked"
+     }
+    }
+   },
+   {
+    "say": "On restart the log is replayed. The parent gets the new separator key 22 and now points to A2.",
+    "msgs": [
+     {
+      "from": "lg1",
+      "to": "root",
+      "label": "redo",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "root": {
+      "label": "root page",
+      "tone": "ok",
+      "sub": "[ 22 | 30 | 60 ]"
+     },
+     "la2": {
+      "label": "leaf A2",
+      "tone": "ok",
+      "sub": "22 25"
+     }
+    },
+    "link": [
+     {
+      "from": "root",
+      "to": "la2",
+      "label": "",
+      "dashed": false
+     }
+    ]
+   },
+   {
+    "say": "Lookup 22 now works: root, then A2. If the root were full, it would split too, and the tree would grow one level.",
+    "msgs": [
+     {
+      "from": "root",
+      "to": "la2",
+      "label": "22 is 22..30",
+      "tone": "accent"
+     }
+    ],
+    "focus": [
+     "la2"
+    ]
+   },
+   {
+    "say": "Cost: a 16-byte insert rewrote whole 4 KB pages (A, A2, root). That is write amplification, the price of fast sorted reads.",
+    "set": {
+     "la": {
+      "label": "leaf A",
+      "tone": "warn",
+      "sub": "rewritten 4KB"
+     },
+     "la2": {
+      "label": "leaf A2",
+      "tone": "warn",
+      "sub": "new 4KB"
+     },
+     "root": {
+      "label": "root page",
+      "tone": "warn",
+      "sub": "rewritten 4KB"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "mvcc-versions",
+  "concept": "mvcc",
+  "title": "Readers never block writers",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "rows",
+    "label": "Row versions in the table",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 120
+   },
+   {
+    "id": "tx",
+    "label": "Transactions",
+    "x": 20,
+    "y": 160,
+    "w": 680,
+    "h": 220
+   }
+  ],
+  "actors": [
+   {
+    "id": "v1",
+    "label": "v1: bal=100",
+    "x": 40,
+    "y": 58,
+    "w": 190,
+    "h": 52,
+    "shape": "cell",
+    "sub": "created by T10, live"
+   },
+   {
+    "id": "t20",
+    "label": "T20 reader",
+    "x": 50,
+    "y": 230,
+    "w": 160,
+    "h": 50,
+    "shape": "round",
+    "sub": "snapshot at 20"
+   },
+   {
+    "id": "t25",
+    "label": "T25 writer",
+    "x": 270,
+    "y": 230,
+    "w": 160,
+    "h": 50,
+    "shape": "round",
+    "sub": "starts at 25"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "T20 starts and reads the account. It sees v1: balance 100, created by T10.",
+    "msgs": [
+     {
+      "from": "v1",
+      "to": "t20",
+      "label": "bal=100",
+      "tone": "ok"
+     }
+    ]
+   },
+   {
+    "say": "T25 updates the balance to 70. It does not overwrite. It writes a new version v2 and marks v1 as ended by T25.",
+    "msgs": [
+     {
+      "from": "t25",
+      "to": "v1",
+      "label": "end v1",
+      "tone": "accent"
+     },
+     {
+      "from": "t25",
+      "to": "v2",
+      "label": "write v2",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "v1": {
+      "label": "v1: bal=100",
+      "tone": "warn",
+      "sub": "ended by T25"
+     }
+    },
+    "add": [
+     {
+      "id": "v2",
+      "label": "v2: bal=70",
+      "x": 260,
+      "y": 58,
+      "w": 190,
+      "h": 52,
+      "shape": "cell",
+      "sub": "created by T25"
+     }
+    ]
+   },
+   {
+    "say": "T20 reads again. T25 has not committed, so T20 still sees v1 = 100. No lock, no waiting.",
+    "msgs": [
+     {
+      "from": "v1",
+      "to": "t20",
+      "label": "still 100",
+      "tone": "ok"
+     }
+    ],
+    "focus": [
+     "t20"
+    ]
+   },
+   {
+    "say": "T25 commits. Version v2 is now visible to any transaction that starts after this.",
+    "set": {
+     "t25": {
+      "label": "T25 writer",
+      "tone": "ok",
+      "sub": "committed"
+     },
+     "v2": {
+      "label": "v2: bal=70",
+      "tone": "ok",
+      "sub": "committed"
+     }
+    }
+   },
+   {
+    "say": "T20 is still running with its old snapshot, so it reads 100 again (repeatable read). New transaction T30 reads v2 = 70.",
+    "msgs": [
+     {
+      "from": "v1",
+      "to": "t20",
+      "label": "100",
+      "tone": "ok"
+     },
+     {
+      "from": "v2",
+      "to": "t30",
+      "label": "70",
+      "tone": "ok"
+     }
+    ],
+    "add": [
+     {
+      "id": "t30",
+      "label": "T30 reader",
+      "x": 490,
+      "y": 230,
+      "w": 160,
+      "h": 50,
+      "shape": "round",
+      "sub": "snapshot at 30"
+     }
+    ]
+   },
+   {
+    "say": "T30 updates twice more, making v3 and v4. T20 may still need v1, so old versions pile up. This is table bloat.",
+    "msgs": [
+     {
+      "from": "t30",
+      "to": "v3",
+      "label": "write v3",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "v1": {
+      "label": "v1: bal=100",
+      "tone": "bad",
+      "sub": "cannot delete"
+     },
+     "v2": {
+      "label": "v2: bal=70",
+      "tone": "bad",
+      "sub": "cannot delete"
+     }
+    },
+    "add": [
+     {
+      "id": "v3",
+      "label": "v3: bal=40",
+      "x": 490,
+      "y": 58,
+      "w": 190,
+      "h": 52,
+      "shape": "cell",
+      "sub": "latest"
+     }
+    ]
+   },
+   {
+    "say": "T20 finally ends. Vacuum finds that no transaction needs v1 and v2 and frees them. One transaction left open for hours would have blocked this cleanup.",
+    "set": {
+     "t20": {
+      "label": "T20 reader",
+      "tone": "muted",
+      "sub": "finished"
+     }
+    },
+    "remove": [
+     "v1",
+     "v2"
+    ]
+   }
+  ]
+ },
+ {
+  "id": "occ-conflict",
+  "concept": "occ",
+  "title": "Two transactions race on one row",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "st",
+    "label": "Shared store",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 120
+   },
+   {
+    "id": "tx",
+    "label": "Transactions (no locks)",
+    "x": 20,
+    "y": 160,
+    "w": 680,
+    "h": 220
+   }
+  ],
+  "actors": [
+   {
+    "id": "x",
+    "label": "row X",
+    "x": 270,
+    "y": 56,
+    "w": 180,
+    "h": 56,
+    "shape": "db",
+    "sub": "stock=5, ver=7"
+   },
+   {
+    "id": "t1",
+    "label": "T1",
+    "x": 60,
+    "y": 220,
+    "w": 200,
+    "h": 60,
+    "shape": "round",
+    "sub": "idle"
+   },
+   {
+    "id": "t2",
+    "label": "T2",
+    "x": 460,
+    "y": 220,
+    "w": 200,
+    "h": 60,
+    "shape": "round",
+    "sub": "idle"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "Both transactions read row X: stock=5, version 7. Nobody takes a lock.",
+    "msgs": [
+     {
+      "from": "x",
+      "to": "t1",
+      "label": "5, ver 7",
+      "tone": "accent"
+     },
+     {
+      "from": "x",
+      "to": "t2",
+      "label": "5, ver 7",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "t1": {
+      "label": "T1",
+      "tone": "accent",
+      "sub": "read X@7"
+     },
+     "t2": {
+      "label": "T2",
+      "tone": "accent",
+      "sub": "read X@7"
+     }
+    }
+   },
+   {
+    "say": "Each works on its own private copy. T1 wants to sell 1 (stock 4). T2 wants to sell 2 (stock 3).",
+    "set": {
+     "t1": {
+      "label": "T1",
+      "tone": "accent",
+      "sub": "writes stock=4"
+     },
+     "t2": {
+      "label": "T2",
+      "tone": "accent",
+      "sub": "writes stock=3"
+     }
+    }
+   },
+   {
+    "say": "T1 tries to commit: 'apply only if X is still version 7'. It is, so the commit succeeds and X becomes version 8.",
+    "msgs": [
+     {
+      "from": "t1",
+      "to": "x",
+      "label": "commit if ver=7",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "x": {
+      "label": "row X",
+      "tone": "ok",
+      "sub": "stock=4, ver=8"
+     },
+     "t1": {
+      "label": "T1",
+      "tone": "ok",
+      "sub": "committed"
+     }
+    }
+   },
+   {
+    "say": "T2 tries the same check, but X is now version 8. The check fails: a conflict.",
+    "msgs": [
+     {
+      "from": "t2",
+      "to": "x",
+      "label": "commit if ver=7",
+      "tone": "bad"
+     },
+     {
+      "from": "x",
+      "to": "t2",
+      "label": "ver is 8",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "t2": {
+      "label": "T2",
+      "tone": "bad",
+      "sub": "conflict"
+     }
+    }
+   },
+   {
+    "say": "T2's work is thrown away. This is the cost of OCC: wasted work when someone else wins.",
+    "set": {
+     "t2": {
+      "label": "T2",
+      "tone": "bad",
+      "sub": "aborted"
+     }
+    }
+   },
+   {
+    "say": "T2 retries. It reads again and gets stock=4, version 8, then computes stock=2.",
+    "msgs": [
+     {
+      "from": "x",
+      "to": "t2",
+      "label": "4, ver 8",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "t2": {
+      "label": "T2 retry",
+      "tone": "accent",
+      "sub": "writes stock=2"
+     }
+    }
+   },
+   {
+    "say": "This time the version still matches, so T2 commits. X becomes version 9.",
+    "msgs": [
+     {
+      "from": "t2",
+      "to": "x",
+      "label": "commit if ver=8",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "x": {
+      "label": "row X",
+      "tone": "ok",
+      "sub": "stock=2, ver=9"
+     },
+     "t2": {
+      "label": "T2 retry",
+      "tone": "ok",
+      "sub": "committed"
+     }
+    }
+   },
+   {
+    "say": "With one hot row, it gets worse: with 10 transactions at once, 9 lose in round one, 8 in round two, and so on. OCC is great when conflicts are rare, bad when they are common.",
+    "add": [
+     {
+      "id": "n",
+      "label": "10 racers on 1 row: 9+8+7+... aborts",
+      "x": 160,
+      "y": 320,
+      "w": 400,
+      "h": 40,
+      "shape": "note",
+      "tone": "warn"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "id": "isolation-write-skew",
+  "concept": "isolation",
+  "title": "Write skew under snapshot isolation",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "tb",
+    "label": "Table on_call (rule: at least 1 doctor on call)",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 120
+   },
+   {
+    "id": "tx",
+    "label": "Two doctors, two transactions",
+    "x": 20,
+    "y": 160,
+    "w": 680,
+    "h": 220
+   }
+  ],
+  "actors": [
+   {
+    "id": "al",
+    "label": "Alice",
+    "x": 100,
+    "y": 58,
+    "w": 200,
+    "h": 56,
+    "shape": "cell",
+    "sub": "on call"
+   },
+   {
+    "id": "bo",
+    "label": "Bob",
+    "x": 420,
+    "y": 58,
+    "w": 200,
+    "h": 56,
+    "shape": "cell",
+    "sub": "on call"
+   },
+   {
+    "id": "t1",
+    "label": "T1 (Alice)",
+    "x": 80,
+    "y": 240,
+    "w": 220,
+    "h": 60,
+    "shape": "round",
+    "sub": "idle"
+   },
+   {
+    "id": "t2",
+    "label": "T2 (Bob)",
+    "x": 420,
+    "y": 240,
+    "w": 220,
+    "h": 60,
+    "shape": "round",
+    "sub": "idle"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "Alice and Bob both feel ill and each starts a transaction at the same moment. Each gets a snapshot where 2 doctors are on call.",
+    "msgs": [
+     {
+      "from": "al",
+      "to": "t1",
+      "label": "2 on call",
+      "tone": "accent"
+     },
+     {
+      "from": "bo",
+      "to": "t2",
+      "label": "2 on call",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "t1": {
+      "label": "T1 (Alice)",
+      "tone": "accent",
+      "sub": "sees count=2"
+     },
+     "t2": {
+      "label": "T2 (Bob)",
+      "tone": "accent",
+      "sub": "sees count=2"
+     }
+    }
+   },
+   {
+    "say": "Each checks the rule: 2 on call, so one can leave. Both decide it is safe.",
+    "set": {
+     "t1": {
+      "label": "T1 (Alice)",
+      "tone": "accent",
+      "sub": "OK to leave"
+     },
+     "t2": {
+      "label": "T2 (Bob)",
+      "tone": "accent",
+      "sub": "OK to leave"
+     }
+    }
+   },
+   {
+    "say": "T1 sets Alice to off call.",
+    "msgs": [
+     {
+      "from": "t1",
+      "to": "al",
+      "label": "off call",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "al": {
+      "label": "Alice",
+      "tone": "warn",
+      "sub": "off call"
+     }
+    }
+   },
+   {
+    "say": "T2 sets Bob to off call. T1 wrote Alice's row and T2 wrote Bob's row, so the database sees no write conflict.",
+    "msgs": [
+     {
+      "from": "t2",
+      "to": "bo",
+      "label": "off call",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "bo": {
+      "label": "Bob",
+      "tone": "warn",
+      "sub": "off call"
+     }
+    }
+   },
+   {
+    "say": "Both commit successfully. Now 0 doctors are on call. Each transaction was correct alone, but together they broke the rule. This is write skew.",
+    "set": {
+     "t1": {
+      "label": "T1 (Alice)",
+      "tone": "ok",
+      "sub": "committed"
+     },
+     "t2": {
+      "label": "T2 (Bob)",
+      "tone": "ok",
+      "sub": "committed"
+     },
+     "al": {
+      "label": "Alice",
+      "tone": "bad",
+      "sub": "off call"
+     },
+     "bo": {
+      "label": "Bob",
+      "tone": "bad",
+      "sub": "off call"
+     }
+    },
+    "add": [
+     {
+      "id": "n",
+      "label": "0 on call: rule broken",
+      "x": 250,
+      "y": 330,
+      "w": 220,
+      "h": 36,
+      "shape": "note",
+      "tone": "bad"
+     }
+    ]
+   },
+   {
+    "say": "Run again with SERIALIZABLE isolation. Same start: both see 2 on call, and T1 commits first.",
+    "set": {
+     "al": {
+      "label": "Alice",
+      "tone": "warn",
+      "sub": "off call"
+     },
+     "bo": {
+      "label": "Bob",
+      "tone": "normal",
+      "sub": "on call"
+     },
+     "t1": {
+      "label": "T1 (Alice)",
+      "tone": "ok",
+      "sub": "committed"
+     },
+     "t2": {
+      "label": "T2 (Bob)",
+      "tone": "accent",
+      "sub": "OK to leave"
+     }
+    },
+    "remove": [
+     "n"
+    ]
+   },
+   {
+    "say": "T2 tries to commit. The database notices T1 changed data that T2 had read (the count). T2's decision is no longer valid.",
+    "msgs": [
+     {
+      "from": "t2",
+      "to": "bo",
+      "label": "commit",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "t2": {
+      "label": "T2 (Bob)",
+      "tone": "bad",
+      "sub": "aborted"
+     }
+    }
+   },
+   {
+    "say": "T2 retries and now sees only 1 on call. It refuses to leave. The rule holds. Cost: some transactions abort, and the app must retry.",
+    "set": {
+     "t2": {
+      "label": "T2 (Bob)",
+      "tone": "ok",
+      "sub": "stays on call"
+     },
+     "bo": {
+      "label": "Bob",
+      "tone": "ok",
+      "sub": "on call"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "recovery-aries",
+  "concept": "recovery",
+  "title": "Crash recovery in three passes",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "mem",
+    "label": "Memory",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 90
+   },
+   {
+    "id": "log",
+    "label": "Log on disk",
+    "x": 20,
+    "y": 120,
+    "w": 680,
+    "h": 120
+   },
+   {
+    "id": "disk",
+    "label": "Data pages on disk",
+    "x": 20,
+    "y": 255,
+    "w": 680,
+    "h": 125
+   }
+  ],
+  "actors": [
+   {
+    "id": "ph",
+    "label": "Database",
+    "x": 260,
+    "y": 52,
+    "w": 200,
+    "h": 44,
+    "shape": "round",
+    "sub": "running"
+   },
+   {
+    "id": "ck",
+    "label": "checkpoint",
+    "x": 40,
+    "y": 150,
+    "w": 130,
+    "h": 36,
+    "shape": "note"
+   },
+   {
+    "id": "l10",
+    "label": "LSN10 T1 writes P5",
+    "x": 185,
+    "y": 150,
+    "w": 170,
+    "h": 36,
+    "shape": "note"
+   },
+   {
+    "id": "l11",
+    "label": "LSN11 T2 writes P6",
+    "x": 370,
+    "y": 150,
+    "w": 170,
+    "h": 36,
+    "shape": "note"
+   },
+   {
+    "id": "l12",
+    "label": "LSN12 T1 COMMIT",
+    "x": 555,
+    "y": 150,
+    "w": 130,
+    "h": 36,
+    "shape": "note"
+   },
+   {
+    "id": "p5",
+    "label": "page 5",
+    "x": 120,
+    "y": 300,
+    "w": 200,
+    "h": 50,
+    "shape": "cell",
+    "sub": "old, pageLSN 0"
+   },
+   {
+    "id": "p6",
+    "label": "page 6",
+    "x": 400,
+    "y": 300,
+    "w": 220,
+    "h": 50,
+    "shape": "cell",
+    "sub": "has T2 change, LSN 11"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "T1 changed page 5 (not yet flushed) and committed. T2 changed page 6 and the buffer pool flushed it early, before T2 committed. Now the power fails.",
+    "set": {
+     "ph": {
+      "label": "Database",
+      "tone": "bad",
+      "sub": "CRASH"
+     },
+     "p6": {
+      "label": "page 6",
+      "tone": "warn",
+      "sub": "uncommitted data!"
+     }
+    }
+   },
+   {
+    "say": "Pass 1, analysis: read the log from the last checkpoint. T1 has a COMMIT, so it is a winner. T2 has none, so it is a loser.",
+    "msgs": [
+     {
+      "from": "ck",
+      "to": "ph",
+      "label": "scan",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "ph": {
+      "label": "Database",
+      "tone": "accent",
+      "sub": "1 analysis: T1 win, T2 lose"
+     }
+    },
+    "focus": [
+     "l12"
+    ]
+   },
+   {
+    "say": "Pass 2, redo: replay history. Page 5 has pageLSN 0, less than 10, so redo LSN 10. Page 5 now has T1's change.",
+    "msgs": [
+     {
+      "from": "l10",
+      "to": "p5",
+      "label": "redo",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "ph": {
+      "label": "Database",
+      "tone": "accent",
+      "sub": "2 redo"
+     },
+     "p5": {
+      "label": "page 5",
+      "tone": "ok",
+      "sub": "T1 change, LSN 10"
+     }
+    }
+   },
+   {
+    "say": "LSN 11: page 6 already has pageLSN 11, so the change is already there. Skip it. Page LSNs stop us from applying a change twice.",
+    "msgs": [
+     {
+      "from": "l11",
+      "to": "p6",
+      "label": "already there",
+      "tone": "muted"
+     }
+    ],
+    "focus": [
+     "p6"
+    ]
+   },
+   {
+    "say": "Pass 3, undo: T2 never committed, so its change on page 6 must go. We reverse it.",
+    "msgs": [
+     {
+      "from": "l11",
+      "to": "p6",
+      "label": "undo",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "ph": {
+      "label": "Database",
+      "tone": "accent",
+      "sub": "3 undo T2"
+     }
+    }
+   },
+   {
+    "say": "The undo is logged as a compensation record (CLR). If we crash again during recovery, we will not undo the same change twice.",
+    "add": [
+     {
+      "id": "clr",
+      "label": "CLR: undo LSN11",
+      "x": 370,
+      "y": 195,
+      "w": 170,
+      "h": 36,
+      "shape": "note"
+     }
+    ]
+   },
+   {
+    "say": "Page 6 is clean and the database opens. Recovery time depends on how much log came after the last checkpoint.",
+    "set": {
+     "p6": {
+      "label": "page 6",
+      "tone": "ok",
+      "sub": "T2 change removed"
+     },
+     "ph": {
+      "label": "Database",
+      "tone": "ok",
+      "sub": "open for business"
+     }
+    }
+   },
+   {
+    "say": "Cost: with a checkpoint every 30 s, replay takes a few seconds. With no checkpoint for an hour, replay can take minutes.",
+    "add": [
+     {
+      "id": "n",
+      "label": "Replay time ~ log since last checkpoint",
+      "x": 160,
+      "y": 335,
+      "w": 400,
+      "h": 36,
+      "shape": "note",
+      "tone": "warn"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "id": "compaction-tombstone",
+  "concept": "compaction",
+  "title": "Compaction and a deleted key",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "l0",
+    "label": "Level 0 (newest, files overlap)",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 105
+   },
+   {
+    "id": "l1",
+    "label": "Level 1",
+    "x": 20,
+    "y": 140,
+    "w": 680,
+    "h": 105
+   },
+   {
+    "id": "l2",
+    "label": "Level 2 (oldest)",
+    "x": 20,
+    "y": 260,
+    "w": 680,
+    "h": 120
+   }
+  ],
+  "actors": [
+   {
+    "id": "fa",
+    "label": "file a",
+    "x": 50,
+    "y": 60,
+    "w": 170,
+    "h": 46,
+    "shape": "db",
+    "sub": "k3=DEL k7=z"
+   },
+   {
+    "id": "fb",
+    "label": "file b",
+    "x": 250,
+    "y": 60,
+    "w": 170,
+    "h": 46,
+    "shape": "db",
+    "sub": "k3=x k5=y"
+   },
+   {
+    "id": "fc",
+    "label": "file c",
+    "x": 50,
+    "y": 180,
+    "w": 170,
+    "h": 46,
+    "shape": "db",
+    "sub": "k1 k3=w k8"
+   },
+   {
+    "id": "fd",
+    "label": "file d",
+    "x": 50,
+    "y": 320,
+    "w": 170,
+    "h": 46,
+    "shape": "db",
+    "sub": "k3=v k9"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "The user deleted k3. A delete is written as a marker (tombstone) in file a. The old values of k3 are still in files b, c and d. The key is stored 4 times.",
+    "set": {
+     "fa": {
+      "label": "file a",
+      "tone": "warn",
+      "sub": "k3=DEL k7=z"
+     }
+    },
+    "focus": [
+     "fa",
+     "fb",
+     "fc",
+     "fd"
+    ]
+   },
+   {
+    "say": "Reading k5 has to look in file a, then file b. Level 0 files overlap, so every one must be checked. Too many L0 files make reads slow.",
+    "set": {
+     "fb": {
+      "label": "file b",
+      "tone": "accent",
+      "sub": "k5=y found"
+     }
+    },
+    "focus": [
+     "fa",
+     "fb"
+    ]
+   },
+   {
+    "say": "L0 has 2 files, which is the trigger. Compaction picks both, plus file c from L1 because its keys overlap.",
+    "focus": [
+     "fa",
+     "fb",
+     "fc"
+    ]
+   },
+   {
+    "say": "Merge the three sorted files into one new file m. For k3 only the newest entry survives: the tombstone.",
+    "msgs": [
+     {
+      "from": "fa",
+      "to": "fm",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "fb",
+      "to": "fm",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "fc",
+      "to": "fm",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "add": [
+     {
+      "id": "fm",
+      "label": "file m",
+      "x": 300,
+      "y": 180,
+      "w": 260,
+      "h": 46,
+      "shape": "db",
+      "sub": "k1 k3=DEL k5=y k7=z k8"
+     }
+    ]
+   },
+   {
+    "say": "The tombstone must stay. File d at Level 2 still holds k3=v, and without the marker the deleted value would come back to life.",
+    "set": {
+     "fm": {
+      "label": "file m",
+      "tone": "warn",
+      "sub": "tombstone kept"
+     },
+     "fd": {
+      "label": "file d",
+      "tone": "warn",
+      "sub": "k3=v still here"
+     }
+    }
+   },
+   {
+    "say": "Old inputs a, b, c are deleted. We read 7 entries and wrote 5, and this work repeats at every level: that is write amplification.",
+    "remove": [
+     "fa",
+     "fb",
+     "fc"
+    ]
+   },
+   {
+    "say": "Later m is merged with file d at the bottom level. Nothing is below, so the tombstone and k3=v are dropped together. Space is finally freed.",
+    "msgs": [
+     {
+      "from": "fm",
+      "to": "fn",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "fd",
+      "to": "fn",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "add": [
+     {
+      "id": "fn",
+      "label": "file n",
+      "x": 300,
+      "y": 320,
+      "w": 260,
+      "h": 46,
+      "shape": "db",
+      "sub": "k1 k5=y k7=z k8 k9"
+     }
+    ]
+   },
+   {
+    "say": "Result: k3 is gone completely. Disk space from a delete came back only after two compactions, so a delete-heavy table can use much more disk than its live data.",
+    "set": {
+     "fn": {
+      "label": "file n",
+      "tone": "ok",
+      "sub": "k3 fully gone"
+     }
+    },
+    "remove": [
+     "fm",
+     "fd"
+    ]
+   }
+  ]
+ },
+ {
+  "id": "cow-vs-mor",
+  "concept": "cowmor",
+  "title": "Copy on write vs merge on read",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "data",
+    "label": "Data files (Parquet)",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 120
+   },
+   {
+    "id": "dl",
+    "label": "Delta files",
+    "x": 20,
+    "y": 155,
+    "w": 680,
+    "h": 100
+   },
+   {
+    "id": "rd",
+    "label": "Reader",
+    "x": 20,
+    "y": 270,
+    "w": 680,
+    "h": 110
+   }
+  ],
+  "actors": [
+   {
+    "id": "fa",
+    "label": "file-A",
+    "x": 40,
+    "y": 60,
+    "w": 190,
+    "h": 50,
+    "shape": "db",
+    "sub": "128 MB, 1M rows"
+   },
+   {
+    "id": "wr",
+    "label": "Writer",
+    "x": 560,
+    "y": 60,
+    "w": 120,
+    "h": 44,
+    "shape": "round"
+   },
+   {
+    "id": "q",
+    "label": "Query",
+    "x": 300,
+    "y": 320,
+    "w": 140,
+    "h": 40,
+    "shape": "round",
+    "sub": "idle"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "UPDATE row 7 (change one value). Two table styles handle this very differently. First: copy on write (COW).",
+    "msgs": [
+     {
+      "from": "wr",
+      "to": "fa",
+      "label": "update row 7",
+      "tone": "accent"
+     }
+    ],
+    "focus": [
+     "fa"
+    ]
+   },
+   {
+    "say": "COW rewrites the whole file: read all 128 MB, change one row, write 128 MB to a new file. One row changed, 128 MB written.",
+    "msgs": [
+     {
+      "from": "fa",
+      "to": "fa2",
+      "label": "copy + patch",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "fa": {
+      "label": "file-A",
+      "tone": "muted",
+      "sub": "old"
+     }
+    },
+    "add": [
+     {
+      "id": "fa2",
+      "label": "file-A2",
+      "x": 290,
+      "y": 60,
+      "w": 190,
+      "h": 50,
+      "shape": "db",
+      "sub": "128 MB rewritten",
+      "tone": "warn"
+     }
+    ]
+   },
+   {
+    "say": "The old file is removed. A query reads one clean file and needs no merging. COW is slow to write but fast to read.",
+    "msgs": [
+     {
+      "from": "fa2",
+      "to": "q",
+      "label": "1 file",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "fa2": {
+      "label": "file-A2",
+      "tone": "ok",
+      "sub": "128 MB, clean"
+     }
+    },
+    "remove": [
+     "fa"
+    ]
+   },
+   {
+    "say": "Now merge on read (MOR). The same kind of update writes only a small delta file: row 7 has the new value, 1 KB.",
+    "msgs": [
+     {
+      "from": "wr",
+      "to": "d1",
+      "label": "1 KB",
+      "tone": "accent"
+     }
+    ],
+    "add": [
+     {
+      "id": "d1",
+      "label": "delta-1",
+      "x": 40,
+      "y": 200,
+      "w": 140,
+      "h": 40,
+      "shape": "note",
+      "sub": "row 7 new"
+     }
+    ]
+   },
+   {
+    "say": "A query must read the big file and the delta, then merge them. Writes became 100,000 times smaller, and reads do extra work.",
+    "msgs": [
+     {
+      "from": "fa2",
+      "to": "q",
+      "label": "128 MB",
+      "tone": "accent"
+     },
+     {
+      "from": "d1",
+      "to": "q",
+      "label": "merge",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "q": {
+      "label": "Query",
+      "tone": "accent",
+      "sub": "merge 2 sources"
+     }
+    }
+   },
+   {
+    "say": "Updates continue and deltas pile up: delta-2, delta-3. Each read merges more sources, so reads get slower and slower.",
+    "msgs": [
+     {
+      "from": "wr",
+      "to": "d3",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "q": {
+      "label": "Query",
+      "tone": "warn",
+      "sub": "merge 4 sources, slow"
+     }
+    },
+    "add": [
+     {
+      "id": "d2",
+      "label": "delta-2",
+      "x": 200,
+      "y": 200,
+      "w": 140,
+      "h": 40,
+      "shape": "note",
+      "sub": "row 90"
+     },
+     {
+      "id": "d3",
+      "label": "delta-3",
+      "x": 360,
+      "y": 200,
+      "w": 140,
+      "h": 40,
+      "shape": "note",
+      "sub": "row 5"
+     }
+    ]
+   },
+   {
+    "say": "Compaction folds all deltas into the base file in the background. Reads are fast again. MOR moves cost from write time to read time and compaction time.",
+    "msgs": [
+     {
+      "from": "d1",
+      "to": "fa2",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "d2",
+      "to": "fa2",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "d3",
+      "to": "fa2",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "fa2": {
+      "label": "file-A3",
+      "tone": "ok",
+      "sub": "deltas folded in"
+     },
+     "q": {
+      "label": "Query",
+      "tone": "ok",
+      "sub": "1 source"
+     }
+    },
+    "remove": [
+     "d1",
+     "d2",
+     "d3"
+    ]
+   }
+  ]
+ },
+ {
+  "id": "delete-vector",
+  "concept": "delvec",
+  "title": "Delete without rewriting the file",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "f",
+    "label": "File on disk (never edited)",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 150
+   },
+   {
+    "id": "dv",
+    "label": "Delete vector",
+    "x": 20,
+    "y": 180,
+    "w": 680,
+    "h": 80
+   },
+   {
+    "id": "rd",
+    "label": "Reader",
+    "x": 20,
+    "y": 275,
+    "w": 680,
+    "h": 105
+   }
+  ],
+  "actors": [
+   {
+    "id": "r1",
+    "label": "id 1",
+    "x": 50,
+    "y": 56,
+    "w": 100,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "r2",
+    "label": "id 2",
+    "x": 170,
+    "y": 56,
+    "w": 100,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "r3",
+    "label": "id 3",
+    "x": 290,
+    "y": 56,
+    "w": 100,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "r4",
+    "label": "id 4",
+    "x": 410,
+    "y": 56,
+    "w": 100,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "r5",
+    "label": "id 5",
+    "x": 530,
+    "y": 56,
+    "w": 100,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "dv",
+    "label": "part-001.dv",
+    "x": 50,
+    "y": 215,
+    "w": 260,
+    "h": 38,
+    "shape": "note",
+    "sub": "empty"
+   },
+   {
+    "id": "cmd",
+    "label": "DELETE id=3",
+    "x": 470,
+    "y": 215,
+    "w": 160,
+    "h": 38,
+    "shape": "round"
+   },
+   {
+    "id": "q",
+    "label": "Query",
+    "x": 50,
+    "y": 320,
+    "w": 130,
+    "h": 40,
+    "shape": "round"
+   },
+   {
+    "id": "res",
+    "label": "Result",
+    "x": 300,
+    "y": 320,
+    "w": 330,
+    "h": 40,
+    "shape": "box"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "part-001.parquet holds 5 rows, ids 1 to 5 (real files hold millions). We run DELETE WHERE id=3.",
+    "msgs": [
+     {
+      "from": "cmd",
+      "to": "r3",
+      "label": "find id 3",
+      "tone": "accent"
+     }
+    ],
+    "focus": [
+     "r3"
+    ]
+   },
+   {
+    "say": "Rewriting the file just to drop one row would copy everything. Instead we write the row position into a small delete vector: bit 2.",
+    "msgs": [
+     {
+      "from": "cmd",
+      "to": "dv",
+      "label": "position 2",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "dv": {
+      "label": "part-001.dv",
+      "tone": "warn",
+      "sub": "bits: {2}"
+     },
+     "r3": {
+      "label": "id 3",
+      "tone": "warn",
+      "sub": "deleted?"
+     }
+    }
+   },
+   {
+    "say": "A query reads the tiny delete vector first, then scans the file.",
+    "msgs": [
+     {
+      "from": "dv",
+      "to": "q",
+      "label": "bits {2}",
+      "tone": "accent"
+     },
+     {
+      "from": "r1",
+      "to": "q",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "q": {
+      "label": "Query",
+      "tone": "accent",
+      "sub": "skip position 2"
+     }
+    }
+   },
+   {
+    "say": "The row at position 2 is skipped. The result is 1, 2, 4, 5. The data file did not change at all.",
+    "msgs": [
+     {
+      "from": "q",
+      "to": "res",
+      "label": "1 2 4 5",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "r3": {
+      "label": "id 3",
+      "tone": "muted",
+      "sub": "skipped"
+     },
+     "res": {
+      "label": "Result",
+      "tone": "ok",
+      "sub": "1 2 4 5"
+     }
+    }
+   },
+   {
+    "say": "More deletes (id 1, id 5) only flip more bits. Each delete costs a few bytes, not a file rewrite.",
+    "msgs": [
+     {
+      "from": "cmd",
+      "to": "dv",
+      "label": "positions 0, 4",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "dv": {
+      "label": "part-001.dv",
+      "tone": "warn",
+      "sub": "bits: {0,2,4}"
+     },
+     "r1": {
+      "label": "id 1",
+      "tone": "muted",
+      "sub": "skipped"
+     },
+     "r5": {
+      "label": "id 5",
+      "tone": "muted",
+      "sub": "skipped"
+     }
+    }
+   },
+   {
+    "say": "Cost: 3 of 5 rows are dead, but every query still reads the whole file and drops 60% of it. With 90% deleted, this wastes most of the I/O.",
+    "set": {
+     "q": {
+      "label": "Query",
+      "tone": "bad",
+      "sub": "reads 100%, uses 40%"
+     }
+    }
+   },
+   {
+    "say": "A maintenance job rewrites the file with only live rows into part-002.parquet and drops the delete vector.",
+    "add": [
+     {
+      "id": "p2",
+      "label": "part-002.parquet",
+      "x": 170,
+      "y": 108,
+      "w": 300,
+      "h": 40,
+      "shape": "db",
+      "sub": "ids 2, 4 only",
+      "tone": "ok"
+     }
+    ],
+    "remove": [
+     "r1",
+     "r2",
+     "r3",
+     "r4",
+     "r5"
+    ]
+   },
+   {
+    "say": "Now the query reads 2 rows and the vector is empty. Deletes are cheap now and cleaned up later.",
+    "set": {
+     "dv": {
+      "label": "part-001.dv",
+      "tone": "muted",
+      "sub": "retired"
+     },
+     "q": {
+      "label": "Query",
+      "tone": "ok",
+      "sub": "reads 2 rows"
+     },
+     "res": {
+      "label": "Result",
+      "tone": "ok",
+      "sub": "2 4"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "zonemap-skip",
+  "concept": "zonemaps",
+  "title": "Skipping files with min/max",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "qq",
+    "label": "Query",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 70
+   },
+   {
+    "id": "ft",
+    "label": "Files and their footers (min/max of price)",
+    "x": 20,
+    "y": 105,
+    "w": 680,
+    "h": 140
+   },
+   {
+    "id": "rd",
+    "label": "Data actually read",
+    "x": 20,
+    "y": 260,
+    "w": 680,
+    "h": 120
+   }
+  ],
+  "actors": [
+   {
+    "id": "q",
+    "label": "WHERE price > 900",
+    "x": 40,
+    "y": 44,
+    "w": 200,
+    "h": 36,
+    "shape": "round"
+   },
+   {
+    "id": "f1",
+    "label": "file 1",
+    "x": 40,
+    "y": 150,
+    "w": 150,
+    "h": 64,
+    "shape": "db",
+    "sub": "min 5, max 990"
+   },
+   {
+    "id": "f2",
+    "label": "file 2",
+    "x": 210,
+    "y": 150,
+    "w": 150,
+    "h": 64,
+    "shape": "db",
+    "sub": "min 8, max 980"
+   },
+   {
+    "id": "f3",
+    "label": "file 3",
+    "x": 380,
+    "y": 150,
+    "w": 150,
+    "h": 64,
+    "shape": "db",
+    "sub": "min 3, max 995"
+   },
+   {
+    "id": "f4",
+    "label": "file 4",
+    "x": 550,
+    "y": 150,
+    "w": 130,
+    "h": 64,
+    "shape": "db",
+    "sub": "min 6, max 970"
+   },
+   {
+    "id": "rd",
+    "label": "Read: nothing yet",
+    "x": 40,
+    "y": 310,
+    "w": 300,
+    "h": 40,
+    "shape": "box"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "A query wants rows with price > 900. Each 100 MB file stores min and max price in its footer, so we can look there first.",
+    "msgs": [
+     {
+      "from": "q",
+      "to": "f1",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "q",
+      "to": "f2",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "q",
+      "to": "f3",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "q",
+      "to": "f4",
+      "label": "",
+      "tone": "accent"
+     }
+    ]
+   },
+   {
+    "say": "The data was written in arrival order, so every file holds a mix of cheap and expensive items. All four files have max above 900.",
+    "focus": [
+     "f1",
+     "f2",
+     "f3",
+     "f4"
+    ]
+   },
+   {
+    "say": "No file can be ruled out, so all four are read: 400 MB scanned to find a few hundred rows. The zone map did not help.",
+    "msgs": [
+     {
+      "from": "f1",
+      "to": "rd",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "f2",
+      "to": "rd",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "f3",
+      "to": "rd",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "f4",
+      "to": "rd",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "rd": {
+      "label": "Read: 4 files, 400 MB",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "Rewrite the table sorted by price (clustering). Now each file covers one price range.",
+    "set": {
+     "f1": {
+      "label": "file 1",
+      "tone": "accent",
+      "sub": "min 5, max 250"
+     },
+     "f2": {
+      "label": "file 2",
+      "tone": "accent",
+      "sub": "min 251, max 500"
+     },
+     "f3": {
+      "label": "file 3",
+      "tone": "accent",
+      "sub": "min 501, max 800"
+     },
+     "f4": {
+      "label": "file 4",
+      "tone": "accent",
+      "sub": "min 801, max 995"
+     },
+     "rd": {
+      "label": "Read: nothing yet",
+      "tone": "normal"
+     }
+    }
+   },
+   {
+    "say": "Same query. Files 1, 2 and 3 have max below 900, so they cannot contain a match. We skip them using only the footers.",
+    "msgs": [
+     {
+      "from": "q",
+      "to": "f1",
+      "label": "skip",
+      "tone": "muted"
+     },
+     {
+      "from": "q",
+      "to": "f2",
+      "label": "skip",
+      "tone": "muted"
+     },
+     {
+      "from": "q",
+      "to": "f3",
+      "label": "skip",
+      "tone": "muted"
+     }
+    ],
+    "set": {
+     "f1": {
+      "label": "file 1",
+      "tone": "muted",
+      "sub": "skip"
+     },
+     "f2": {
+      "label": "file 2",
+      "tone": "muted",
+      "sub": "skip"
+     },
+     "f3": {
+      "label": "file 3",
+      "tone": "muted",
+      "sub": "skip"
+     }
+    }
+   },
+   {
+    "say": "Only file 4 is read: 100 MB instead of 400 MB, four times less I/O.",
+    "msgs": [
+     {
+      "from": "q",
+      "to": "f4",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "f4",
+      "to": "rd",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "f4": {
+      "label": "file 4",
+      "tone": "ok",
+      "sub": "min 801, max 995"
+     },
+     "rd": {
+      "label": "Read: 1 file, 100 MB",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "The limit: min/max says only 'maybe'. File 4 spans 801 to 995, so most of its rows are still below 900 and we scan it all. Zone maps help only when the data is sorted on that column.",
+    "set": {
+     "f4": {
+      "label": "file 4",
+      "tone": "warn",
+      "sub": "maybe: scan it all"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "columnar-scan",
+  "concept": "columnar",
+  "title": "Reading one column of three",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "rw",
+    "label": "Row store: each page holds whole rows",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 110
+   },
+   {
+    "id": "cl",
+    "label": "Column store: one file per column",
+    "x": 20,
+    "y": 145,
+    "w": 680,
+    "h": 120
+   },
+   {
+    "id": "qg",
+    "label": "Query",
+    "x": 20,
+    "y": 280,
+    "w": 680,
+    "h": 100
+   }
+  ],
+  "actors": [
+   {
+    "id": "p1",
+    "label": "page 1",
+    "x": 40,
+    "y": 56,
+    "w": 200,
+    "h": 52,
+    "shape": "cell",
+    "sub": "1,IN,40 | 2,US,15"
+   },
+   {
+    "id": "p2",
+    "label": "page 2",
+    "x": 260,
+    "y": 56,
+    "w": 200,
+    "h": 52,
+    "shape": "cell",
+    "sub": "3,IN,20 | 4,DE,8"
+   },
+   {
+    "id": "p3",
+    "label": "page 3",
+    "x": 480,
+    "y": 56,
+    "w": 200,
+    "h": 52,
+    "shape": "cell",
+    "sub": "5,US,60 | 6,IN,11"
+   },
+   {
+    "id": "ci",
+    "label": "id.col",
+    "x": 40,
+    "y": 180,
+    "w": 190,
+    "h": 52,
+    "shape": "db",
+    "sub": "1 2 3 4 5 6"
+   },
+   {
+    "id": "cc",
+    "label": "country.col",
+    "x": 265,
+    "y": 180,
+    "w": 190,
+    "h": 52,
+    "shape": "db",
+    "sub": "IN US IN DE US IN"
+   },
+   {
+    "id": "ca",
+    "label": "amount.col",
+    "x": 490,
+    "y": 180,
+    "w": 190,
+    "h": 52,
+    "shape": "db",
+    "sub": "40 15 20 8 60 11"
+   },
+   {
+    "id": "q",
+    "label": "SELECT SUM(amount)",
+    "x": 230,
+    "y": 320,
+    "w": 260,
+    "h": 44,
+    "shape": "round",
+    "sub": "idle"
+   },
+   {
+    "id": "ins",
+    "label": "INSERT row",
+    "x": 570,
+    "y": 320,
+    "w": 120,
+    "h": 40,
+    "shape": "round"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "The table has 3 columns (id, country, amount) and 3 million rows. We want only SUM(amount).",
+    "focus": [
+     "q"
+    ]
+   },
+   {
+    "say": "Row store: amounts sit inside whole rows, so we must read every page. 300 MB are read to use 100 MB of amounts.",
+    "msgs": [
+     {
+      "from": "p1",
+      "to": "q",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "p2",
+      "to": "q",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "p3",
+      "to": "q",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "q": {
+      "label": "SELECT SUM(amount)",
+      "tone": "warn",
+      "sub": "read 300 MB"
+     }
+    }
+   },
+   {
+    "say": "Column store: all amounts are stored together. We read amount.col only. id.col and country.col are never touched: 100 MB.",
+    "msgs": [
+     {
+      "from": "ca",
+      "to": "q",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "q": {
+      "label": "SELECT SUM(amount)",
+      "tone": "ok",
+      "sub": "read 100 MB"
+     },
+     "ci": {
+      "label": "id.col",
+      "tone": "muted",
+      "sub": "not read"
+     },
+     "cc": {
+      "label": "country.col",
+      "tone": "muted",
+      "sub": "not read"
+     }
+    }
+   },
+   {
+    "say": "Similar values sit side by side, so they compress well. country.col becomes a dictionary (IN=0, US=1, DE=2) and small numbers. amount.col drops from 100 MB to about 25 MB.",
+    "set": {
+     "cc": {
+      "label": "country.col",
+      "tone": "accent",
+      "sub": "0 1 0 2 1 0"
+     },
+     "ca": {
+      "label": "amount.col",
+      "tone": "accent",
+      "sub": "25 MB packed"
+     },
+     "q": {
+      "label": "SELECT SUM(amount)",
+      "tone": "ok",
+      "sub": "read 25 MB"
+     }
+    }
+   },
+   {
+    "say": "The sum runs as one tight loop over an array of numbers, which the CPU does very fast. Total: about 0.1 s.",
+    "set": {
+     "q": {
+      "label": "SELECT SUM(amount)",
+      "tone": "ok",
+      "sub": "= 77,000,000 in 0.1 s"
+     }
+    }
+   },
+   {
+    "say": "The cost: one INSERT must update every column file. A row store changes 1 page; this table changes 3 files.",
+    "msgs": [
+     {
+      "from": "ins",
+      "to": "ci",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "ins",
+      "to": "cc",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "ins",
+      "to": "ca",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "ci": {
+      "label": "id.col",
+      "tone": "warn",
+      "sub": "+1 value"
+     },
+     "cc": {
+      "label": "country.col",
+      "tone": "warn",
+      "sub": "+1 value"
+     },
+     "ca": {
+      "label": "amount.col",
+      "tone": "warn",
+      "sub": "+1 value"
+     }
+    }
+   },
+   {
+    "say": "So column stores batch many rows into one big write. They are great for analytics (read few columns, many rows) and poor for single-row updates.",
+    "set": {
+     "ci": {
+      "label": "id.col",
+      "tone": "normal"
+     },
+     "cc": {
+      "label": "country.col",
+      "tone": "normal"
+     },
+     "ca": {
+      "label": "amount.col",
+      "tone": "normal"
+     },
+     "ins": {
+      "label": "INSERT row",
+      "tone": "warn",
+      "sub": "batch 100k rows"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "inverted-index",
+  "concept": "invindex",
+  "title": "Building and querying a word index",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "dc",
+    "label": "Documents",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 100
+   },
+   {
+    "id": "ix",
+    "label": "Inverted index: word to list of document ids",
+    "x": 20,
+    "y": 135,
+    "w": 680,
+    "h": 150
+   },
+   {
+    "id": "qg",
+    "label": "Query",
+    "x": 20,
+    "y": 300,
+    "w": 680,
+    "h": 80
+   }
+  ],
+  "actors": [
+   {
+    "id": "d1",
+    "label": "doc 1",
+    "x": 50,
+    "y": 52,
+    "w": 170,
+    "h": 48,
+    "shape": "cell",
+    "sub": "red fox runs"
+   },
+   {
+    "id": "d2",
+    "label": "doc 2",
+    "x": 270,
+    "y": 52,
+    "w": 170,
+    "h": 48,
+    "shape": "cell",
+    "sub": "red car"
+   },
+   {
+    "id": "d3",
+    "label": "doc 3",
+    "x": 490,
+    "y": 52,
+    "w": 170,
+    "h": 48,
+    "shape": "cell",
+    "sub": "fox and car"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "We have 3 documents. A scan for 'red fox' would read all of them. With 100 million documents that is far too slow.",
+    "focus": [
+     "d1",
+     "d2",
+     "d3"
+    ]
+   },
+   {
+    "say": "Index doc 1: split the text into words and add doc 1 to each word's list (the posting list).",
+    "msgs": [
+     {
+      "from": "d1",
+      "to": "w_red",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "d1",
+      "to": "w_fox",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "d1",
+      "to": "w_runs",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "add": [
+     {
+      "id": "w_red",
+      "label": "red",
+      "x": 40,
+      "y": 175,
+      "w": 150,
+      "h": 44,
+      "shape": "cell",
+      "sub": "1"
+     },
+     {
+      "id": "w_fox",
+      "label": "fox",
+      "x": 210,
+      "y": 175,
+      "w": 150,
+      "h": 44,
+      "shape": "cell",
+      "sub": "1"
+     },
+     {
+      "id": "w_runs",
+      "label": "runs",
+      "x": 380,
+      "y": 175,
+      "w": 150,
+      "h": 44,
+      "shape": "cell",
+      "sub": "1"
+     }
+    ]
+   },
+   {
+    "say": "Index doc 2: 'red' gets a second entry, and 'car' is a new word.",
+    "msgs": [
+     {
+      "from": "d2",
+      "to": "w_red",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "d2",
+      "to": "w_car",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "w_red": {
+      "label": "red",
+      "tone": "accent",
+      "sub": "1, 2"
+     }
+    },
+    "add": [
+     {
+      "id": "w_car",
+      "label": "car",
+      "x": 550,
+      "y": 175,
+      "w": 130,
+      "h": 44,
+      "shape": "cell",
+      "sub": "2"
+     }
+    ]
+   },
+   {
+    "say": "Index doc 3: 'fox' gets doc 3, 'car' gets doc 3. Lists stay sorted by id.",
+    "msgs": [
+     {
+      "from": "d3",
+      "to": "w_fox",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "d3",
+      "to": "w_car",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "w_fox": {
+      "label": "fox",
+      "tone": "accent",
+      "sub": "1, 3"
+     },
+     "w_car": {
+      "label": "car",
+      "tone": "accent",
+      "sub": "2, 3"
+     }
+    }
+   },
+   {
+    "say": "Query 'red AND fox'. We look up each word directly. No document is read yet.",
+    "msgs": [
+     {
+      "from": "q",
+      "to": "w_red",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "q",
+      "to": "w_fox",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "add": [
+     {
+      "id": "q",
+      "label": "red AND fox",
+      "x": 40,
+      "y": 330,
+      "w": 160,
+      "h": 40,
+      "shape": "round"
+     },
+     {
+      "id": "res",
+      "label": "Result",
+      "x": 260,
+      "y": 330,
+      "w": 400,
+      "h": 40,
+      "shape": "box",
+      "sub": "waiting"
+     }
+    ]
+   },
+   {
+    "say": "Merge the two sorted lists: {1, 2} and {1, 3} share only doc 1. Cost depends on list length, not on the number of documents.",
+    "msgs": [
+     {
+      "from": "w_red",
+      "to": "res",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "w_fox",
+      "to": "res",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "res": {
+      "label": "Result",
+      "tone": "ok",
+      "sub": "doc 1"
+     }
+    }
+   },
+   {
+    "say": "Problem case: a common word. 'the' appears in 90 million of 100 million documents, so its list is huge. 'the AND fox' must walk a 90-million-entry list.",
+    "msgs": [
+     {
+      "from": "q",
+      "to": "w_the",
+      "label": "the",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "res": {
+      "label": "Result",
+      "tone": "warn",
+      "sub": "walk 90M ids"
+     }
+    },
+    "add": [
+     {
+      "id": "w_the",
+      "label": "the",
+      "x": 40,
+      "y": 235,
+      "w": 640,
+      "h": 40,
+      "shape": "cell",
+      "sub": "1, 2, 3, ... 90,000,000 ids",
+      "tone": "bad"
+     }
+    ]
+   },
+   {
+    "say": "Fix: start from the shortest list ('fox', 2 ids) and jump through the long one with skip pointers. Search engines also drop very common words or score them low.",
+    "msgs": [
+     {
+      "from": "w_fox",
+      "to": "w_the",
+      "label": "probe 2 ids",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "w_the": {
+      "label": "the",
+      "tone": "warn",
+      "sub": "skip pointers"
+     },
+     "res": {
+      "label": "Result",
+      "tone": "ok",
+      "sub": "2 probes, not 90M"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "hash-join",
+  "concept": "joins",
+  "title": "Hash join and what happens when it spills",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "b",
+    "label": "Build side: small table users",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 100
+   },
+   {
+    "id": "h",
+    "label": "Hash table in memory",
+    "x": 20,
+    "y": 130,
+    "w": 680,
+    "h": 110
+   },
+   {
+    "id": "pr",
+    "label": "Probe side: big table orders",
+    "x": 20,
+    "y": 255,
+    "w": 680,
+    "h": 125
+   }
+  ],
+  "actors": [
+   {
+    "id": "u1",
+    "label": "user 1",
+    "x": 50,
+    "y": 54,
+    "w": 150,
+    "h": 44,
+    "shape": "cell",
+    "sub": "Ana"
+   },
+   {
+    "id": "u2",
+    "label": "user 2",
+    "x": 240,
+    "y": 54,
+    "w": 150,
+    "h": 44,
+    "shape": "cell",
+    "sub": "Ben"
+   },
+   {
+    "id": "u3",
+    "label": "user 3",
+    "x": 430,
+    "y": 54,
+    "w": 150,
+    "h": 44,
+    "shape": "cell",
+    "sub": "Cy"
+   },
+   {
+    "id": "h1",
+    "label": "bucket 1",
+    "x": 50,
+    "y": 170,
+    "w": 150,
+    "h": 50,
+    "shape": "box",
+    "sub": "empty"
+   },
+   {
+    "id": "h2",
+    "label": "bucket 2",
+    "x": 240,
+    "y": 170,
+    "w": 150,
+    "h": 50,
+    "shape": "box",
+    "sub": "empty"
+   },
+   {
+    "id": "h3",
+    "label": "bucket 3",
+    "x": 430,
+    "y": 170,
+    "w": 150,
+    "h": 50,
+    "shape": "box",
+    "sub": "empty"
+   },
+   {
+    "id": "o1",
+    "label": "order user=2",
+    "x": 50,
+    "y": 310,
+    "w": 150,
+    "h": 44,
+    "shape": "cell",
+    "sub": "$40"
+   },
+   {
+    "id": "o2",
+    "label": "order user=9",
+    "x": 240,
+    "y": 310,
+    "w": 150,
+    "h": 44,
+    "shape": "cell",
+    "sub": "$15"
+   },
+   {
+    "id": "o3",
+    "label": "order user=1",
+    "x": 430,
+    "y": 310,
+    "w": 150,
+    "h": 44,
+    "shape": "cell",
+    "sub": "$70"
+   },
+   {
+    "id": "res",
+    "label": "Output",
+    "x": 600,
+    "y": 170,
+    "w": 90,
+    "h": 50,
+    "shape": "box",
+    "sub": "0 rows"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "Join orders with users on user id. Step one: read the small table and put each user in a hash table in memory, keyed by user id.",
+    "msgs": [
+     {
+      "from": "u1",
+      "to": "h1",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "u2",
+      "to": "h2",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "u3",
+      "to": "h3",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "h1": {
+      "label": "bucket 1",
+      "tone": "accent",
+      "sub": "Ana"
+     },
+     "h2": {
+      "label": "bucket 2",
+      "tone": "accent",
+      "sub": "Ben"
+     },
+     "h3": {
+      "label": "bucket 3",
+      "tone": "accent",
+      "sub": "Cy"
+     }
+    }
+   },
+   {
+    "say": "Step two: stream the big table one row at a time. Order 1 has user=2. One hash lookup finds Ben, and we output (Ben, $40).",
+    "msgs": [
+     {
+      "from": "o1",
+      "to": "h2",
+      "label": "user 2",
+      "tone": "accent"
+     },
+     {
+      "from": "h2",
+      "to": "res",
+      "label": "Ben $40",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "res": {
+      "label": "Output",
+      "tone": "ok",
+      "sub": "1 row"
+     }
+    }
+   },
+   {
+    "say": "Order 2 has user=9. The lookup finds nothing, so the row is dropped. The big table is read once and never sorted.",
+    "msgs": [
+     {
+      "from": "o2",
+      "to": "h3",
+      "label": "user 9",
+      "tone": "muted"
+     }
+    ],
+    "set": {
+     "o2": {
+      "label": "order user=9",
+      "tone": "muted",
+      "sub": "no match"
+     }
+    }
+   },
+   {
+    "say": "Order 3 has user=1, which finds Ana. Output grows to 2 rows. Total cost: one pass over each table.",
+    "msgs": [
+     {
+      "from": "o3",
+      "to": "h1",
+      "label": "user 1",
+      "tone": "accent"
+     },
+     {
+      "from": "h1",
+      "to": "res",
+      "label": "Ana $70",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "res": {
+      "label": "Output",
+      "tone": "ok",
+      "sub": "2 rows"
+     }
+    }
+   },
+   {
+    "say": "Failure case: the 'small' table is really 20 GB, but the hash table has only 4 GB of memory. The hash table no longer fits.",
+    "set": {
+     "h1": {
+      "label": "bucket 1",
+      "tone": "bad",
+      "sub": "too big"
+     },
+     "h2": {
+      "label": "bucket 2",
+      "tone": "bad",
+      "sub": "too big"
+     },
+     "h3": {
+      "label": "bucket 3",
+      "tone": "bad",
+      "sub": "too big"
+     }
+    },
+    "add": [
+     {
+      "id": "sp",
+      "label": "spill files",
+      "x": 600,
+      "y": 310,
+      "w": 90,
+      "h": 44,
+      "shape": "db",
+      "sub": "8 parts",
+      "tone": "bad"
+     }
+    ]
+   },
+   {
+    "say": "The join spills: both tables are split by hash into 8 partitions and written to disk. Each partition pair is joined alone. Every byte is now written and read again, about 3 times the I/O.",
+    "msgs": [
+     {
+      "from": "h2",
+      "to": "sp",
+      "label": "write parts",
+      "tone": "bad"
+     },
+     {
+      "from": "o2",
+      "to": "sp",
+      "label": "write parts",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "res": {
+      "label": "Output",
+      "tone": "warn",
+      "sub": "3x slower"
+     }
+    }
+   },
+   {
+    "say": "Fix: the optimizer picks the smaller input as the build side, filters it first, or sends the small table to every worker (broadcast). If both are big, it uses a sort-merge join instead.",
+    "set": {
+     "h1": {
+      "label": "bucket 1",
+      "tone": "ok",
+      "sub": "fits"
+     },
+     "h2": {
+      "label": "bucket 2",
+      "tone": "ok",
+      "sub": "fits"
+     },
+     "h3": {
+      "label": "bucket 3",
+      "tone": "ok",
+      "sub": "fits"
+     },
+     "res": {
+      "label": "Output",
+      "tone": "ok",
+      "sub": "fast again"
+     }
+    },
+    "remove": [
+     "sp"
+    ]
+   }
+  ]
+ },
+ {
+  "id": "shuffle-skew",
+  "concept": "shuffle",
+  "title": "Shuffle and a skewed key",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "mp",
+    "label": "Map side: read and group by country",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 100
+   },
+   {
+    "id": "sf",
+    "label": "Shuffle files on disk (one per mapper)",
+    "x": 20,
+    "y": 130,
+    "w": 680,
+    "h": 85
+   },
+   {
+    "id": "rd",
+    "label": "Reduce side: one partition per reducer",
+    "x": 20,
+    "y": 230,
+    "w": 680,
+    "h": 150
+   }
+  ],
+  "actors": [
+   {
+    "id": "m1",
+    "label": "mapper 1",
+    "x": 50,
+    "y": 52,
+    "w": 170,
+    "h": 46,
+    "shape": "box",
+    "sub": "split 1"
+   },
+   {
+    "id": "m2",
+    "label": "mapper 2",
+    "x": 270,
+    "y": 52,
+    "w": 170,
+    "h": 46,
+    "shape": "box",
+    "sub": "split 2"
+   },
+   {
+    "id": "m3",
+    "label": "mapper 3",
+    "x": 490,
+    "y": 52,
+    "w": 170,
+    "h": 46,
+    "shape": "box",
+    "sub": "split 3"
+   },
+   {
+    "id": "s1",
+    "label": "map-1.shuffle",
+    "x": 50,
+    "y": 166,
+    "w": 170,
+    "h": 38,
+    "shape": "db"
+   },
+   {
+    "id": "s2",
+    "label": "map-2.shuffle",
+    "x": 270,
+    "y": 166,
+    "w": 170,
+    "h": 38,
+    "shape": "db"
+   },
+   {
+    "id": "s3",
+    "label": "map-3.shuffle",
+    "x": 490,
+    "y": 166,
+    "w": 170,
+    "h": 38,
+    "shape": "db"
+   },
+   {
+    "id": "r0",
+    "label": "reducer 0",
+    "x": 50,
+    "y": 290,
+    "w": 170,
+    "h": 60,
+    "shape": "box",
+    "sub": "waiting"
+   },
+   {
+    "id": "r1",
+    "label": "reducer 1",
+    "x": 270,
+    "y": 290,
+    "w": 170,
+    "h": 60,
+    "shape": "box",
+    "sub": "waiting"
+   },
+   {
+    "id": "r2",
+    "label": "reducer 2",
+    "x": 490,
+    "y": 290,
+    "w": 170,
+    "h": 60,
+    "shape": "box",
+    "sub": "waiting"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "Each mapper reads its own piece of the orders table. Most rows (70%) have country = US.",
+    "set": {
+     "m1": {
+      "label": "mapper 1",
+      "tone": "accent",
+      "sub": "US US US IN"
+     },
+     "m2": {
+      "label": "mapper 2",
+      "tone": "accent",
+      "sub": "US US DE US"
+     },
+     "m3": {
+      "label": "mapper 3",
+      "tone": "accent",
+      "sub": "US IN US US"
+     }
+    }
+   },
+   {
+    "say": "Each mapper hashes the key (country) and splits its rows into 3 groups. It writes them to one local file. hash(US) mod 3 = 1, so every US row goes to group 1.",
+    "msgs": [
+     {
+      "from": "m1",
+      "to": "s1",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "m2",
+      "to": "s2",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "m3",
+      "to": "s3",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "s1": {
+      "label": "map-1.shuffle",
+      "tone": "accent",
+      "sub": "g0 | g1 | g2"
+     },
+     "s2": {
+      "label": "map-2.shuffle",
+      "tone": "accent",
+      "sub": "g0 | g1 | g2"
+     },
+     "s3": {
+      "label": "map-3.shuffle",
+      "tone": "accent",
+      "sub": "g0 | g1 | g2"
+     }
+    }
+   },
+   {
+    "say": "Now the shuffle: each reducer fetches its group from all 3 files over the network. Same key always lands on the same reducer.",
+    "msgs": [
+     {
+      "from": "s1",
+      "to": "r0",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "s2",
+      "to": "r1",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "s3",
+      "to": "r2",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "s2",
+      "to": "r0",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "s1",
+      "to": "r1",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "s3",
+      "to": "r1",
+      "label": "",
+      "tone": "accent"
+     }
+    ]
+   },
+   {
+    "say": "The skew shows up: reducer 1 got every US row, 900 MB. The others got 10 MB (reducer 0) and 90 MB (reducer 2).",
+    "set": {
+     "r0": {
+      "label": "reducer 0",
+      "tone": "ok",
+      "sub": "10 MB"
+     },
+     "r1": {
+      "label": "reducer 1",
+      "tone": "bad",
+      "sub": "900 MB"
+     },
+     "r2": {
+      "label": "reducer 2",
+      "tone": "ok",
+      "sub": "90 MB"
+     }
+    }
+   },
+   {
+    "say": "Reducers 0 and 2 finish in 3 seconds and sit idle. Reducer 1 needs 60 seconds and may run out of memory. The whole stage takes as long as its slowest task.",
+    "set": {
+     "r0": {
+      "label": "reducer 0",
+      "tone": "muted",
+      "sub": "done in 3 s"
+     },
+     "r2": {
+      "label": "reducer 2",
+      "tone": "muted",
+      "sub": "done in 5 s"
+     },
+     "r1": {
+      "label": "reducer 1",
+      "tone": "warn",
+      "sub": "still running at 60 s"
+     }
+    }
+   },
+   {
+    "say": "Fix: salting. Add a random suffix to the hot key: US_0, US_1, US_2. Now the US rows spread over all reducers, 300 MB each.",
+    "msgs": [
+     {
+      "from": "s2",
+      "to": "r0",
+      "label": "US_0",
+      "tone": "accent"
+     },
+     {
+      "from": "s2",
+      "to": "r1",
+      "label": "US_1",
+      "tone": "accent"
+     },
+     {
+      "from": "s2",
+      "to": "r2",
+      "label": "US_2",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "r0": {
+      "label": "reducer 0",
+      "tone": "accent",
+      "sub": "US_0 300 MB"
+     },
+     "r1": {
+      "label": "reducer 1",
+      "tone": "accent",
+      "sub": "US_1 300 MB"
+     },
+     "r2": {
+      "label": "reducer 2",
+      "tone": "accent",
+      "sub": "US_2 300 MB"
+     }
+    }
+   },
+   {
+    "say": "A second small step adds the three partial sums into one US total. The stage now takes about 20 s instead of 60 s, at the price of an extra step.",
+    "set": {
+     "r0": {
+      "label": "reducer 0",
+      "tone": "ok",
+      "sub": "20 s"
+     },
+     "r1": {
+      "label": "reducer 1",
+      "tone": "ok",
+      "sub": "20 s"
+     },
+     "r2": {
+      "label": "reducer 2",
+      "tone": "ok",
+      "sub": "20 s"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "aqe-replan",
+  "concept": "aqe",
+  "title": "Re-planning a query while it runs",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "pl",
+    "label": "Plan made before the run (from guessed sizes)",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 105
+   },
+   {
+    "id": "rt",
+    "label": "Facts learned at run time",
+    "x": 20,
+    "y": 140,
+    "w": 680,
+    "h": 85
+   },
+   {
+    "id": "np",
+    "label": "Plan changed by AQE",
+    "x": 20,
+    "y": 240,
+    "w": 680,
+    "h": 140
+   }
+  ],
+  "actors": [
+   {
+    "id": "p1",
+    "label": "scan users",
+    "x": 40,
+    "y": 56,
+    "w": 190,
+    "h": 50,
+    "shape": "box",
+    "sub": "guess: 2 GB"
+   },
+   {
+    "id": "p2",
+    "label": "scan orders",
+    "x": 265,
+    "y": 56,
+    "w": 190,
+    "h": 50,
+    "shape": "box",
+    "sub": "guess: 50 GB"
+   },
+   {
+    "id": "p3",
+    "label": "sort-merge join",
+    "x": 490,
+    "y": 56,
+    "w": 190,
+    "h": 50,
+    "shape": "box",
+    "sub": "200 shuffle parts"
+   },
+   {
+    "id": "st",
+    "label": "stage 1 stats",
+    "x": 230,
+    "y": 170,
+    "w": 260,
+    "h": 46,
+    "shape": "note",
+    "sub": "not run yet"
+   }
+  ],
+  "links": [
+   {
+    "from": "p1",
+    "to": "p3",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "p2",
+    "to": "p3",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "The planner has only old table statistics. It guesses users = 2 GB, too big to broadcast, so it plans a sort-merge join: shuffle both sides into 200 partitions.",
+    "focus": [
+     "p1",
+     "p3"
+    ]
+   },
+   {
+    "say": "Stage 1 runs: scan users with the filter country = 'IN'. The real result is only 8 MB, not 2 GB.",
+    "msgs": [
+     {
+      "from": "p1",
+      "to": "st",
+      "label": "8 MB",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "st": {
+      "label": "stage 1 stats",
+      "tone": "ok",
+      "sub": "users after filter: 8 MB"
+     },
+     "p1": {
+      "label": "scan users",
+      "tone": "ok",
+      "sub": "actual: 8 MB"
+     }
+    }
+   },
+   {
+    "say": "AQE sees 8 MB, below the 10 MB broadcast limit. It drops the sort-merge join and plans a broadcast join: send the 8 MB to every worker. The 50 GB orders table is never shuffled.",
+    "msgs": [
+     {
+      "from": "st",
+      "to": "j2",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "p3": {
+      "label": "sort-merge join",
+      "tone": "muted",
+      "sub": "discarded"
+     }
+    },
+    "add": [
+     {
+      "id": "j2",
+      "label": "broadcast join",
+      "x": 40,
+      "y": 285,
+      "w": 200,
+      "h": 56,
+      "shape": "box",
+      "sub": "8 MB to each worker",
+      "tone": "ok"
+     }
+    ]
+   },
+   {
+    "say": "Next, an aggregation made 200 shuffle partitions of only 0.5 MB each. 200 tiny tasks waste more time starting than working. AQE merges them into 5 tasks of about 20 MB.",
+    "msgs": [
+     {
+      "from": "st",
+      "to": "c2",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "add": [
+     {
+      "id": "c2",
+      "label": "coalesce",
+      "x": 265,
+      "y": 285,
+      "w": 190,
+      "h": 56,
+      "shape": "box",
+      "sub": "200 parts to 5",
+      "tone": "ok"
+     }
+    ]
+   },
+   {
+    "say": "Then it finds a skewed partition: one holds 4 GB while the median is 40 MB. AQE splits it into 40 pieces of 100 MB, so no single task runs for minutes.",
+    "msgs": [
+     {
+      "from": "st",
+      "to": "k2",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "add": [
+     {
+      "id": "k2",
+      "label": "split skew",
+      "x": 490,
+      "y": 285,
+      "w": 190,
+      "h": 56,
+      "shape": "box",
+      "sub": "1 part to 40",
+      "tone": "ok"
+     }
+    ]
+   },
+   {
+    "say": "Result: the query that took 12 minutes with the first plan finishes in about 3 minutes, using real sizes instead of guesses.",
+    "set": {
+     "st": {
+      "label": "stage 1 stats",
+      "tone": "ok",
+      "sub": "12 min to 3 min"
+     }
+    }
+   },
+   {
+    "say": "The limit: AQE can only change what has not started. Stage 1 ran on the old plan, and facts appear only after a shuffle finishes. A bad first stage cannot be undone.",
+    "set": {
+     "p2": {
+      "label": "scan orders",
+      "tone": "warn",
+      "sub": "already planned"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "volcano-pull",
+  "concept": "volcano",
+  "title": "One row at a time, pulled by next()",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "op",
+    "label": "Operators: each calls next() on the one below",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 120
+   },
+   {
+    "id": "tb",
+    "label": "Table orders (id, amount)",
+    "x": 20,
+    "y": 155,
+    "w": 680,
+    "h": 90
+   },
+   {
+    "id": "out",
+    "label": "Output and cost",
+    "x": 20,
+    "y": 260,
+    "w": 680,
+    "h": 120
+   }
+  ],
+  "actors": [
+   {
+    "id": "pj",
+    "label": "Project id",
+    "x": 40,
+    "y": 56,
+    "w": 170,
+    "h": 50,
+    "shape": "box",
+    "sub": "SELECT id"
+   },
+   {
+    "id": "fl",
+    "label": "Filter",
+    "x": 275,
+    "y": 56,
+    "w": 170,
+    "h": 50,
+    "shape": "box",
+    "sub": "amount > 10"
+   },
+   {
+    "id": "sn",
+    "label": "Scan",
+    "x": 510,
+    "y": 56,
+    "w": 170,
+    "h": 50,
+    "shape": "box",
+    "sub": "orders"
+   },
+   {
+    "id": "t1",
+    "label": "(1, 50)",
+    "x": 40,
+    "y": 190,
+    "w": 140,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "t2",
+    "label": "(2, 5)",
+    "x": 210,
+    "y": 190,
+    "w": 140,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "t3",
+    "label": "(3, 70)",
+    "x": 380,
+    "y": 190,
+    "w": 140,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "t4",
+    "label": "(4, 3)",
+    "x": 550,
+    "y": 190,
+    "w": 130,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "out",
+    "label": "Output",
+    "x": 40,
+    "y": 310,
+    "w": 200,
+    "h": 46,
+    "shape": "box",
+    "sub": "empty"
+   },
+   {
+    "id": "ct",
+    "label": "next() calls",
+    "x": 300,
+    "y": 310,
+    "w": 380,
+    "h": 46,
+    "shape": "note",
+    "sub": "0 calls"
+   }
+  ],
+  "links": [
+   {
+    "from": "pj",
+    "to": "fl",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "fl",
+    "to": "sn",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "The top operator asks for a row: next(). Project asks Filter, Filter asks Scan. Nothing moves until someone asks.",
+    "msgs": [
+     {
+      "from": "pj",
+      "to": "fl",
+      "label": "next()",
+      "tone": "accent"
+     },
+     {
+      "from": "fl",
+      "to": "sn",
+      "label": "next()",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "ct": {
+      "label": "next() calls",
+      "tone": "normal",
+      "sub": "2 calls"
+     }
+    }
+   },
+   {
+    "say": "Scan reads the first row (1, 50) and hands it up.",
+    "msgs": [
+     {
+      "from": "sn",
+      "to": "fl",
+      "label": "(1, 50)",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "t1": {
+      "label": "(1, 50)",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "50 is more than 10, so Filter passes the row up. Project keeps only the id and puts it in the output.",
+    "msgs": [
+     {
+      "from": "fl",
+      "to": "pj",
+      "label": "(1, 50)",
+      "tone": "ok"
+     },
+     {
+      "from": "pj",
+      "to": "out",
+      "label": "id=1",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "out": {
+      "label": "Output",
+      "tone": "ok",
+      "sub": "1"
+     },
+     "ct": {
+      "label": "next() calls",
+      "tone": "normal",
+      "sub": "3 calls for 1 row"
+     }
+    }
+   },
+   {
+    "say": "The user asks for more. Project calls next() again. Scan returns (2, 5), and Filter rejects it because 5 is not above 10.",
+    "msgs": [
+     {
+      "from": "pj",
+      "to": "fl",
+      "label": "next()",
+      "tone": "accent"
+     },
+     {
+      "from": "fl",
+      "to": "sn",
+      "label": "next()",
+      "tone": "accent"
+     },
+     {
+      "from": "sn",
+      "to": "fl",
+      "label": "(2, 5)",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "t2": {
+      "label": "(2, 5)",
+      "tone": "muted",
+      "sub": "rejected"
+     },
+     "ct": {
+      "label": "next() calls",
+      "tone": "normal",
+      "sub": "5 calls"
+     }
+    }
+   },
+   {
+    "say": "Filter asks Scan again on its own. Scan returns (3, 70), which passes. The output now has 1 and 3.",
+    "msgs": [
+     {
+      "from": "fl",
+      "to": "sn",
+      "label": "next()",
+      "tone": "accent"
+     },
+     {
+      "from": "sn",
+      "to": "fl",
+      "label": "(3, 70)",
+      "tone": "ok"
+     },
+     {
+      "from": "fl",
+      "to": "pj",
+      "label": "(3, 70)",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "t3": {
+      "label": "(3, 70)",
+      "tone": "accent"
+     },
+     "out": {
+      "label": "Output",
+      "tone": "ok",
+      "sub": "1, 3"
+     },
+     "ct": {
+      "label": "next() calls",
+      "tone": "normal",
+      "sub": "9 calls"
+     }
+    }
+   },
+   {
+    "say": "Last row (4, 3) is rejected too. Scan then answers end of data and the end signal travels up through every operator.",
+    "msgs": [
+     {
+      "from": "sn",
+      "to": "fl",
+      "label": "(4, 3)",
+      "tone": "bad"
+     },
+     {
+      "from": "sn",
+      "to": "fl",
+      "label": "END",
+      "tone": "muted"
+     }
+    ],
+    "set": {
+     "t4": {
+      "label": "(4, 3)",
+      "tone": "muted",
+      "sub": "rejected"
+     }
+    }
+   },
+   {
+    "say": "Cost: 4 rows needed about 12 function calls. At 1 billion rows with 3 operators that is billions of calls, each with a virtual jump that stalls the CPU.",
+    "set": {
+     "ct": {
+      "label": "next() calls",
+      "tone": "bad",
+      "sub": "~3 per row per operator"
+     },
+     "pj": {
+      "label": "Project id",
+      "tone": "warn"
+     },
+     "fl": {
+      "label": "Filter",
+      "tone": "warn"
+     },
+     "sn": {
+      "label": "Scan",
+      "tone": "warn"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "vectorized-batch",
+  "concept": "vectorized",
+  "title": "The same query, 1,024 rows at a time",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "op",
+    "label": "Operators: next() returns a batch",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 120
+   },
+   {
+    "id": "vc",
+    "label": "Column vectors in CPU cache",
+    "x": 20,
+    "y": 155,
+    "w": 680,
+    "h": 90
+   },
+   {
+    "id": "out",
+    "label": "Output and cost",
+    "x": 20,
+    "y": 260,
+    "w": 680,
+    "h": 120
+   }
+  ],
+  "actors": [
+   {
+    "id": "pj",
+    "label": "Project id",
+    "x": 40,
+    "y": 56,
+    "w": 170,
+    "h": 50,
+    "shape": "box",
+    "sub": "SELECT id"
+   },
+   {
+    "id": "fl",
+    "label": "Filter",
+    "x": 275,
+    "y": 56,
+    "w": 170,
+    "h": 50,
+    "shape": "box",
+    "sub": "amount > 10"
+   },
+   {
+    "id": "sn",
+    "label": "Scan",
+    "x": 510,
+    "y": 56,
+    "w": 170,
+    "h": 50,
+    "shape": "box",
+    "sub": "orders"
+   },
+   {
+    "id": "va",
+    "label": "amount vector",
+    "x": 40,
+    "y": 190,
+    "w": 300,
+    "h": 44,
+    "shape": "cell"
+   },
+   {
+    "id": "sv",
+    "label": "selection vector",
+    "x": 380,
+    "y": 190,
+    "w": 300,
+    "h": 44,
+    "shape": "cell"
+   },
+   {
+    "id": "out",
+    "label": "Output",
+    "x": 40,
+    "y": 310,
+    "w": 200,
+    "h": 46,
+    "shape": "box",
+    "sub": "empty"
+   },
+   {
+    "id": "ct",
+    "label": "next() calls",
+    "x": 300,
+    "y": 310,
+    "w": 380,
+    "h": 46,
+    "shape": "note",
+    "sub": "0 calls"
+   }
+  ],
+  "links": [
+   {
+    "from": "pj",
+    "to": "fl",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "fl",
+    "to": "sn",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "Same query, new idea: each next() returns a batch of 1,024 rows, not one row. Project asks Filter, Filter asks Scan, once.",
+    "msgs": [
+     {
+      "from": "pj",
+      "to": "fl",
+      "label": "next()",
+      "tone": "accent"
+     },
+     {
+      "from": "fl",
+      "to": "sn",
+      "label": "next()",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "ct": {
+      "label": "next() calls",
+      "tone": "normal",
+      "sub": "2 calls"
+     }
+    }
+   },
+   {
+    "say": "Scan returns the amount column for rows 1 to 1,024 as a plain array of numbers.",
+    "msgs": [
+     {
+      "from": "sn",
+      "to": "fl",
+      "label": "batch 1024",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "va": {
+      "label": "amount vector",
+      "tone": "accent",
+      "sub": "50 5 70 3 ... 1024 values"
+     }
+    }
+   },
+   {
+    "say": "Filter runs one tight loop over the array: is each value above 10? The CPU can test 8 values in one SIMD instruction, and the array sits in cache.",
+    "set": {
+     "fl": {
+      "label": "Filter",
+      "tone": "accent",
+      "sub": "loop over 1024"
+     }
+    },
+    "focus": [
+     "va"
+    ]
+   },
+   {
+    "say": "The result is a selection vector: positions 0, 2, ... that passed. The data is not copied, only the list of survivors moves on.",
+    "msgs": [
+     {
+      "from": "fl",
+      "to": "pj",
+      "label": "batch + selection",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "sv": {
+      "label": "selection vector",
+      "tone": "ok",
+      "sub": "0 2 ... 612 positions"
+     }
+    }
+   },
+   {
+    "say": "Project takes the id column for those positions and writes the output. Total: 3 next() calls for 1,024 rows. The row-at-a-time engine needed about 3,000.",
+    "msgs": [
+     {
+      "from": "pj",
+      "to": "out",
+      "label": "612 ids",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "out": {
+      "label": "Output",
+      "tone": "ok",
+      "sub": "612 ids"
+     },
+     "ct": {
+      "label": "next() calls",
+      "tone": "ok",
+      "sub": "3 calls (was ~3,000)"
+     }
+    }
+   },
+   {
+    "say": "Cost case: a very selective filter passes only 3 of 1,024 rows. Later operators now get nearly empty batches and lose the benefit, so engines compact batches or fuse operators.",
+    "set": {
+     "sv": {
+      "label": "selection vector",
+      "tone": "warn",
+      "sub": "only 3 positions"
+     },
+     "out": {
+      "label": "Output",
+      "tone": "warn",
+      "sub": "tiny batch"
+     }
+    }
+   },
+   {
+    "say": "It also needs column-friendly data, such as Parquet. Most modern engines (DuckDB, Photon, ClickHouse) use batches for this reason.",
+    "set": {
+     "fl": {
+      "label": "Filter",
+      "tone": "ok"
+     },
+     "ct": {
+      "label": "next() calls",
+      "tone": "ok",
+      "sub": "~100x fewer calls"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "cdc-log-tail",
+  "concept": "cdc",
+  "title": "Reading the database log as a stream",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "db",
+    "label": "Source database",
+    "x": 20,
+    "y": 20,
+    "w": 330,
+    "h": 360
+   },
+   {
+    "id": "tp",
+    "label": "Kafka topic orders",
+    "x": 370,
+    "y": 20,
+    "w": 330,
+    "h": 170
+   },
+   {
+    "id": "sk",
+    "label": "Search index (copy)",
+    "x": 370,
+    "y": 205,
+    "w": 330,
+    "h": 175
+   }
+  ],
+  "actors": [
+   {
+    "id": "tb",
+    "label": "orders table",
+    "x": 40,
+    "y": 56,
+    "w": 290,
+    "h": 44,
+    "shape": "db",
+    "sub": "id=7 not yet"
+   },
+   {
+    "id": "cn",
+    "label": "CDC connector",
+    "x": 110,
+    "y": 320,
+    "w": 150,
+    "h": 50,
+    "shape": "round",
+    "sub": "offset: none"
+   },
+   {
+    "id": "ix",
+    "label": "index",
+    "x": 390,
+    "y": 260,
+    "w": 290,
+    "h": 50,
+    "shape": "db",
+    "sub": "empty"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "The app inserts order 7 for $40. The database appends the change to its write-ahead log. This log exists anyway, for crash recovery.",
+    "msgs": [
+     {
+      "from": "tb",
+      "to": "w1",
+      "label": "log",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "tb": {
+      "label": "orders table",
+      "tone": "accent",
+      "sub": "id=7, $40"
+     }
+    },
+    "add": [
+     {
+      "id": "w1",
+      "label": "LSN 100 INSERT id=7 $40",
+      "x": 40,
+      "y": 125,
+      "w": 290,
+      "h": 36,
+      "shape": "note"
+     }
+    ]
+   },
+   {
+    "say": "Two more changes arrive: id=7 goes to $55 (LSN 101), then id=7 is deleted (LSN 102). The log keeps every step in order.",
+    "msgs": [
+     {
+      "from": "tb",
+      "to": "w2",
+      "label": "log",
+      "tone": "accent"
+     },
+     {
+      "from": "tb",
+      "to": "w3",
+      "label": "log",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "tb": {
+      "label": "orders table",
+      "tone": "muted",
+      "sub": "id=7 gone"
+     }
+    },
+    "add": [
+     {
+      "id": "w2",
+      "label": "LSN 101 UPDATE id=7 $55",
+      "x": 40,
+      "y": 170,
+      "w": 290,
+      "h": 36,
+      "shape": "note"
+     },
+     {
+      "id": "w3",
+      "label": "LSN 102 DELETE id=7",
+      "x": 40,
+      "y": 215,
+      "w": 290,
+      "h": 36,
+      "shape": "note"
+     }
+    ]
+   },
+   {
+    "say": "The connector tails the log like tail -f. It reads LSN 100 without querying the table, so the app sees no extra load. It remembers its offset.",
+    "msgs": [
+     {
+      "from": "w1",
+      "to": "cn",
+      "label": "read",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "cn": {
+      "label": "CDC connector",
+      "tone": "accent",
+      "sub": "offset: LSN 100"
+     }
+    }
+   },
+   {
+    "say": "It publishes the change as an event to the Kafka topic, keyed by id=7 so all events for one order stay in order.",
+    "msgs": [
+     {
+      "from": "cn",
+      "to": "e0",
+      "label": "publish",
+      "tone": "accent"
+     }
+    ],
+    "add": [
+     {
+      "id": "e0",
+      "label": "k=7 insert $40",
+      "x": 390,
+      "y": 56,
+      "w": 290,
+      "h": 34,
+      "shape": "cell"
+     }
+    ]
+   },
+   {
+    "say": "The connector moves on and publishes the update and the delete as well.",
+    "msgs": [
+     {
+      "from": "w2",
+      "to": "cn",
+      "label": "read",
+      "tone": "accent"
+     },
+     {
+      "from": "w3",
+      "to": "cn",
+      "label": "read",
+      "tone": "accent"
+     },
+     {
+      "from": "cn",
+      "to": "e1",
+      "label": "publish",
+      "tone": "accent"
+     },
+     {
+      "from": "cn",
+      "to": "e2",
+      "label": "publish",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "cn": {
+      "label": "CDC connector",
+      "tone": "accent",
+      "sub": "offset: LSN 102"
+     }
+    },
+    "add": [
+     {
+      "id": "e1",
+      "label": "k=7 update $55",
+      "x": 390,
+      "y": 98,
+      "w": 290,
+      "h": 34,
+      "shape": "cell"
+     },
+     {
+      "id": "e2",
+      "label": "k=7 delete",
+      "x": 390,
+      "y": 140,
+      "w": 290,
+      "h": 34,
+      "shape": "cell"
+     }
+    ]
+   },
+   {
+    "say": "A consumer applies the events in order. The index shows $40, then $55, then the row is removed. The copy follows the database within seconds.",
+    "msgs": [
+     {
+      "from": "e0",
+      "to": "ix",
+      "label": "$40",
+      "tone": "accent"
+     },
+     {
+      "from": "e1",
+      "to": "ix",
+      "label": "$55",
+      "tone": "accent"
+     },
+     {
+      "from": "e2",
+      "to": "ix",
+      "label": "delete",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "ix": {
+      "label": "index",
+      "tone": "ok",
+      "sub": "id=7 removed"
+     }
+    }
+   },
+   {
+    "say": "Failure: the connector crashes after publishing LSN 101 but before saving its offset. The DB must keep log files until the connector returns, so disk can fill up.",
+    "set": {
+     "cn": {
+      "label": "CDC connector",
+      "tone": "bad",
+      "sub": "crashed, saved offset: LSN 100"
+     }
+    }
+   },
+   {
+    "say": "On restart it resumes from the saved offset and publishes the update (LSN 101) again. This is at-least-once delivery. The consumer ignores it, because it has already applied LSN 101 for key 7.",
+    "msgs": [
+     {
+      "from": "w2",
+      "to": "cn",
+      "label": "re-read",
+      "tone": "accent"
+     },
+     {
+      "from": "cn",
+      "to": "e1",
+      "label": "duplicate",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "cn": {
+      "label": "CDC connector",
+      "tone": "ok",
+      "sub": "resumed"
+     },
+     "ix": {
+      "label": "index",
+      "tone": "ok",
+      "sub": "duplicate ignored"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "commit-log-replicas",
+  "concept": "commitlog",
+  "title": "A partition log, replicas and consumers",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "ld",
+    "label": "Leader broker: partition 0 (append only)",
+    "x": 20,
+    "y": 20,
+    "w": 680,
+    "h": 105
+   },
+   {
+    "id": "fl",
+    "label": "Follower broker: copy of partition 0",
+    "x": 20,
+    "y": 135,
+    "w": 680,
+    "h": 100
+   },
+   {
+    "id": "cs",
+    "label": "Consumers keep their own offsets",
+    "x": 20,
+    "y": 250,
+    "w": 680,
+    "h": 130
+   }
+  ],
+  "actors": [
+   {
+    "id": "pr",
+    "label": "Producer",
+    "x": 580,
+    "y": 56,
+    "w": 100,
+    "h": 44,
+    "shape": "round"
+   },
+   {
+    "id": "ca",
+    "label": "consumer A",
+    "x": 40,
+    "y": 300,
+    "w": 200,
+    "h": 56,
+    "shape": "round",
+    "sub": "not started"
+   },
+   {
+    "id": "cb",
+    "label": "consumer B",
+    "x": 270,
+    "y": 300,
+    "w": 200,
+    "h": 56,
+    "shape": "round",
+    "sub": "not started"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "A producer sends order events to partition 0. The leader appends each to the end of the log and gives it the next offset. Offset 0 is 'click'.",
+    "msgs": [
+     {
+      "from": "pr",
+      "to": "c0",
+      "label": "append",
+      "tone": "accent"
+     }
+    ],
+    "add": [
+     {
+      "id": "c0",
+      "label": "0 click",
+      "x": 40,
+      "y": 58,
+      "w": 95,
+      "h": 40,
+      "shape": "cell"
+     }
+    ]
+   },
+   {
+    "say": "Offsets 1 and 2 follow: 'cart' and 'pay'. The log is never edited, only appended, which is a fast sequential write.",
+    "msgs": [
+     {
+      "from": "pr",
+      "to": "c1",
+      "label": "append",
+      "tone": "accent"
+     },
+     {
+      "from": "pr",
+      "to": "c2",
+      "label": "append",
+      "tone": "accent"
+     }
+    ],
+    "add": [
+     {
+      "id": "c1",
+      "label": "1 cart",
+      "x": 145,
+      "y": 58,
+      "w": 95,
+      "h": 40,
+      "shape": "cell"
+     },
+     {
+      "id": "c2",
+      "label": "2 pay",
+      "x": 250,
+      "y": 58,
+      "w": 95,
+      "h": 40,
+      "shape": "cell"
+     }
+    ]
+   },
+   {
+    "say": "The follower broker copies the log, in the same order, and acknowledges. Now two machines hold offsets 0 to 2.",
+    "msgs": [
+     {
+      "from": "c0",
+      "to": "f0",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "c1",
+      "to": "f1",
+      "label": "",
+      "tone": "accent"
+     },
+     {
+      "from": "c2",
+      "to": "f2",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "add": [
+     {
+      "id": "f0",
+      "label": "0 click",
+      "x": 40,
+      "y": 173,
+      "w": 95,
+      "h": 40,
+      "shape": "cell"
+     },
+     {
+      "id": "f1",
+      "label": "1 cart",
+      "x": 145,
+      "y": 173,
+      "w": 95,
+      "h": 40,
+      "shape": "cell"
+     },
+     {
+      "id": "f2",
+      "label": "2 pay",
+      "x": 250,
+      "y": 173,
+      "w": 95,
+      "h": 40,
+      "shape": "cell"
+     }
+    ]
+   },
+   {
+    "say": "Consumer A reads from offset 0. It tracks its own position. Reading does not remove anything.",
+    "msgs": [
+     {
+      "from": "c0",
+      "to": "ca",
+      "label": "click",
+      "tone": "accent"
+     },
+     {
+      "from": "c1",
+      "to": "ca",
+      "label": "cart",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "ca": {
+      "label": "consumer A",
+      "tone": "accent",
+      "sub": "next offset: 2"
+     }
+    }
+   },
+   {
+    "say": "Consumer B starts later from offset 0 and reads the same events at its own speed. One log, many independent readers.",
+    "msgs": [
+     {
+      "from": "c0",
+      "to": "cb",
+      "label": "click",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "cb": {
+      "label": "consumer B",
+      "tone": "accent",
+      "sub": "next offset: 1"
+     }
+    }
+   },
+   {
+    "say": "The producer sends offset 3 'ship' with acks=1: the leader says OK before the follower has copied it.",
+    "msgs": [
+     {
+      "from": "pr",
+      "to": "c3",
+      "label": "append",
+      "tone": "accent"
+     },
+     {
+      "from": "c3",
+      "to": "pr",
+      "label": "OK",
+      "tone": "ok"
+     }
+    ],
+    "add": [
+     {
+      "id": "c3",
+      "label": "3 ship",
+      "x": 355,
+      "y": 58,
+      "w": 95,
+      "h": 40,
+      "shape": "cell",
+      "tone": "warn"
+     }
+    ]
+   },
+   {
+    "say": "The leader machine dies. Offset 3 existed only there, so it is lost, even though the producer was told OK. The follower holds offsets 0 to 2.",
+    "set": {
+     "c0": {
+      "label": "0 click",
+      "tone": "bad"
+     },
+     "c1": {
+      "label": "1 cart",
+      "tone": "bad"
+     },
+     "c2": {
+      "label": "2 pay",
+      "tone": "bad"
+     },
+     "c3": {
+      "label": "3 ship",
+      "tone": "bad",
+      "sub": "lost"
+     }
+    }
+   },
+   {
+    "say": "The follower becomes the new leader. Consumers continue from their saved offsets. With acks=all the leader waits for the follower, so offset 3 would have been safe.",
+    "set": {
+     "f0": {
+      "label": "0 click",
+      "tone": "ok"
+     },
+     "f1": {
+      "label": "1 cart",
+      "tone": "ok"
+     },
+     "f2": {
+      "label": "2 pay",
+      "tone": "ok"
+     },
+     "ca": {
+      "label": "consumer A",
+      "tone": "ok",
+      "sub": "resume at offset 2"
+     },
+     "cb": {
+      "label": "consumer B",
+      "tone": "ok",
+      "sub": "resume at offset 1"
+     }
+    }
+   }
+  ]
+ }
+]

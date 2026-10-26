@@ -29,6 +29,10 @@ for i in ids:
     if rd.get("quiz") and len(rd["quiz"]) < 5: probs.append(f"{len(rd['quiz'])} quiz questions (need 5)")
     if rd.get("terms") and len(rd["terms"]) < 6: probs.append(f"{len(rd['terms'])} terms (need 6+)")
     if len(n["refs"]) < 4: probs.append(f"{len(n['refs'])} sources (need 4+)")
+    lay = n.get("l", 9)
+    if not rd.get("tradeoffs"): probs.append("missing tradeoffs (required for every concept)")
+    if lay <= 3 and not rd.get("interview"): probs.append("missing interview (required for L0-L3)")
+    if rd.get("interview") and len(rd["interview"]) < 4: probs.append(f"{len(rd['interview'])} interview questions (need 4+)")
     if probs: bad += 1
     print(f"{'OK ' if not probs else '!! '} {i:22s} {w:5d} words  " + " ".join(f"{s}={sec_w[s]}" for s in kg.SECTIONS if sec_w[s]) + f" refs={len(n['refs'])}" + ("" if not probs else "\n     -> " + "; ".join(probs)))
 print(f"\n{len(ids)} concepts, {bad} below standard")

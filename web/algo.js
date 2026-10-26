@@ -1,6 +1,7 @@
 /* Down the Stack — Algorithms tab. Loaded after app.js (inlined after it in the standalone file).
    1. Visualizers: each algorithm runs once on your input and records every step as a frame, so Back works as well as Next.
    2. Practice: problems from DATA.practice; your code runs in a Web Worker with a 2-second limit.
+   3. Animations: a gallery of every animated scene (web/scene.js), grouped by layer; each opens its concept's read at the scene.
    app.js calls DTSAlgo.render(el, state.algo) and reads DTSAlgo.hash(state.algo); everything else is local to this file. */
 (function(){
 "use strict";
@@ -789,13 +790,39 @@ function resultsHTML(p, r){
 
 /* ---------------- view ---------------- */
 let EL = null;
-function hash(st){ return st.tab==="practice" ? "#practice/" + (st.prob || "list") : "#algo/" + (byId(st.viz) ? st.viz : V[0].id); }
+function hash(st){ return st.tab==="practice" ? "#practice/" + (st.prob || "list") : st.tab==="anim" ? "#animations" : "#algo/" + (byId(st.viz) ? st.viz : V[0].id); }
+/* ---------------- animations gallery ---------------- */
+const SC = { list:null, waiting:false, err:"" };
+function galleryHTML(){
+  const A = app(), N = A.N, all = (SC.list||[]).filter(s=>N[s.concept]);
+  if(!all.length) return `<h2 class="vh">Animations</h2><p class="vsub">${SC.err ? "Could not load the animations: " + esc(SC.err) : "No animated scenes yet. Add files to content/anim/ (the format is in content/anim/README.md) and run python3 tools/build.py."}</p>`;
+  const byL = [0,1,2,3,4,5].map(l=>all.filter(s=>N[s.concept].l===l).sort((a,b)=>N[a.concept].label.localeCompare(N[b.concept].label) || String(a.title).localeCompare(String(b.title))));
+  return `<h2 class="vh">Animations</h2><p class="vsub">${all.length} step-by-step animations of how things work: messages between machines, data moving between memory and disk, structures changing shape. Each one opens in its concept's read, where you can step through it.</p>` +
+    byL.map((list,l)=>list.length ? `<h3 class="ysec">L${l} · ${esc(A.LAYERS[l].n)} · ${list.length}</h3><div class="sc-gal">${list.map(s=>`<button type="button" class="sc-card" data-sceneopen="${esc(s.id)}" style="--c:${A.lc(l)}"><span class="sc-th" data-thumb="${esc(s.id)}" style="aspect-ratio:${+s.w||720}/${+s.h||400}"></span><span class="tt">${esc(s.title||s.id)}</span><span class="ts"><span class="sw"></span>${esc(N[s.concept].label)} · ${(s.steps||[]).length} steps</span></button>`).join("")}</div>` : "").join("");
+}
+function galleryThumbs(el){
+  if(!window.DTSScene) return;
+  const by = {}; (SC.list||[]).forEach(s=>by[s.id]=s);
+  const boxes = Array.from(el.querySelectorAll("[data-thumb]"));
+  // draw the thumbnails in small batches so a long gallery does not block the page
+  let i = 0; const batch = () => { const end = Math.min(boxes.length, i+12); for(; i<end; i++){ const b = boxes[i], s = by[b.dataset.thumb]; if(s && b.isConnected && !b.firstChild) try{ b.appendChild(window.DTSScene.thumb(s)); }catch(e){} } if(i<boxes.length) requestAnimationFrame(batch); };
+  batch();
+}
 function render(el, st){
   EL = el; bind(el);
   if(!byId(st.viz)) st.viz = V[0].id;
   try{ if(!app().R.open) history.replaceState(null, "", hash(st)); }catch(e){}
   const nprob = problems().length;
-  const tabs = `<div class="filters alg-tabs" role="group" aria-label="Algorithms"><button type="button" data-atab="viz" aria-pressed="${st.tab!=="practice"}">Visualizers · ${V.length}</button><button type="button" data-atab="practice" aria-pressed="${st.tab==="practice"}">Practice · ${nprob}</button></div>`;
+  const nscn = (app().SCENES||[]).length;
+  const tabs = `<div class="filters alg-tabs" role="group" aria-label="Algorithms"><button type="button" data-atab="viz" aria-pressed="${st.tab!=="practice"&&st.tab!=="anim"}">Visualizers · ${V.length}</button><button type="button" data-atab="practice" aria-pressed="${st.tab==="practice"}">Practice · ${nprob}</button><button type="button" data-atab="anim" aria-pressed="${st.tab==="anim"}">Animations · ${nscn}</button></div>`;
+  if(st.tab==="anim"){
+    if(!SC.list){ el.innerHTML = tabs + `<p class="empty">Loading the animations…</p>`;
+      if(!SC.waiting){ SC.waiting = true; app().Store.scenes().then(l=>{ SC.list = l||[]; }).catch(e=>{ SC.list = []; SC.err = e.message; }).then(()=>{ SC.waiting = false; const a = app(); if(a.state.view==="algorithms" && a.state.algo.tab==="anim" && !a.R.open) render(el, a.state.algo); }); }
+      return; }
+    el.innerHTML = tabs + `<div class="alg-anim">${galleryHTML()}</div>`;
+    galleryThumbs(el);
+    return;
+  }
   if(st.tab==="practice"){
     if(!PR.saved){ el.innerHTML = tabs + `<p class="empty">Loading your practice…</p>`; if(!PR.waiting){ PR.waiting = true; loadSaved().then(()=>{ PR.waiting = false; if(app().state.view==="algorithms") render(el, app().state.algo); }); } return; }
     const p = problems().find(x=>x.id===st.prob);
@@ -861,6 +888,6 @@ function bind(el){
   });
 }
 
-window.DTSAlgo = { render, hash, list:()=>V.map(v=>v.id), _P:P, _V:V, _run:runViz, _init:initVals };
+window.DTSAlgo = { render, hash, list:()=>V.map(v=>v.id), forConcept:id=>V.filter(v=>(v.concepts||[]).includes(id)).map(v=>({id:v.id, title:v.title})), _P:P, _V:V, _run:runViz, _init:initVals };
 if(window.__dts && window.__dts.algoReady) window.__dts.algoReady();
 })();

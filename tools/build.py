@@ -6,6 +6,8 @@
 Usage: python3 tools/build.py [--check] [--no-html]
 Environment: DTS_CONTENT_DB=path   write the database somewhere else (tests use a temp file)
              DTS_PRACTICE_FIXTURE=1 also load tests/fixtures/problems_sample.json (UI tests)
+             DTS_ANIM_FIXTURE=1 also load tests/fixtures/anim_sample.json (animated scenes for tests)
+             DTS_ANIM_DIR=path  read animated scenes from another folder instead of content/anim/
 """
 import glob, json, os, re, sqlite3, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -42,6 +44,9 @@ CREATE TABLE design_paragraphs (design_id TEXT NOT NULL REFERENCES designs(id), 
 CREATE TABLE design_sources (design_id TEXT NOT NULL REFERENCES designs(id), ord INTEGER NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, who TEXT NOT NULL, url TEXT NOT NULL, PRIMARY KEY (design_id, ord));
 -- practice problems: one JSON object per row (statement, tests, starter, solution, ...), in file order
 CREATE TABLE practice (id TEXT PRIMARY KEY, ord INTEGER NOT NULL, pattern TEXT NOT NULL, difficulty TEXT NOT NULL, body TEXT NOT NULL);
+-- animated scenes (content/anim/*.json, format in content/anim/README.md): one JSON object per row, in file order
+CREATE TABLE scenes (id TEXT PRIMARY KEY, concept TEXT NOT NULL REFERENCES nodes(id), ord INTEGER NOT NULL, title TEXT NOT NULL, steps INTEGER NOT NULL, body TEXT NOT NULL);
+CREATE INDEX scenes_concept ON scenes(concept, ord);
 -- search owners: node ids, layer essays 'L0'..'L5' and design questions 'design/<id>'
 CREATE VIRTUAL TABLE search USING fts5(owner UNINDEXED, label, mechanism, body, tokenize = 'porter unicode61');
 """
@@ -92,6 +97,8 @@ def write_db(data, path):
                                                            "\n".join(p for sec, ps in d["rd"].items() if sec not in ("diagram", "animation") for p in ps)))
     for i, p in enumerate(data["practice"]):
         db.execute("INSERT INTO practice VALUES (?,?,?,?,?)", (p["id"], i, p.get("pattern", ""), p.get("difficulty", ""), json.dumps(p, ensure_ascii=False)))
+    for i, s in enumerate(data.get("scenes", [])):
+        db.execute("INSERT INTO scenes VALUES (?,?,?,?,?,?)", (s["id"], s["concept"], i, s.get("title", ""), len(s["steps"]), json.dumps(s, ensure_ascii=False)))
     db.execute("INSERT INTO search(search) VALUES ('optimize')")
     db.commit(); db.execute("VACUUM"); db.close()
     os.replace(tmp, path)
@@ -103,11 +110,13 @@ def standalone(data, out):
     css = open(os.path.join(web, "app.css"), encoding="utf-8").read()
     js = open(os.path.join(web, "app.js"), encoding="utf-8").read()
     algo = open(os.path.join(web, "algo.js"), encoding="utf-8").read()
+    scene = open(os.path.join(web, "scene.js"), encoding="utf-8").read()
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
     html = html.replace('<link rel="stylesheet" href="app.css">', "<style>\n" + css + "\n</style>")
     html = html.replace('<script src="app.js"></script>', "<script>window.DATA=" + payload + ";</script>\n<script>\n" + js + "\n</script>")
+    html = html.replace('<script src="scene.js"></script>', "<script>\n" + scene.replace("</script", "<\\/script") + "\n</script>")
     html = html.replace('<script src="algo.js"></script>', "<script>\n" + algo.replace("</script", "<\\/script") + "\n</script>")
-    assert "window.DATA" in html and "<style>" in html and 'src="algo.js"' not in html, "index.html placeholders changed"
+    assert "window.DATA" in html and "<style>" in html and 'src="algo.js"' not in html and 'src="scene.js"' not in html, "index.html placeholders changed"
     # the hosted page gets its own document shell, so drop ours
     html = re.sub(r"(?is)<!doctype html>\s*|</?html[^>]*>\s*|</?head>\s*|</?body>\s*", "", html)
     html = re.sub(r'<meta charset="utf-8">\s*', "", html)
@@ -135,6 +144,32 @@ def load_practice():
             seen.add(p["id"]); out.append(p)
     return out, errs
 
+ANIM_FIXTURE = os.path.join(ROOT, "tests", "fixtures", "anim_sample.json")
+
+def load_scenes(node_ids):
+    """Animated scenes: every content/anim/*.json (a JSON list of scenes; DTS_ANIM_DIR points elsewhere), validated with
+    tools/checkanim.py. With DTS_ANIM_FIXTURE set, tests/fixtures/anim_sample.json is added (content wins on id clashes).
+    Returns (scenes, errors); any error fails the build. A missing folder means no scenes."""
+    import checkanim
+    folder = os.environ.get("DTS_ANIM_DIR") or os.path.join(ROOT, "content", "anim")
+    files = sorted(glob.glob(os.path.join(folder, "*.json")))
+    if os.environ.get("DTS_ANIM_FIXTURE"): files.append(ANIM_FIXTURE)
+    out, seen, errs = [], {}, []
+    for f in files:
+        where = os.path.relpath(f, ROOT)
+        try: items = json.load(open(f, encoding="utf-8"))
+        except (OSError, ValueError) as e: errs.append(f"{where}: invalid JSON: {e}"); continue
+        if not isinstance(items, list) or not all(isinstance(s, dict) for s in items): errs.append(f"{where}: must be a JSON list of scene objects"); continue
+        e = checkanim.check(items, node_ids, where)
+        e += [f"{where}:{s.get('id')} bad id (use kebab-case: a-z, 0-9 and -)" for s in items if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(s.get("id", "")))]
+        if e: errs.extend(e); continue
+        for s in items:
+            if s["id"] in seen:
+                if f != ANIM_FIXTURE: errs.append(f"{where}:{s['id']} duplicate id (also in {seen[s['id']]})")
+                continue
+            seen[s["id"]] = where; out.append(s)
+    return out, errs
+
 def main():
     args = sys.argv[1:]
     t0 = time.time()
@@ -145,10 +180,14 @@ def main():
     data["practice"], perrs = load_practice()
     for e in perrs: print("practice: skipped " + e, file=sys.stderr)
     data["stats"]["practice"] = len(data["practice"])
+    data["scenes"], aerrs = load_scenes({n["id"] for n in data["nodes"]})
+    if aerrs:
+        print("ANIMATION ERRORS (fix them, or check one file with python3 tools/checkanim.py <file>):\n  " + "\n  ".join(aerrs), file=sys.stderr); sys.exit(1)
+    data["stats"]["scenes"] = len(data["scenes"])
     st = data["stats"]
     print(f"content ok: {st['nodes']} concepts {st['per_layer']}, {st['edges']} links, {st['side']} side links, "
           f"{st['tours']} tours, {st['courses']} courses, {st['words']:,} words, {st['refs']} sources ({st['urls']} with direct links), {st['deep']} deep reads, "
-          f"{st['designs']} design questions, {st['practice']} practice problems")
+          f"{st['designs']} design questions, {st['practice']} practice problems, {st['scenes']} animated scenes")
     if "--check" in args: return
     os.makedirs(os.path.join(ROOT, "data"), exist_ok=True); os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)
     db = os.environ.get("DTS_CONTENT_DB") or os.path.join(ROOT, "data", "content.db")

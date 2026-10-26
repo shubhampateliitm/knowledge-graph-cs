@@ -6,7 +6,8 @@
 Serves the web app from web/ and a JSON API:
   GET  /api/health
   GET  /api/graph                      every concept (summary), links, tours, layer essays (summary), stats
-  GET  /api/read/<id>                  full read for a concept or a layer essay (L0..L5)
+  GET  /api/read/<id>                  full read for a concept or a layer essay (L0..L5); concepts include "scenes" (animated scenes, full)
+  GET  /api/scenes?concept=<id>        every animated scene in full (or one concept's); summaries are in /api/graph -> scenes
   GET  /api/search?q=...&limit=20      full-text search over every read (SQLite FTS5, BM25 ranking)
   GET  /api/library?kind=book          every source in the map, grouped by work, with the concepts that cite it
   GET  /api/me                         your progress, bookmarks, notes counts, reading time
@@ -117,9 +118,15 @@ class Content:
                 design_list.append(dict(base, summary=(rd.get("summary") or [""])[0]))
         practice = [json.loads(r[0]) for r in db.execute("SELECT body FROM practice ORDER BY ord")] if "practice" in has else []
         self.practice_ids = {p["id"] for p in practice}
+        # animated scenes: full bodies in each concept's read, summaries in the graph
+        self.scenes = [json.loads(r[0]) for r in db.execute("SELECT body FROM scenes ORDER BY ord")] if "scenes" in has else []
+        by_concept = {}
+        for s_ in self.scenes: by_concept.setdefault(s_["concept"], []).append(s_)
+        for n in nodes: self.reads[n["id"]]["scenes"] = by_concept.get(n["id"], [])
+        scene_list = [dict(id=s_["id"], concept=s_["concept"], title=s_.get("title", ""), n=len(s_.get("steps", []))) for s_ in self.scenes]
         db.close()
         self.ids = set(self.reads)
-        self.graph = dict(nodes=nodes, edges=edges, side=side, tours=tours, layers=layers, curriculum=curriculum, designs=design_list, practice=practice, stats=self.stats, built_at=self.built_at, mode="server")
+        self.graph = dict(nodes=nodes, edges=edges, side=side, tours=tours, layers=layers, curriculum=curriculum, designs=design_list, practice=practice, scenes=scene_list, stats=self.stats, built_at=self.built_at, mode="server")
         self.graph_json = json.dumps(self.graph, ensure_ascii=False, separators=(",", ":")).encode()
         self.graph_gz = gzip.compress(self.graph_json, 6)
         self.local = threading.local()
@@ -286,6 +293,10 @@ def make_handler(app, allowed_hosts):
                     if not d: return self.err(404, f"unknown design {m.group(1)!r}")
                     return self.send(200, d)
                 if p == "/api/practice": return self.send(200, app.user.practice())
+                if p == "/api/scenes":
+                    cid = (qs.get("concept") or [None])[0]
+                    if cid is not None and not self.known(cid): return
+                    return self.send(200, [s_ for s_ in c.scenes if cid is None or s_["concept"] == cid])
                 m = re.fullmatch(r"/api/read/([A-Za-z0-9-]+)", p)
                 if m:
                     if not self.known(m.group(1)): return

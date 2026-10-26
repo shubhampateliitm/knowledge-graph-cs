@@ -83,8 +83,8 @@ const shots = process.argv[3] || null;
   await page.goto(url.replace(/#.*$/, '') + '#read/bloom'); await page.waitForSelector('#reader .quiz');
   ok((await page.$$('#reader .terms dt')).length >= 6, 'key terms render');
   ok(!!(await page.$('#reader .diagram pre')), 'diagram renders');
-  ok((await page.$$('#reader .quiz details')).length === 5, 'five self-check questions');
-  await page.click('#reader .quiz summary'); ok(await page.isVisible('#reader .quiz details[open] p'), 'answer opens');
+  ok((await page.$$('#reader #rs-quiz .quiz details')).length === 5, 'five self-check questions');
+  await page.click('#reader #rs-quiz .quiz summary'); ok(await page.isVisible('#reader #rs-quiz .quiz details[open] p'), 'answer opens');
   await page.click('[data-markread="bloom"]'); await page.waitForTimeout(300);
   await page.click('[data-rclose]').catch(()=>{}); await page.click('[data-view="you"]'); await page.waitForSelector('#review');
   ok(/due today/.test(await page.textContent('#review')), 'marking a deep read as read fills the review deck');
@@ -185,15 +185,96 @@ const shots = process.argv[3] || null;
     await page.click('[data-aprob=""]'); await page.waitForSelector('.pr-row');
     ok((await page.textContent('[data-aprob="sample-valid-brackets"]')).includes('solved'), 'solved mark shows in the list');
   } else console.log('  - practice fixture not built in (set DTS_PRACTICE_FIXTURE=1); skipped practice checks');
+  // animated scenes (build with DTS_ANIM_FIXTURE=1 for the two samples in tests/fixtures/anim_sample.json)
+  if (await page.evaluate(() => (window.__dts.SCENES || []).some(s => s.id === 'sample-tcp-handshake'))) {
+    await page.goto(base + '#scene/sample-tcp-handshake'); await page.waitForSelector('#reader #rs-watch .scene svg .sc-a');
+    const secs = await page.evaluate(() => [...document.querySelectorAll('#reader .rd-sec')].map(x => x.id));
+    ok(secs.indexOf('rs-watch') === secs.indexOf('rs-how') + 1, '"Watch it work" comes right after How it works');
+    const ntcp = await page.evaluate(() => window.__dts.SCENES.filter(s => s.concept === 'tcp').length);
+    ok(await page.locator('#rs-watch .sc-tab').count() === (ntcp > 1 ? ntcp : 0), 'one tab per scene when a concept has several (' + ntcp + ')');
+    const fig = page.locator('#rs-watch .scene[data-scene="sample-tcp-handshake"]');
+    ok(await fig.count() === 1 && (await page.getAttribute('#rs-watch .sc-tab[aria-selected="true"]', 'data-sctab').catch(() => '0')) !== null, 'deep link #scene/... opens the read at that scene');
+    ok(await fig.locator('.sc-a').count() === 4 && await fig.locator('.sc-g').count() === 3 && await fig.locator('.sc-l').count() === 1, 'scene draws actors, groups and links');
+    const sig = () => fig.evaluate(f => [...f.querySelectorAll('.sc-a')].map(g => [g.dataset.id, g.dataset.label, g.dataset.sub, g.getAttribute('class').replace(/ (chg|recv|pop)\b/g, ''), g.getAttribute('transform'), g.style.opacity].join('|')).join(';')
+      + '#' + f.querySelectorAll('.sc-l').length + '#' + f.querySelectorAll('.sc-gh').length + '#' + f.querySelectorAll('.sc-ring').length + '#' + f.querySelectorAll('.sc-fx > *').length);
+    const kOf = async () => (await fig.locator('.sc-k').textContent()).trim();
+    const sig1 = await sig(), cap1 = await fig.locator('.sc-cap').textContent();
+    ok(await kOf() === 'step 1 of 7' && cap1.includes('listen()'), 'scene starts at step 1 with its caption');
+    await fig.locator('[data-sc="next"]').click();
+    ok(await kOf() === 'step 2 of 7' && (await fig.locator('.sc-cap').textContent()) !== cap1, 'Next changes the step and the caption');
+    ok(await fig.locator('.sc-fx .sc-dot').count() === 1 && await fig.locator('.sc-fx .sc-pill').count() === 1, 'a message dot with its label travels');
+    await page.waitForSelector('#rs-watch .scene:not(.animating) .sc-a[data-id="rto"]', { timeout: 8000 });
+    const sig2 = await sig();
+    ok(sig2 !== sig1 && /rto\|Retransmit timer/.test(sig2) && /c\|Client socket\|SYN_SENT/.test(sig2), 'step 2 adds the timer and changes the client');
+    await fig.locator('[data-sc="next"]').click(); await page.waitForTimeout(150);
+    await fig.locator('[data-sc="back"]').click();
+    ok(await kOf() === 'step 2 of 7' && await sig() === sig2, 'Back in the middle of an animation restores the exact previous state');
+    await fig.locator('[data-sc="back"]').click();
+    ok(await kOf() === 'step 1 of 7' && await sig() === sig1 && (await fig.locator('.sc-cap').textContent()) === cap1, 'Back to step 1 restores the exact first state');
+    await fig.locator('.sc-dots span[data-i="3"]').click();
+    ok(await kOf() === 'step 3 of 7' && await fig.locator('.sc-gh.lost .sc-x').count() === 1, 'a lost message ends halfway with an X');
+    await fig.locator('.sc-dots span[data-i="1"]').click();
+    await fig.focus(); await page.keyboard.press('ArrowRight');
+    ok(await kOf() === 'step 2 of 7', 'Right arrow steps forward');
+    await page.keyboard.press('ArrowLeft');
+    ok(await kOf() === 'step 1 of 7' && await sig() === sig1, 'Left arrow steps back');
+    await fig.locator('[data-sc="speed"][data-v="2"]').click();
+    ok((await fig.locator('[data-sc="speed"][data-v="2"]').getAttribute('aria-pressed')) === 'true', 'speed 2x selected');
+    await fig.locator('[data-sc="play"]').click();
+    ok((await fig.locator('[data-sc="play"]').getAttribute('aria-pressed')) === 'true' && (await fig.locator('[data-sc="play"]').textContent()) === 'Pause', 'Play starts playing');
+    await page.waitForFunction(() => /step [3-7] of 7/.test(document.querySelector('#rs-watch .scene .sc-k').textContent), null, { timeout: 15000 });
+    ok(true, 'Play advances through the steps on its own');
+    await fig.locator('[data-sc="play"]').click(); const kp = await kOf(); await page.waitForTimeout(3000);
+    ok(await kOf() === kp && (await fig.locator('[data-sc="play"]').getAttribute('aria-pressed')) === 'false', 'Pause stops on the current step');
+    await fig.locator('[data-sc="restart"]').click();
+    ok(await kOf() === 'step 1 of 7' && (await fig.locator('[data-sc="play"]').getAttribute('aria-pressed')) === 'true', 'Restart plays from step 1');
+    await fig.focus(); await page.keyboard.press(' ');
+    ok((await fig.locator('[data-sc="play"]').getAttribute('aria-pressed')) === 'false', 'Space pauses');
+    // visualizer link, tabs, gallery
+    await page.goto(base + '#read/eviction'); await page.waitForSelector('#reader #rs-watch .scene');
+    ok(/Try it yourself: LRU cache/.test(await page.textContent('#rs-watch .sc-try')), 'read links the visualizer that lists this concept');
+    const evIds = await page.evaluate(() => window.__dts.SCENES.filter(s => s.concept === 'eviction').map(s => s.id));
+    if (evIds.length > 1) {
+      await page.click('#rs-watch .sc-tab[data-sctab="1"]');
+      ok((await page.getAttribute('#rs-watch .scene', 'data-scene')) === evIds[1] && (await page.getAttribute('#rs-watch .sc-tab[data-sctab="1"]', 'aria-selected')) === 'true', 'tabs switch between a concept\'s scenes');
+    }
+    await page.click('#rs-watch [data-tryviz="lru"]'); await page.waitForSelector('#av-stage');
+    ok(await page.locator('[data-aviz="lru"][aria-pressed="true"]').count() === 1 && await page.locator('#reader').isHidden(), '"Try it yourself" opens the visualizer');
+    await page.click('[data-atab="anim"]'); await page.waitForSelector('.sc-card svg .sc-a');
+    const ncard = await page.locator('.sc-card').count(), nsc = await page.evaluate(() => window.__dts.SCENES.length);
+    ok(ncard === nsc && await page.locator('.alg-anim .ysec').count() >= 1 && /#animations$/.test(page.url()), 'Animations gallery lists every scene by layer (' + ncard + ')');
+    await page.click('.sc-card[data-sceneopen="sample-lru-eviction"]'); await page.waitForSelector('#reader:not([hidden]) #rs-watch .scene[data-scene="sample-lru-eviction"]');
+    ok((await page.textContent('#reader h1')).length > 2, 'a gallery card opens its concept read at the scene');
+    await page.click('#reader [data-rclose]');
+    // reduced motion: no travelling dot, the step's end state at once
+    const rctx = await browser.newContext({ viewport: { width: 1280, height: 900 }, reducedMotion: 'reduce' });
+    const rp = await rctx.newPage(); rp.on('pageerror', e => errors.push('pageerror: ' + e.message));
+    await rp.goto(base + '#scene/sample-tcp-handshake'); await rp.waitForSelector('#rs-watch .scene .sc-a');
+    await rp.click('#rs-watch .scene [data-sc="next"]');
+    ok(await rp.locator('#rs-watch .scene .sc-fx > *').count() === 0 && await rp.locator('#rs-watch .sc-a[data-id="rto"]').count() === 1 && await rp.locator('#rs-watch .scene .sc-gh').count() === 1, 'reduced motion jumps to the end state without travel');
+    await rctx.close();
+  } else console.log('  - scene fixture not built in (set DTS_ANIM_FIXTURE=1); skipped scene checks');
   // mobile
   await page.setViewportSize({ width: 390, height: 844 }); await page.goto(base + '#explore'); await page.waitForSelector('.col .item');
   const sw = await page.evaluate(() => document.documentElement.scrollWidth);
   ok(sw <= 392, 'no horizontal page scroll on phone width (' + sw + ')');
   if (shots) await page.screenshot({ path: shots + '/5-mobile.png' });
-  for (const h of ['#design', '#algo/merge', '#algo/dijkstra', '#practice/list', '#design/url-shortener']) {
+  const sceneHashes = (await page.evaluate(() => (window.__dts.SCENES || []).some(s => s.id === 'sample-tcp-handshake'))) ? ['#animations', '#scene/sample-tcp-handshake', '#scene/sample-lru-eviction'] : [];
+  for (const h of ['#design', '#algo/merge', '#algo/dijkstra', '#practice/list', '#design/url-shortener'].concat(sceneHashes)) {
     await page.goto(base + h); await page.waitForTimeout(350);
     const w = await page.evaluate(() => Math.max(document.documentElement.scrollWidth, document.getElementById('reader').hidden ? 0 : document.getElementById('reader').scrollWidth));
     ok(w <= 392, 'no horizontal page scroll on phone width at ' + h + ' (' + w + ')');
+  }
+  if (sceneHashes.length) {
+    await page.goto(base + '#scene/sample-tcp-handshake'); await page.waitForSelector('#rs-watch .scene .sc-a');
+    const z = page.locator('#rs-watch .scene .sc-zoom');
+    ok(await z.isVisible(), 'phone: zoom button offered for a small drawing');
+    await z.click(); await page.waitForTimeout(200);
+    const zw = await page.evaluate(() => { const b = document.querySelector('#rs-watch .sc-stage'); return [b.scrollWidth > b.clientWidth, document.documentElement.scrollWidth, document.getElementById('reader').scrollWidth]; });
+    ok(zw[0] && zw[1] <= 392 && zw[2] <= 392, 'phone: zoomed drawing scrolls inside its frame, not the page (' + zw.join(',') + ')');
+    await page.click('#rs-watch .scene [data-sc="next"]'); await page.waitForTimeout(100);
+    ok((await page.textContent('#rs-watch .scene .sc-k')).trim() === 'step 2 of 7', 'phone: Next works');
+    if (shots) await page.screenshot({ path: shots + '/8-scene-phone.png' });
   }
   await browser.close();
   console.log(errors.length ? '\nERRORS:\n' + errors.join('\n') : '\nall browser checks passed');

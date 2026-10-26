@@ -1,0 +1,4862 @@
+[
+ {
+  "id": "watermark-late-event",
+  "concept": "watermarks",
+  "title": "A watermark closes a window; a late event misses it",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "src",
+    "label": "Source",
+    "x": 20,
+    "y": 170,
+    "w": 100,
+    "h": 50,
+    "shape": "box",
+    "sub": "events"
+   },
+   {
+    "id": "op",
+    "label": "Window 10:00-10:05",
+    "x": 260,
+    "y": 150,
+    "w": 170,
+    "h": 90,
+    "shape": "box",
+    "sub": "buffer: empty"
+   },
+   {
+    "id": "wm",
+    "label": "Watermark",
+    "x": 260,
+    "y": 40,
+    "w": 170,
+    "h": 50,
+    "shape": "note",
+    "sub": "none yet"
+   },
+   {
+    "id": "out",
+    "label": "Results",
+    "x": 598,
+    "y": 170,
+    "w": 104,
+    "h": 50,
+    "shape": "box",
+    "sub": ""
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "A source sends events with their own event time. First: e1 with time 10:01. The operator keeps it in the 10:00-10:05 window.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "op",
+      "label": "e1 t=10:01",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "op": {
+      "sub": "buffer: 10:01"
+     }
+    }
+   },
+   {
+    "say": "e2 arrives with time 10:04. It also belongs to the same window, so the buffer holds two events.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "op",
+      "label": "e2 t=10:04",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "op": {
+      "sub": "buffer: 10:01, 10:04"
+     }
+    }
+   },
+   {
+    "say": "The watermark says: no event older than this time is expected. Rule: watermark = newest event time minus 2 minutes of allowed delay.",
+    "set": {
+     "wm": {
+      "sub": "max t=10:04, WM=10:02",
+      "tone": "accent"
+     }
+    },
+    "focus": [
+     "wm"
+    ]
+   },
+   {
+    "say": "e3 arrives with time 10:07. The newest time is now 10:07, so the watermark moves to 10:05.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "op",
+      "label": "e3 t=10:07",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "wm": {
+      "sub": "max t=10:07, WM=10:05",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "Watermark 10:05 has reached the window end 10:05. The window closes and sends its result: count = 2.",
+    "msgs": [
+     {
+      "from": "op",
+      "to": "out",
+      "label": "count=2 (10:00-10:05)",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "op": {
+      "sub": "CLOSED, e3 in next window",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Failure: e4 with time 10:03 was delayed on the network and shows up now. Its time is below the watermark 10:05, so it is late.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "op",
+      "label": "e4 t=10:03",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "op": {
+      "sub": "e4 is late!",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "The window already sent its answer, so e4 is not counted. Result 2 is now wrong; the real count is 3.",
+    "set": {
+     "out": {
+      "sub": "says 2, truth 3",
+      "tone": "bad"
+     }
+    },
+    "focus": [
+     "out"
+    ]
+   },
+   {
+    "say": "Fix 1: send late events to a side output, so they can be fixed later or counted in a correction.",
+    "add": [
+     {
+      "id": "side",
+      "label": "Late side output",
+      "x": 260,
+      "y": 310,
+      "w": 170,
+      "h": 50,
+      "shape": "box",
+      "sub": "e4 t=10:03",
+      "tone": "warn"
+     }
+    ],
+    "link": [
+     {
+      "from": "op",
+      "to": "side",
+      "label": "late",
+      "dashed": true
+     }
+    ],
+    "msgs": [
+     {
+      "from": "op",
+      "to": "side",
+      "label": "e4",
+      "tone": "warn"
+     }
+    ]
+   },
+   {
+    "say": "Fix 2: wait longer. A 5-minute delay would catch e4, but then the result for 10:05 is sent at 10:10 instead. More waiting means more correct but slower.",
+    "set": {
+     "wm": {
+      "sub": "delay 5 min: WM=10:02",
+      "tone": "warn"
+     }
+    },
+    "focus": [
+     "wm"
+    ]
+   }
+  ]
+ },
+ {
+  "id": "windowing-tumbling-sliding",
+  "concept": "windowing",
+  "title": "Tumbling and sliding windows",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "src",
+    "label": "Events",
+    "x": 20,
+    "y": 170,
+    "w": 90,
+    "h": 50,
+    "shape": "box",
+    "sub": "clicks"
+   },
+   {
+    "id": "w1",
+    "label": "10:00-10:05",
+    "x": 200,
+    "y": 40,
+    "w": 120,
+    "h": 50,
+    "shape": "box",
+    "sub": "count 0"
+   },
+   {
+    "id": "w2",
+    "label": "10:05-10:10",
+    "x": 200,
+    "y": 170,
+    "w": 120,
+    "h": 50,
+    "shape": "box",
+    "sub": "count 0"
+   },
+   {
+    "id": "w3",
+    "label": "10:10-10:15",
+    "x": 200,
+    "y": 300,
+    "w": 120,
+    "h": 50,
+    "shape": "box",
+    "sub": "count 0"
+   },
+   {
+    "id": "s1",
+    "label": "10:00-10:10",
+    "x": 470,
+    "y": 60,
+    "w": 130,
+    "h": 50,
+    "shape": "box",
+    "sub": "count 0",
+    "tone": "muted"
+   },
+   {
+    "id": "s2",
+    "label": "10:05-10:15",
+    "x": 470,
+    "y": 250,
+    "w": 130,
+    "h": 50,
+    "shape": "box",
+    "sub": "count 0",
+    "tone": "muted"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "Tumbling windows cut time into fixed 5-minute pieces with no overlap. Every event goes into exactly one piece.",
+    "set": {
+     "w1": {
+      "tone": "accent"
+     },
+     "w2": {
+      "tone": "accent"
+     },
+     "w3": {
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "Event at 10:02 lands in window 10:00-10:05.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "w1",
+      "label": "t=10:02",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "w1": {
+      "sub": "count 1"
+     }
+    }
+   },
+   {
+    "say": "Event at 10:04 lands in the same window.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "w1",
+      "label": "t=10:04",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "w1": {
+      "sub": "count 2"
+     }
+    }
+   },
+   {
+    "say": "Event at 10:06 belongs to the next piece, 10:05-10:10. Window 1 is now final: 2 clicks per 5 minutes.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "w2",
+      "label": "t=10:06",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "w2": {
+      "sub": "count 1"
+     },
+     "w1": {
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Now the sliding window: size 10 minutes, slide 5 minutes. A new window starts every 5 minutes, so windows overlap.",
+    "set": {
+     "s1": {
+      "tone": "accent"
+     },
+     "s2": {
+      "tone": "accent"
+     }
+    },
+    "focus": [
+     "s1",
+     "s2"
+    ]
+   },
+   {
+    "say": "The 10:06 event is inside both 10:00-10:10 and 10:05-10:15. One event is counted twice, once per window.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "s1",
+      "label": "t=10:06",
+      "tone": "normal"
+     },
+     {
+      "from": "src",
+      "to": "s2",
+      "label": "t=10:06",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "s1": {
+      "sub": "count 3"
+     },
+     "s2": {
+      "sub": "count 1"
+     }
+    }
+   },
+   {
+    "say": "The 10:02 and 10:04 events are only in the first sliding window, so it holds 3 events: a smooth 10-minute count updated every 5 minutes.",
+    "set": {
+     "s1": {
+      "tone": "ok"
+     }
+    },
+    "focus": [
+     "s1"
+    ]
+   },
+   {
+    "say": "Cost: each event is stored in size/slide = 2 windows. A 1-hour window sliding every 1 minute would copy every event 60 times.",
+    "set": {
+     "s2": {
+      "sub": "count 1 (copy)",
+      "tone": "warn"
+     }
+    },
+    "focus": [
+     "s2"
+    ]
+   }
+  ]
+ },
+ {
+  "id": "windowing-session",
+  "concept": "windowing",
+  "title": "Session windows and a late event that merges two sessions",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "src",
+    "label": "User clicks",
+    "x": 20,
+    "y": 170,
+    "w": 100,
+    "h": 50,
+    "shape": "box",
+    "sub": "gap = 30 s"
+   },
+   {
+    "id": "a",
+    "label": "Session A",
+    "x": 250,
+    "y": 90,
+    "w": 150,
+    "h": 50,
+    "shape": "box",
+    "sub": "empty"
+   },
+   {
+    "id": "b",
+    "label": "Session B",
+    "x": 250,
+    "y": 260,
+    "w": 150,
+    "h": 50,
+    "shape": "box",
+    "sub": "empty"
+   },
+   {
+    "id": "out",
+    "label": "Total per session",
+    "x": 540,
+    "y": 170,
+    "w": 150,
+    "h": 50,
+    "shape": "box",
+    "sub": ""
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "A session window has no fixed size. It stays open while events keep coming, and closes after a 30-second gap with no events.",
+    "set": {
+     "a": {
+      "sub": "open",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "Click at 0 s opens session A. It will close at 0+30 = 30 s unless more clicks arrive.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "a",
+      "label": "t=0s",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "a": {
+      "sub": "0s..30s, 1 click"
+     }
+    }
+   },
+   {
+    "say": "Click at 10 s and click at 25 s each push the end later. Session A now runs until 25+30 = 55 s with 3 clicks.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "a",
+      "label": "t=10s",
+      "tone": "normal"
+     },
+     {
+      "from": "src",
+      "to": "a",
+      "label": "t=25s",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "a": {
+      "sub": "0s..55s, 3 clicks"
+     }
+    }
+   },
+   {
+    "say": "Nothing arrives for 30 s, so at 55 s session A closes and sends its result.",
+    "msgs": [
+     {
+      "from": "a",
+      "to": "out",
+      "label": "A: 3 clicks",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "a": {
+      "sub": "closed",
+      "tone": "ok"
+     },
+     "out": {
+      "sub": "A=3"
+     }
+    }
+   },
+   {
+    "say": "Click at 100 s starts a new session B. It would run 100 s to 130 s.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "b",
+      "label": "t=100s",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "b": {
+      "sub": "100s..130s, 1 click",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "Failure case: a late click with time 80 s arrives. It is 25 s after the end of A, which is less than the 30 s gap.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "a",
+      "label": "t=80s late",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "a": {
+      "sub": "reopened to 110s",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "A now ends at 80+30 = 110 s, which overlaps B (starts 100 s). The two sessions merge into one.",
+    "msgs": [
+     {
+      "from": "a",
+      "to": "b",
+      "label": "merge",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "b": {
+      "label": "Session A+B",
+      "sub": "0s..130s, 5 clicks",
+      "tone": "warn"
+     },
+     "a": {
+      "sub": "merged",
+      "tone": "muted"
+     }
+    }
+   },
+   {
+    "say": "The earlier result A=3 is now wrong. The engine must send a correction: one session with 5 clicks.",
+    "msgs": [
+     {
+      "from": "b",
+      "to": "out",
+      "label": "A+B: 5 clicks",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "out": {
+      "sub": "retracted A=3, now 5",
+      "tone": "warn"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "checkpoint-restore",
+  "concept": "checkpoint",
+  "title": "A checkpoint barrier, a crash, and a restore",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "co",
+    "label": "Coordinator",
+    "x": 290,
+    "y": 20,
+    "w": 140,
+    "h": 46,
+    "shape": "box",
+    "sub": "checkpoint 7"
+   },
+   {
+    "id": "src",
+    "label": "Source",
+    "x": 8,
+    "y": 170,
+    "w": 133,
+    "h": 56,
+    "shape": "box",
+    "sub": "offset 1000"
+   },
+   {
+    "id": "op",
+    "label": "Counter",
+    "x": 270,
+    "y": 170,
+    "w": 140,
+    "h": 56,
+    "shape": "box",
+    "sub": "count 1000"
+   },
+   {
+    "id": "snk",
+    "label": "Sink",
+    "x": 560,
+    "y": 170,
+    "w": 110,
+    "h": 56,
+    "shape": "box",
+    "sub": "count 1000"
+   },
+   {
+    "id": "st",
+    "label": "Checkpoint store",
+    "x": 270,
+    "y": 320,
+    "w": 160,
+    "h": 56,
+    "shape": "db",
+    "sub": "empty"
+   }
+  ],
+  "links": [
+   {
+    "from": "src",
+    "to": "op",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "op",
+    "to": "snk",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "co",
+    "to": "src",
+    "label": "",
+    "dashed": true
+   }
+  ],
+  "steps": [
+   {
+    "say": "A stream job reads a log and counts events. Every few seconds the coordinator starts a checkpoint: a saved copy of all state.",
+    "msgs": [
+     {
+      "from": "co",
+      "to": "src",
+      "label": "start cp 7",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "co": {
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "The source writes a special barrier into the stream, and saves its own position: offset 1000.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "st",
+      "label": "offset=1000",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "st": {
+      "sub": "cp7: src=1000"
+     }
+    }
+   },
+   {
+    "say": "The barrier travels with the data. When the counter sees it, all events before the barrier are counted, so it saves count = 1000.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "op",
+      "label": "barrier 7",
+      "tone": "accent"
+     },
+     {
+      "from": "op",
+      "to": "st",
+      "label": "count=1000",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "st": {
+      "sub": "cp7: src=1000, op=1000"
+     }
+    }
+   },
+   {
+    "say": "The sink sees the barrier and tells the coordinator. All parts saved, so checkpoint 7 is complete.",
+    "msgs": [
+     {
+      "from": "op",
+      "to": "snk",
+      "label": "barrier 7",
+      "tone": "accent"
+     },
+     {
+      "from": "snk",
+      "to": "co",
+      "label": "ack cp 7",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "co": {
+      "sub": "cp 7 done",
+      "tone": "ok"
+     },
+     "st": {
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Work continues. The job reads offsets 1000 to 1450 and counts up to 1450. These 450 events are not in any checkpoint yet.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "op",
+      "label": "evts 1000-1450",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "src": {
+      "sub": "offset 1450"
+     },
+     "op": {
+      "sub": "count 1450"
+     },
+     "snk": {
+      "sub": "count 1450"
+     }
+    }
+   },
+   {
+    "say": "Failure: the counter machine crashes. Its memory is gone, including count 1450.",
+    "set": {
+     "op": {
+      "label": "Counter (dead)",
+      "sub": "state lost",
+      "tone": "bad"
+     }
+    },
+    "focus": [
+     "op"
+    ]
+   },
+   {
+    "say": "The job restarts and loads checkpoint 7 from the store: counter back to 1000.",
+    "msgs": [
+     {
+      "from": "st",
+      "to": "op",
+      "label": "count=1000",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "op": {
+      "label": "Counter",
+      "sub": "count 1000",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "The source also rewinds to the saved offset 1000, so the same 450 events are read again.",
+    "msgs": [
+     {
+      "from": "st",
+      "to": "src",
+      "label": "offset=1000",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "src": {
+      "sub": "offset 1000 (replay)",
+      "tone": "warn"
+     },
+     "snk": {
+      "sub": "count 1000"
+     }
+    }
+   },
+   {
+    "say": "The counter replays offsets 1000 to 1450 and reaches 1450 again. Each event counted exactly once in state, even though it was read twice.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "op",
+      "label": "evts 1000-1450",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "src": {
+      "sub": "offset 1450",
+      "tone": "normal"
+     },
+     "op": {
+      "sub": "count 1450"
+     },
+     "snk": {
+      "sub": "count 1450",
+      "tone": "ok"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "backpressure-slow-sink",
+  "concept": "backpressure",
+  "title": "A slow stage pushes back up the pipeline",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "kf",
+    "label": "Kafka topic",
+    "x": 20,
+    "y": 160,
+    "w": 100,
+    "h": 56,
+    "shape": "db",
+    "sub": "lag 0"
+   },
+   {
+    "id": "a",
+    "label": "Parse",
+    "x": 151,
+    "y": 160,
+    "w": 138,
+    "h": 56,
+    "shape": "box",
+    "sub": "out buf 0/32"
+   },
+   {
+    "id": "b",
+    "label": "Enrich (slow)",
+    "x": 330,
+    "y": 160,
+    "w": 120,
+    "h": 56,
+    "shape": "box",
+    "sub": "in buf 0/32"
+   },
+   {
+    "id": "snk",
+    "label": "Sink",
+    "x": 510,
+    "y": 160,
+    "w": 100,
+    "h": 56,
+    "shape": "box",
+    "sub": "ok"
+   },
+   {
+    "id": "mem",
+    "label": "Memory",
+    "x": 318,
+    "y": 310,
+    "w": 144,
+    "h": 50,
+    "shape": "note",
+    "sub": "safe"
+   }
+  ],
+  "links": [
+   {
+    "from": "kf",
+    "to": "a",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "a",
+    "to": "b",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "b",
+    "to": "snk",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "A pipeline: Kafka, Parse, Enrich, Sink. Each stage has a small buffer of 32 records. Everything runs at 1000 records per second.",
+    "msgs": [
+     {
+      "from": "kf",
+      "to": "a",
+      "label": "1000/s",
+      "tone": "normal"
+     },
+     {
+      "from": "a",
+      "to": "b",
+      "label": "1000/s",
+      "tone": "normal"
+     },
+     {
+      "from": "b",
+      "to": "snk",
+      "label": "1000/s",
+      "tone": "normal"
+     }
+    ]
+   },
+   {
+    "say": "Enrich calls a slow service and drops to 200 records per second. It takes 200 in but Parse still sends 1000.",
+    "set": {
+     "b": {
+      "sub": "in buf 12/32",
+      "tone": "warn"
+     }
+    },
+    "msgs": [
+     {
+      "from": "a",
+      "to": "b",
+      "label": "1000/s",
+      "tone": "warn"
+     }
+    ]
+   },
+   {
+    "say": "5 seconds later the buffer in front of Enrich is full: 32/32. Enrich has no room to accept more.",
+    "set": {
+     "b": {
+      "sub": "in buf 32/32",
+      "tone": "bad"
+     }
+    },
+    "focus": [
+     "b"
+    ]
+   },
+   {
+    "say": "Parse cannot hand over its output, so its own buffer fills: 32/32. Parse now blocks and stops reading.",
+    "set": {
+     "a": {
+      "sub": "out buf 32/32 blocked",
+      "tone": "bad"
+     }
+    },
+    "focus": [
+     "a"
+    ]
+   },
+   {
+    "say": "This is backpressure: the slowness travels backward. Parse reads Kafka only at 200 per second now, matching Enrich.",
+    "msgs": [
+     {
+      "from": "kf",
+      "to": "a",
+      "label": "200/s",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "a": {
+      "sub": "out buf 32/32 slow",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "The records wait safely in Kafka, which is on disk. Lag grows by 800 per second, 4800 after 6 s. Memory in the job stays flat.",
+    "set": {
+     "kf": {
+      "sub": "lag 4800",
+      "tone": "warn"
+     },
+     "mem": {
+      "sub": "flat, no OOM",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Without backpressure, Parse would keep pushing 800 extra records per second into memory. After a few minutes the job would crash with out-of-memory.",
+    "set": {
+     "mem": {
+      "sub": "OOM if no backpressure",
+      "tone": "bad"
+     }
+    },
+    "focus": [
+     "mem"
+    ]
+   },
+   {
+    "say": "The team scales Enrich from 1 to 5 workers: 1000 per second again. Buffers drain and the chain speeds up.",
+    "set": {
+     "b": {
+      "label": "Enrich x5",
+      "sub": "in buf 3/32",
+      "tone": "ok"
+     },
+     "a": {
+      "sub": "out buf 5/32",
+      "tone": "normal"
+     }
+    },
+    "msgs": [
+     {
+      "from": "a",
+      "to": "b",
+      "label": "1000/s",
+      "tone": "ok"
+     }
+    ]
+   },
+   {
+    "say": "Enrich now handles 1000 per second plus a catch-up burst, so the 4800 lagging records are cleared in about 30 s and lag returns to 0.",
+    "set": {
+     "kf": {
+      "sub": "lag 0",
+      "tone": "ok"
+     }
+    },
+    "msgs": [
+     {
+      "from": "kf",
+      "to": "a",
+      "label": "catch-up",
+      "tone": "ok"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "id": "consumergroup-rebalance",
+  "concept": "consumergroups",
+  "title": "A consumer crashes and the group rebalances",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "p0",
+    "label": "Partition 0",
+    "x": 20,
+    "y": 40,
+    "w": 110,
+    "h": 50,
+    "shape": "db",
+    "sub": "end 600"
+   },
+   {
+    "id": "p1",
+    "label": "Partition 1",
+    "x": 20,
+    "y": 120,
+    "w": 110,
+    "h": 50,
+    "shape": "db",
+    "sub": "end 600"
+   },
+   {
+    "id": "p2",
+    "label": "Partition 2",
+    "x": 20,
+    "y": 200,
+    "w": 110,
+    "h": 50,
+    "shape": "db",
+    "sub": "end 600"
+   },
+   {
+    "id": "p3",
+    "label": "Partition 3",
+    "x": 20,
+    "y": 280,
+    "w": 110,
+    "h": 50,
+    "shape": "db",
+    "sub": "end 600"
+   },
+   {
+    "id": "c1",
+    "label": "Consumer C1",
+    "x": 329,
+    "y": 40,
+    "w": 121,
+    "h": 56,
+    "shape": "box",
+    "sub": "group billing"
+   },
+   {
+    "id": "c2",
+    "label": "Consumer C2",
+    "x": 318,
+    "y": 260,
+    "w": 144,
+    "h": 56,
+    "shape": "box",
+    "sub": "group billing"
+   },
+   {
+    "id": "co",
+    "label": "Group coordinator",
+    "x": 540,
+    "y": 150,
+    "w": 150,
+    "h": 70,
+    "shape": "box",
+    "sub": "committed: none"
+   }
+  ],
+  "links": [
+   {
+    "from": "p0",
+    "to": "c1",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "p1",
+    "to": "c1",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "p2",
+    "to": "c2",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "p3",
+    "to": "c2",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "Topic orders has 4 partitions. Group billing has 2 consumers. Each partition goes to exactly one consumer: C1 gets P0 and P1, C2 gets P2 and P3.",
+    "focus": [
+     "c1",
+     "c2"
+    ]
+   },
+   {
+    "say": "Consumers commit their position now and then. C1 commits P0=520, C2 commits P2=480.",
+    "msgs": [
+     {
+      "from": "c1",
+      "to": "co",
+      "label": "commit P0=520",
+      "tone": "ok"
+     },
+     {
+      "from": "c2",
+      "to": "co",
+      "label": "commit P2=480",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "co": {
+      "sub": "P0=520, P2=480"
+     }
+    }
+   },
+   {
+    "say": "C2 keeps working and reads P2 up to offset 520, but its next commit is not due yet. All the time it sends heartbeats.",
+    "msgs": [
+     {
+      "from": "c2",
+      "to": "co",
+      "label": "heartbeat",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "c2": {
+      "sub": "P2 at 520, uncommitted",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "Failure: C2 crashes. The heartbeats stop.",
+    "set": {
+     "c2": {
+      "label": "C2 (dead)",
+      "sub": "no heartbeat",
+      "tone": "bad"
+     }
+    },
+    "msgs": [
+     {
+      "from": "c2",
+      "to": "co",
+      "label": "heartbeat",
+      "tone": "bad",
+      "lost": true
+     }
+    ]
+   },
+   {
+    "say": "After the 10 s session timeout the coordinator decides C2 is dead and starts a rebalance. Everyone pauses reading.",
+    "msgs": [
+     {
+      "from": "co",
+      "to": "c1",
+      "label": "rebalance",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "co": {
+      "sub": "rebalancing...",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "New plan: C1 takes all 4 partitions. P2 and P3 move from C2 to C1.",
+    "unlink": [
+     [
+      "p2",
+      "c2"
+     ],
+     [
+      "p3",
+      "c2"
+     ]
+    ],
+    "link": [
+     {
+      "from": "p2",
+      "to": "c1",
+      "label": "",
+      "dashed": false
+     },
+     {
+      "from": "p3",
+      "to": "c1",
+      "label": "",
+      "dashed": false
+     }
+    ],
+    "set": {
+     "c1": {
+      "sub": "P0, P1, P2, P3"
+     },
+     "co": {
+      "sub": "stable, gen 2",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "C1 starts P2 from the last committed offset 480, not 520. The 40 messages (481 to 520) are processed twice, so handlers should be safe to repeat.",
+    "msgs": [
+     {
+      "from": "p2",
+      "to": "c1",
+      "label": "from 480",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "c1": {
+      "sub": "P2 replays 40 msgs",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "A new consumer C3 starts and joins the group. Another rebalance runs.",
+    "add": [
+     {
+      "id": "c3",
+      "label": "Consumer C3",
+      "x": 330,
+      "y": 150,
+      "w": 120,
+      "h": 56,
+      "shape": "box",
+      "sub": "joined",
+      "tone": "accent"
+     }
+    ],
+    "set": {},
+    "msgs": [
+     {
+      "from": "c3",
+      "to": "co",
+      "label": "join",
+      "tone": "accent"
+     }
+    ]
+   },
+   {
+    "say": "The new plan: C1 keeps P0 and P1, C3 takes P2 and P3. Load is even again. A fifth consumer would get nothing, because 4 partitions allow at most 4 active consumers.",
+    "unlink": [
+     [
+      "p2",
+      "c1"
+     ],
+     [
+      "p3",
+      "c1"
+     ]
+    ],
+    "link": [
+     {
+      "from": "p2",
+      "to": "c3",
+      "label": "",
+      "dashed": false
+     },
+     {
+      "from": "p3",
+      "to": "c3",
+      "label": "",
+      "dashed": false
+     }
+    ],
+    "set": {
+     "c1": {
+      "sub": "P0, P1"
+     },
+     "c3": {
+      "sub": "P2, P3",
+      "tone": "ok"
+     },
+     "co": {
+      "sub": "stable, gen 3",
+      "tone": "ok"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "logcompaction-latest-per-key",
+  "concept": "logcompaction",
+  "title": "Compaction keeps the newest value for each key",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "c0",
+    "label": "off0 A=1",
+    "x": 20,
+    "y": 70,
+    "w": 100,
+    "h": 48,
+    "shape": "cell"
+   },
+   {
+    "id": "c1",
+    "label": "off1 B=1",
+    "x": 132,
+    "y": 70,
+    "w": 100,
+    "h": 48,
+    "shape": "cell"
+   },
+   {
+    "id": "c2",
+    "label": "off2 A=2",
+    "x": 244,
+    "y": 70,
+    "w": 100,
+    "h": 48,
+    "shape": "cell"
+   },
+   {
+    "id": "c3",
+    "label": "off3 C=1",
+    "x": 356,
+    "y": 70,
+    "w": 100,
+    "h": 48,
+    "shape": "cell"
+   },
+   {
+    "id": "c4",
+    "label": "off4 B=2",
+    "x": 468,
+    "y": 70,
+    "w": 100,
+    "h": 48,
+    "shape": "cell"
+   },
+   {
+    "id": "c5",
+    "label": "off5 A=3",
+    "x": 580,
+    "y": 70,
+    "w": 100,
+    "h": 48,
+    "shape": "cell"
+   },
+   {
+    "id": "cl",
+    "label": "Cleaner",
+    "x": 296,
+    "y": 170,
+    "w": 127,
+    "h": 44,
+    "shape": "box",
+    "sub": "scans the log"
+   },
+   {
+    "id": "sl",
+    "label": "Slow consumer DB",
+    "x": 470,
+    "y": 310,
+    "w": 170,
+    "h": 56,
+    "shape": "db",
+    "sub": "offline 2 days"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "A topic holds the latest profile per key. Six records so far: A was written 3 times, B twice, C once. Offsets never change.",
+    "focus": [
+     "c0",
+     "c2",
+     "c5"
+    ]
+   },
+   {
+    "say": "The cleaner scans the log. For key A it finds A=3 at offset 5 is the newest. For key B, B=2 at offset 4 is the newest.",
+    "set": {
+     "c0": {
+      "tone": "muted"
+     },
+     "c1": {
+      "tone": "muted"
+     },
+     "c2": {
+      "tone": "muted"
+     }
+    },
+    "focus": [
+     "cl"
+    ]
+   },
+   {
+    "say": "Old values are removed: off0, off1 and off2. Kept: off3, off4, off5. The offsets keep their numbers, so there are gaps.",
+    "remove": [
+     "c0",
+     "c1",
+     "c2"
+    ],
+    "move": {
+     "c3": {
+      "x": 20,
+      "y": 70
+     },
+     "c4": {
+      "x": 132,
+      "y": 70
+     },
+     "c5": {
+      "x": 244,
+      "y": 70
+     }
+    },
+    "set": {
+     "cl": {
+      "sub": "3 of 6 records left",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "A new reader starting at offset 0 sees C=1, B=2, A=3. That is the full latest state, just smaller than the full history.",
+    "focus": [
+     "c3",
+     "c4",
+     "c5"
+    ]
+   },
+   {
+    "say": "To delete key A, a producer writes a tombstone: A=null at offset 6. A tombstone is a normal record with an empty value.",
+    "add": [
+     {
+      "id": "c6",
+      "label": "off6 A=null",
+      "x": 356,
+      "y": 70,
+      "w": 110,
+      "h": 48,
+      "shape": "cell",
+      "tone": "warn"
+     }
+    ]
+   },
+   {
+    "say": "Next compaction removes A=3 because A=null is newer. The tombstone itself stays, so readers learn A was deleted.",
+    "remove": [
+     "c5"
+    ],
+    "set": {
+     "cl": {
+      "sub": "kept: B=2, A=null",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "After delete.retention.ms (default 24 hours) the tombstone is removed too. Key A is now gone from the log.",
+    "remove": [
+     "c6"
+    ],
+    "set": {
+     "cl": {
+      "sub": "tombstone expired"
+     }
+    }
+   },
+   {
+    "say": "Failure case: a consumer was offline for 2 days. It never saw A=null, and the tombstone is gone. It still has A=3 in its own database.",
+    "set": {
+     "sl": {
+      "sub": "still has A=3",
+      "tone": "bad"
+     }
+    },
+    "focus": [
+     "sl"
+    ]
+   },
+   {
+    "say": "Rule: keep tombstones longer than the slowest consumer can be offline. Otherwise some copies of deleted data live on.",
+    "set": {
+     "sl": {
+      "sub": "needs a re-sync",
+      "tone": "warn"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "deliverysem-retry-duplicate",
+  "concept": "deliverysem",
+  "title": "Lost message, lost ack and a duplicate",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "pr",
+    "label": "Producer",
+    "x": 17,
+    "y": 170,
+    "w": 115,
+    "h": 56,
+    "shape": "box",
+    "sub": "id PID=7"
+   },
+   {
+    "id": "br",
+    "label": "Broker log",
+    "x": 300,
+    "y": 170,
+    "w": 150,
+    "h": 70,
+    "shape": "db",
+    "sub": "empty"
+   },
+   {
+    "id": "cn",
+    "label": "Consumer",
+    "x": 571,
+    "y": 170,
+    "w": 127,
+    "h": 56,
+    "shape": "box",
+    "sub": ""
+   }
+  ],
+  "links": [
+   {
+    "from": "pr",
+    "to": "br",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "br",
+    "to": "cn",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "At-most-once: the producer sends m1 and never retries. The network drops it.",
+    "msgs": [
+     {
+      "from": "pr",
+      "to": "br",
+      "label": "m1",
+      "tone": "bad",
+      "lost": true
+     }
+    ],
+    "set": {
+     "pr": {
+      "sub": "sent m1, no retry"
+     }
+    }
+   },
+   {
+    "say": "The broker log is empty, and nobody knows. m1 is lost forever. Fast and simple, but data can disappear.",
+    "set": {
+     "br": {
+      "sub": "empty (m1 lost)",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "At-least-once: the producer sends m2 and waits for an ack. The broker stores it at offset 5.",
+    "msgs": [
+     {
+      "from": "pr",
+      "to": "br",
+      "label": "m2",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "br": {
+      "sub": "5: m2",
+      "tone": "normal"
+     },
+     "pr": {
+      "sub": "sent m2, waiting"
+     }
+    }
+   },
+   {
+    "say": "The broker's ack is lost on the way back. The producer cannot tell if m2 was stored or not.",
+    "msgs": [
+     {
+      "from": "br",
+      "to": "pr",
+      "label": "ack",
+      "tone": "bad",
+      "lost": true
+     }
+    ],
+    "set": {
+     "pr": {
+      "sub": "no ack after 5 s",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "After 5 seconds the producer retries m2, because losing data is worse than sending it twice.",
+    "msgs": [
+     {
+      "from": "pr",
+      "to": "br",
+      "label": "m2 (retry)",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "br": {
+      "sub": "5: m2   6: m2",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "The log now has m2 twice, at offsets 5 and 6. A consumer will see a duplicate.",
+    "msgs": [
+     {
+      "from": "br",
+      "to": "cn",
+      "label": "m2, m2",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "cn": {
+      "sub": "got m2 two times",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "Exactly-once writes: the producer has PID=7 and numbers its messages. m3 is sent with seq=0 and stored at offset 7.",
+    "msgs": [
+     {
+      "from": "pr",
+      "to": "br",
+      "label": "m3 PID=7 seq=0",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "br": {
+      "sub": "5,6: m2   7: m3 (seq 0)"
+     },
+     "pr": {
+      "sub": "m3 seq 0",
+      "tone": "accent"
+     },
+     "cn": {
+      "sub": ""
+     }
+    }
+   },
+   {
+    "say": "The ack is lost again and the producer retries m3 with the same seq=0. The broker sees it already stored seq=0 from PID=7, ignores the copy, and just acks.",
+    "msgs": [
+     {
+      "from": "br",
+      "to": "pr",
+      "label": "ack",
+      "tone": "bad",
+      "lost": true
+     },
+     {
+      "from": "pr",
+      "to": "br",
+      "label": "m3 seq=0 (retry)",
+      "tone": "warn"
+     },
+     {
+      "from": "br",
+      "to": "pr",
+      "label": "ack (dup ignored)",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "br": {
+      "sub": "log unchanged",
+      "tone": "ok"
+     },
+     "pr": {
+      "sub": "acked",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "The consumer side must also be safe: it reads m3, writes the result, and crashes before committing offset 7. It would read m3 again. Fix: save the result and the offset in one transaction, or make the handler idempotent.",
+    "msgs": [
+     {
+      "from": "br",
+      "to": "cn",
+      "label": "m3",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "cn": {
+      "sub": "crash before commit",
+      "tone": "warn"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "cachelayer-stampede",
+  "concept": "cachelayer",
+  "title": "Cache-aside, then a stampede when a hot key expires",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "cl",
+    "label": "Clients",
+    "x": 20,
+    "y": 170,
+    "w": 100,
+    "h": 56,
+    "shape": "box",
+    "sub": "1000 req/s"
+   },
+   {
+    "id": "app",
+    "label": "App",
+    "x": 190,
+    "y": 170,
+    "w": 100,
+    "h": 56,
+    "shape": "box",
+    "sub": ""
+   },
+   {
+    "id": "ca",
+    "label": "Cache",
+    "x": 420,
+    "y": 50,
+    "w": 130,
+    "h": 56,
+    "shape": "db",
+    "sub": "empty"
+   },
+   {
+    "id": "db",
+    "label": "Database",
+    "x": 410,
+    "y": 290,
+    "w": 150,
+    "h": 56,
+    "shape": "db",
+    "sub": "capacity 200 q/s"
+   }
+  ],
+  "links": [
+   {
+    "from": "cl",
+    "to": "app",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "app",
+    "to": "ca",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "app",
+    "to": "db",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "A client asks the app for user:42. The app checks the cache first.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "app",
+      "label": "GET user:42",
+      "tone": "normal"
+     },
+     {
+      "from": "app",
+      "to": "ca",
+      "label": "get user:42",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "ca": {
+      "sub": "miss"
+     }
+    }
+   },
+   {
+    "say": "Cache miss. The app asks the database. The query takes 20 ms.",
+    "msgs": [
+     {
+      "from": "app",
+      "to": "db",
+      "label": "SELECT user 42",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "db": {
+      "sub": "1 query, 20 ms"
+     }
+    }
+   },
+   {
+    "say": "The app puts the row in the cache with TTL = 60 seconds, and answers the client.",
+    "msgs": [
+     {
+      "from": "db",
+      "to": "app",
+      "label": "row",
+      "tone": "normal"
+     },
+     {
+      "from": "app",
+      "to": "ca",
+      "label": "set TTL=60s",
+      "tone": "ok"
+     },
+     {
+      "from": "app",
+      "to": "cl",
+      "label": "200 OK",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "ca": {
+      "sub": "user:42, TTL 60s",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Next requests are cache hits: about 1 ms, and the database sees nothing. With 98% hits, 1000 req/s become only 20 req/s on the database.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "app",
+      "label": "GET user:42",
+      "tone": "normal"
+     },
+     {
+      "from": "app",
+      "to": "ca",
+      "label": "hit, 1 ms",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "db": {
+      "sub": "idle",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "At 60 seconds the TTL runs out and user:42 disappears from the cache. This is a very popular key.",
+    "set": {
+     "ca": {
+      "sub": "expired",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "Failure: in the next 20 ms, about 20 requests all miss the cache and all query the database for the same row. For a key with 1000 req/s and a slow query, this becomes hundreds.",
+    "msgs": [
+     {
+      "from": "app",
+      "to": "ca",
+      "label": "miss x20",
+      "tone": "bad"
+     },
+     {
+      "from": "app",
+      "to": "db",
+      "label": "20 identical queries",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "db": {
+      "sub": "overloaded",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "The database slows from 20 ms to 2 s. More requests pile up while waiting, so even more miss. This chain is the stampede.",
+    "set": {
+     "db": {
+      "sub": "2 s per query, timeouts",
+      "tone": "bad"
+     },
+     "cl": {
+      "sub": "errors 500",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "Fix 1: single-flight. The first miss takes a lock and loads the row. The other 999 wait about 20 ms and then read the new cache entry. The database gets 1 query.",
+    "msgs": [
+     {
+      "from": "app",
+      "to": "db",
+      "label": "1 query",
+      "tone": "ok"
+     },
+     {
+      "from": "db",
+      "to": "app",
+      "label": "row",
+      "tone": "ok"
+     },
+     {
+      "from": "app",
+      "to": "ca",
+      "label": "set TTL=60s",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "db": {
+      "sub": "1 query only",
+      "tone": "ok"
+     },
+     "ca": {
+      "sub": "user:42 loaded",
+      "tone": "ok"
+     },
+     "cl": {
+      "sub": "200 OK",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Fix 2: add random jitter to TTL, for example 60 s plus or minus 10 s, so thousands of keys written together do not all expire in the same second.",
+    "set": {
+     "ca": {
+      "sub": "TTL 50-70 s random",
+      "tone": "ok"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "eviction-lru-vs-scan",
+  "concept": "eviction",
+  "title": "LRU evicts the oldest-used key; a scan pushes out hot keys",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "rq",
+    "label": "Request",
+    "x": 20,
+    "y": 170,
+    "w": 100,
+    "h": 50,
+    "shape": "box",
+    "sub": "",
+    "tone": "accent"
+   },
+   {
+    "id": "s1",
+    "label": "(empty)",
+    "x": 270,
+    "y": 50,
+    "w": 200,
+    "h": 60,
+    "shape": "box",
+    "sub": "newest use"
+   },
+   {
+    "id": "s2",
+    "label": "(empty)",
+    "x": 270,
+    "y": 140,
+    "w": 200,
+    "h": 60,
+    "shape": "box",
+    "sub": ""
+   },
+   {
+    "id": "s3",
+    "label": "(empty)",
+    "x": 270,
+    "y": 230,
+    "w": 200,
+    "h": 60,
+    "shape": "box",
+    "sub": "oldest use"
+   },
+   {
+    "id": "ev",
+    "label": "Evicted",
+    "x": 559,
+    "y": 140,
+    "w": 121,
+    "h": 60,
+    "shape": "note",
+    "sub": "nothing yet"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "An LRU cache with room for 3 keys. Top slot = used most recently, bottom slot = used longest ago. Request: GET A.",
+    "msgs": [
+     {
+      "from": "rq",
+      "to": "s1",
+      "label": "GET A",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "s1": {
+      "label": "A",
+      "sub": "newest use",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "GET B. B goes on top and A moves down one slot.",
+    "msgs": [
+     {
+      "from": "rq",
+      "to": "s1",
+      "label": "GET B",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "s1": {
+      "label": "B",
+      "tone": "accent"
+     },
+     "s2": {
+      "label": "A"
+     }
+    }
+   },
+   {
+    "say": "GET C. The cache is now full: C, B, A.",
+    "msgs": [
+     {
+      "from": "rq",
+      "to": "s1",
+      "label": "GET C",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "s1": {
+      "label": "C",
+      "tone": "accent"
+     },
+     "s2": {
+      "label": "B"
+     },
+     "s3": {
+      "label": "A",
+      "sub": "oldest use"
+     }
+    }
+   },
+   {
+    "say": "GET A again is a hit. A moves to the top, so now the oldest is B.",
+    "msgs": [
+     {
+      "from": "rq",
+      "to": "s1",
+      "label": "GET A hit",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "s1": {
+      "label": "A",
+      "tone": "ok"
+     },
+     "s2": {
+      "label": "C"
+     },
+     "s3": {
+      "label": "B",
+      "sub": "oldest use"
+     }
+    }
+   },
+   {
+    "say": "GET D is a miss and the cache is full. LRU removes the least recently used key: B.",
+    "msgs": [
+     {
+      "from": "rq",
+      "to": "s1",
+      "label": "GET D miss",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "s1": {
+      "label": "D",
+      "tone": "accent"
+     },
+     "s2": {
+      "label": "A"
+     },
+     "s3": {
+      "label": "C",
+      "sub": "oldest use"
+     },
+     "ev": {
+      "sub": "B (unused longest)",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "Failure: a nightly job scans 1000 keys once (X1 to X1000). Each new key pushes out the oldest one, so A, C and D are all gone after 3 scans.",
+    "msgs": [
+     {
+      "from": "rq",
+      "to": "s1",
+      "label": "scan X1..X1000",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "s1": {
+      "label": "X1000",
+      "tone": "bad"
+     },
+     "s2": {
+      "label": "X999",
+      "tone": "bad"
+     },
+     "s3": {
+      "label": "X998",
+      "sub": "oldest use",
+      "tone": "bad"
+     },
+     "ev": {
+      "sub": "A, C, D (hot keys)",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "Morning traffic asks for A again: miss. The scan keys are never used again, but they took the space. This is cache pollution.",
+    "msgs": [
+     {
+      "from": "rq",
+      "to": "s1",
+      "label": "GET A miss",
+      "tone": "bad"
+     }
+    ],
+    "focus": [
+     "rq",
+     "s1"
+    ]
+   },
+   {
+    "say": "LFU counts uses instead of recency. A has 50 hits, scan keys only 1 hit each, so the scan keys are evicted first and A stays.",
+    "set": {
+     "s1": {
+      "label": "A",
+      "sub": "50 hits",
+      "tone": "ok"
+     },
+     "s2": {
+      "label": "X1000",
+      "sub": "1 hit",
+      "tone": "muted"
+     },
+     "s3": {
+      "label": "X999",
+      "sub": "1 hit, next out",
+      "tone": "muted"
+     },
+     "ev": {
+      "sub": "X998 (1 hit)",
+      "tone": "ok"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "cdn-miss-hit-stale",
+  "concept": "cdn",
+  "title": "A CDN edge: miss, hit, stale file and purge",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "us",
+    "label": "User in Mumbai",
+    "x": 20,
+    "y": 170,
+    "w": 120,
+    "h": 56,
+    "shape": "box",
+    "sub": ""
+   },
+   {
+    "id": "ed",
+    "label": "Edge Mumbai",
+    "x": 288,
+    "y": 170,
+    "w": 133,
+    "h": 56,
+    "shape": "db",
+    "sub": "cache empty"
+   },
+   {
+    "id": "or",
+    "label": "Origin in US",
+    "x": 560,
+    "y": 170,
+    "w": 130,
+    "h": 56,
+    "shape": "box",
+    "sub": "logo.png v1"
+   }
+  ],
+  "links": [
+   {
+    "from": "us",
+    "to": "ed",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "ed",
+    "to": "or",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "A user asks for /logo.png. The request goes to the nearest edge server in Mumbai, not to the origin.",
+    "msgs": [
+     {
+      "from": "us",
+      "to": "ed",
+      "label": "GET /logo.png",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "ed": {
+      "sub": "miss",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "The edge has no copy, so it goes to the origin in the US. Round trip is about 180 ms.",
+    "msgs": [
+     {
+      "from": "ed",
+      "to": "or",
+      "label": "GET (cache miss)",
+      "tone": "normal"
+     }
+    ]
+   },
+   {
+    "say": "The origin answers with the file (200 KB) and a header: Cache-Control: max-age=3600. That means: keep it for 1 hour.",
+    "msgs": [
+     {
+      "from": "or",
+      "to": "ed",
+      "label": "200 + max-age=3600",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "ed": {
+      "sub": "logo v1, 3600 s left",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "The edge sends it to the user. This first user waited 190 ms.",
+    "msgs": [
+     {
+      "from": "ed",
+      "to": "us",
+      "label": "200 OK, 190 ms",
+      "tone": "normal"
+     }
+    ]
+   },
+   {
+    "say": "A second user in Mumbai asks for the same file. Edge hit: 12 ms, and the origin does not see this request.",
+    "msgs": [
+     {
+      "from": "us",
+      "to": "ed",
+      "label": "GET /logo.png",
+      "tone": "normal"
+     },
+     {
+      "from": "ed",
+      "to": "us",
+      "label": "hit, 12 ms",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "ed": {
+      "sub": "logo v1, 3100 s left",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Failure: the team uploads a new logo, v2. The edge still has v1 with 3100 s left, so users keep seeing the old logo for up to 52 minutes.",
+    "set": {
+     "or": {
+      "sub": "logo.png v2",
+      "tone": "accent"
+     },
+     "ed": {
+      "sub": "still serves v1",
+      "tone": "bad"
+     }
+    },
+    "msgs": [
+     {
+      "from": "ed",
+      "to": "us",
+      "label": "v1 (stale)",
+      "tone": "bad"
+     }
+    ]
+   },
+   {
+    "say": "Fix: send a purge request for /logo.png. The edge deletes its copy. Better: put a version in the name, like logo.v2.png, so no purge is needed.",
+    "msgs": [
+     {
+      "from": "or",
+      "to": "ed",
+      "label": "PURGE /logo.png",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "ed": {
+      "sub": "empty",
+      "tone": "muted"
+     }
+    }
+   },
+   {
+    "say": "Next request is a miss, so the edge fetches v2 and caches it again with a fresh 3600 s.",
+    "msgs": [
+     {
+      "from": "ed",
+      "to": "or",
+      "label": "GET",
+      "tone": "normal"
+     },
+     {
+      "from": "or",
+      "to": "ed",
+      "label": "200 v2",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "ed": {
+      "sub": "logo v2, 3600 s left",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "When max-age ends, the edge asks the origin: 'If-None-Match: abc'. If the file is unchanged, origin replies 304 with no body, so almost nothing is downloaded.",
+    "msgs": [
+     {
+      "from": "ed",
+      "to": "or",
+      "label": "If-None-Match: abc",
+      "tone": "normal"
+     },
+     {
+      "from": "or",
+      "to": "ed",
+      "label": "304 Not Modified",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "ed": {
+      "sub": "v2 renewed, 3600 s",
+      "tone": "ok"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "loadbalancing-health-check",
+  "concept": "loadbalancing",
+  "title": "Round robin, a failed server, and least connections",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "cl",
+    "label": "Clients",
+    "x": 20,
+    "y": 170,
+    "w": 100,
+    "h": 56,
+    "shape": "box",
+    "sub": ""
+   },
+   {
+    "id": "lb",
+    "label": "Load balancer",
+    "x": 220,
+    "y": 170,
+    "w": 130,
+    "h": 56,
+    "shape": "box",
+    "sub": "round robin"
+   },
+   {
+    "id": "s1",
+    "label": "Server 1",
+    "x": 500,
+    "y": 50,
+    "w": 130,
+    "h": 56,
+    "shape": "box",
+    "sub": "up"
+   },
+   {
+    "id": "s2",
+    "label": "Server 2",
+    "x": 500,
+    "y": 170,
+    "w": 130,
+    "h": 56,
+    "shape": "box",
+    "sub": "up"
+   },
+   {
+    "id": "s3",
+    "label": "Server 3",
+    "x": 500,
+    "y": 290,
+    "w": 130,
+    "h": 56,
+    "shape": "box",
+    "sub": "up"
+   }
+  ],
+  "links": [
+   {
+    "from": "cl",
+    "to": "lb",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "lb",
+    "to": "s1",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "lb",
+    "to": "s2",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "lb",
+    "to": "s3",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "Request 1 comes in. Round robin sends requests to the servers in turn: first S1.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "lb",
+      "label": "req 1",
+      "tone": "normal"
+     },
+     {
+      "from": "lb",
+      "to": "s1",
+      "label": "req 1",
+      "tone": "normal"
+     }
+    ]
+   },
+   {
+    "say": "Request 2 goes to S2.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "lb",
+      "label": "req 2",
+      "tone": "normal"
+     },
+     {
+      "from": "lb",
+      "to": "s2",
+      "label": "req 2",
+      "tone": "normal"
+     }
+    ]
+   },
+   {
+    "say": "Request 3 goes to S3, then request 4 goes back to S1. Each server gets one third.",
+    "msgs": [
+     {
+      "from": "lb",
+      "to": "s3",
+      "label": "req 3",
+      "tone": "normal"
+     },
+     {
+      "from": "lb",
+      "to": "s1",
+      "label": "req 4",
+      "tone": "normal"
+     }
+    ]
+   },
+   {
+    "say": "Failure: S2 crashes. The balancer checks GET /health on each server every 5 s. S2 does not answer.",
+    "set": {
+     "s2": {
+      "label": "Server 2",
+      "sub": "no answer",
+      "tone": "bad"
+     }
+    },
+    "msgs": [
+     {
+      "from": "lb",
+      "to": "s2",
+      "label": "health check",
+      "tone": "bad",
+      "lost": true
+     }
+    ]
+   },
+   {
+    "say": "Until it is marked down, requests still go to S2 and fail. Request 5 gets an error.",
+    "msgs": [
+     {
+      "from": "lb",
+      "to": "s2",
+      "label": "req 5",
+      "tone": "bad",
+      "lost": true
+     }
+    ],
+    "set": {
+     "lb": {
+      "sub": "S2: 1 of 3 fails"
+     }
+    }
+   },
+   {
+    "say": "After 3 failed checks (15 s), the balancer removes S2 from the list. The arrow disappears.",
+    "unlink": [
+     [
+      "lb",
+      "s2"
+     ]
+    ],
+    "set": {
+     "s2": {
+      "sub": "removed",
+      "tone": "muted"
+     },
+     "lb": {
+      "sub": "S1, S3 only",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "Requests 6, 7 and 8 now alternate between S1 and S3. Users see no more errors, but each server takes 50% instead of 33%.",
+    "msgs": [
+     {
+      "from": "lb",
+      "to": "s3",
+      "label": "req 6",
+      "tone": "normal"
+     },
+     {
+      "from": "lb",
+      "to": "s1",
+      "label": "req 7",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "s1": {
+      "sub": "50% of load"
+     },
+     "s3": {
+      "sub": "50% of load"
+     }
+    }
+   },
+   {
+    "say": "S2 is repaired. After 2 checks in a row pass, the balancer puts it back.",
+    "link": [
+     {
+      "from": "lb",
+      "to": "s2",
+      "label": "",
+      "dashed": false
+     }
+    ],
+    "set": {
+     "s2": {
+      "sub": "back in pool",
+      "tone": "ok"
+     },
+     "lb": {
+      "sub": "round robin",
+      "tone": "ok"
+     }
+    },
+    "msgs": [
+     {
+      "from": "lb",
+      "to": "s2",
+      "label": "health ok",
+      "tone": "ok"
+     }
+    ]
+   },
+   {
+    "say": "Round robin ignores load. If S1 has a slow request type with 50 open connections and S3 has 5, 'least connections' sends the next request to S3.",
+    "set": {
+     "lb": {
+      "sub": "least connections"
+     },
+     "s1": {
+      "sub": "50 connections",
+      "tone": "warn"
+     },
+     "s3": {
+      "sub": "5 connections",
+      "tone": "ok"
+     }
+    },
+    "msgs": [
+     {
+      "from": "lb",
+      "to": "s3",
+      "label": "req 9",
+      "tone": "ok"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "id": "ratelimit-token-bucket",
+  "concept": "ratelimit",
+  "title": "A token bucket allows a burst, then blocks",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "cl",
+    "label": "Client",
+    "x": 20,
+    "y": 100,
+    "w": 100,
+    "h": 56,
+    "shape": "box",
+    "sub": ""
+   },
+   {
+    "id": "rl",
+    "label": "Rate limiter A",
+    "x": 240,
+    "y": 100,
+    "w": 150,
+    "h": 70,
+    "shape": "box",
+    "sub": "tokens 10 / 10"
+   },
+   {
+    "id": "api",
+    "label": "API",
+    "x": 575,
+    "y": 100,
+    "w": 109,
+    "h": 56,
+    "shape": "box",
+    "sub": "ok"
+   },
+   {
+    "id": "rl2",
+    "label": "Rate limiter B",
+    "x": 240,
+    "y": 290,
+    "w": 150,
+    "h": 70,
+    "shape": "box",
+    "sub": "local: 10 / 10",
+    "tone": "muted"
+   },
+   {
+    "id": "rd",
+    "label": "Redis counter",
+    "x": 470,
+    "y": 290,
+    "w": 150,
+    "h": 56,
+    "shape": "db",
+    "sub": ""
+   }
+  ],
+  "links": [
+   {
+    "from": "cl",
+    "to": "rl",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "rl",
+    "to": "api",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "rl2",
+    "to": "api",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "Rule: a bucket holds up to 10 tokens and gets 5 new tokens every second. Each request takes 1 token. The bucket starts full.",
+    "focus": [
+     "rl"
+    ]
+   },
+   {
+    "say": "Burst: 10 requests arrive in the same instant. Each takes a token, so all 10 pass. The bucket is empty.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "rl",
+      "label": "10 requests",
+      "tone": "normal"
+     },
+     {
+      "from": "rl",
+      "to": "api",
+      "label": "10 pass",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "rl": {
+      "sub": "tokens 0 / 10",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "Request number 11 arrives at once. No token left, so it is rejected with 429 Too Many Requests and 'Retry-After: 1'.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "rl",
+      "label": "req 11",
+      "tone": "normal"
+     },
+     {
+      "from": "rl",
+      "to": "cl",
+      "label": "429 Retry-After: 1",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "rl": {
+      "sub": "tokens 0 / 10",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "One second later, 5 tokens are added (5 per second).",
+    "set": {
+     "rl": {
+      "sub": "tokens 5 / 10",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "The client retries and sends 5 requests. All 5 pass, and the bucket is empty again. Long-run speed can never be above 5 per second.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "rl",
+      "label": "5 requests",
+      "tone": "normal"
+     },
+     {
+      "from": "rl",
+      "to": "api",
+      "label": "5 pass",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "rl": {
+      "sub": "tokens 0 / 10",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "The client stays quiet for 2 seconds: +10 tokens, but the cap is 10. Idle time builds only a limited burst, never more.",
+    "set": {
+     "rl": {
+      "sub": "tokens 10 / 10 (cap)",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Failure: with two API servers, each keeps its own counter. A user sending 10 requests to each gets 20 through, double the limit.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "rl",
+      "label": "10",
+      "tone": "normal"
+     },
+     {
+      "from": "cl",
+      "to": "rl2",
+      "label": "10",
+      "tone": "normal"
+     },
+     {
+      "from": "rl",
+      "to": "api",
+      "label": "10 pass",
+      "tone": "normal"
+     },
+     {
+      "from": "rl2",
+      "to": "api",
+      "label": "10 pass",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "rl": {
+      "sub": "tokens 0 / 10"
+     },
+     "rl2": {
+      "sub": "local: 0 / 10",
+      "tone": "bad"
+     },
+     "api": {
+      "sub": "got 20, limit 10",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "Fix: both limiters take tokens from one shared counter in Redis, using an atomic step. Now the user gets 10 in total across all servers.",
+    "link": [
+     {
+      "from": "rl",
+      "to": "rd",
+      "label": "",
+      "dashed": false
+     },
+     {
+      "from": "rl2",
+      "to": "rd",
+      "label": "",
+      "dashed": false
+     }
+    ],
+    "set": {
+     "rd": {
+      "sub": "tokens 10 / 10",
+      "tone": "ok"
+     },
+     "rl2": {
+      "sub": "shared with A",
+      "tone": "ok"
+     },
+     "api": {
+      "sub": "ok",
+      "tone": "ok"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "tcp-handshake-loss",
+  "concept": "tcp",
+  "title": "TCP: handshake, data, a lost segment and a retransmit",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "cl",
+    "label": "Client",
+    "x": 2,
+    "y": 150,
+    "w": 185,
+    "h": 80,
+    "shape": "box",
+    "sub": "seq 1000"
+   },
+   {
+    "id": "sv",
+    "label": "Server",
+    "x": 538,
+    "y": 150,
+    "w": 173,
+    "h": 80,
+    "shape": "box",
+    "sub": "listening"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "Before any data, TCP sets up a connection. The client picks a random start number and sends SYN seq=1000.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "SYN seq=1000",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "cl": {
+      "sub": "SYN sent"
+     }
+    }
+   },
+   {
+    "say": "The server picks its own start number 5000 and answers SYN-ACK: seq=5000, ack=1001 (it expects client byte 1001 next).",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "SYN-ACK seq=5000 ack=1001",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "sv": {
+      "sub": "SYN received"
+     }
+    }
+   },
+   {
+    "say": "The client confirms with ACK ack=5001. Both sides now agree on numbers, and the connection is open after 1 round trip.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "ACK ack=5001",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "cl": {
+      "sub": "established",
+      "tone": "ok"
+     },
+     "sv": {
+      "sub": "established",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "The client sends 100 bytes of data: seq=1001, len=100. Every byte has a number, so the server can put them in order.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "DATA seq=1001 len=100",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "cl": {
+      "sub": "sent up to 1100"
+     }
+    }
+   },
+   {
+    "say": "The server replies ACK ack=1101: 'I have everything before byte 1101, send 1101 next'.",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "ACK ack=1101",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "sv": {
+      "sub": "got up to 1100",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Failure: the client sends seq=1101 len=100, but a router drops it. The client starts a retransmit timer (RTO = 200 ms).",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "DATA seq=1101",
+      "tone": "bad",
+      "lost": true
+     }
+    ],
+    "set": {
+     "cl": {
+      "sub": "waiting ack 1201, timer 200ms",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "The client keeps going. seq=1201 arrives, but the server still misses 1101, so it repeats ACK ack=1101. That is a duplicate ACK; 3 of them mean a hole.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "DATA seq=1201",
+      "tone": "normal"
+     },
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "ACK ack=1101 (dup)",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "sv": {
+      "sub": "has 1201-1300, hole at 1101",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "The client resends seq=1101 (after the timer or 3 duplicate ACKs).",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "DATA seq=1101 (retx)",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "cl": {
+      "sub": "retransmitting 1101"
+     }
+    }
+   },
+   {
+    "say": "Now the server has 1101 to 1300 without a gap, and answers ACK ack=1301. Data is delivered in order, nothing missing.",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "ACK ack=1301",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "sv": {
+      "sub": "got up to 1300",
+      "tone": "ok"
+     },
+     "cl": {
+      "sub": "all acked",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "To close, the client sends FIN seq=1301 and the server answers with ACK 1302. The server then sends its own FIN, so each direction closes by itself.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "FIN seq=1301",
+      "tone": "normal"
+     },
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "ACK ack=1302",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "cl": {
+      "sub": "closing",
+      "tone": "muted"
+     },
+     "sv": {
+      "sub": "closing",
+      "tone": "muted"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "congestion-slow-start",
+  "concept": "congestion",
+  "title": "Slow start, congestion avoidance, and a loss that resets everything",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "sd",
+    "label": "Sender",
+    "x": 17,
+    "y": 150,
+    "w": 156,
+    "h": 80,
+    "shape": "box",
+    "sub": "cwnd 1"
+   },
+   {
+    "id": "rt",
+    "label": "Router",
+    "x": 300,
+    "y": 150,
+    "w": 130,
+    "h": 80,
+    "shape": "box",
+    "sub": "queue 0 / 8"
+   },
+   {
+    "id": "rc",
+    "label": "Receiver",
+    "x": 560,
+    "y": 150,
+    "w": 130,
+    "h": 80,
+    "shape": "box",
+    "sub": ""
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "A sender does not know how fast the network is, so it starts small. cwnd (packets allowed in flight) = 1, slow-start limit ssthresh = 16.",
+    "msgs": [
+     {
+      "from": "sd",
+      "to": "rt",
+      "label": "1 pkt",
+      "tone": "normal"
+     },
+     {
+      "from": "rt",
+      "to": "rc",
+      "label": "1 pkt",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "sd": {
+      "sub": "cwnd 1, ssthresh 16"
+     }
+    }
+   },
+   {
+    "say": "The ACK comes back. In slow start every ACK adds 1, so cwnd doubles each round trip: next round 2 packets.",
+    "msgs": [
+     {
+      "from": "sd",
+      "to": "rt",
+      "label": "2 pkts",
+      "tone": "normal"
+     },
+     {
+      "from": "rt",
+      "to": "rc",
+      "label": "2 pkts",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "sd": {
+      "sub": "cwnd 2",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "Next round cwnd = 4, then 8. Growth is fast: from 1 to 8 in just 3 round trips.",
+    "msgs": [
+     {
+      "from": "sd",
+      "to": "rt",
+      "label": "4 pkts",
+      "tone": "normal"
+     },
+     {
+      "from": "rt",
+      "to": "rc",
+      "label": "4 pkts",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "sd": {
+      "sub": "cwnd 4 then 8",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "At cwnd = 16 it reaches ssthresh. Now it grows slowly: +1 packet per round trip (congestion avoidance). Next round is 17 packets.",
+    "msgs": [
+     {
+      "from": "sd",
+      "to": "rt",
+      "label": "16 pkts",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "sd": {
+      "sub": "cwnd 16 then 17",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "17 packets arrive in a burst and the router queue (limit 8) overflows. Packets are dropped.",
+    "msgs": [
+     {
+      "from": "sd",
+      "to": "rt",
+      "label": "17 pkts",
+      "tone": "warn"
+     },
+     {
+      "from": "rt",
+      "to": "rc",
+      "label": "some lost",
+      "tone": "bad",
+      "lost": true
+     }
+    ],
+    "set": {
+     "rt": {
+      "sub": "queue 8 / 8 FULL",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "The sender gets no ACKs for the lost packets and its timer fires after 1 s. A timeout is a strong sign of congestion.",
+    "set": {
+     "sd": {
+      "sub": "timeout! no ACKs",
+      "tone": "bad"
+     }
+    },
+    "focus": [
+     "sd"
+    ]
+   },
+   {
+    "say": "Reaction: ssthresh = half of cwnd = 8, and cwnd drops back to 1. All the speed is lost in one step.",
+    "set": {
+     "sd": {
+      "sub": "cwnd 1, ssthresh 8",
+      "tone": "warn"
+     },
+     "rt": {
+      "sub": "queue 0 / 8",
+      "tone": "normal"
+     }
+    }
+   },
+   {
+    "say": "Slow start again: 1, 2, 4, 8. It takes 3 round trips to be back to 8 packets, the old half-speed.",
+    "msgs": [
+     {
+      "from": "sd",
+      "to": "rt",
+      "label": "1,2,4,8 pkts",
+      "tone": "normal"
+     },
+     {
+      "from": "rt",
+      "to": "rc",
+      "label": "delivered",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "sd": {
+      "sub": "cwnd 8 = ssthresh",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "After 8 it climbs +1 per round trip: 9, 10, 11... Getting back to 17 takes 9 more round trips. Loss is expensive, and the sender repeats this saw-tooth shape.",
+    "msgs": [
+     {
+      "from": "sd",
+      "to": "rt",
+      "label": "9, 10, 11 pkts",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "sd": {
+      "sub": "cwnd 9, 10, 11...",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Gentler case: if only one packet is lost and 3 duplicate ACKs arrive, the sender does fast retransmit and halves cwnd (17 to 8), skipping the reset to 1.",
+    "set": {
+     "sd": {
+      "sub": "3 dup ACKs: cwnd 17 to 8",
+      "tone": "ok"
+     }
+    },
+    "focus": [
+     "sd"
+    ]
+   }
+  ]
+ },
+ {
+  "id": "tls-handshake-13",
+  "concept": "tls",
+  "title": "A TLS 1.3 handshake and a certificate failure",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "cl",
+    "label": "Browser",
+    "x": 30,
+    "y": 120,
+    "w": 130,
+    "h": 80,
+    "shape": "box",
+    "sub": "wants shop.com"
+   },
+   {
+    "id": "sv",
+    "label": "Server",
+    "x": 550,
+    "y": 120,
+    "w": 150,
+    "h": 80,
+    "shape": "box",
+    "sub": "shop.com"
+   },
+   {
+    "id": "ca",
+    "label": "Trusted root CAs",
+    "x": 270,
+    "y": 300,
+    "w": 180,
+    "h": 56,
+    "shape": "note",
+    "sub": "stored in browser"
+   }
+  ],
+  "links": [
+   {
+    "from": "cl",
+    "to": "sv",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "The browser sends ClientHello: the ciphers it supports, its key_share (a public number for key exchange), and SNI=shop.com (the site name).",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "ClientHello + key_share",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "cl": {
+      "sub": "sent my key_share"
+     }
+    }
+   },
+   {
+    "say": "The server picks cipher TLS_AES_128_GCM and sends its own key_share in ServerHello. Both sides now compute the same secret key, never sent on the wire.",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "ServerHello + key_share",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "cl": {
+      "sub": "has shared key",
+      "tone": "ok"
+     },
+     "sv": {
+      "sub": "has shared key",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "From here everything is encrypted. The server sends its certificate (its public key, name shop.com, signed by a CA) and a signature proving it owns the private key.",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "Certificate + signature",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "sv": {
+      "sub": "proves identity"
+     }
+    }
+   },
+   {
+    "say": "The browser checks three things: the name matches shop.com, today is inside the validity dates, and the signature chain leads to a trusted root CA.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "ca",
+      "label": "check chain",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "ca": {
+      "sub": "chain valid",
+      "tone": "ok"
+     },
+     "cl": {
+      "sub": "cert ok",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "The browser sends Finished. The handshake took 1 round trip. Now the HTTP request can go out.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "Finished",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "sv": {
+      "sub": "handshake done",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Application data is encrypted with the shared key: GET /account. Anyone on the network sees only random-looking bytes.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "encrypted: GET /account",
+      "tone": "ok"
+     }
+    ]
+   },
+   {
+    "say": "Failure: on another visit the server's certificate expired on 2026-09-01. The check at step 4 fails.",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "Certificate (expired)",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "ca": {
+      "sub": "date check failed",
+      "tone": "bad"
+     },
+     "sv": {
+      "sub": "cert expired 2026-09-01",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "The browser sends a fatal alert, closes the connection, and shows a warning page. No data is sent. A fake server cannot pass either: without shop.com's private key it cannot make the signature.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "alert: bad certificate",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "cl": {
+      "sub": "connection blocked",
+      "tone": "bad"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "dns-resolution-ttl",
+  "concept": "dns",
+  "title": "Resolving www.shop.com, caching, and a stale answer",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "br",
+    "label": "Browser",
+    "x": 12,
+    "y": 170,
+    "w": 115,
+    "h": 56,
+    "shape": "box",
+    "sub": ""
+   },
+   {
+    "id": "rs",
+    "label": "Resolver 8.8.8.8",
+    "x": 185,
+    "y": 170,
+    "w": 150,
+    "h": 56,
+    "shape": "box",
+    "sub": "cache empty"
+   },
+   {
+    "id": "rt",
+    "label": "Root server",
+    "x": 500,
+    "y": 30,
+    "w": 160,
+    "h": 50,
+    "shape": "box",
+    "sub": "knows .com"
+   },
+   {
+    "id": "td",
+    "label": "TLD .com server",
+    "x": 500,
+    "y": 140,
+    "w": 160,
+    "h": 50,
+    "shape": "box",
+    "sub": "knows shop.com NS"
+   },
+   {
+    "id": "au",
+    "label": "ns1.shop.com",
+    "x": 500,
+    "y": 250,
+    "w": 160,
+    "h": 56,
+    "shape": "box",
+    "sub": "A: 93.184.216.34"
+   }
+  ],
+  "links": [
+   {
+    "from": "br",
+    "to": "rs",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "rs",
+    "to": "rt",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "rs",
+    "to": "td",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "rs",
+    "to": "au",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "The browser asks the resolver: what is the IP of www.shop.com? The resolver cache is empty.",
+    "msgs": [
+     {
+      "from": "br",
+      "to": "rs",
+      "label": "www.shop.com?",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "rs": {
+      "sub": "cache miss",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "The resolver asks a root server. The root does not know the IP, but says: ask the .com servers.",
+    "msgs": [
+     {
+      "from": "rs",
+      "to": "rt",
+      "label": "www.shop.com?",
+      "tone": "normal"
+     },
+     {
+      "from": "rt",
+      "to": "rs",
+      "label": "ask .com servers",
+      "tone": "normal"
+     }
+    ]
+   },
+   {
+    "say": "The .com server also does not know the IP, but it knows who runs shop.com: ns1.shop.com.",
+    "msgs": [
+     {
+      "from": "rs",
+      "to": "td",
+      "label": "www.shop.com?",
+      "tone": "normal"
+     },
+     {
+      "from": "td",
+      "to": "rs",
+      "label": "ask ns1.shop.com",
+      "tone": "normal"
+     }
+    ]
+   },
+   {
+    "say": "The authority server for shop.com gives the real answer: A record 93.184.216.34, TTL 300 seconds.",
+    "msgs": [
+     {
+      "from": "rs",
+      "to": "au",
+      "label": "www.shop.com?",
+      "tone": "normal"
+     },
+     {
+      "from": "au",
+      "to": "rs",
+      "label": "93.184.216.34, TTL 300",
+      "tone": "ok"
+     }
+    ]
+   },
+   {
+    "say": "The resolver stores the answer for 300 s and replies to the browser. This first lookup took about 120 ms with 3 round trips.",
+    "msgs": [
+     {
+      "from": "rs",
+      "to": "br",
+      "label": "93.184.216.34",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "rs": {
+      "sub": "cached, TTL 300",
+      "tone": "ok"
+     },
+     "br": {
+      "sub": "connecting to .34"
+     }
+    }
+   },
+   {
+    "say": "100 s later another user asks the same resolver. It answers from cache in 1 ms with 200 s left. No other server is asked.",
+    "msgs": [
+     {
+      "from": "br",
+      "to": "rs",
+      "label": "www.shop.com?",
+      "tone": "normal"
+     },
+     {
+      "from": "rs",
+      "to": "br",
+      "label": "93.184.216.34 (cache)",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "rs": {
+      "sub": "cache hit, TTL left 200"
+     }
+    }
+   },
+   {
+    "say": "Failure: shop.com moves to a new server and the authority now says 198.51.100.8.",
+    "set": {
+     "au": {
+      "sub": "A: 198.51.100.8 (new)",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "Resolvers still hold the old answer, so they keep sending users to the old IP 93.184.216.34 until the TTL ends. Some users get the new site, some the old one.",
+    "msgs": [
+     {
+      "from": "rs",
+      "to": "br",
+      "label": "93.184.216.34 (stale)",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "rs": {
+      "sub": "stale, TTL left 120",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "At 300 s the cache entry expires. The next query goes to the authority and gets the new IP. Tip: lower TTL to 60 s a day before a move.",
+    "msgs": [
+     {
+      "from": "rs",
+      "to": "au",
+      "label": "www.shop.com?",
+      "tone": "normal"
+     },
+     {
+      "from": "au",
+      "to": "rs",
+      "label": "198.51.100.8, TTL 300",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "rs": {
+      "sub": "new IP cached",
+      "tone": "ok"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "http-hol-blocking",
+  "concept": "http",
+  "title": "HTTP/1.1 waits in line; HTTP/2 shares one connection",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "cl",
+    "label": "Browser",
+    "x": 0,
+    "y": 150,
+    "w": 167,
+    "h": 70,
+    "shape": "box",
+    "sub": "needs 3 images"
+   },
+   {
+    "id": "tc",
+    "label": "TCP connection",
+    "x": 278,
+    "y": 40,
+    "w": 173,
+    "h": 50,
+    "shape": "note",
+    "sub": "1 request at a time"
+   },
+   {
+    "id": "sv",
+    "label": "Server",
+    "x": 580,
+    "y": 150,
+    "w": 110,
+    "h": 70,
+    "shape": "box",
+    "sub": ""
+   }
+  ],
+  "links": [
+   {
+    "from": "cl",
+    "to": "sv",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "The browser has the page and needs 3 images: a.png (500 KB), b.png (5 KB), c.png (5 KB). It sends GET /a.png on one HTTP/1.1 connection.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "GET /a.png",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "cl": {
+      "sub": "waits for a.png"
+     }
+    }
+   },
+   {
+    "say": "The big image takes 400 ms. In HTTP/1.1 the next request waits for the response to finish, so b.png and c.png queue behind it.",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "a.png 500 KB, 400 ms",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "tc": {
+      "sub": "b, c stuck behind a",
+      "tone": "bad"
+     },
+     "cl": {
+      "sub": "b, c waiting",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "Only then GET /b.png, 20 ms, and GET /c.png, 20 ms. Total about 440 ms; the small files waited for the big one (head-of-line blocking).",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "GET /b.png, /c.png",
+      "tone": "normal"
+     },
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "b, c 5 KB each",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "cl": {
+      "sub": "done at 440 ms",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "Old fix: open 6 parallel connections per site. It works, but each connection needs its own TCP and TLS handshake and memory.",
+    "set": {
+     "tc": {
+      "sub": "6 connections, 6 handshakes",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "HTTP/2 sends all three requests at the same time on one connection, as streams 1, 3 and 5.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "stream 1: /a.png",
+      "tone": "normal"
+     },
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "stream 3: /b.png",
+      "tone": "normal"
+     },
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "stream 5: /c.png",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "tc": {
+      "sub": "1 connection, 3 streams",
+      "tone": "accent"
+     },
+     "cl": {
+      "sub": "all 3 requested at 0 ms"
+     }
+    }
+   },
+   {
+    "say": "The server splits responses into small frames and mixes them. b and c finish in 30 ms while a.png keeps streaming. Page is complete at 400 ms and small files were fast.",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "s3, s5 done at 30 ms",
+      "tone": "ok"
+     },
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "s1 frames...",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "cl": {
+      "sub": "b, c at 30 ms; a at 400",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Failure: below HTTP/2 is one TCP stream. One packet carrying a piece of stream 1 is lost.",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "s1 frame",
+      "tone": "bad",
+      "lost": true
+     }
+    ],
+    "set": {
+     "tc": {
+      "sub": "packet lost, TCP waits",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "TCP must give bytes in order, so it holds all later data, even the finished frames of streams 3 and 5, until the retransmit arrives (about 1 round trip, 100 ms). All streams freeze together.",
+    "set": {
+     "cl": {
+      "sub": "all streams frozen ~100 ms",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "This blocking at the TCP level cannot be fixed inside HTTP/2. HTTP/3 solves it by using QUIC, where each stream recovers by itself.",
+    "set": {
+     "tc": {
+      "sub": "HTTP/3: QUIC streams",
+      "tone": "ok"
+     }
+    },
+    "focus": [
+     "tc"
+    ]
+   }
+  ]
+ },
+ {
+  "id": "quic-streams-loss-migrate",
+  "concept": "quic",
+  "title": "QUIC: one-RTT start, loss on one stream, and a network change",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "cl",
+    "label": "Client",
+    "x": 0,
+    "y": 140,
+    "w": 185,
+    "h": 80,
+    "shape": "box",
+    "sub": "Wi-Fi 10.0.0.5"
+   },
+   {
+    "id": "sv",
+    "label": "Server",
+    "x": 570,
+    "y": 140,
+    "w": 120,
+    "h": 80,
+    "shape": "box",
+    "sub": ""
+   },
+   {
+    "id": "cid",
+    "label": "Connection ID",
+    "x": 270,
+    "y": 40,
+    "w": 180,
+    "h": 50,
+    "shape": "note",
+    "sub": "0xA1B2 (not set)"
+   }
+  ],
+  "links": [
+   {
+    "from": "cl",
+    "to": "sv",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "QUIC runs over UDP port 443. The client sends an Initial packet #0 that carries the TLS ClientHello inside it.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "Initial #0: ClientHello",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "cl": {
+      "sub": "handshake starts"
+     }
+    }
+   },
+   {
+    "say": "The server answers with its Initial and Handshake packets: ServerHello, certificate, Finished. Both keys are ready after one round trip.",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "Initial + Handshake: cert, Finished",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "cid": {
+      "sub": "0xA1B2 agreed",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "The client can send the request right away. TCP + TLS would need 2 round trips before this; QUIC needs 1. HTTP request goes on stream 4.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "1-RTT: GET /page (stream 4)",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "cl": {
+      "sub": "connected after 1 RTT",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "The server answers with three packets: #5 carries stream 4 (the HTML), #6 carries stream 8 (app.js), #7 carries more of stream 4. Packet #5 is lost.",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "#5 stream 4",
+      "tone": "bad",
+      "lost": true
+     },
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "#6 stream 8",
+      "tone": "ok"
+     },
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "#7 stream 4",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "sv": {
+      "sub": "sent #5, #6, #7"
+     }
+    }
+   },
+   {
+    "say": "Stream 8 is complete and goes to the app right now. Stream 4 waits for its missing bytes, but nothing else is blocked. (In TCP, everything would wait.)",
+    "set": {
+     "cl": {
+      "sub": "stream 8 done; stream 4 waits",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "The client sends an ACK that says: I have #6 and #7, but not #5.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "ACK: got 6-7, missing 5",
+      "tone": "normal"
+     }
+    ]
+   },
+   {
+    "say": "The server resends the same stream-4 bytes, but in a new packet #8. Packet numbers are never reused, so there is no confusion about which copy was acknowledged.",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "cl",
+      "label": "#8 stream 4 (retx)",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "cl": {
+      "sub": "stream 4 complete",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Network change: the phone leaves Wi-Fi and moves to 5G. Its IP changes from 10.0.0.5 to 100.64.2.9. A TCP connection would break here, because it is tied to the IP addresses.",
+    "set": {
+     "cl": {
+      "sub": "5G 100.64.2.9",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "QUIC packets carry the Connection ID 0xA1B2. The server sees the same ID from the new address, checks the new path, and continues. No new handshake, the download keeps going.",
+    "msgs": [
+     {
+      "from": "cl",
+      "to": "sv",
+      "label": "#9 conn 0xA1B2 from new IP",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "cid": {
+      "sub": "0xA1B2 same, new path",
+      "tone": "ok"
+     },
+     "sv": {
+      "sub": "path validated",
+      "tone": "ok"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "iprouting-longest-prefix-ttl",
+  "concept": "iprouting",
+  "title": "Routers pick the longest prefix; TTL stops a loop",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "a",
+    "label": "Host A",
+    "x": 12,
+    "y": 170,
+    "w": 115,
+    "h": 56,
+    "shape": "box",
+    "sub": "10.0.1.5"
+   },
+   {
+    "id": "r1",
+    "label": "R1",
+    "x": 151,
+    "y": 170,
+    "w": 127,
+    "h": 56,
+    "shape": "box",
+    "sub": "gateway"
+   },
+   {
+    "id": "r2",
+    "label": "R2",
+    "x": 303,
+    "y": 170,
+    "w": 133,
+    "h": 56,
+    "shape": "box",
+    "sub": "2 routes match"
+   },
+   {
+    "id": "r3",
+    "label": "R3",
+    "x": 468,
+    "y": 50,
+    "w": 133,
+    "h": 56,
+    "shape": "box",
+    "sub": "route 203.0.0.0/16"
+   },
+   {
+    "id": "r4",
+    "label": "R4",
+    "x": 480,
+    "y": 290,
+    "w": 110,
+    "h": 56,
+    "shape": "box",
+    "sub": "203.0.113.0/24"
+   },
+   {
+    "id": "b",
+    "label": "Host B",
+    "x": 606,
+    "y": 290,
+    "w": 98,
+    "h": 56,
+    "shape": "box",
+    "sub": "203.0.113.9"
+   }
+  ],
+  "links": [
+   {
+    "from": "a",
+    "to": "r1",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "r1",
+    "to": "r2",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "r2",
+    "to": "r3",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "r2",
+    "to": "r4",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "r4",
+    "to": "b",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "Host A sends a packet to 203.0.113.9 with TTL 64. It is not in A's own network, so A gives it to the default gateway R1.",
+    "msgs": [
+     {
+      "from": "a",
+      "to": "r1",
+      "label": "dst 203.0.113.9 TTL 64",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "a": {
+      "sub": "TTL 64"
+     }
+    }
+   },
+   {
+    "say": "R1 looks in its table: the only match is the default route 0.0.0.0/0, next hop R2. It lowers TTL by 1 and forwards.",
+    "msgs": [
+     {
+      "from": "r1",
+      "to": "r2",
+      "label": "TTL 63",
+      "tone": "normal"
+     }
+    ],
+    "set": {
+     "r1": {
+      "sub": "default route to R2"
+     }
+    }
+   },
+   {
+    "say": "R2 has two matching routes: 203.0.0.0/16 to R3 and 203.0.113.0/24 to R4. The router picks the longest prefix, the most specific: /24 to R4.",
+    "msgs": [
+     {
+      "from": "r2",
+      "to": "r4",
+      "label": "TTL 62, via /24",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "r2": {
+      "sub": "/24 beats /16",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "R4 is directly connected to the 203.0.113.0/24 network, so it delivers to Host B with TTL 61. Success.",
+    "msgs": [
+     {
+      "from": "r4",
+      "to": "b",
+      "label": "TTL 61",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "b": {
+      "sub": "packet arrived",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Failure: a packet for 203.0.50.7 comes in. R2 matches only 203.0.0.0/16, so it sends the packet to R3.",
+    "msgs": [
+     {
+      "from": "a",
+      "to": "r1",
+      "label": "dst 203.0.50.7 TTL 64",
+      "tone": "normal"
+     },
+     {
+      "from": "r1",
+      "to": "r2",
+      "label": "TTL 63",
+      "tone": "normal"
+     },
+     {
+      "from": "r2",
+      "to": "r3",
+      "label": "TTL 62",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "r3": {
+      "sub": "TTL 61 arrives"
+     }
+    }
+   },
+   {
+    "say": "R3 has a wrong route: 203.0.0.0/8 back to R2. The packet goes back and forth R2 to R3 to R2... TTL falls by 1 each hop.",
+    "msgs": [
+     {
+      "from": "r3",
+      "to": "r2",
+      "label": "TTL 60",
+      "tone": "bad"
+     },
+     {
+      "from": "r2",
+      "to": "r3",
+      "label": "TTL 59",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "r3": {
+      "sub": "bad route back to R2",
+      "tone": "bad"
+     },
+     "r2": {
+      "sub": "looping packet",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "After about 60 hops TTL reaches 0. The router that makes it 0 drops the packet and sends back an ICMP 'Time Exceeded' message to A.",
+    "msgs": [
+     {
+      "from": "r3",
+      "to": "a",
+      "label": "ICMP time exceeded",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "r3": {
+      "sub": "TTL 0: dropped",
+      "tone": "warn"
+     },
+     "a": {
+      "sub": "got time exceeded",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "Without TTL, looping packets would stay forever and fill the links. With TTL, the damage is limited and the error tells the admin where to look (traceroute uses this).",
+    "set": {
+     "r2": {
+      "sub": "fix: remove R3 route",
+      "tone": "ok"
+     },
+     "r3": {
+      "sub": "route removed",
+      "tone": "ok"
+     }
+    },
+    "focus": [
+     "r2",
+     "r3"
+    ]
+   }
+  ]
+ },
+ {
+  "id": "nat-table-mapping",
+  "concept": "nat",
+  "title": "NAT rewrites addresses and forgets idle connections",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "pc",
+    "label": "PC 192.168.1.10",
+    "x": 20,
+    "y": 40,
+    "w": 160,
+    "h": 56,
+    "shape": "box",
+    "sub": "port 51000"
+   },
+   {
+    "id": "ph",
+    "label": "Phone 192.168.1.11",
+    "x": 20,
+    "y": 200,
+    "w": 160,
+    "h": 56,
+    "shape": "box",
+    "sub": "port 51000"
+   },
+   {
+    "id": "nt",
+    "label": "NAT router",
+    "x": 290,
+    "y": 100,
+    "w": 160,
+    "h": 80,
+    "shape": "box",
+    "sub": "public 203.0.113.5"
+   },
+   {
+    "id": "sv",
+    "label": "Server",
+    "x": 530,
+    "y": 100,
+    "w": 160,
+    "h": 80,
+    "shape": "box",
+    "sub": "198.51.100.7:443"
+   },
+   {
+    "id": "t1",
+    "label": "",
+    "x": 260,
+    "y": 290,
+    "w": 220,
+    "h": 40,
+    "shape": "cell",
+    "sub": ""
+   },
+   {
+    "id": "t2",
+    "label": "",
+    "x": 260,
+    "y": 340,
+    "w": 220,
+    "h": 40,
+    "shape": "cell",
+    "sub": ""
+   }
+  ],
+  "links": [
+   {
+    "from": "pc",
+    "to": "nt",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "ph",
+    "to": "nt",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "nt",
+    "to": "sv",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "The PC has a private address that cannot be routed on the internet. It sends a packet from 192.168.1.10:51000 to the server 198.51.100.7:443.",
+    "msgs": [
+     {
+      "from": "pc",
+      "to": "nt",
+      "label": "from 192.168.1.10:51000",
+      "tone": "normal"
+     }
+    ]
+   },
+   {
+    "say": "The NAT router rewrites the source to its public address and a free port: 203.0.113.5:40001. It writes the pair into its table.",
+    "msgs": [
+     {
+      "from": "nt",
+      "to": "sv",
+      "label": "from 203.0.113.5:40001",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "t1": {
+      "label": ".10:51000 = :40001",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "The phone also uses local port 51000. If the NAT only changed the IP, the two would clash. It gives the phone public port 40002.",
+    "msgs": [
+     {
+      "from": "ph",
+      "to": "nt",
+      "label": "from 192.168.1.11:51000",
+      "tone": "normal"
+     },
+     {
+      "from": "nt",
+      "to": "sv",
+      "label": "from 203.0.113.5:40002",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "t2": {
+      "label": ".11:51000 = :40002",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "The server answers to 203.0.113.5:40001. The NAT looks up 40001 in its table, rewrites the destination to 192.168.1.10:51000 and forwards.",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "nt",
+      "label": "to :40001",
+      "tone": "normal"
+     },
+     {
+      "from": "nt",
+      "to": "pc",
+      "label": "to 192.168.1.10:51000",
+      "tone": "ok"
+     }
+    ]
+   },
+   {
+    "say": "A reply to port 40002 goes to the phone in the same way. One public IP can serve many devices, because the port tells them apart.",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "nt",
+      "label": "to :40002",
+      "tone": "normal"
+     },
+     {
+      "from": "nt",
+      "to": "ph",
+      "label": "to 192.168.1.11:51000",
+      "tone": "ok"
+     }
+    ]
+   },
+   {
+    "say": "Failure: a stranger sends a packet to 203.0.113.5:40003. There is no table entry, so the NAT does not know which device it is for and drops it. That also works like a basic firewall.",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "nt",
+      "label": "to :40003",
+      "tone": "bad",
+      "lost": true
+     }
+    ],
+    "set": {
+     "nt": {
+      "sub": "no mapping: drop",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "Mappings expire. The phone's call has been silent for 120 s, so the NAT deletes its entry for port 40002.",
+    "remove": [
+     "t2"
+    ],
+    "set": {
+     "ph": {
+      "sub": "idle 120 s",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "Now the server sends audio to :40002. There is no entry any more, so the packet is dropped and the call goes silent. Fix: keep-alive packets every 25 s refresh the mapping.",
+    "msgs": [
+     {
+      "from": "sv",
+      "to": "nt",
+      "label": "to :40002",
+      "tone": "bad",
+      "lost": true
+     }
+    ],
+    "set": {
+     "ph": {
+      "sub": "call frozen",
+      "tone": "bad"
+     },
+     "nt": {
+      "sub": "40002 unknown",
+      "tone": "bad"
+     }
+    }
+   }
+  ]
+ }
+]

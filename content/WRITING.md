@@ -106,3 +106,14 @@ explain the real mechanism and connect it clearly to the computing concepts buil
    Aim for every concept to print `OK`.
 5. Do not edit any other file. If a node's one-line mechanism or status (shown in the brief) is wrong or outdated,
    write the correction in `content/drafts/<your-file>.notes.txt` as `id | field | old | new | source`.
+
+## Required since v7: trade-offs and interview sections
+
+- `tradeoffs:` ("It depends: trade-offs") — 3–6 paragraphs, one decision each: "Choose X when …; choose Y when …",
+  naming the deciding factors with numbers, and what you give up either way. Required for EVERY concept. For L4/L5
+  (maths, physics, philosophy) the decisions are about which model, method or approximation to use and when it breaks
+  down (e.g. exact vs approximate, frequentist vs Bayesian, classical vs quantum model).
+- `interview:` ("In the interview") — 4–6 lines `question || strong answer outline`: the probing questions a
+  staff-level interviewer asks (follow-ups, failure cases, scaling limits, "why not X?"); answers 2–5 sentences.
+  Required for L0–L3. Different from `quiz:` (self-check recall); interview questions are harder and open-ended.
+- Do NOT write `animation:` sections in reads. Animations are separate scene files (content/anim/), made by other writers.

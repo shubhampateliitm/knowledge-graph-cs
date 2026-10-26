@@ -12,7 +12,7 @@ for name in [a for a in sys.argv[1:] if not a.startswith("--")]:
     r = subprocess.run([sys.executable, os.path.join(ROOT, "tools/checkread.py"), src] + ([] if force else ["--strict"]), capture_output=True, text=True)
     print(r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr)
     if r.returncode: print(f"{name}: NOT merged\n" + r.stdout[-3000:]); continue
-    dst = os.path.join(ROOT, "content/reads/long", ("y_" if name.startswith("x") else "d_") + name + ".txt")
+    dst = os.path.join(ROOT, "content/reads/long", ("y_" if name[0] in "xt" else "d_") + name + ".txt")
     shutil.move(src, dst); print(f"{name}: merged -> {os.path.relpath(dst, ROOT)}")
 r = subprocess.run([sys.executable, os.path.join(ROOT, "tools/build.py"), "--check"], capture_output=True, text=True)
 print((r.stdout + r.stderr).strip().splitlines()[-1])

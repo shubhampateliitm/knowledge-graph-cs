@@ -31,6 +31,7 @@ try {
     DATA = window.DATA;
     DATA.nodes.forEach(n=>{ READS[n.id]={id:n.id, rd:n.rd, refs:n.refs}; n.b=(n.rd.value||[""])[0]; n.q=(n.rd.intuition||[""])[0]; n.nr=n.refs.length; });
     DATA.layers.forEach(l=>{ READS[l.id]={id:l.id, rd:l.rd, refs:l.refs}; });
+    (DATA.scenes||[]).forEach(s=>{ const r=READS[s.concept]; if(r) (r.scenes=r.scenes||[]).push(s); });
   } else {
     DATA = await api("GET","/api/graph");
   }
@@ -56,6 +57,9 @@ const COURSE = {}; CUR.courses.forEach(c=>COURSE[c.code]=c);
 const TAUGHT = {}; CUR.courses.forEach(c=>c.concepts.forEach(id=>(TAUGHT[id]=TAUGHT[id]||[]).push(c.code)));
 const courseLabel = code => code.replace(/^([A-Z]+)(\d)/,"$1 $2");
 // system design questions: summaries in server mode (full text from /api/design/<id>), full objects in standalone mode
+// animated scenes: summaries for every scene (standalone DATA.scenes holds them in full; the server sends them in each read)
+const SCENES = (DATA.scenes||[]).filter(s=>N[s.concept]).map(s=>({id:s.id, concept:s.concept, title:s.title||s.id, n:s.n!==undefined?s.n:(s.steps||[]).length}));
+let SCENE_ALL = STANDALONE ? (DATA.scenes||[]) : null;
 const DESIGNS = (DATA.designs||[]).map(d=>{ if(d.rd && d.summary===undefined) d.summary=(d.rd.summary||[""])[0]; return d; });
 const DES = {}, DES_FULL = {}; DESIGNS.forEach(d=>{ DES[d.id]=d; if(d.rd) DES_FULL[d.id]=d; });
 const USES = {}; DESIGNS.forEach(d=>d.concepts.forEach(id=>{ if(N[id]) (USES[id]=USES[id]||[]).push(d.id); }));
@@ -90,6 +94,10 @@ const Store = {
   async read(id){
     if(READS[id]) return READS[id];
     const r = await api("GET","/api/read/"+encodeURIComponent(id)); READS[id]=r; return r;
+  },
+  async scenes(){
+    if(!SCENE_ALL) SCENE_ALL = await api("GET","/api/scenes");
+    return SCENE_ALL;
   },
   status(id){ const p=this.me.progress[id]; return p?p.status:null; },
   isBookmarked(id){ return this.me.bookmarks.some(b=>b.id===id); },
@@ -490,12 +498,33 @@ function animAct(id, act){
   animStop(id);
   if(act==="prev") animShow(id, a.k-1); else if(act==="next") animShow(id, a.k+1); else if(act==="restart") animShow(id, 0);
 }
-function animStopAll(){ Object.keys(ANIM).forEach(id=>{ clearInterval(ANIM[id].t); if(!document.getElementById(id)) delete ANIM[id]; }); if(animObs){ animObs.disconnect(); animObs=null; } }
+function animStopAll(){ if(window.DTSScene) window.DTSScene.stopAll(); Object.keys(ANIM).forEach(id=>{ clearInterval(ANIM[id].t); if(!document.getElementById(id)) delete ANIM[id]; }); if(animObs){ animObs.disconnect(); animObs=null; } }
 function animWatch(root){
   // autoplay once when an animation scrolls into view, unless the reader asked for reduced motion
   const els = root.querySelectorAll(".anim"); if(!els.length || reduced || !("IntersectionObserver" in window)) return;
   animObs = new IntersectionObserver(es=>es.forEach(e=>{ const a=ANIM[e.target.id]; if(e.isIntersecting && a && !a.seen){ a.seen=true; animPlay(e.target.id); } }), {threshold:0.6});
   els.forEach(el=>animObs.observe(el));
+}
+/* animated scenes (web/scene.js) in a concept read: tabs when there is more than one, and links to the visualizers for it */
+function watchHTML(id, list){
+  const tabs = list.length>1 ? `<div class="sc-tabs" role="tablist" aria-label="Animations">${list.map((s,i)=>`<button type="button" role="tab" class="sc-tab" data-sctab="${i}" aria-selected="${i===0}" tabindex="${i===0?0:-1}">${esc(s.title||s.id)}</button>`).join("")}</div>` : "";
+  return `<p class="stand-sum">Step through it with Back and Next (or the arrow keys), or press Play. ${list.length>1?`${list.length} animations: pick one above the drawing.`:""}</p><div class="sc-wrap" data-scenes="${id}">${tabs}<div class="sc-host" role="${list.length>1?"tabpanel":"presentation"}"></div></div><p class="sc-try" data-trycon="${id}" hidden></p>`;
+}
+function sceneTab(wrap, i){
+  const list = (READS[wrap.dataset.scenes]||{}).scenes||[]; if(!list[i] || !window.DTSScene) return null;
+  wrap.querySelectorAll(".sc-tab").forEach((b,j)=>{ b.setAttribute("aria-selected", String(j===i)); b.tabIndex = j===i?0:-1; });
+  const host = wrap.querySelector(".sc-host"), old = host.firstElementChild && host.firstElementChild.__player; if(old) old.destroy();
+  return window.DTSScene.mount(host, list[i], {title: list.length<=1});
+}
+function mountScenes(root, sceneId){
+  let hit = null;
+  root.querySelectorAll(".sc-wrap").forEach(w=>{ const list=(READS[w.dataset.scenes]||{}).scenes||[]; const i=Math.max(0, list.findIndex(s=>s.id===sceneId)); const p=sceneTab(w, i); if(p && list[i] && list[i].id===sceneId) hit=p; });
+  fillTry(root);
+  return hit;
+}
+function fillTry(root){
+  if(!root || !window.DTSAlgo || !window.DTSAlgo.forConcept) return;
+  root.querySelectorAll("[data-trycon]").forEach(p=>{ const v=window.DTSAlgo.forConcept(p.dataset.trycon); p.innerHTML = v.map(x=>`<button type="button" data-tryviz="${esc(x.id)}">Try it yourself: ${esc(x.title)}</button>`).join(""); p.hidden = !v.length; });
 }
 function sec(id, no, title, body){ return body ? `<section class="rd-sec" id="rs-${id}"><h2><span class="no">${no}</span>${title}</h2>${body}</section>` : ""; }
 function srow(id, reason, dash, meta){ const m=N[id]; return `<button type="button" class="srow" style="--c:${lc(m.l)}" data-read="${id}"><span class="bar${dash?" dash":""}"></span><span><span class="sn">${esc(m.label)}</span><span class="sm">${meta||"L"+m.l}</span>${markHTML(id)}<span class="sr">${esc(reason)}</span></span></button>`; }
@@ -532,13 +561,14 @@ function nodeRead(n, r, ctx){
   h += ladderHTML(n);
   if(USES[n.id]) h += `<p class="ladder-cap">Appears in design questions: ${USES[n.id].map(did=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-design="${did}">${esc(DES[did].title)}</button>`).join(", ")}.</p>`;
   if(TAUGHT[n.id]) h += `<p class="ladder-cap">Taught in Stanford ${TAUGHT[n.id].map(code=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-course="${code}">${esc(courseLabel(code))}</button>`).join(", ")}.</p>`;
-  const toc = [["value","Why it exists"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How it works"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],rd.tradeoffs&&["tradeoffs","It depends: trade-offs"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],rd.interview&&["interview","In the interview"],rd.quiz&&["quiz","Check yourself"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
+  const toc = [["value","Why it exists"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How it works"],(r.scenes||[]).length&&["watch","Watch it work"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],rd.tradeoffs&&["tradeoffs","It depends: trade-offs"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],rd.interview&&["interview","In the interview"],rd.quiz&&["quiz","Check yourself"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
   h += `<nav class="toc" aria-label="Sections">${toc.map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
   let no=0; const NO=()=>String(++no).padStart(2,"0");
   h += sec("value", NO(), "Why it exists", P(rd.value,"lead"));
   if(rd.terms) h += sec("terms", NO(), "Key terms", termsHTML(rd.terms));
   if(rd.history) h += sec("history", NO(), "How we got here", P(rd.history));
   h += sec("how", NO(), "How it works", P(rd.how) + diagramHTML(rd.diagram) + animHTML(rd.animation));
+  if((r.scenes||[]).length) h += sec("watch", NO(), "Watch it work", watchHTML(n.id, r.scenes));
   if(rd.example) h += sec("example", NO(), "A worked example", `<div class="example">${P(rd.example)}</div>`);
   if(downs.length||insp.length) h += sec("stands", NO(), "What it stands on",
     `<p class="stand-sum">${esc(n.label)} rests directly on ${downs.length} idea${downs.length===1?"":"s"}. Counting everything beneath those, it stands on ${tot} concepts across ${lays.length} layer${lays.length===1?"":"s"} (${lays.map(l=>"L"+l).join(", ")}). Each line says what that lower layer contributes.</p>` +
@@ -693,6 +723,8 @@ async function renderReader(){
   const h1 = el.querySelector("h1"); if(h1){ h1.tabIndex=-1; try{ h1.focus({preventScroll:true}); }catch(e){} }
   const id = curId(); if(id) fillNotes(id);
   animWatch(el);
+  const sp = mountScenes(el, c.scene);
+  if(c.scene && sp){ const w=$("rs-watch"); if(w) w.scrollIntoView({block:"start"}); try{ sp.root.focus({preventScroll:true}); }catch(e){} }
 }
 function updProg(){
   const el=$("reader"), p=$("rprog"); if(!p) return;
@@ -756,6 +788,9 @@ document.addEventListener("click", async e=>{
   const d = b.dataset;
   try{
     if(d.anim){ const f=b.closest(".anim"); if(f) animAct(f.id, d.anim); return; }
+    if(d.sctab!==undefined){ const w=b.closest(".sc-wrap"); if(w) sceneTab(w, +d.sctab); return; }
+    if(d.sceneopen){ const s=SCENES.find(x=>x.id===d.sceneopen); if(s) return openRead({type:"node", id:s.concept, scene:s.id}, {seq:null}); return; }
+    if(d.tryviz){ if(R.open) closeRead(); state.algo.tab="viz"; state.algo.viz=d.tryviz; return setView("algorithms"); }
     if(d.design) return openRead({type:"design", id:d.design}, {seq:null});
     if(d.dstudy){ const ds=DES[d.dstudy], ids=ds.concepts.filter(id=>N[id]); return openRead({type:"node", id:ids[0]}, {seq:{name:ds.title, ids}}); }
     if(d.rclose!==undefined) return closeRead();
@@ -797,6 +832,8 @@ document.addEventListener("keydown", e=>{
   if(e.key==="Escape" && R.open && document.activeElement!==$("q")){ e.preventDefault(); return backRead(); }
   if(e.key==="Enter" && e.target.closest && e.target.closest("[data-gsel]")){ select(e.target.closest("[data-gsel]").dataset.gsel); }
   if(e.key==="Enter" && e.target.closest && e.target.closest("[data-gread]")){ openRead({type:"node", id:e.target.closest("[data-gread]").dataset.gread}, {seq:null}); }
+  const tb = e.target.closest && e.target.closest(".sc-tab");
+  if(tb && (e.key==="ArrowLeft"||e.key==="ArrowRight")){ e.preventDefault(); const all=[...tb.parentNode.querySelectorAll(".sc-tab")], i=(all.indexOf(tb)+(e.key==="ArrowRight"?1:all.length-1))%all.length; all[i].focus(); sceneTab(tb.closest(".sc-wrap"), i); return; }
   const an = e.target.closest && e.target.closest(".anim");
   if(an && (e.key==="ArrowLeft"||e.key==="ArrowRight") && !/INPUT|TEXTAREA/.test(e.target.tagName)){ e.preventDefault(); animAct(an.id, e.key==="ArrowLeft"?"prev":"next"); }
   if(e.key==="/" && !/INPUT|TEXTAREA/.test(document.activeElement.tagName)){ e.preventDefault(); if(R.open) closeRead(); $("q").focus(); }
@@ -828,6 +865,9 @@ function route(initial){
   const m = h.match(/^read\/(.+)$/), ml = h.match(/^layer\/([0-5])$/);
   if(m && N[m[1]]){ if(R.open && curId()===m[1]) return; if(initial) render(true); exploreFrom(m[1]); return openRead({type:"node", id:m[1]}, {seq:null}); }
   if(ml){ if(R.open && curId()==="L"+ml[1]) return; if(initial) render(true); return openRead({type:"layer", l:+ml[1]}, {seq:null}); }
+  const msc = h.match(/^scene\/(.+)$/), scn = msc && SCENES.find(x=>x.id===msc[1]);
+  if(scn){ if(R.open && curId()===scn.concept && R.cur.scene===scn.id) return; if(initial) render(true); exploreFrom(scn.concept); return openRead({type:"node", id:scn.concept, scene:scn.id}, {seq:null}); }
+  if(h==="animations"){ if(R.open) closeRead(); state.view="algorithms"; state.algo.tab="anim"; render(true); return; }
   const md = h.match(/^design\/(.+)$/);
   if(md && DES[md[1]]){ if(R.open && R.cur.type==="design" && R.cur.id===md[1]) return; if(initial){ state.view="design"; render(true); } return openRead({type:"design", id:md[1]}, {seq:null}); }
   const ma = h.match(/^(algo|practice)\/(.+)$/);
@@ -841,8 +881,8 @@ function route(initial){
   }
 }
 // hooks for web/algo.js (set before the first render, which may already show the Algorithms tab)
-window.__dts = { state, Store, N, R, DATA, LAYERS, STANDALONE, api, esc, lc, toast, reduced, openRead, closeRead, select, setView,
-  algoReady(){ if(state.view==="algorithms" && !R.open) renderAlgoView(); } };
+window.__dts = { state, Store, N, R, DATA, LAYERS, STANDALONE, SCENES, api, esc, lc, toast, reduced, openRead, closeRead, select, setView,
+  algoReady(){ if(R.open) fillTry($("reader")); if(state.view==="algorithms" && !R.open) renderAlgoView(); } };
 window.addEventListener("hashchange", ()=>route(false));
 route(true);
 })();

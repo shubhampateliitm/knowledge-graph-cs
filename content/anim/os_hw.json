@@ -1,0 +1,5808 @@
+[
+ {
+  "id": "vmem-translate-fault",
+  "concept": "vmem",
+  "title": "One address, from TLB hit to page fault",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "cpu",
+    "label": "CPU",
+    "x": 20,
+    "y": 170,
+    "w": 100,
+    "h": 56,
+    "shape": "box",
+    "sub": "runs program"
+   },
+   {
+    "id": "tlb",
+    "label": "TLB",
+    "x": 200,
+    "y": 50,
+    "w": 120,
+    "h": 56,
+    "shape": "box",
+    "sub": "64 entries"
+   },
+   {
+    "id": "pt",
+    "label": "Page table",
+    "x": 200,
+    "y": 290,
+    "w": 120,
+    "h": 56,
+    "shape": "box",
+    "sub": "4 levels in RAM"
+   },
+   {
+    "id": "ram",
+    "label": "RAM frames",
+    "x": 410,
+    "y": 170,
+    "w": 130,
+    "h": 56,
+    "shape": "box",
+    "sub": "physical memory"
+   },
+   {
+    "id": "disk",
+    "label": "Disk / SSD",
+    "x": 590,
+    "y": 170,
+    "w": 110,
+    "h": 60,
+    "shape": "db",
+    "sub": "swap file"
+   }
+  ],
+  "links": [
+   {
+    "from": "cpu",
+    "to": "tlb",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "tlb",
+    "to": "pt",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "cpu",
+    "to": "ram",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "ram",
+    "to": "disk",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "pt",
+    "to": "ram",
+    "label": "",
+    "dashed": true
+   }
+  ],
+  "steps": [
+   {
+    "say": "The program loads virtual address 0x7F3A2010. That is page 0x7F3A2, offset 0x010. The CPU must turn it into a real RAM address.",
+    "msgs": [
+     {
+      "from": "cpu",
+      "to": "tlb",
+      "label": "VA 0x7F3A2010",
+      "tone": "accent"
+     }
+    ],
+    "focus": [
+     "cpu",
+     "tlb"
+    ]
+   },
+   {
+    "say": "The TLB (a small cache of translations) does not have page 0x7F3A2. This is a TLB miss.",
+    "set": {
+     "tlb": {
+      "label": "TLB",
+      "tone": "bad",
+      "sub": "miss"
+     }
+    }
+   },
+   {
+    "say": "The hardware walks the page table: 4 reads from RAM, about 20 ns each when cached, up to 100+ ns when not.",
+    "msgs": [
+     {
+      "from": "tlb",
+      "to": "pt",
+      "label": "walk 4 levels",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "pt": {
+      "label": "Page table",
+      "tone": "warn",
+      "sub": "reading PTE"
+     }
+    }
+   },
+   {
+    "say": "The entry says: present, frame 0x1A2B. The translation goes into the TLB so the next access is fast.",
+    "msgs": [
+     {
+      "from": "pt",
+      "to": "tlb",
+      "label": "frame 0x1A2B",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "tlb": {
+      "label": "TLB",
+      "tone": "ok",
+      "sub": "0x7F3A2 -> 0x1A2B"
+     },
+     "pt": {
+      "label": "Page table",
+      "tone": "ok",
+      "sub": "PTE present"
+     }
+    }
+   },
+   {
+    "say": "Now the real address is 0x1A2B010. One RAM read costs about 80 ns.",
+    "msgs": [
+     {
+      "from": "cpu",
+      "to": "ram",
+      "label": "PA 0x1A2B010",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "ram": {
+      "label": "RAM frames",
+      "tone": "normal",
+      "sub": "frame 0x1A2B read"
+     }
+    }
+   },
+   {
+    "say": "The next access to the same page is a TLB hit: about 1 ns for the translation. This is why locality matters.",
+    "msgs": [
+     {
+      "from": "cpu",
+      "to": "tlb",
+      "label": "VA 0x7F3A2FF8",
+      "tone": "accent"
+     },
+     {
+      "from": "tlb",
+      "to": "ram",
+      "label": "PA 0x1A2BFF8",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "tlb": {
+      "label": "TLB",
+      "tone": "ok",
+      "sub": "hit, ~1 ns"
+     }
+    }
+   },
+   {
+    "say": "Now the program touches page 0x7F3A9. Its entry is marked not present. The CPU raises a page fault and the OS takes over.",
+    "msgs": [
+     {
+      "from": "cpu",
+      "to": "pt",
+      "label": "VA 0x7F3A9000",
+      "tone": "accent"
+     },
+     {
+      "from": "pt",
+      "to": "cpu",
+      "label": "PAGE FAULT",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "pt": {
+      "label": "Page table",
+      "tone": "bad",
+      "sub": "PTE not present"
+     },
+     "cpu": {
+      "label": "CPU",
+      "tone": "bad",
+      "sub": "trapped to kernel"
+     }
+    }
+   },
+   {
+    "say": "The OS finds the data in swap and reads one 4 KB page from the SSD. This takes about 100 microseconds, roughly 1,000 times slower than RAM.",
+    "msgs": [
+     {
+      "from": "disk",
+      "to": "ram",
+      "label": "4 KB page",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "disk": {
+      "label": "Disk / SSD",
+      "tone": "warn",
+      "sub": "~100 us read"
+     },
+     "ram": {
+      "label": "RAM frames",
+      "tone": "warn",
+      "sub": "frame 0x3C4D filled"
+     }
+    }
+   },
+   {
+    "say": "The OS writes the new entry (frame 0x3C4D, present) and restarts the instruction. On a hard disk this fault would take about 10 ms.",
+    "msgs": [
+     {
+      "from": "ram",
+      "to": "pt",
+      "label": "PTE = 0x3C4D",
+      "tone": "ok"
+     },
+     {
+      "from": "pt",
+      "to": "cpu",
+      "label": "retry",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "pt": {
+      "label": "Page table",
+      "tone": "ok",
+      "sub": "PTE present"
+     },
+     "cpu": {
+      "label": "CPU",
+      "tone": "ok",
+      "sub": "running again"
+     }
+    }
+   },
+   {
+    "say": "Summary of costs: TLB hit ~1 ns, TLB miss ~100 ns, page fault from SSD ~100,000 ns.",
+    "set": {
+     "tlb": {
+      "label": "TLB",
+      "tone": "ok",
+      "sub": "1 ns"
+     },
+     "ram": {
+      "label": "RAM frames",
+      "tone": "warn",
+      "sub": "100 ns"
+     },
+     "disk": {
+      "label": "Disk / SSD",
+      "tone": "bad",
+      "sub": "100,000 ns"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "pagecache-read-write",
+  "concept": "pagecache",
+  "title": "A read, a hit, and a dirty write",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "ram",
+    "label": "Kernel RAM",
+    "x": 230,
+    "y": 85,
+    "w": 230,
+    "h": 175
+   }
+  ],
+  "actors": [
+   {
+    "id": "app",
+    "label": "Application",
+    "x": 20,
+    "y": 160,
+    "w": 110,
+    "h": 56,
+    "shape": "box",
+    "sub": "read(fd)"
+   },
+   {
+    "id": "pc",
+    "label": "Page cache",
+    "x": 250,
+    "y": 110,
+    "w": 190,
+    "h": 50,
+    "shape": "box",
+    "sub": "kernel RAM"
+   },
+   {
+    "id": "p2",
+    "label": "pg 2",
+    "x": 250,
+    "y": 215,
+    "w": 70,
+    "h": 34,
+    "shape": "cell"
+   },
+   {
+    "id": "p3",
+    "label": "pg 3",
+    "x": 335,
+    "y": 215,
+    "w": 70,
+    "h": 34,
+    "shape": "cell"
+   },
+   {
+    "id": "disk",
+    "label": "SSD",
+    "x": 590,
+    "y": 160,
+    "w": 100,
+    "h": 60,
+    "shape": "db",
+    "sub": "4 KB blocks"
+   }
+  ],
+  "links": [
+   {
+    "from": "app",
+    "to": "pc",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "pc",
+    "to": "disk",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "The app reads 4 KB at file offset 8192. That is file page 2. The kernel first looks in the page cache.",
+    "msgs": [
+     {
+      "from": "app",
+      "to": "pc",
+      "label": "read page 2",
+      "tone": "accent"
+     }
+    ],
+    "focus": [
+     "pc"
+    ]
+   },
+   {
+    "say": "Page 2 is not in the cache: a miss. The kernel must go to the SSD.",
+    "set": {
+     "pc": {
+      "label": "Page cache",
+      "tone": "bad",
+      "sub": "miss on page 2"
+     }
+    }
+   },
+   {
+    "say": "The SSD read takes about 100 microseconds. The kernel notices a sequential pattern and also reads pages 3 and 4 ahead of time (readahead).",
+    "msgs": [
+     {
+      "from": "disk",
+      "to": "pc",
+      "label": "pages 2-4",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "disk": {
+      "label": "SSD",
+      "tone": "warn",
+      "sub": "~100 us"
+     }
+    }
+   },
+   {
+    "say": "Page 2 is now in RAM and is copied to the app. The cache keeps it.",
+    "msgs": [
+     {
+      "from": "pc",
+      "to": "app",
+      "label": "4 KB copy",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "p2": {
+      "label": "pg 2",
+      "tone": "ok",
+      "sub": "clean"
+     },
+     "p3": {
+      "label": "pg 3",
+      "tone": "ok",
+      "sub": "clean"
+     },
+     "pc": {
+      "label": "Page cache",
+      "tone": "ok",
+      "sub": "hit next time"
+     },
+     "disk": {
+      "label": "SSD",
+      "tone": "normal",
+      "sub": "idle"
+     }
+    }
+   },
+   {
+    "say": "Reading page 2 again is a hit. No disk, about 1 microsecond for the syscall and copy: around 100 times faster.",
+    "msgs": [
+     {
+      "from": "app",
+      "to": "pc",
+      "label": "read page 2",
+      "tone": "accent"
+     },
+     {
+      "from": "pc",
+      "to": "app",
+      "label": "hit ~1 us",
+      "tone": "ok"
+     }
+    ]
+   },
+   {
+    "say": "Now the app writes 100 bytes into page 2. The kernel changes the cached copy only and marks the page dirty. write() returns in about 2 microseconds.",
+    "msgs": [
+     {
+      "from": "app",
+      "to": "pc",
+      "label": "write 100 B",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "p2": {
+      "label": "pg 2",
+      "tone": "warn",
+      "sub": "DIRTY"
+     }
+    }
+   },
+   {
+    "say": "A background thread writes dirty pages back after about 30 seconds. Until then the new data exists only in RAM.",
+    "set": {
+     "pc": {
+      "label": "Page cache",
+      "tone": "warn",
+      "sub": "1 dirty page"
+     }
+    }
+   },
+   {
+    "say": "Failure case: power is lost at second 20. The write is gone, even though write() said success. The app should have called fsync.",
+    "set": {
+     "app": {
+      "label": "Application",
+      "tone": "bad",
+      "sub": "crash"
+     },
+     "p2": {
+      "label": "pg 2",
+      "tone": "bad",
+      "sub": "LOST"
+     },
+     "pc": {
+      "label": "Page cache",
+      "tone": "bad",
+      "sub": "empty after reboot"
+     }
+    }
+   },
+   {
+    "say": "fsync() forces the write to the SSD now. It costs about 0.1 to 2 ms, so databases batch it. After it, page 2 is clean and safe.",
+    "msgs": [
+     {
+      "from": "pc",
+      "to": "disk",
+      "label": "flush pg 2",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "app": {
+      "label": "Application",
+      "tone": "ok",
+      "sub": "fsync()"
+     },
+     "p2": {
+      "label": "pg 2",
+      "tone": "ok",
+      "sub": "clean"
+     },
+     "pc": {
+      "label": "Page cache",
+      "tone": "ok",
+      "sub": "0 dirty"
+     },
+     "disk": {
+      "label": "SSD",
+      "tone": "ok",
+      "sub": "durable"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "mmap-fault-share",
+  "concept": "mmap",
+  "title": "mmap: pages load only when touched",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "proc",
+    "label": "Process",
+    "x": 20,
+    "y": 60,
+    "w": 120,
+    "h": 56,
+    "shape": "box",
+    "sub": "VMA 0x7F00_0000"
+   },
+   {
+    "id": "pt",
+    "label": "Page table",
+    "x": 250,
+    "y": 60,
+    "w": 130,
+    "h": 56,
+    "shape": "box",
+    "sub": "all empty"
+   },
+   {
+    "id": "pc",
+    "label": "Page cache",
+    "x": 250,
+    "y": 200,
+    "w": 130,
+    "h": 56,
+    "shape": "box",
+    "sub": "file pages"
+   },
+   {
+    "id": "file",
+    "label": "data.db",
+    "x": 570,
+    "y": 200,
+    "w": 110,
+    "h": 60,
+    "shape": "db",
+    "sub": "1 GB file"
+   },
+   {
+    "id": "proc2",
+    "label": "Process 2",
+    "x": 20,
+    "y": 320,
+    "w": 120,
+    "h": 50,
+    "shape": "box",
+    "sub": "also maps file"
+   }
+  ],
+  "links": [
+   {
+    "from": "proc",
+    "to": "pt",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "pt",
+    "to": "pc",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "pc",
+    "to": "file",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "proc2",
+    "to": "pc",
+    "label": "",
+    "dashed": true
+   }
+  ],
+  "steps": [
+   {
+    "say": "mmap() maps the 1 GB file at 0x7F00_0000. The call is fast: it only records a range. No file data is read yet.",
+    "msgs": [
+     {
+      "from": "proc",
+      "to": "pt",
+      "label": "mmap 1 GB",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "pt": {
+      "label": "Page table",
+      "tone": "normal",
+      "sub": "0 pages mapped"
+     }
+    }
+   },
+   {
+    "say": "The program reads address 0x7F00_5000, which is file page 5. There is no page table entry, so the CPU raises a page fault.",
+    "msgs": [
+     {
+      "from": "proc",
+      "to": "pt",
+      "label": "load 0x7F005000",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "pt": {
+      "label": "Page table",
+      "tone": "bad",
+      "sub": "not present"
+     },
+     "proc": {
+      "label": "Process",
+      "tone": "bad",
+      "sub": "page fault"
+     }
+    }
+   },
+   {
+    "say": "The kernel looks in the page cache. Page 5 is not there. This is a major fault, because disk is needed.",
+    "msgs": [
+     {
+      "from": "pt",
+      "to": "pc",
+      "label": "find page 5",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "pc": {
+      "label": "Page cache",
+      "tone": "bad",
+      "sub": "miss"
+     }
+    }
+   },
+   {
+    "say": "It reads 4 KB from the file. About 100 microseconds on an SSD.",
+    "msgs": [
+     {
+      "from": "file",
+      "to": "pc",
+      "label": "4 KB",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "pc": {
+      "label": "Page cache",
+      "tone": "ok",
+      "sub": "page 5 loaded"
+     },
+     "file": {
+      "label": "data.db",
+      "tone": "warn",
+      "sub": "~100 us"
+     }
+    }
+   },
+   {
+    "say": "The kernel fills the page table entry to point at that frame and restarts the load. The program never called read().",
+    "msgs": [
+     {
+      "from": "pc",
+      "to": "pt",
+      "label": "map frame",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "pt": {
+      "label": "Page table",
+      "tone": "ok",
+      "sub": "page 5 present"
+     },
+     "proc": {
+      "label": "Process",
+      "tone": "ok",
+      "sub": "running"
+     }
+    }
+   },
+   {
+    "say": "Touching page 5 again costs only a normal memory access, about 80 ns, with no system call. This is why mmap can beat read().",
+    "msgs": [
+     {
+      "from": "proc",
+      "to": "pt",
+      "label": "load 0x7F005008",
+      "tone": "accent"
+     },
+     {
+      "from": "pt",
+      "to": "proc",
+      "label": "hit",
+      "tone": "ok"
+     }
+    ]
+   },
+   {
+    "say": "A second process maps the same file. It points at the same cached frame, so no extra RAM is used: sharing for free.",
+    "msgs": [
+     {
+      "from": "proc2",
+      "to": "pc",
+      "label": "same frame",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "proc2": {
+      "label": "Process 2",
+      "tone": "ok",
+      "sub": "shares page 5"
+     }
+    }
+   },
+   {
+    "say": "A write to a MAP_SHARED page marks it dirty. The kernel writes it back later, or when you call msync.",
+    "msgs": [
+     {
+      "from": "proc",
+      "to": "pc",
+      "label": "store 8 B",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "pc": {
+      "label": "Page cache",
+      "tone": "warn",
+      "sub": "page 5 dirty"
+     }
+    }
+   },
+   {
+    "say": "Failure case: another program truncates the file to 4 KB. The next access to page 5 has no data behind it, so the process gets SIGBUS and dies.",
+    "set": {
+     "file": {
+      "label": "data.db",
+      "tone": "bad",
+      "sub": "truncated to 4 KB"
+     },
+     "proc": {
+      "label": "Process",
+      "tone": "bad",
+      "sub": "SIGBUS"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "scheduling-fair-queue",
+  "concept": "scheduling",
+  "title": "Fair scheduling: smallest runtime goes first",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "cpu",
+    "label": "CPU 0",
+    "x": 290,
+    "y": 50,
+    "w": 140,
+    "h": 56,
+    "shape": "box",
+    "sub": "idle"
+   },
+   {
+    "id": "A",
+    "label": "A",
+    "x": 120,
+    "y": 230,
+    "w": 110,
+    "h": 50,
+    "shape": "cell",
+    "sub": "vrt 10.0 ms"
+   },
+   {
+    "id": "B",
+    "label": "B",
+    "x": 250,
+    "y": 230,
+    "w": 110,
+    "h": 50,
+    "shape": "cell",
+    "sub": "vrt 10.5 ms"
+   },
+   {
+    "id": "C",
+    "label": "C (hog)",
+    "x": 380,
+    "y": 230,
+    "w": 110,
+    "h": 50,
+    "shape": "cell",
+    "sub": "vrt 12.0 ms"
+   },
+   {
+    "id": "D",
+    "label": "D (I/O)",
+    "x": 510,
+    "y": 230,
+    "w": 110,
+    "h": 50,
+    "shape": "cell",
+    "sub": "sleeping",
+    "tone": "muted"
+   }
+  ],
+  "links": [
+   {
+    "from": "A",
+    "to": "cpu",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "B",
+    "to": "cpu",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "C",
+    "to": "cpu",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "D",
+    "to": "cpu",
+    "label": "",
+    "dashed": true
+   }
+  ],
+  "steps": [
+   {
+    "say": "Three tasks want the CPU. Each has a virtual runtime (vrt): how much CPU time it already got. The scheduler always picks the smallest.",
+    "focus": [
+     "A",
+     "B",
+     "C"
+    ]
+   },
+   {
+    "say": "A has the smallest vrt (10.0 ms), so A runs. The time slice is about 4 ms.",
+    "msgs": [
+     {
+      "from": "A",
+      "to": "cpu",
+      "label": "run A",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "cpu": {
+      "label": "CPU 0",
+      "tone": "accent",
+      "sub": "running A"
+     }
+    }
+   },
+   {
+    "say": "After 4 ms, A's vrt is 14.0. B is now the smallest, so the scheduler switches to B. Everyone gets a fair share.",
+    "msgs": [
+     {
+      "from": "B",
+      "to": "cpu",
+      "label": "run B",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "A": {
+      "label": "A",
+      "tone": "normal",
+      "sub": "vrt 14.0 ms"
+     },
+     "cpu": {
+      "label": "CPU 0",
+      "tone": "accent",
+      "sub": "running B"
+     }
+    }
+   },
+   {
+    "say": "Task D finishes disk I/O and wakes up. It slept, so its vrt is low (10.5). It runs next: interactive tasks get fast response.",
+    "msgs": [
+     {
+      "from": "D",
+      "to": "cpu",
+      "label": "wake up",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "D": {
+      "label": "D (I/O)",
+      "tone": "ok",
+      "sub": "vrt 10.5 ms"
+     },
+     "B": {
+      "label": "B",
+      "tone": "normal",
+      "sub": "vrt 14.5 ms"
+     },
+     "cpu": {
+      "label": "CPU 0",
+      "tone": "ok",
+      "sub": "running D"
+     }
+    }
+   },
+   {
+    "say": "C is a CPU hog, so its vrt is highest (12.0). It waits its turn, but never starves: its vrt does not grow while it waits.",
+    "set": {
+     "C": {
+      "label": "C (hog)",
+      "tone": "warn",
+      "sub": "waits, vrt 12.0"
+     }
+    },
+    "focus": [
+     "C"
+    ]
+   },
+   {
+    "say": "Priorities work through weights. A nice-0 task has weight 1024, a nice-10 task about 110. So nice-10 gets roughly 10 times less CPU.",
+    "set": {
+     "C": {
+      "label": "C (nice 10)",
+      "tone": "muted",
+      "sub": "weight 110"
+     },
+     "A": {
+      "label": "A (nice 0)",
+      "tone": "ok",
+      "sub": "weight 1024"
+     }
+    }
+   },
+   {
+    "say": "Failure case: 100 runnable tasks on one core. The target latency is about 6 ms, but each task needs a minimum slice of 0.75 ms.",
+    "set": {
+     "cpu": {
+      "label": "CPU 0",
+      "tone": "bad",
+      "sub": "100 tasks queued"
+     },
+     "B": {
+      "label": "B",
+      "tone": "bad",
+      "sub": "waits ~75 ms"
+     }
+    }
+   },
+   {
+    "say": "So each task waits about 100 x 0.75 = 75 ms for its turn. This is why an overloaded server feels slow even if no single task is bad.",
+    "set": {
+     "A": {
+      "label": "A",
+      "tone": "bad",
+      "sub": "waits ~75 ms"
+     },
+     "C": {
+      "label": "C (nice 10)",
+      "tone": "bad",
+      "sub": "waits ~75 ms"
+     },
+     "D": {
+      "label": "D (I/O)",
+      "tone": "bad",
+      "sub": "waits ~75 ms"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "ctxswitch-cost",
+  "concept": "ctxswitch",
+  "title": "What a context switch really costs",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "pa",
+    "label": "Process A",
+    "x": 20,
+    "y": 60,
+    "w": 130,
+    "h": 56,
+    "shape": "box",
+    "sub": "running"
+   },
+   {
+    "id": "k",
+    "label": "Kernel",
+    "x": 290,
+    "y": 60,
+    "w": 140,
+    "h": 56,
+    "shape": "box",
+    "sub": "scheduler"
+   },
+   {
+    "id": "pb",
+    "label": "Process B",
+    "x": 570,
+    "y": 60,
+    "w": 130,
+    "h": 56,
+    "shape": "box",
+    "sub": "waiting"
+   },
+   {
+    "id": "reg",
+    "label": "CPU registers",
+    "x": 20,
+    "y": 250,
+    "w": 150,
+    "h": 56,
+    "shape": "box",
+    "sub": "A's values"
+   },
+   {
+    "id": "pcb",
+    "label": "Saved state",
+    "x": 290,
+    "y": 250,
+    "w": 140,
+    "h": 56,
+    "shape": "box",
+    "sub": "A's PCB"
+   },
+   {
+    "id": "tlb",
+    "label": "TLB + L1/L2",
+    "x": 540,
+    "y": 250,
+    "w": 160,
+    "h": 56,
+    "shape": "box",
+    "sub": "A's data"
+   }
+  ],
+  "links": [
+   {
+    "from": "pa",
+    "to": "k",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "k",
+    "to": "pb",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "reg",
+    "to": "pcb",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "k",
+    "to": "tlb",
+    "label": "",
+    "dashed": true
+   }
+  ],
+  "steps": [
+   {
+    "say": "Process A has used its 4 ms slice. A timer interrupt fires at 1000 Hz.",
+    "msgs": [
+     {
+      "from": "pa",
+      "to": "k",
+      "label": "timer IRQ",
+      "tone": "warn"
+     }
+    ],
+    "focus": [
+     "k"
+    ]
+   },
+   {
+    "say": "The CPU jumps into the kernel (mode switch, about 100 ns). The scheduler picks Process B.",
+    "set": {
+     "k": {
+      "label": "Kernel",
+      "tone": "accent",
+      "sub": "pick B"
+     }
+    }
+   },
+   {
+    "say": "The kernel saves A's registers: 16 general registers, instruction pointer 0x401A2C, stack pointer, flags. About 0.5 microseconds.",
+    "msgs": [
+     {
+      "from": "reg",
+      "to": "pcb",
+      "label": "save 20 regs",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "pcb": {
+      "label": "Saved state",
+      "tone": "ok",
+      "sub": "A saved"
+     }
+    }
+   },
+   {
+    "say": "It switches to B's page table by writing the CR3 register. Without tagged TLB entries, the whole TLB is flushed.",
+    "msgs": [
+     {
+      "from": "k",
+      "to": "tlb",
+      "label": "load CR3",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "tlb": {
+      "label": "TLB + L1/L2",
+      "tone": "bad",
+      "sub": "TLB flushed"
+     }
+    }
+   },
+   {
+    "say": "It loads B's saved registers and returns to user mode. The direct cost is about 1 to 2 microseconds.",
+    "msgs": [
+     {
+      "from": "pcb",
+      "to": "reg",
+      "label": "load B regs",
+      "tone": "ok"
+     },
+     {
+      "from": "k",
+      "to": "pb",
+      "label": "return to B",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "reg": {
+      "label": "CPU registers",
+      "tone": "ok",
+      "sub": "B's values"
+     },
+     "pb": {
+      "label": "Process B",
+      "tone": "ok",
+      "sub": "running"
+     },
+     "pa": {
+      "label": "Process A",
+      "tone": "muted",
+      "sub": "paused"
+     }
+    }
+   },
+   {
+    "say": "The hidden cost is bigger. B starts with a cold TLB and cold caches: each miss costs 100 ns instead of 1 ns.",
+    "msgs": [
+     {
+      "from": "pb",
+      "to": "tlb",
+      "label": "miss, miss, miss",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "tlb": {
+      "label": "TLB + L1/L2",
+      "tone": "bad",
+      "sub": "cold: 100 ns misses"
+     }
+    }
+   },
+   {
+    "say": "B may need to refill hundreds of cache lines and TLB entries, so the real cost is often 10 to 50 microseconds.",
+    "set": {
+     "pb": {
+      "label": "Process B",
+      "tone": "warn",
+      "sub": "slow warm-up"
+     }
+    }
+   },
+   {
+    "say": "Failure case: 10,000 switches per second at 30 us each means 30 percent of one core is wasted. Fewer threads and longer slices reduce this.",
+    "set": {
+     "k": {
+      "label": "Kernel",
+      "tone": "bad",
+      "sub": "30% core lost"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "locks-race-and-contention",
+  "concept": "locks",
+  "title": "A lost update, a lock, and contention",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "t1",
+    "label": "Thread 1",
+    "x": 20,
+    "y": 60,
+    "w": 120,
+    "h": 56,
+    "shape": "box",
+    "sub": "counter++"
+   },
+   {
+    "id": "t2",
+    "label": "Thread 2",
+    "x": 20,
+    "y": 280,
+    "w": 120,
+    "h": 56,
+    "shape": "box",
+    "sub": "counter++"
+   },
+   {
+    "id": "mem",
+    "label": "counter",
+    "x": 300,
+    "y": 170,
+    "w": 130,
+    "h": 56,
+    "shape": "cell",
+    "sub": "= 41"
+   },
+   {
+    "id": "lk",
+    "label": "Lock",
+    "x": 300,
+    "y": 50,
+    "w": 130,
+    "h": 50,
+    "shape": "round",
+    "sub": "free"
+   },
+   {
+    "id": "fx",
+    "label": "futex (kernel)",
+    "x": 540,
+    "y": 170,
+    "w": 150,
+    "h": 56,
+    "shape": "box",
+    "sub": "sleep queue"
+   }
+  ],
+  "links": [
+   {
+    "from": "t1",
+    "to": "mem",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "t2",
+    "to": "mem",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "t1",
+    "to": "lk",
+    "label": "",
+    "dashed": true
+   },
+   {
+    "from": "t2",
+    "to": "lk",
+    "label": "",
+    "dashed": true
+   },
+   {
+    "from": "t2",
+    "to": "fx",
+    "label": "",
+    "dashed": true
+   }
+  ],
+  "steps": [
+   {
+    "say": "No lock yet. Both threads run counter++ at the same time. The value in memory is 41.",
+    "focus": [
+     "mem"
+    ]
+   },
+   {
+    "say": "Both threads read 41 into a register, before either writes back.",
+    "msgs": [
+     {
+      "from": "mem",
+      "to": "t1",
+      "label": "read 41",
+      "tone": "accent"
+     },
+     {
+      "from": "mem",
+      "to": "t2",
+      "label": "read 41",
+      "tone": "accent"
+     }
+    ]
+   },
+   {
+    "say": "Each thread adds 1 and writes 42. Two increments happened, but the counter is 42, not 43. One update is lost: a data race.",
+    "msgs": [
+     {
+      "from": "t1",
+      "to": "mem",
+      "label": "write 42",
+      "tone": "bad"
+     },
+     {
+      "from": "t2",
+      "to": "mem",
+      "label": "write 42",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "mem": {
+      "label": "counter",
+      "tone": "bad",
+      "sub": "= 42 (wrong!)"
+     }
+    }
+   },
+   {
+    "say": "Fix: protect the update with a lock. Thread 1 takes it with one atomic compare-and-swap (CAS), about 20 ns when nobody else wants it.",
+    "msgs": [
+     {
+      "from": "t1",
+      "to": "lk",
+      "label": "CAS 0 to 1",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "lk": {
+      "label": "Lock",
+      "tone": "ok",
+      "sub": "held by T1"
+     },
+     "mem": {
+      "label": "counter",
+      "tone": "normal",
+      "sub": "= 41"
+     }
+    }
+   },
+   {
+    "say": "Thread 2 tries the lock, the CAS fails. It spins a few times (burning CPU), then asks the kernel to put it to sleep with a futex call.",
+    "msgs": [
+     {
+      "from": "t2",
+      "to": "lk",
+      "label": "CAS fails",
+      "tone": "bad"
+     },
+     {
+      "from": "t2",
+      "to": "fx",
+      "label": "futex_wait",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "t2": {
+      "label": "Thread 2",
+      "tone": "bad",
+      "sub": "blocked"
+     },
+     "fx": {
+      "label": "futex (kernel)",
+      "tone": "warn",
+      "sub": "T2 sleeping"
+     }
+    }
+   },
+   {
+    "say": "Thread 1 does its update inside the lock: 41 becomes 42. Thread 2 is waiting and doing nothing useful.",
+    "msgs": [
+     {
+      "from": "t1",
+      "to": "mem",
+      "label": "write 42",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "mem": {
+      "label": "counter",
+      "tone": "ok",
+      "sub": "= 42"
+     }
+    }
+   },
+   {
+    "say": "Thread 1 unlocks and wakes Thread 2. The wake-up goes through the scheduler and takes about 5 to 50 microseconds, 250 to 2,500 times the 20 ns fast path.",
+    "msgs": [
+     {
+      "from": "t1",
+      "to": "lk",
+      "label": "unlock",
+      "tone": "ok"
+     },
+     {
+      "from": "fx",
+      "to": "t2",
+      "label": "wake up",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "lk": {
+      "label": "Lock",
+      "tone": "normal",
+      "sub": "free"
+     },
+     "fx": {
+      "label": "futex (kernel)",
+      "tone": "normal",
+      "sub": "empty"
+     }
+    }
+   },
+   {
+    "say": "Thread 2 takes the lock and writes 43. The answer is correct now.",
+    "msgs": [
+     {
+      "from": "t2",
+      "to": "lk",
+      "label": "CAS 0 to 1",
+      "tone": "ok"
+     },
+     {
+      "from": "t2",
+      "to": "mem",
+      "label": "write 43",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "mem": {
+      "label": "counter",
+      "tone": "ok",
+      "sub": "= 43 (right)"
+     },
+     "t2": {
+      "label": "Thread 2",
+      "tone": "ok",
+      "sub": "running"
+     },
+     "lk": {
+      "label": "Lock",
+      "tone": "ok",
+      "sub": "held by T2"
+     }
+    }
+   },
+   {
+    "say": "Cost case: with 32 threads on one hot lock, 31 are always asleep. Throughput can be lower than with 1 thread. Keep critical sections short and split locks.",
+    "set": {
+     "lk": {
+      "label": "Lock",
+      "tone": "bad",
+      "sub": "hot: 31 waiting"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "deadlock-cycle",
+  "concept": "deadlock",
+  "title": "Two threads wait for each other forever",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "t1",
+    "label": "Thread 1",
+    "x": 40,
+    "y": 150,
+    "w": 120,
+    "h": 60,
+    "shape": "circle"
+   },
+   {
+    "id": "t2",
+    "label": "Thread 2",
+    "x": 560,
+    "y": 150,
+    "w": 120,
+    "h": 60,
+    "shape": "circle"
+   },
+   {
+    "id": "la",
+    "label": "Lock A",
+    "x": 300,
+    "y": 50,
+    "w": 120,
+    "h": 50,
+    "shape": "round",
+    "sub": "free"
+   },
+   {
+    "id": "lb",
+    "label": "Lock B",
+    "x": 300,
+    "y": 280,
+    "w": 120,
+    "h": 50,
+    "shape": "round",
+    "sub": "free"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "Two threads, two locks. Thread 1 will lock A then B. Thread 2 will lock B then A. The order is different.",
+    "focus": [
+     "t1",
+     "t2"
+    ]
+   },
+   {
+    "say": "Thread 1 takes Lock A. It works for about 1 ms.",
+    "msgs": [
+     {
+      "from": "t1",
+      "to": "la",
+      "label": "lock A",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "la": {
+      "label": "Lock A",
+      "tone": "ok",
+      "sub": "held by T1"
+     }
+    },
+    "link": [
+     {
+      "from": "la",
+      "to": "t1",
+      "label": "held by",
+      "dashed": false
+     }
+    ]
+   },
+   {
+    "say": "At the same time, Thread 2 takes Lock B.",
+    "msgs": [
+     {
+      "from": "t2",
+      "to": "lb",
+      "label": "lock B",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "lb": {
+      "label": "Lock B",
+      "tone": "ok",
+      "sub": "held by T2"
+     }
+    },
+    "link": [
+     {
+      "from": "lb",
+      "to": "t2",
+      "label": "held by",
+      "dashed": false
+     }
+    ]
+   },
+   {
+    "say": "Thread 1 now asks for Lock B. It is held by Thread 2, so Thread 1 waits.",
+    "msgs": [
+     {
+      "from": "t1",
+      "to": "lb",
+      "label": "wants B",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "t1": {
+      "label": "Thread 1",
+      "tone": "warn",
+      "sub": "waiting for B"
+     }
+    },
+    "link": [
+     {
+      "from": "t1",
+      "to": "lb",
+      "label": "wants",
+      "dashed": true
+     }
+    ]
+   },
+   {
+    "say": "Thread 2 asks for Lock A. It is held by Thread 1, so Thread 2 waits too.",
+    "msgs": [
+     {
+      "from": "t2",
+      "to": "la",
+      "label": "wants A",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "t2": {
+      "label": "Thread 2",
+      "tone": "warn",
+      "sub": "waiting for A"
+     }
+    },
+    "link": [
+     {
+      "from": "t2",
+      "to": "la",
+      "label": "wants",
+      "dashed": true
+     }
+    ]
+   },
+   {
+    "say": "There is a cycle: T1 holds A and wants B; T2 holds B and wants A. Nobody can move. CPU use drops to 0 percent and requests hang.",
+    "set": {
+     "t1": {
+      "label": "Thread 1",
+      "tone": "bad",
+      "sub": "DEADLOCK"
+     },
+     "t2": {
+      "label": "Thread 2",
+      "tone": "bad",
+      "sub": "DEADLOCK"
+     },
+     "la": {
+      "label": "Lock A",
+      "tone": "bad",
+      "sub": "stuck"
+     },
+     "lb": {
+      "label": "Lock B",
+      "tone": "bad",
+      "sub": "stuck"
+     }
+    }
+   },
+   {
+    "say": "The four conditions for deadlock: mutual exclusion, hold and wait, no preemption, circular wait. Break any one and it cannot happen.",
+    "focus": [
+     "la",
+     "lb"
+    ]
+   },
+   {
+    "say": "Best fix: a global lock order. Everyone must take A before B. Thread 2 now asks for A first and waits with nothing held.",
+    "set": {
+     "t1": {
+      "label": "Thread 1",
+      "tone": "ok",
+      "sub": "runs, holds A"
+     },
+     "t2": {
+      "label": "Thread 2",
+      "tone": "muted",
+      "sub": "waits for A only"
+     },
+     "lb": {
+      "label": "Lock B",
+      "tone": "normal",
+      "sub": "free"
+     },
+     "la": {
+      "label": "Lock A",
+      "tone": "ok",
+      "sub": "held by T1"
+     }
+    },
+    "unlink": [
+     [
+      "lb",
+      "t2"
+     ],
+     [
+      "t2",
+      "la"
+     ],
+     [
+      "t2",
+      "lb"
+     ],
+     [
+      "t1",
+      "lb"
+     ]
+    ]
+   },
+   {
+    "say": "Thread 1 now gets Lock B too, because Thread 2 holds nothing.",
+    "msgs": [
+     {
+      "from": "t1",
+      "to": "lb",
+      "label": "lock B",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "t1": {
+      "label": "Thread 1",
+      "tone": "ok",
+      "sub": "has A and B"
+     },
+     "lb": {
+      "label": "Lock B",
+      "tone": "ok",
+      "sub": "held by T1"
+     }
+    }
+   },
+   {
+    "say": "Thread 1 finishes and releases both locks. Then Thread 2 runs: A, then B. No cycle is possible. Other fixes: try-lock with a timeout, or one big lock.",
+    "msgs": [
+     {
+      "from": "t1",
+      "to": "la",
+      "label": "unlock",
+      "tone": "ok"
+     },
+     {
+      "from": "t2",
+      "to": "la",
+      "label": "lock A",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "t1": {
+      "label": "Thread 1",
+      "tone": "muted",
+      "sub": "done"
+     },
+     "t2": {
+      "label": "Thread 2",
+      "tone": "ok",
+      "sub": "running"
+     },
+     "la": {
+      "label": "Lock A",
+      "tone": "ok",
+      "sub": "held by T2"
+     },
+     "lb": {
+      "label": "Lock B",
+      "tone": "normal",
+      "sub": "free"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "condvar-wait-signal",
+  "concept": "condvars",
+  "title": "Condition variable: wait in a while loop",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "pr",
+    "label": "Producer",
+    "x": 20,
+    "y": 60,
+    "w": 120,
+    "h": 56,
+    "shape": "box",
+    "sub": "push item"
+   },
+   {
+    "id": "q",
+    "label": "Queue",
+    "x": 290,
+    "y": 170,
+    "w": 140,
+    "h": 56,
+    "shape": "db",
+    "sub": "0 items"
+   },
+   {
+    "id": "c1",
+    "label": "Consumer 1",
+    "x": 570,
+    "y": 60,
+    "w": 130,
+    "h": 56,
+    "shape": "box",
+    "sub": "pop item"
+   },
+   {
+    "id": "c2",
+    "label": "Consumer 2",
+    "x": 570,
+    "y": 280,
+    "w": 130,
+    "h": 56,
+    "shape": "box",
+    "sub": "pop item"
+   },
+   {
+    "id": "mx",
+    "label": "Mutex + cond",
+    "x": 290,
+    "y": 50,
+    "w": 140,
+    "h": 50,
+    "shape": "round",
+    "sub": "free"
+   }
+  ],
+  "links": [
+   {
+    "from": "pr",
+    "to": "q",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "q",
+    "to": "c1",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "q",
+    "to": "c2",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "c1",
+    "to": "mx",
+    "label": "",
+    "dashed": true
+   },
+   {
+    "from": "c2",
+    "to": "mx",
+    "label": "",
+    "dashed": true
+   }
+  ],
+  "steps": [
+   {
+    "say": "The queue is empty. Consumer 1 takes the mutex and checks the queue. 0 items, so it must wait.",
+    "msgs": [
+     {
+      "from": "c1",
+      "to": "mx",
+      "label": "lock mutex",
+      "tone": "ok"
+     },
+     {
+      "from": "c1",
+      "to": "q",
+      "label": "queue empty?",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "mx": {
+      "label": "Mutex + cond",
+      "tone": "ok",
+      "sub": "held by C1"
+     }
+    }
+   },
+   {
+    "say": "cond_wait does two things atomically: it releases the mutex and puts C1 to sleep. If these were separate, a signal could slip in between and be lost.",
+    "msgs": [
+     {
+      "from": "c1",
+      "to": "mx",
+      "label": "wait: unlock+sleep",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "c1": {
+      "label": "Consumer 1",
+      "tone": "muted",
+      "sub": "sleeping (0% CPU)"
+     },
+     "mx": {
+      "label": "Mutex + cond",
+      "tone": "normal",
+      "sub": "free, C1 waits"
+     }
+    }
+   },
+   {
+    "say": "Consumer 1 sleeps and uses no CPU: no busy-waiting. Consumer 2 is busy with other work and is not waiting.",
+    "set": {
+     "c2": {
+      "label": "Consumer 2",
+      "tone": "accent",
+      "sub": "busy elsewhere"
+     }
+    }
+   },
+   {
+    "say": "The producer locks the mutex, pushes one item and unlocks. The queue now has 1 item.",
+    "msgs": [
+     {
+      "from": "pr",
+      "to": "mx",
+      "label": "lock",
+      "tone": "ok"
+     },
+     {
+      "from": "pr",
+      "to": "q",
+      "label": "push item",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "q": {
+      "label": "Queue",
+      "tone": "ok",
+      "sub": "1 item"
+     },
+     "mx": {
+      "label": "Mutex + cond",
+      "tone": "ok",
+      "sub": "held by Producer"
+     }
+    }
+   },
+   {
+    "say": "It calls signal. The kernel wakes Consumer 1. This costs a few microseconds, but C1 is still not running yet.",
+    "msgs": [
+     {
+      "from": "pr",
+      "to": "c1",
+      "label": "signal",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "c1": {
+      "label": "Consumer 1",
+      "tone": "warn",
+      "sub": "woken, needs mutex"
+     },
+     "mx": {
+      "label": "Mutex + cond",
+      "tone": "normal",
+      "sub": "free"
+     }
+    }
+   },
+   {
+    "say": "Before C1 gets the mutex back, Consumer 2 finishes its work, locks the mutex, and takes the item. The queue is empty again.",
+    "msgs": [
+     {
+      "from": "c2",
+      "to": "mx",
+      "label": "lock",
+      "tone": "warn"
+     },
+     {
+      "from": "c2",
+      "to": "q",
+      "label": "pop item",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "q": {
+      "label": "Queue",
+      "tone": "bad",
+      "sub": "0 items"
+     },
+     "c2": {
+      "label": "Consumer 2",
+      "tone": "ok",
+      "sub": "took the item"
+     }
+    }
+   },
+   {
+    "say": "Now C1 gets the mutex. If the code was `if (empty) wait;` it would go on and pop from an empty queue: a crash or garbage. This is a stolen or spurious wakeup.",
+    "msgs": [
+     {
+      "from": "c1",
+      "to": "q",
+      "label": "pop (empty!)",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "c1": {
+      "label": "Consumer 1",
+      "tone": "bad",
+      "sub": "BUG with if"
+     }
+    }
+   },
+   {
+    "say": "Correct code: `while (empty) wait;`. C1 re-checks the queue, sees 0 items, and goes back to sleep. Always test the condition in a loop.",
+    "msgs": [
+     {
+      "from": "c1",
+      "to": "mx",
+      "label": "wait again",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "c1": {
+      "label": "Consumer 1",
+      "tone": "ok",
+      "sub": "re-check, sleeps"
+     },
+     "q": {
+      "label": "Queue",
+      "tone": "normal",
+      "sub": "0 items"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "allocators-fragmentation",
+  "concept": "allocators",
+  "title": "malloc, free and fragmentation",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "h0",
+    "label": "A",
+    "x": 20,
+    "y": 150,
+    "w": 76,
+    "h": 50,
+    "shape": "cell",
+    "sub": "0x1000",
+    "tone": "ok"
+   },
+   {
+    "id": "h1",
+    "label": "B",
+    "x": 106,
+    "y": 150,
+    "w": 76,
+    "h": 50,
+    "shape": "cell",
+    "sub": "0x1040",
+    "tone": "ok"
+   },
+   {
+    "id": "h2",
+    "label": "C",
+    "x": 192,
+    "y": 150,
+    "w": 76,
+    "h": 50,
+    "shape": "cell",
+    "sub": "0x1080",
+    "tone": "ok"
+   },
+   {
+    "id": "h3",
+    "label": "D",
+    "x": 278,
+    "y": 150,
+    "w": 76,
+    "h": 50,
+    "shape": "cell",
+    "sub": "0x10C0",
+    "tone": "ok"
+   },
+   {
+    "id": "h4",
+    "label": "E",
+    "x": 364,
+    "y": 150,
+    "w": 76,
+    "h": 50,
+    "shape": "cell",
+    "sub": "0x1100",
+    "tone": "ok"
+   },
+   {
+    "id": "h5",
+    "label": "F",
+    "x": 450,
+    "y": 150,
+    "w": 76,
+    "h": 50,
+    "shape": "cell",
+    "sub": "0x1140",
+    "tone": "ok"
+   },
+   {
+    "id": "h6",
+    "label": "G",
+    "x": 536,
+    "y": 150,
+    "w": 76,
+    "h": 50,
+    "shape": "cell",
+    "sub": "0x1180",
+    "tone": "ok"
+   },
+   {
+    "id": "h7",
+    "label": "H",
+    "x": 622,
+    "y": 150,
+    "w": 76,
+    "h": 50,
+    "shape": "cell",
+    "sub": "0x11C0",
+    "tone": "ok"
+   },
+   {
+    "id": "app",
+    "label": "malloc(128)",
+    "x": 290,
+    "y": 300,
+    "w": 140,
+    "h": 50,
+    "shape": "box",
+    "sub": "needs 128 B"
+   },
+   {
+    "id": "os",
+    "label": "Kernel brk",
+    "x": 570,
+    "y": 300,
+    "w": 130,
+    "h": 50,
+    "shape": "box",
+    "sub": "grow heap"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "The heap is cut into 64-byte chunks starting at 0x1000. All 8 chunks, A to H, are in use. Each box shows its address.",
+    "focus": [
+     "h0",
+     "h7"
+    ]
+   },
+   {
+    "say": "The program frees A, C, E and G. A free is fast: about 20 ns, it just puts the chunk on a free list.",
+    "set": {
+     "h0": {
+      "label": "A",
+      "tone": "muted",
+      "sub": "0x1000"
+     },
+     "h2": {
+      "label": "C",
+      "tone": "muted",
+      "sub": "0x1080"
+     },
+     "h4": {
+      "label": "E",
+      "tone": "muted",
+      "sub": "0x1100"
+     },
+     "h6": {
+      "label": "G",
+      "tone": "muted",
+      "sub": "0x1180"
+     }
+    }
+   },
+   {
+    "say": "Total free memory is 4 x 64 = 256 bytes. That looks like plenty.",
+    "focus": [
+     "h0",
+     "h2",
+     "h4",
+     "h6"
+    ]
+   },
+   {
+    "say": "Now the program asks for malloc(128). That needs two free chunks side by side. Every free chunk has a used neighbour.",
+    "msgs": [
+     {
+      "from": "app",
+      "to": "h0",
+      "label": "fits? no",
+      "tone": "bad"
+     },
+     {
+      "from": "app",
+      "to": "h2",
+      "label": "fits? no",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "app": {
+      "label": "malloc(128)",
+      "tone": "bad",
+      "sub": "no hole big enough"
+     }
+    }
+   },
+   {
+    "say": "The request fails although 256 bytes are free. This is external fragmentation: memory is free but cut into pieces that are too small.",
+    "focus": [
+     "h1",
+     "h3",
+     "h5"
+    ]
+   },
+   {
+    "say": "The allocator must ask the kernel for more memory with brk or mmap. This costs about 1 to 5 microseconds, plus page faults when new pages are first touched.",
+    "msgs": [
+     {
+      "from": "app",
+      "to": "os",
+      "label": "brk +132 KB",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "os": {
+      "label": "Kernel brk",
+      "tone": "warn",
+      "sub": "heap grows"
+     }
+    }
+   },
+   {
+    "say": "A better outcome: the program frees B. Now A, B and C are neighbours and all free.",
+    "set": {
+     "h1": {
+      "label": "B",
+      "tone": "muted",
+      "sub": "0x1040"
+     }
+    }
+   },
+   {
+    "say": "The allocator coalesces A, B and C into one 192-byte block. malloc(128) now fits with no kernel call, in about 20 ns.",
+    "msgs": [
+     {
+      "from": "app",
+      "to": "h0",
+      "label": "malloc(128)",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "h0": {
+      "label": "A+B+C",
+      "tone": "ok",
+      "sub": "192 B free"
+     },
+     "h1": {
+      "label": "(merged)",
+      "tone": "muted",
+      "sub": ""
+     },
+     "h2": {
+      "label": "(merged)",
+      "tone": "muted",
+      "sub": ""
+     },
+     "app": {
+      "label": "malloc(128)",
+      "tone": "ok",
+      "sub": "served from 192 B"
+     },
+     "os": {
+      "label": "Kernel brk",
+      "tone": "normal",
+      "sub": "not needed"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "gc-mark-sweep",
+  "concept": "gc",
+  "title": "Mark and sweep, and the pause",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "root",
+    "label": "Roots",
+    "x": 20,
+    "y": 150,
+    "w": 100,
+    "h": 56,
+    "shape": "box",
+    "sub": "stack, globals"
+   },
+   {
+    "id": "a",
+    "label": "A",
+    "x": 200,
+    "y": 60,
+    "w": 90,
+    "h": 44,
+    "shape": "cell",
+    "sub": "0x7A10"
+   },
+   {
+    "id": "b",
+    "label": "B",
+    "x": 360,
+    "y": 60,
+    "w": 90,
+    "h": 44,
+    "shape": "cell",
+    "sub": "0x7A50"
+   },
+   {
+    "id": "c",
+    "label": "C",
+    "x": 200,
+    "y": 260,
+    "w": 90,
+    "h": 44,
+    "shape": "cell",
+    "sub": "0x7B20"
+   },
+   {
+    "id": "d",
+    "label": "D",
+    "x": 360,
+    "y": 260,
+    "w": 90,
+    "h": 44,
+    "shape": "cell",
+    "sub": "0x7B60"
+   },
+   {
+    "id": "e",
+    "label": "E",
+    "x": 530,
+    "y": 60,
+    "w": 90,
+    "h": 44,
+    "shape": "cell",
+    "sub": "0x7B90"
+   },
+   {
+    "id": "gc",
+    "label": "GC thread",
+    "x": 540,
+    "y": 260,
+    "w": 140,
+    "h": 56,
+    "shape": "round",
+    "sub": "idle"
+   }
+  ],
+  "links": [
+   {
+    "from": "root",
+    "to": "a",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "a",
+    "to": "b",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "b",
+    "to": "e",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "c",
+    "to": "d",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "d",
+    "to": "c",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "The heap holds five objects. Roots (stack variables and globals) point to A. A points to B, B points to E. C and D point to each other.",
+    "focus": [
+     "root",
+     "a",
+     "b",
+     "c",
+     "d",
+     "e"
+    ]
+   },
+   {
+    "say": "The program keeps allocating. The heap is 95 percent full (about 1.9 GB of 2 GB), so a collection starts.",
+    "set": {
+     "gc": {
+      "label": "GC thread",
+      "tone": "warn",
+      "sub": "heap 95% full"
+     }
+    }
+   },
+   {
+    "say": "Stop the world: all application threads pause, so the object graph cannot change while GC looks at it.",
+    "set": {
+     "gc": {
+      "label": "GC thread",
+      "tone": "bad",
+      "sub": "STOP THE WORLD"
+     },
+     "root": {
+      "label": "Roots",
+      "tone": "muted",
+      "sub": "paused"
+     }
+    }
+   },
+   {
+    "say": "Mark phase: start at the roots. Visit A and mark it live.",
+    "msgs": [
+     {
+      "from": "gc",
+      "to": "a",
+      "label": "mark",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "a": {
+      "label": "A",
+      "tone": "ok",
+      "sub": "live"
+     }
+    }
+   },
+   {
+    "say": "Follow A's pointer to B, then B's pointer to E. All three are live.",
+    "msgs": [
+     {
+      "from": "a",
+      "to": "b",
+      "label": "follow",
+      "tone": "ok"
+     },
+     {
+      "from": "b",
+      "to": "e",
+      "label": "follow",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "b": {
+      "label": "B",
+      "tone": "ok",
+      "sub": "live"
+     },
+     "e": {
+      "label": "E",
+      "tone": "ok",
+      "sub": "live"
+     }
+    }
+   },
+   {
+    "say": "C and D were never reached. They point to each other, but no root leads to them. A cycle does not keep an object alive here.",
+    "set": {
+     "c": {
+      "label": "C",
+      "tone": "bad",
+      "sub": "unreached"
+     },
+     "d": {
+      "label": "D",
+      "tone": "bad",
+      "sub": "unreached"
+     }
+    }
+   },
+   {
+    "say": "Sweep phase: free every unmarked object. C and D go back to the free space.",
+    "set": {
+     "gc": {
+      "label": "GC thread",
+      "tone": "ok",
+      "sub": "swept 2 objects"
+     }
+    },
+    "remove": [
+     "c",
+     "d"
+    ]
+   },
+   {
+    "say": "The application resumes. For a 2 GB heap with a small live set the pause was about 12 ms. Cost grows with the amount of live data.",
+    "set": {
+     "gc": {
+      "label": "GC thread",
+      "tone": "ok",
+      "sub": "pause 12 ms"
+     },
+     "root": {
+      "label": "Roots",
+      "tone": "ok",
+      "sub": "running"
+     }
+    }
+   },
+   {
+    "say": "Failure case: with 20 GB of live data a full stop-the-world pause can last seconds. Requests time out. Generational and concurrent collectors cut this to under 1 to 10 ms.",
+    "set": {
+     "gc": {
+      "label": "GC thread",
+      "tone": "bad",
+      "sub": "20 GB live: 3 s pause"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "cachelines-sequential-vs-stride",
+  "concept": "cachelines",
+  "title": "One miss loads 64 bytes",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "cpu",
+    "label": "CPU core",
+    "x": 20,
+    "y": 160,
+    "w": 110,
+    "h": 56,
+    "shape": "box",
+    "sub": "reads int a[i]"
+   },
+   {
+    "id": "l1",
+    "label": "L1 cache",
+    "x": 200,
+    "y": 160,
+    "w": 110,
+    "h": 56,
+    "shape": "box",
+    "sub": "32 KB, 4 cycles"
+   },
+   {
+    "id": "l3",
+    "label": "L2 / L3",
+    "x": 370,
+    "y": 160,
+    "w": 110,
+    "h": 56,
+    "shape": "box",
+    "sub": "14 / 40 cycles"
+   },
+   {
+    "id": "ram",
+    "label": "RAM",
+    "x": 560,
+    "y": 160,
+    "w": 110,
+    "h": 56,
+    "shape": "db",
+    "sub": "~200 cycles"
+   },
+   {
+    "id": "line",
+    "label": "Line 0x1000",
+    "x": 200,
+    "y": 290,
+    "w": 200,
+    "h": 50,
+    "shape": "cell",
+    "sub": "64 B = 16 ints"
+   }
+  ],
+  "links": [
+   {
+    "from": "cpu",
+    "to": "l1",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "l1",
+    "to": "l3",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "l3",
+    "to": "ram",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "The program sums int a[1000] in order. The array starts at 0x1000. Each int is 4 bytes. First read: a[0] at 0x1000.",
+    "msgs": [
+     {
+      "from": "cpu",
+      "to": "l1",
+      "label": "a[0] @0x1000",
+      "tone": "accent"
+     }
+    ]
+   },
+   {
+    "say": "L1 miss (checked in 4 cycles). L2 and L3 miss too (about 40 cycles). The request goes to RAM.",
+    "msgs": [
+     {
+      "from": "l1",
+      "to": "l3",
+      "label": "miss",
+      "tone": "bad"
+     },
+     {
+      "from": "l3",
+      "to": "ram",
+      "label": "miss",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "l1": {
+      "label": "L1 cache",
+      "tone": "bad",
+      "sub": "miss"
+     }
+    }
+   },
+   {
+    "say": "RAM answers in about 200 cycles (70 ns at 3 GHz). It does not send 4 bytes, it sends the whole 64-byte line 0x1000 to 0x103F.",
+    "msgs": [
+     {
+      "from": "ram",
+      "to": "l1",
+      "label": "64 B line",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "ram": {
+      "label": "RAM",
+      "tone": "warn",
+      "sub": "200 cycles"
+     },
+     "line": {
+      "label": "Line 0x1000",
+      "tone": "ok",
+      "sub": "in L1"
+     }
+    }
+   },
+   {
+    "say": "a[1] to a[15] are in the same line. Each is an L1 hit: 4 cycles (about 1 ns). One miss paid for 16 reads.",
+    "msgs": [
+     {
+      "from": "cpu",
+      "to": "l1",
+      "label": "a[1..15]",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "l1": {
+      "label": "L1 cache",
+      "tone": "ok",
+      "sub": "15 hits x 4 cyc"
+     }
+    }
+   },
+   {
+    "say": "Average cost: (200 + 15 x 4) / 16 = 16 cycles per int. The hardware prefetcher also fetches the next line early, so it is often even less.",
+    "set": {
+     "cpu": {
+      "label": "CPU core",
+      "tone": "ok",
+      "sub": "16 cycles/int"
+     }
+    }
+   },
+   {
+    "say": "Now the bad case: read every 16th int (stride 64 bytes): a[0], a[16], a[32]. Each read touches a new line.",
+    "msgs": [
+     {
+      "from": "cpu",
+      "to": "l1",
+      "label": "a[16] @0x1040",
+      "tone": "accent"
+     },
+     {
+      "from": "l1",
+      "to": "ram",
+      "label": "miss",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "line": {
+      "label": "Line 0x1040",
+      "tone": "bad",
+      "sub": "new line"
+     },
+     "l1": {
+      "label": "L1 cache",
+      "tone": "bad",
+      "sub": "miss every read"
+     }
+    }
+   },
+   {
+    "say": "Every read is a full miss: 200 cycles each. That is 12 times slower per access (200 vs 16). Same data size, very different speed.",
+    "set": {
+     "cpu": {
+      "label": "CPU core",
+      "tone": "bad",
+      "sub": "200 cycles/int"
+     }
+    }
+   },
+   {
+    "say": "Walking a 2D array by column is this worst case. A 4096-int-wide matrix has a stride of 16 KB, and the lines can also fight for the same cache sets, which makes it worse.",
+    "set": {
+     "ram": {
+      "label": "RAM",
+      "tone": "bad",
+      "sub": "bandwidth wasted"
+     },
+     "line": {
+      "label": "Line",
+      "tone": "bad",
+      "sub": "63 of 64 B unused"
+     }
+    }
+   },
+   {
+    "say": "Rule: walk memory in order and keep related fields together. Use all 64 bytes of each line you pay for.",
+    "set": {
+     "cpu": {
+      "label": "CPU core",
+      "tone": "ok",
+      "sub": "row order: 16 cyc"
+     },
+     "ram": {
+      "label": "RAM",
+      "tone": "ok",
+      "sub": "idle"
+     },
+     "l1": {
+      "label": "L1 cache",
+      "tone": "ok",
+      "sub": "hits"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "coherence-false-sharing",
+  "concept": "coherence",
+  "title": "MESI states and false sharing",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "c0",
+    "label": "Core 0",
+    "x": 40,
+    "y": 40,
+    "w": 150,
+    "h": 50,
+    "shape": "box",
+    "sub": "writes x"
+   },
+   {
+    "id": "c1",
+    "label": "Core 1",
+    "x": 530,
+    "y": 40,
+    "w": 150,
+    "h": 50,
+    "shape": "box",
+    "sub": "writes y"
+   },
+   {
+    "id": "l0",
+    "label": "L1 of core 0",
+    "x": 40,
+    "y": 150,
+    "w": 170,
+    "h": 60,
+    "shape": "box",
+    "sub": "line 0x2000: -"
+   },
+   {
+    "id": "l1",
+    "label": "L1 of core 1",
+    "x": 510,
+    "y": 150,
+    "w": 170,
+    "h": 60,
+    "shape": "box",
+    "sub": "line 0x2000: -"
+   },
+   {
+    "id": "mem",
+    "label": "L3 / RAM",
+    "x": 270,
+    "y": 300,
+    "w": 190,
+    "h": 56,
+    "shape": "box",
+    "sub": "x at 0x2000, y at 0x2008"
+   }
+  ],
+  "links": [
+   {
+    "from": "c0",
+    "to": "l0",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "c1",
+    "to": "l1",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "l0",
+    "to": "mem",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "l1",
+    "to": "mem",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "l0",
+    "to": "l1",
+    "label": "bus",
+    "dashed": true
+   }
+  ],
+  "steps": [
+   {
+    "say": "One 64-byte cache line at 0x2000 holds two variables: x (offset 0) and y (offset 8). They are separate, but share one line.",
+    "focus": [
+     "mem"
+    ]
+   },
+   {
+    "say": "Core 0 reads x. It is the only core with the line, so the state is E (Exclusive). A read costs one fetch, about 40 cycles from L3.",
+    "msgs": [
+     {
+      "from": "mem",
+      "to": "l0",
+      "label": "line 0x2000",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "l0": {
+      "label": "L1 of core 0",
+      "tone": "ok",
+      "sub": "line 0x2000: E"
+     }
+    }
+   },
+   {
+    "say": "Core 1 reads y. The line is copied to Core 1. Now both cores have it, both in state S (Shared).",
+    "msgs": [
+     {
+      "from": "mem",
+      "to": "l1",
+      "label": "line 0x2000",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "l0": {
+      "label": "L1 of core 0",
+      "tone": "ok",
+      "sub": "line 0x2000: S"
+     },
+     "l1": {
+      "label": "L1 of core 1",
+      "tone": "ok",
+      "sub": "line 0x2000: S"
+     }
+    }
+   },
+   {
+    "say": "Core 0 writes x. To write, it needs the line alone. It sends an invalidate to Core 1, whose copy becomes I (Invalid). Core 0 becomes M (Modified).",
+    "msgs": [
+     {
+      "from": "c0",
+      "to": "l0",
+      "label": "x = 1",
+      "tone": "accent"
+     },
+     {
+      "from": "l0",
+      "to": "l1",
+      "label": "invalidate",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "l0": {
+      "label": "L1 of core 0",
+      "tone": "warn",
+      "sub": "line 0x2000: M"
+     },
+     "l1": {
+      "label": "L1 of core 1",
+      "tone": "bad",
+      "sub": "line 0x2000: I"
+     }
+    }
+   },
+   {
+    "say": "Core 1 writes y. It has no valid copy, so it asks for the line. Core 0 must send its modified line (about 60 to 100 ns across cores) and drops to I.",
+    "msgs": [
+     {
+      "from": "c1",
+      "to": "l1",
+      "label": "y = 1",
+      "tone": "accent"
+     },
+     {
+      "from": "l0",
+      "to": "l1",
+      "label": "line + data",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "l0": {
+      "label": "L1 of core 0",
+      "tone": "bad",
+      "sub": "line 0x2000: I"
+     },
+     "l1": {
+      "label": "L1 of core 1",
+      "tone": "warn",
+      "sub": "line 0x2000: M"
+     }
+    }
+   },
+   {
+    "say": "Core 0 writes x again. The line moves back. The two cores keep stealing the line from each other.",
+    "msgs": [
+     {
+      "from": "c0",
+      "to": "l0",
+      "label": "x = 2",
+      "tone": "accent"
+     },
+     {
+      "from": "l1",
+      "to": "l0",
+      "label": "line + data",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "l0": {
+      "label": "L1 of core 0",
+      "tone": "warn",
+      "sub": "line 0x2000: M"
+     },
+     "l1": {
+      "label": "L1 of core 1",
+      "tone": "bad",
+      "sub": "line 0x2000: I"
+     }
+    }
+   },
+   {
+    "say": "This is false sharing: the threads share no data, but share a line. Each write costs about 80 ns instead of 1 ns. A loop of 100 million increments can take 8 s instead of 0.1 s.",
+    "set": {
+     "c0": {
+      "label": "Core 0",
+      "tone": "bad",
+      "sub": "80 ns per write"
+     },
+     "c1": {
+      "label": "Core 1",
+      "tone": "bad",
+      "sub": "80 ns per write"
+     }
+    }
+   },
+   {
+    "say": "Fix: pad or align each hot variable to its own 64-byte line, so that y moves to 0x2040.",
+    "set": {
+     "mem": {
+      "label": "L3 / RAM",
+      "tone": "ok",
+      "sub": "x at 0x2000, y at 0x2040"
+     }
+    }
+   },
+   {
+    "say": "Now each core keeps its own line in M state and writes at L1 speed, 1 ns per write, with no traffic between cores.",
+    "set": {
+     "l0": {
+      "label": "L1 of core 0",
+      "tone": "ok",
+      "sub": "0x2000: M"
+     },
+     "l1": {
+      "label": "L1 of core 1",
+      "tone": "ok",
+      "sub": "0x2040: M"
+     },
+     "c0": {
+      "label": "Core 0",
+      "tone": "ok",
+      "sub": "1 ns per write"
+     },
+     "c1": {
+      "label": "Core 1",
+      "tone": "ok",
+      "sub": "1 ns per write"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "pipeline-fill-stall",
+  "concept": "pipeline",
+  "title": "A 5-stage pipeline and a stall",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "s0",
+    "label": "IF fetch",
+    "x": 30,
+    "y": 40,
+    "w": 100,
+    "h": 50,
+    "shape": "round"
+   },
+   {
+    "id": "s1",
+    "label": "ID decode",
+    "x": 170,
+    "y": 40,
+    "w": 100,
+    "h": 50,
+    "shape": "round"
+   },
+   {
+    "id": "s2",
+    "label": "EX execute",
+    "x": 310,
+    "y": 40,
+    "w": 100,
+    "h": 50,
+    "shape": "round"
+   },
+   {
+    "id": "s3",
+    "label": "MEM memory",
+    "x": 450,
+    "y": 40,
+    "w": 100,
+    "h": 50,
+    "shape": "round"
+   },
+   {
+    "id": "s4",
+    "label": "WB write",
+    "x": 590,
+    "y": 40,
+    "w": 100,
+    "h": 50,
+    "shape": "round"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "Cycle 1: instruction i1 enters Fetch (IF). The CPU has 5 stages. Each stage does one small job per cycle.",
+    "add": [
+     {
+      "id": "i1",
+      "label": "i1 add",
+      "x": 30,
+      "y": 130,
+      "w": 100,
+      "h": 34,
+      "shape": "cell",
+      "tone": "accent"
+     }
+    ]
+   },
+   {
+    "say": "Cycle 2: i1 moves to Decode. At the same time, i2 is fetched. Stages work in parallel, like an assembly line.",
+    "move": {
+     "i1": {
+      "x": 170,
+      "y": 130
+     }
+    },
+    "add": [
+     {
+      "id": "i2",
+      "label": "i2 load r1",
+      "x": 30,
+      "y": 176,
+      "w": 100,
+      "h": 34,
+      "shape": "cell",
+      "tone": "accent"
+     }
+    ]
+   },
+   {
+    "say": "Cycle 3: i1 executes, i2 decodes, i3 is fetched. Three instructions are in flight.",
+    "move": {
+     "i1": {
+      "x": 310,
+      "y": 130
+     },
+     "i2": {
+      "x": 170,
+      "y": 176
+     }
+    },
+    "add": [
+     {
+      "id": "i3",
+      "label": "i3 add r1,..",
+      "x": 30,
+      "y": 222,
+      "w": 100,
+      "h": 34,
+      "shape": "cell",
+      "tone": "accent"
+     }
+    ]
+   },
+   {
+    "say": "Cycle 4: four instructions in flight. Nothing is finished yet: this is the fill time of 4 cycles.",
+    "move": {
+     "i1": {
+      "x": 450,
+      "y": 130
+     },
+     "i2": {
+      "x": 310,
+      "y": 176
+     },
+     "i3": {
+      "x": 170,
+      "y": 222
+     }
+    },
+    "add": [
+     {
+      "id": "i4",
+      "label": "i4 sub",
+      "x": 30,
+      "y": 268,
+      "w": 100,
+      "h": 34,
+      "shape": "cell",
+      "tone": "accent"
+     }
+    ]
+   },
+   {
+    "say": "Cycle 5: i1 finishes (WB). But i3 needs r1, and i2 (a load) has not read memory yet. i3 must wait, so a bubble (an empty slot) goes into EX. This is a load-use stall.",
+    "move": {
+     "i1": {
+      "x": 590,
+      "y": 130
+     },
+     "i2": {
+      "x": 450,
+      "y": 176
+     }
+    },
+    "add": [
+     {
+      "id": "bub",
+      "label": "bubble",
+      "x": 310,
+      "y": 314,
+      "w": 100,
+      "h": 34,
+      "shape": "cell",
+      "tone": "bad"
+     }
+    ]
+   },
+   {
+    "say": "Cycle 6: i2 finishes. i3 now gets r1 and executes. i4 was held back by the stall. 1 cycle lost.",
+    "move": {
+     "i2": {
+      "x": 590,
+      "y": 176
+     },
+     "i3": {
+      "x": 310,
+      "y": 222
+     },
+     "i4": {
+      "x": 170,
+      "y": 268
+     },
+     "bub": {
+      "x": 450,
+      "y": 314
+     }
+    },
+    "remove": [
+     "i1"
+    ]
+   },
+   {
+    "say": "Cycle 7: the bubble travels down the pipe doing nothing. i3 is in MEM, i4 in EX.",
+    "move": {
+     "i3": {
+      "x": 450,
+      "y": 222
+     },
+     "i4": {
+      "x": 310,
+      "y": 268
+     },
+     "bub": {
+      "x": 590,
+      "y": 314
+     }
+    },
+    "remove": [
+     "i2"
+    ]
+   },
+   {
+    "say": "Cycle 8: i3 finishes. The bubble leaves the pipe.",
+    "move": {
+     "i3": {
+      "x": 590,
+      "y": 222
+     },
+     "i4": {
+      "x": 450,
+      "y": 268
+     }
+    },
+    "remove": [
+     "bub"
+    ]
+   },
+   {
+    "say": "Cycle 9: i4 finishes. 4 instructions took 9 cycles, 5 of them lost to filling and 1 stall. A long run reaches about 1 instruction per cycle. A mispredicted branch (see branch prediction) would flush all stages: 15 to 20 cycles.",
+    "move": {
+     "i4": {
+      "x": 590,
+      "y": 268
+     }
+    },
+    "remove": [
+     "i3"
+    ],
+    "set": {
+     "s4": {
+      "label": "WB write",
+      "tone": "ok",
+      "sub": "done: 9 cycles"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "ooo-hide-miss",
+  "concept": "ooo",
+  "title": "Out-of-order execution hides a cache miss",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "i1",
+    "label": "1 load r1,[rax]",
+    "x": 20,
+    "y": 50,
+    "w": 190,
+    "h": 44,
+    "shape": "cell",
+    "sub": "waiting"
+   },
+   {
+    "id": "i2",
+    "label": "2 add r2,r1,1",
+    "x": 20,
+    "y": 110,
+    "w": 190,
+    "h": 44,
+    "shape": "cell",
+    "sub": "waiting"
+   },
+   {
+    "id": "i3",
+    "label": "3 mul r3,r4,r5",
+    "x": 20,
+    "y": 170,
+    "w": 190,
+    "h": 44,
+    "shape": "cell",
+    "sub": "waiting"
+   },
+   {
+    "id": "i4",
+    "label": "4 add r6,r3,r3",
+    "x": 20,
+    "y": 230,
+    "w": 190,
+    "h": 44,
+    "shape": "cell",
+    "sub": "waiting"
+   },
+   {
+    "id": "i5",
+    "label": "5 sub r7,r8,r9",
+    "x": 20,
+    "y": 290,
+    "w": 190,
+    "h": 44,
+    "shape": "cell",
+    "sub": "waiting"
+   },
+   {
+    "id": "rob",
+    "label": "ROB (224 slots)",
+    "x": 300,
+    "y": 50,
+    "w": 200,
+    "h": 60,
+    "shape": "box",
+    "sub": "5 in flight"
+   },
+   {
+    "id": "ex",
+    "label": "Execution units",
+    "x": 300,
+    "y": 170,
+    "w": 200,
+    "h": 60,
+    "shape": "round",
+    "sub": "4 wide"
+   },
+   {
+    "id": "mem",
+    "label": "RAM",
+    "x": 580,
+    "y": 50,
+    "w": 110,
+    "h": 60,
+    "shape": "db",
+    "sub": "miss: 200 cycles"
+   },
+   {
+    "id": "ret",
+    "label": "Retire",
+    "x": 300,
+    "y": 290,
+    "w": 200,
+    "h": 50,
+    "shape": "box",
+    "sub": "in program order"
+   }
+  ],
+  "links": [
+   {
+    "from": "i1",
+    "to": "rob",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "i3",
+    "to": "rob",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "rob",
+    "to": "ex",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "rob",
+    "to": "ret",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "i1",
+    "to": "mem",
+    "label": "",
+    "dashed": true
+   }
+  ],
+  "steps": [
+   {
+    "say": "Five instructions are fetched into the reorder buffer (ROB). The CPU may run them in any order when their inputs are ready.",
+    "msgs": [
+     {
+      "from": "i1",
+      "to": "rob",
+      "label": "",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "rob": {
+      "label": "ROB (224 slots)",
+      "tone": "accent",
+      "sub": "5 in flight"
+     }
+    }
+   },
+   {
+    "say": "Instruction 1 loads from memory, and the data is not in any cache. It will take about 200 cycles.",
+    "msgs": [
+     {
+      "from": "i1",
+      "to": "mem",
+      "label": "load",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "i1": {
+      "label": "1 load r1,[rax]",
+      "tone": "bad",
+      "sub": "miss: 200 cycles"
+     },
+     "mem": {
+      "label": "RAM",
+      "tone": "warn",
+      "sub": "reading..."
+     }
+    }
+   },
+   {
+    "say": "Instruction 2 needs r1, so it must wait. An in-order CPU would stop here for 200 cycles and run nothing else.",
+    "set": {
+     "i2": {
+      "label": "2 add r2,r1,1",
+      "tone": "warn",
+      "sub": "waits for r1"
+     }
+    }
+   },
+   {
+    "say": "Instructions 3 and 5 do not need r1. They run now, in the same cycle on different units. The CPU looks ahead past the stuck instruction.",
+    "msgs": [
+     {
+      "from": "rob",
+      "to": "ex",
+      "label": "issue 3 and 5",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "i3": {
+      "label": "3 mul r3,r4,r5",
+      "tone": "ok",
+      "sub": "running, 3 cycles"
+     },
+     "i5": {
+      "label": "5 sub r7,r8,r9",
+      "tone": "ok",
+      "sub": "done (1 cycle)"
+     },
+     "ex": {
+      "label": "Execution units",
+      "tone": "ok",
+      "sub": "2 busy"
+     }
+    }
+   },
+   {
+    "say": "Instruction 4 uses r3. When the multiply ends (3 cycles), 4 runs too. By cycle 5 everything except 1 and 2 is done.",
+    "set": {
+     "i3": {
+      "label": "3 mul r3,r4,r5",
+      "tone": "ok",
+      "sub": "done"
+     },
+     "i4": {
+      "label": "4 add r6,r3,r3",
+      "tone": "ok",
+      "sub": "done"
+     }
+    }
+   },
+   {
+    "say": "Results wait in the ROB. They cannot retire yet: instructions must commit in program order, so the program looks sequential.",
+    "msgs": [
+     {
+      "from": "rob",
+      "to": "ret",
+      "label": "blocked at 1",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "ret": {
+      "label": "Retire",
+      "tone": "warn",
+      "sub": "waiting for 1"
+     }
+    }
+   },
+   {
+    "say": "Cycle 200: the data arrives. Instruction 1 finishes, 2 runs in cycle 201, and all five retire together in a burst.",
+    "msgs": [
+     {
+      "from": "mem",
+      "to": "i1",
+      "label": "data",
+      "tone": "ok"
+     },
+     {
+      "from": "ret",
+      "to": "rob",
+      "label": "retire 1..5",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "i1": {
+      "label": "1 load r1,[rax]",
+      "tone": "ok",
+      "sub": "done"
+     },
+     "i2": {
+      "label": "2 add r2,r1,1",
+      "tone": "ok",
+      "sub": "done"
+     },
+     "i5": {
+      "label": "5 sub r7,r8,r9",
+      "tone": "ok",
+      "sub": "retired"
+     },
+     "mem": {
+      "label": "RAM",
+      "tone": "ok",
+      "sub": "done"
+     },
+     "ret": {
+      "label": "Retire",
+      "tone": "ok",
+      "sub": "5 instructions"
+     }
+    }
+   },
+   {
+    "say": "Failure case: the ROB holds 224 instructions, about 56 cycles of work at 4 per cycle. A 200-cycle miss still stalls the CPU once the ROB is full. Two misses in a row cost double.",
+    "set": {
+     "rob": {
+      "label": "ROB (224 slots)",
+      "tone": "bad",
+      "sub": "FULL: stall"
+     },
+     "ex": {
+      "label": "Execution units",
+      "tone": "bad",
+      "sub": "idle"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "branchpred-flush",
+  "concept": "branchpred",
+  "title": "Predict a branch, or flush the pipeline",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "br",
+    "label": "if (a[i] >= 128)",
+    "x": 20,
+    "y": 60,
+    "w": 170,
+    "h": 56,
+    "shape": "box",
+    "sub": "branch @0x4005A0"
+   },
+   {
+    "id": "pr",
+    "label": "Predictor",
+    "x": 280,
+    "y": 60,
+    "w": 150,
+    "h": 56,
+    "shape": "box",
+    "sub": "2-bit counter"
+   },
+   {
+    "id": "fe",
+    "label": "Fetch (guessing)",
+    "x": 520,
+    "y": 60,
+    "w": 170,
+    "h": 56,
+    "shape": "box",
+    "sub": "ahead of the branch"
+   },
+   {
+    "id": "ex",
+    "label": "Execute",
+    "x": 520,
+    "y": 200,
+    "w": 170,
+    "h": 56,
+    "shape": "box",
+    "sub": "finds the truth"
+   },
+   {
+    "id": "fl",
+    "label": "Flush",
+    "x": 280,
+    "y": 300,
+    "w": 150,
+    "h": 50,
+    "shape": "round",
+    "sub": "throw work away"
+   },
+   {
+    "id": "cnt",
+    "label": "Counter value",
+    "x": 20,
+    "y": 200,
+    "w": 170,
+    "h": 56,
+    "shape": "cell",
+    "sub": "11 = strongly taken"
+   }
+  ],
+  "links": [
+   {
+    "from": "br",
+    "to": "pr",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "pr",
+    "to": "fe",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "fe",
+    "to": "ex",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "ex",
+    "to": "fl",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "br",
+    "to": "cnt",
+    "label": "",
+    "dashed": true
+   }
+  ],
+  "steps": [
+   {
+    "say": "A loop tests each array item. The CPU can't wait ~15 cycles to learn the answer, so it guesses and keeps fetching.",
+    "focus": [
+     "br",
+     "pr"
+    ]
+   },
+   {
+    "say": "Sorted array: the first 1,000 items are all >= 128, so the branch is taken every time. The 2-bit counter saturates at 11 (strongly taken).",
+    "msgs": [
+     {
+      "from": "br",
+      "to": "pr",
+      "label": "taken",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "cnt": {
+      "label": "Counter value",
+      "tone": "ok",
+      "sub": "11 = strongly taken"
+     },
+     "pr": {
+      "label": "Predictor",
+      "tone": "ok",
+      "sub": "predict: taken"
+     }
+    }
+   },
+   {
+    "say": "Prediction is right again and again. Fetch runs ahead on the right path. Cost: 0 extra cycles, almost 100 percent correct.",
+    "msgs": [
+     {
+      "from": "pr",
+      "to": "fe",
+      "label": "taken path",
+      "tone": "ok"
+     },
+     {
+      "from": "fe",
+      "to": "ex",
+      "label": "correct",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "fe": {
+      "label": "Fetch (guessing)",
+      "tone": "ok",
+      "sub": "right path"
+     }
+    }
+   },
+   {
+    "say": "Now a random array: half the items are < 128. The branch is taken, not taken, taken, not taken...",
+    "set": {
+     "br": {
+      "label": "if (a[i] >= 128)",
+      "tone": "warn",
+      "sub": "random 50/50"
+     },
+     "cnt": {
+      "label": "Counter value",
+      "tone": "warn",
+      "sub": "10 = weakly taken"
+     }
+    }
+   },
+   {
+    "say": "Predictor says taken, and Fetch loads ~20 instructions from that path. They are in the pipeline when the branch executes.",
+    "msgs": [
+     {
+      "from": "pr",
+      "to": "fe",
+      "label": "taken path",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "fe": {
+      "label": "Fetch (guessing)",
+      "tone": "warn",
+      "sub": "20 instr. in flight"
+     }
+    }
+   },
+   {
+    "say": "Execute finds the item was 90: NOT taken. The prediction was wrong.",
+    "msgs": [
+     {
+      "from": "ex",
+      "to": "pr",
+      "label": "not taken!",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "ex": {
+      "label": "Execute",
+      "tone": "bad",
+      "sub": "mispredicted"
+     },
+     "cnt": {
+      "label": "Counter value",
+      "tone": "warn",
+      "sub": "01 = weakly not taken"
+     }
+    }
+   },
+   {
+    "say": "The CPU flushes all wrong-path work and restarts fetching at the right address. This costs about 15 to 20 cycles, around 5 ns at 4 GHz.",
+    "msgs": [
+     {
+      "from": "ex",
+      "to": "fl",
+      "label": "flush",
+      "tone": "bad"
+     },
+     {
+      "from": "fl",
+      "to": "fe",
+      "label": "refetch",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "fl": {
+      "label": "Flush",
+      "tone": "bad",
+      "sub": "~17 cycles lost"
+     },
+     "fe": {
+      "label": "Fetch (guessing)",
+      "tone": "bad",
+      "sub": "restarting"
+     }
+    }
+   },
+   {
+    "say": "Cost with random data: 1 million items x 50 percent wrong x 17 cycles = 8.5 million cycles, about 2 ms at 4 GHz. The sorted array pays almost nothing.",
+    "set": {
+     "fl": {
+      "label": "Flush",
+      "tone": "bad",
+      "sub": "8.5M cycles lost"
+     },
+     "br": {
+      "label": "if (a[i] >= 128)",
+      "tone": "bad",
+      "sub": "unsorted: 2 ms extra"
+     }
+    }
+   },
+   {
+    "say": "Fixes: sort the data first, use a branch-free form (a conditional move), or keep branches regular. A 2-bit counter handles a loop well: it mispredicts only once at loop exit.",
+    "set": {
+     "br": {
+      "label": "if (a[i] >= 128)",
+      "tone": "ok",
+      "sub": "branch-free: 0 flush"
+     },
+     "fl": {
+      "label": "Flush",
+      "tone": "ok",
+      "sub": "none"
+     },
+     "ex": {
+      "label": "Execute",
+      "tone": "ok",
+      "sub": "steady"
+     },
+     "fe": {
+      "label": "Fetch (guessing)",
+      "tone": "ok",
+      "sub": "full speed"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "simd-lanes",
+  "concept": "simd",
+  "title": "Eight additions in one instruction",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "la",
+    "label": "a[ ]",
+    "x": 20,
+    "y": 50,
+    "w": 70,
+    "h": 40,
+    "shape": "note"
+   },
+   {
+    "id": "lb",
+    "label": "b[ ]",
+    "x": 20,
+    "y": 130,
+    "w": 70,
+    "h": 40,
+    "shape": "note"
+   },
+   {
+    "id": "lc",
+    "label": "c[ ]",
+    "x": 20,
+    "y": 210,
+    "w": 70,
+    "h": 40,
+    "shape": "note"
+   },
+   {
+    "id": "a0",
+    "label": "1",
+    "x": 110,
+    "y": 50,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "b0",
+    "label": "10",
+    "x": 110,
+    "y": 130,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "c0",
+    "label": "?",
+    "x": 110,
+    "y": 210,
+    "w": 64,
+    "h": 40,
+    "shape": "cell",
+    "tone": "muted"
+   },
+   {
+    "id": "a1",
+    "label": "2",
+    "x": 182,
+    "y": 50,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "b1",
+    "label": "20",
+    "x": 182,
+    "y": 130,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "c1",
+    "label": "?",
+    "x": 182,
+    "y": 210,
+    "w": 64,
+    "h": 40,
+    "shape": "cell",
+    "tone": "muted"
+   },
+   {
+    "id": "a2",
+    "label": "3",
+    "x": 254,
+    "y": 50,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "b2",
+    "label": "30",
+    "x": 254,
+    "y": 130,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "c2",
+    "label": "?",
+    "x": 254,
+    "y": 210,
+    "w": 64,
+    "h": 40,
+    "shape": "cell",
+    "tone": "muted"
+   },
+   {
+    "id": "a3",
+    "label": "4",
+    "x": 326,
+    "y": 50,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "b3",
+    "label": "40",
+    "x": 326,
+    "y": 130,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "c3",
+    "label": "?",
+    "x": 326,
+    "y": 210,
+    "w": 64,
+    "h": 40,
+    "shape": "cell",
+    "tone": "muted"
+   },
+   {
+    "id": "a4",
+    "label": "5",
+    "x": 398,
+    "y": 50,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "b4",
+    "label": "50",
+    "x": 398,
+    "y": 130,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "c4",
+    "label": "?",
+    "x": 398,
+    "y": 210,
+    "w": 64,
+    "h": 40,
+    "shape": "cell",
+    "tone": "muted"
+   },
+   {
+    "id": "a5",
+    "label": "6",
+    "x": 470,
+    "y": 50,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "b5",
+    "label": "60",
+    "x": 470,
+    "y": 130,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "c5",
+    "label": "?",
+    "x": 470,
+    "y": 210,
+    "w": 64,
+    "h": 40,
+    "shape": "cell",
+    "tone": "muted"
+   },
+   {
+    "id": "a6",
+    "label": "7",
+    "x": 542,
+    "y": 50,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "b6",
+    "label": "70",
+    "x": 542,
+    "y": 130,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "c6",
+    "label": "?",
+    "x": 542,
+    "y": 210,
+    "w": 64,
+    "h": 40,
+    "shape": "cell",
+    "tone": "muted"
+   },
+   {
+    "id": "a7",
+    "label": "8",
+    "x": 614,
+    "y": 50,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "b7",
+    "label": "80",
+    "x": 614,
+    "y": 130,
+    "w": 64,
+    "h": 40,
+    "shape": "cell"
+   },
+   {
+    "id": "c7",
+    "label": "?",
+    "x": 614,
+    "y": 210,
+    "w": 64,
+    "h": 40,
+    "shape": "cell",
+    "tone": "muted"
+   },
+   {
+    "id": "op",
+    "label": "Instruction",
+    "x": 20,
+    "y": 300,
+    "w": 200,
+    "h": 56,
+    "shape": "round",
+    "sub": "waiting"
+   },
+   {
+    "id": "cost",
+    "label": "Cost",
+    "x": 460,
+    "y": 300,
+    "w": 230,
+    "h": 56,
+    "shape": "round",
+    "sub": "-"
+   }
+  ],
+  "links": [],
+  "steps": [
+   {
+    "say": "Add two arrays of 8 floats: c[i] = a[i] + b[i]. a holds 1 to 8, b holds 10 to 80. Each float is 4 bytes, so each array is 32 bytes.",
+    "focus": [
+     "a0",
+     "a7",
+     "b0",
+     "b7"
+    ]
+   },
+   {
+    "say": "Scalar code: one addss instruction adds one pair. First lane: 1 + 10 = 11.",
+    "msgs": [
+     {
+      "from": "op",
+      "to": "c0",
+      "label": "addss",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "c0": {
+      "label": "11",
+      "tone": "ok"
+     },
+     "op": {
+      "label": "Instruction",
+      "tone": "accent",
+      "sub": "addss (1 of 8)"
+     },
+     "cost": {
+      "label": "Cost",
+      "tone": "normal",
+      "sub": "1 instr, 1 result"
+     }
+    }
+   },
+   {
+    "say": "The scalar loop needs 8 adds (plus 8 loads, 8 stores and loop counting). About 8 instructions of work for 8 results.",
+    "set": {
+     "c1": {
+      "label": "22",
+      "tone": "ok"
+     },
+     "c2": {
+      "label": "33",
+      "tone": "ok"
+     },
+     "c3": {
+      "label": "44",
+      "tone": "ok"
+     },
+     "c4": {
+      "label": "55",
+      "tone": "ok"
+     },
+     "c5": {
+      "label": "66",
+      "tone": "ok"
+     },
+     "c6": {
+      "label": "77",
+      "tone": "ok"
+     },
+     "c7": {
+      "label": "88",
+      "tone": "ok"
+     },
+     "op": {
+      "label": "Instruction",
+      "tone": "warn",
+      "sub": "addss x 8"
+     },
+     "cost": {
+      "label": "Cost",
+      "tone": "warn",
+      "sub": "8 instr (~8 cycles)"
+     }
+    }
+   },
+   {
+    "say": "Now reset. SIMD means one instruction works on many values. AVX2 has 256-bit registers: 8 floats side by side (8 lanes).",
+    "set": {
+     "c0": {
+      "label": "?",
+      "tone": "muted"
+     },
+     "c1": {
+      "label": "?",
+      "tone": "muted"
+     },
+     "c2": {
+      "label": "?",
+      "tone": "muted"
+     },
+     "c3": {
+      "label": "?",
+      "tone": "muted"
+     },
+     "c4": {
+      "label": "?",
+      "tone": "muted"
+     },
+     "c5": {
+      "label": "?",
+      "tone": "muted"
+     },
+     "c6": {
+      "label": "?",
+      "tone": "muted"
+     },
+     "c7": {
+      "label": "?",
+      "tone": "muted"
+     },
+     "op": {
+      "label": "Instruction",
+      "tone": "accent",
+      "sub": "vaddps ymm0,ymm1,ymm2"
+     },
+     "cost": {
+      "label": "Cost",
+      "tone": "normal",
+      "sub": "-"
+     }
+    },
+    "focus": [
+     "la",
+     "lb"
+    ]
+   },
+   {
+    "say": "One vaddps adds all 8 lanes at the same time, in about the same time as one scalar add.",
+    "msgs": [
+     {
+      "from": "op",
+      "to": "c0",
+      "label": "",
+      "tone": "ok"
+     },
+     {
+      "from": "op",
+      "to": "c7",
+      "label": "",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "c0": {
+      "label": "11",
+      "tone": "ok"
+     },
+     "c1": {
+      "label": "22",
+      "tone": "ok"
+     },
+     "c2": {
+      "label": "33",
+      "tone": "ok"
+     },
+     "c3": {
+      "label": "44",
+      "tone": "ok"
+     },
+     "c4": {
+      "label": "55",
+      "tone": "ok"
+     },
+     "c5": {
+      "label": "66",
+      "tone": "ok"
+     },
+     "c6": {
+      "label": "77",
+      "tone": "ok"
+     },
+     "c7": {
+      "label": "88",
+      "tone": "ok"
+     },
+     "cost": {
+      "label": "Cost",
+      "tone": "ok",
+      "sub": "1 instr, 8 results"
+     },
+     "op": {
+      "label": "Instruction",
+      "tone": "ok",
+      "sub": "vaddps (8 lanes)"
+     }
+    }
+   },
+   {
+    "say": "AVX-512 has 512-bit registers: 16 floats per instruction, so up to 16 times more work per instruction than scalar code.",
+    "set": {
+     "op": {
+      "label": "Instruction",
+      "tone": "ok",
+      "sub": "vaddps zmm (16 lanes)"
+     },
+     "cost": {
+      "label": "Cost",
+      "tone": "ok",
+      "sub": "1 instr, 16 results"
+     }
+    }
+   },
+   {
+    "say": "Failure case 1: the array has 1,003 floats. The loop does 125 vector steps of 8, then 3 left-over items need a scalar tail or a mask.",
+    "set": {
+     "c5": {
+      "label": "tail",
+      "tone": "warn",
+      "sub": "left over"
+     },
+     "c6": {
+      "label": "tail",
+      "tone": "warn",
+      "sub": "left over"
+     },
+     "c7": {
+      "label": "tail",
+      "tone": "warn",
+      "sub": "left over"
+     },
+     "cost": {
+      "label": "Cost",
+      "tone": "warn",
+      "sub": "+3 scalar adds"
+     }
+    }
+   },
+   {
+    "say": "Failure case 2: an if inside the loop. All lanes run both sides; a mask decides which results to keep, so you pay for both paths.",
+    "set": {
+     "op": {
+      "label": "Instruction",
+      "tone": "warn",
+      "sub": "vblendps mask"
+     },
+     "cost": {
+      "label": "Cost",
+      "tone": "warn",
+      "sub": "both branches run"
+     }
+    }
+   },
+   {
+    "say": "Failure case 3: memory limits you. Reading 2 arrays and writing 1 moves 12 bytes per float. At 50 GB/s RAM bandwidth that is about 4 billion floats per second, so 16 lanes can't help a big array.",
+    "set": {
+     "cost": {
+      "label": "Cost",
+      "tone": "bad",
+      "sub": "RAM-bound, not CPU"
+     },
+     "op": {
+      "label": "Instruction",
+      "tone": "bad",
+      "sub": "waiting for RAM"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "dram-row-buffer",
+  "concept": "dram",
+  "title": "DRAM: row hit, row miss and refresh",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "mc",
+    "label": "Memory controller",
+    "x": 20,
+    "y": 150,
+    "w": 150,
+    "h": 60,
+    "shape": "box",
+    "sub": "wants data"
+   },
+   {
+    "id": "r5",
+    "label": "Row 5000",
+    "x": 290,
+    "y": 60,
+    "w": 150,
+    "h": 44,
+    "shape": "cell",
+    "sub": "in array"
+   },
+   {
+    "id": "r7",
+    "label": "Row 7000",
+    "x": 290,
+    "y": 120,
+    "w": 150,
+    "h": 44,
+    "shape": "cell",
+    "sub": "in array"
+   },
+   {
+    "id": "rb",
+    "label": "Row buffer",
+    "x": 290,
+    "y": 230,
+    "w": 150,
+    "h": 60,
+    "shape": "round",
+    "sub": "8 KB, empty"
+   },
+   {
+    "id": "cap",
+    "label": "Cell: 1 capacitor",
+    "x": 520,
+    "y": 150,
+    "w": 170,
+    "h": 60,
+    "shape": "box",
+    "sub": "1 bit = ~10 fF charge"
+   }
+  ],
+  "links": [
+   {
+    "from": "mc",
+    "to": "r5",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "mc",
+    "to": "r7",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "r5",
+    "to": "rb",
+    "label": "",
+    "dashed": true
+   },
+   {
+    "from": "r7",
+    "to": "rb",
+    "label": "",
+    "dashed": true
+   },
+   {
+    "from": "rb",
+    "to": "mc",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "A DRAM bank is a grid of tiny capacitors. A charged one means 1. Data is read one whole row (8 KB) at a time, never one bit alone.",
+    "focus": [
+     "r5",
+     "cap"
+    ]
+   },
+   {
+    "say": "The CPU wants a byte in row 5000. The row buffer is empty. The controller sends ACTIVATE row 5000.",
+    "msgs": [
+     {
+      "from": "mc",
+      "to": "r5",
+      "label": "ACTIVATE",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "mc": {
+      "label": "Memory controller",
+      "tone": "accent",
+      "sub": "ACT row 5000"
+     }
+    }
+   },
+   {
+    "say": "The row is copied into the row buffer. Reading a row drains the capacitors, so the chip rewrites them. This takes tRCD, about 14 ns.",
+    "msgs": [
+     {
+      "from": "r5",
+      "to": "rb",
+      "label": "8 KB row",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "rb": {
+      "label": "Row buffer",
+      "tone": "warn",
+      "sub": "row 5000 open"
+     },
+     "r5": {
+      "label": "Row 5000",
+      "tone": "warn",
+      "sub": "being restored"
+     }
+    }
+   },
+   {
+    "say": "Now READ column 40. The data comes out after tCAS, about 14 ns more. Total from empty: about 28 ns inside the chip.",
+    "msgs": [
+     {
+      "from": "mc",
+      "to": "rb",
+      "label": "READ col 40",
+      "tone": "accent"
+     },
+     {
+      "from": "rb",
+      "to": "mc",
+      "label": "64 B",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "mc": {
+      "label": "Memory controller",
+      "tone": "ok",
+      "sub": "got data, 28 ns"
+     }
+    }
+   },
+   {
+    "say": "Next access is also in row 5000: a row hit. Only tCAS, 14 ns. The controller reorders requests to get more hits.",
+    "msgs": [
+     {
+      "from": "mc",
+      "to": "rb",
+      "label": "READ col 41",
+      "tone": "accent"
+     },
+     {
+      "from": "rb",
+      "to": "mc",
+      "label": "64 B",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "mc": {
+      "label": "Memory controller",
+      "tone": "ok",
+      "sub": "row hit: 14 ns"
+     },
+     "rb": {
+      "label": "Row buffer",
+      "tone": "ok",
+      "sub": "row 5000 hit"
+     }
+    }
+   },
+   {
+    "say": "Now an access to row 7000: a row conflict. The open row must be closed first.",
+    "msgs": [
+     {
+      "from": "mc",
+      "to": "rb",
+      "label": "PRECHARGE",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "rb": {
+      "label": "Row buffer",
+      "tone": "bad",
+      "sub": "closing row 5000"
+     },
+     "mc": {
+      "label": "Memory controller",
+      "tone": "warn",
+      "sub": "needs row 7000"
+     }
+    }
+   },
+   {
+    "say": "Then ACTIVATE row 7000 and READ. Cost: tRP 14 + tRCD 14 + tCAS 14 = about 42 ns, 3 times a row hit. With controller and bus, the CPU sees about 70 to 90 ns.",
+    "msgs": [
+     {
+      "from": "mc",
+      "to": "r7",
+      "label": "ACTIVATE",
+      "tone": "accent"
+     },
+     {
+      "from": "r7",
+      "to": "rb",
+      "label": "8 KB row",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "rb": {
+      "label": "Row buffer",
+      "tone": "warn",
+      "sub": "row 7000 open"
+     },
+     "mc": {
+      "label": "Memory controller",
+      "tone": "bad",
+      "sub": "row conflict: 42 ns"
+     }
+    }
+   },
+   {
+    "say": "Capacitors leak. Every cell must be refreshed every 64 ms. The controller sends a refresh about every 7.8 microseconds.",
+    "set": {
+     "cap": {
+      "label": "Cell: 1 capacitor",
+      "tone": "warn",
+      "sub": "leaks in ~64 ms"
+     },
+     "r5": {
+      "label": "Row 5000",
+      "tone": "warn",
+      "sub": "refresh needed"
+     }
+    }
+   },
+   {
+    "say": "During a refresh (about 350 ns) the bank can't answer. A request that arrives then waits. This is one source of tail latency.",
+    "msgs": [
+     {
+      "from": "mc",
+      "to": "r5",
+      "label": "REFRESH",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "mc": {
+      "label": "Memory controller",
+      "tone": "bad",
+      "sub": "blocked ~350 ns"
+     },
+     "r5": {
+      "label": "Row 5000",
+      "tone": "warn",
+      "sub": "refreshing"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "ftl-write-amplification",
+  "concept": "ftl",
+  "title": "Why an SSD write becomes many writes",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "b7",
+    "label": "Block 7",
+    "x": 40,
+    "y": 160,
+    "w": 370,
+    "h": 80
+   },
+   {
+    "id": "b9",
+    "label": "Block 9",
+    "x": 450,
+    "y": 160,
+    "w": 200,
+    "h": 125
+   }
+  ],
+  "actors": [
+   {
+    "id": "host",
+    "label": "Host (OS)",
+    "x": 20,
+    "y": 40,
+    "w": 130,
+    "h": 50,
+    "shape": "box",
+    "sub": "writes 4 KB"
+   },
+   {
+    "id": "ftl",
+    "label": "FTL map",
+    "x": 240,
+    "y": 40,
+    "w": 230,
+    "h": 50,
+    "shape": "box",
+    "sub": "LBA to flash page"
+   },
+   {
+    "id": "p0",
+    "label": "pg0",
+    "x": 50,
+    "y": 185,
+    "w": 80,
+    "h": 40,
+    "shape": "cell",
+    "sub": "free"
+   },
+   {
+    "id": "p1",
+    "label": "pg1",
+    "x": 140,
+    "y": 185,
+    "w": 80,
+    "h": 40,
+    "shape": "cell",
+    "sub": "free"
+   },
+   {
+    "id": "p2",
+    "label": "pg2",
+    "x": 230,
+    "y": 185,
+    "w": 80,
+    "h": 40,
+    "shape": "cell",
+    "sub": "free"
+   },
+   {
+    "id": "p3",
+    "label": "pg3",
+    "x": 320,
+    "y": 185,
+    "w": 80,
+    "h": 40,
+    "shape": "cell",
+    "sub": "free"
+   },
+   {
+    "id": "q0",
+    "label": "pg0",
+    "x": 460,
+    "y": 185,
+    "w": 80,
+    "h": 40,
+    "shape": "cell",
+    "sub": "free"
+   },
+   {
+    "id": "q1",
+    "label": "pg1",
+    "x": 550,
+    "y": 185,
+    "w": 80,
+    "h": 40,
+    "shape": "cell",
+    "sub": "free"
+   },
+   {
+    "id": "q2",
+    "label": "pg2",
+    "x": 460,
+    "y": 235,
+    "w": 80,
+    "h": 40,
+    "shape": "cell",
+    "sub": "free",
+    "tone": "muted"
+   },
+   {
+    "id": "q3",
+    "label": "pg3",
+    "x": 550,
+    "y": 235,
+    "w": 80,
+    "h": 40,
+    "shape": "cell",
+    "sub": "free",
+    "tone": "muted"
+   },
+   {
+    "id": "st",
+    "label": "Flash chip",
+    "x": 250,
+    "y": 320,
+    "w": 220,
+    "h": 50,
+    "shape": "box",
+    "sub": "program ~0.5 ms, erase ~3 ms"
+   }
+  ],
+  "links": [
+   {
+    "from": "host",
+    "to": "ftl",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "ftl",
+    "to": "p0",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "ftl",
+    "to": "p3",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "st",
+    "to": "p1",
+    "label": "",
+    "dashed": true
+   }
+  ],
+  "steps": [
+   {
+    "say": "Flash has a rule: a page can be written only once, and only a whole block (hundreds of pages) can be erased. Here a block has 4 pages. Block 7 is on the left, block 9 is empty on the right.",
+    "focus": [
+     "p0",
+     "q0"
+    ]
+   },
+   {
+    "say": "The host writes logical block 100 (LBA 100). The FTL puts it in the next free page, block 7 page 0, and records the mapping.",
+    "msgs": [
+     {
+      "from": "host",
+      "to": "ftl",
+      "label": "write LBA 100",
+      "tone": "accent"
+     },
+     {
+      "from": "ftl",
+      "to": "p0",
+      "label": "program",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "p0": {
+      "label": "pg0",
+      "tone": "ok",
+      "sub": "L100 valid"
+     },
+     "ftl": {
+      "label": "FTL map",
+      "tone": "accent",
+      "sub": "L100 to blk7.pg0"
+     }
+    }
+   },
+   {
+    "say": "The host writes LBA 101, 102 as well. They fill pages 1 and 2.",
+    "msgs": [
+     {
+      "from": "ftl",
+      "to": "p1",
+      "label": "L101",
+      "tone": "ok"
+     },
+     {
+      "from": "ftl",
+      "to": "p2",
+      "label": "L102",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "p1": {
+      "label": "pg1",
+      "tone": "ok",
+      "sub": "L101 valid"
+     },
+     "p2": {
+      "label": "pg2",
+      "tone": "ok",
+      "sub": "L102 valid"
+     }
+    }
+   },
+   {
+    "say": "Now the host overwrites LBA 100. Flash can't change a page in place. The FTL writes the new data to page 3 and marks page 0 as stale (garbage).",
+    "msgs": [
+     {
+      "from": "host",
+      "to": "ftl",
+      "label": "rewrite L100",
+      "tone": "accent"
+     },
+     {
+      "from": "ftl",
+      "to": "p3",
+      "label": "program",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "p0": {
+      "label": "pg0",
+      "tone": "bad",
+      "sub": "stale"
+     },
+     "p3": {
+      "label": "pg3",
+      "tone": "ok",
+      "sub": "L100 v2 valid"
+     },
+     "ftl": {
+      "label": "FTL map",
+      "tone": "accent",
+      "sub": "L100 to blk7.pg3"
+     }
+    }
+   },
+   {
+    "say": "Block 7 is full: 1 stale page and 3 valid pages. The drive has to free it to accept more writes.",
+    "focus": [
+     "p0",
+     "p1",
+     "p2",
+     "p3"
+    ]
+   },
+   {
+    "say": "Garbage collection: copy the 3 valid pages to block 9 first. These are extra writes the host never asked for.",
+    "msgs": [
+     {
+      "from": "p1",
+      "to": "q0",
+      "label": "copy",
+      "tone": "warn"
+     },
+     {
+      "from": "p2",
+      "to": "q1",
+      "label": "copy",
+      "tone": "warn"
+     },
+     {
+      "from": "p3",
+      "to": "q2",
+      "label": "copy",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "q0": {
+      "label": "pg0",
+      "tone": "warn",
+      "sub": "L101"
+     },
+     "q1": {
+      "label": "pg1",
+      "tone": "warn",
+      "sub": "L102"
+     },
+     "q2": {
+      "label": "pg2",
+      "tone": "warn",
+      "sub": "L100 v2"
+     }
+    }
+   },
+   {
+    "say": "Then erase block 7 as a whole. An erase takes about 3 ms, 6 times slower than a page write.",
+    "msgs": [
+     {
+      "from": "st",
+      "to": "p0",
+      "label": "ERASE blk 7",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "p0": {
+      "label": "pg0",
+      "tone": "muted",
+      "sub": "free"
+     },
+     "p1": {
+      "label": "pg1",
+      "tone": "muted",
+      "sub": "free"
+     },
+     "p2": {
+      "label": "pg2",
+      "tone": "muted",
+      "sub": "free"
+     },
+     "p3": {
+      "label": "pg3",
+      "tone": "muted",
+      "sub": "free"
+     },
+     "st": {
+      "label": "Flash chip",
+      "tone": "bad",
+      "sub": "erasing ~3 ms"
+     }
+    }
+   },
+   {
+    "say": "Count the flash writes: the host wrote 4 pages (L100, 101, 102, L100 again). The flash wrote 4 + 3 copies = 7. Write amplification is 7/4 = 1.75.",
+    "set": {
+     "ftl": {
+      "label": "FTL map",
+      "tone": "warn",
+      "sub": "WA = 1.75"
+     },
+     "st": {
+      "label": "Flash chip",
+      "tone": "warn",
+      "sub": "7 writes for 4"
+     }
+    }
+   },
+   {
+    "say": "Cost: each block survives only about 1,000 to 3,000 erase cycles (TLC). Random small writes on a nearly full drive can reach WA of 5 to 10, so the drive dies sooner and writes slow down. Free space (over-provisioning) keeps WA low.",
+    "set": {
+     "st": {
+      "label": "Flash chip",
+      "tone": "bad",
+      "sub": "wear: 3,000 erases"
+     },
+     "ftl": {
+      "label": "FTL map",
+      "tone": "bad",
+      "sub": "full drive: WA 5-10"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "transistor-switch",
+  "concept": "transistor",
+  "title": "An NMOS transistor as a switch",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "vg",
+    "label": "Gate voltage",
+    "x": 30,
+    "y": 30,
+    "w": 150,
+    "h": 44,
+    "shape": "note",
+    "sub": "Vg = 0 V"
+   },
+   {
+    "id": "gate",
+    "label": "Gate",
+    "x": 270,
+    "y": 30,
+    "w": 180,
+    "h": 44,
+    "shape": "box",
+    "sub": "poly + thin oxide"
+   },
+   {
+    "id": "src",
+    "label": "Source n+",
+    "x": 100,
+    "y": 130,
+    "w": 130,
+    "h": 70,
+    "shape": "box",
+    "sub": "0 V"
+   },
+   {
+    "id": "ch",
+    "label": "Channel (p-type)",
+    "x": 280,
+    "y": 130,
+    "w": 160,
+    "h": 70,
+    "shape": "box",
+    "sub": "no carriers",
+    "tone": "muted"
+   },
+   {
+    "id": "drn",
+    "label": "Drain n+",
+    "x": 490,
+    "y": 130,
+    "w": 130,
+    "h": 70,
+    "shape": "box",
+    "sub": "0.8 V"
+   },
+   {
+    "id": "e1",
+    "label": "e-",
+    "x": 110,
+    "y": 215,
+    "w": 40,
+    "h": 30,
+    "shape": "cell"
+   },
+   {
+    "id": "e2",
+    "label": "e-",
+    "x": 160,
+    "y": 215,
+    "w": 40,
+    "h": 30,
+    "shape": "cell"
+   },
+   {
+    "id": "out",
+    "label": "Load: 1 fF",
+    "x": 490,
+    "y": 300,
+    "w": 130,
+    "h": 50,
+    "shape": "round",
+    "sub": "to charge"
+   }
+  ],
+  "links": [
+   {
+    "from": "vg",
+    "to": "gate",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "gate",
+    "to": "ch",
+    "label": "field",
+    "dashed": true
+   },
+   {
+    "from": "src",
+    "to": "ch",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "ch",
+    "to": "drn",
+    "label": "",
+    "dashed": false
+   }
+  ],
+  "steps": [
+   {
+    "say": "A transistor has a source, a drain and a gate. The silicon under the gate is p-type: it has holes and almost no free electrons, so no current can flow between source and drain.",
+    "focus": [
+     "src",
+     "drn",
+     "ch"
+    ]
+   },
+   {
+    "say": "Gate at 0 V: the switch is OFF. The leakage is only about nanoamps, since the channel is blocked.",
+    "set": {
+     "ch": {
+      "label": "Channel (p-type)",
+      "tone": "muted",
+      "sub": "no electrons: OFF"
+     },
+     "drn": {
+      "label": "Drain n+",
+      "tone": "normal",
+      "sub": "0.8 V, no current"
+     }
+    }
+   },
+   {
+    "say": "Now raise the gate to 0.8 V. This is above the threshold voltage (Vt about 0.3 V). The gate is insulated by a ~1 nm oxide, so no current flows into it, only an electric field.",
+    "msgs": [
+     {
+      "from": "vg",
+      "to": "gate",
+      "label": "0.8 V",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "vg": {
+      "label": "Gate voltage",
+      "tone": "accent",
+      "sub": "Vg = 0.8 V"
+     },
+     "gate": {
+      "label": "Gate",
+      "tone": "accent",
+      "sub": "+0.8 V"
+     }
+    }
+   },
+   {
+    "say": "The positive field pulls electrons from the source toward the surface under the gate, and pushes holes away.",
+    "set": {
+     "ch": {
+      "label": "Channel (p-type)",
+      "tone": "warn",
+      "sub": "electrons gather"
+     }
+    },
+    "move": {
+     "e1": {
+      "x": 290,
+      "y": 150
+     },
+     "e2": {
+      "x": 340,
+      "y": 150
+     }
+    }
+   },
+   {
+    "say": "A thin layer of electrons, a few nm thick, forms a channel (n-type inversion layer). The source and drain are now connected: the switch is ON.",
+    "set": {
+     "ch": {
+      "label": "Channel (n-type)",
+      "tone": "ok",
+      "sub": "inversion layer: ON"
+     },
+     "src": {
+      "label": "Source n+",
+      "tone": "ok",
+      "sub": "0 V"
+     }
+    }
+   },
+   {
+    "say": "The drain is at 0.8 V, so electrons drift from source to drain. The transistor passes about 0.5 mA per micrometre of width, and charges the load.",
+    "msgs": [
+     {
+      "from": "src",
+      "to": "ch",
+      "label": "electrons",
+      "tone": "ok"
+     },
+     {
+      "from": "ch",
+      "to": "drn",
+      "label": "electrons",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "out": {
+      "label": "Load: 1 fF",
+      "tone": "ok",
+      "sub": "charging"
+     }
+    },
+    "move": {
+     "e1": {
+      "x": 520,
+      "y": 150
+     },
+     "e2": {
+      "x": 570,
+      "y": 150
+     }
+    }
+   },
+   {
+    "say": "Speed and energy: charging a 1 fF load to 0.8 V takes about 5 to 10 picoseconds and uses about 0.3 femtojoules (1/2 x C x V squared). A chip does billions of these per second.",
+    "set": {
+     "out": {
+      "label": "Load: 1 fF",
+      "tone": "ok",
+      "sub": "0.3 fJ per switch"
+     }
+    }
+   },
+   {
+    "say": "Turn the gate back to 0 V: the channel disappears and the switch opens again.",
+    "set": {
+     "vg": {
+      "label": "Gate voltage",
+      "tone": "normal",
+      "sub": "Vg = 0 V"
+     },
+     "gate": {
+      "label": "Gate",
+      "tone": "normal",
+      "sub": "0 V"
+     },
+     "ch": {
+      "label": "Channel (p-type)",
+      "tone": "muted",
+      "sub": "OFF"
+     }
+    },
+    "move": {
+     "e1": {
+      "x": 110,
+      "y": 215
+     },
+     "e2": {
+      "x": 160,
+      "y": 215
+     }
+    }
+   },
+   {
+    "say": "Failure case: as transistors shrink, the oxide is only a few atoms thick. Electrons tunnel through it and leak even when OFF. Leakage is now a big part of chip power, and heat is why clock speeds stopped near 5 GHz.",
+    "set": {
+     "gate": {
+      "label": "Gate",
+      "tone": "bad",
+      "sub": "tunnelling leak"
+     },
+     "ch": {
+      "label": "Channel",
+      "tone": "bad",
+      "sub": "sub-threshold leak"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "pn-junction-diode",
+  "concept": "pnjunction",
+  "title": "A p-n junction: bias decides if current flows",
+  "w": 720,
+  "h": 400,
+  "groups": [],
+  "actors": [
+   {
+    "id": "p",
+    "label": "p side",
+    "x": 40,
+    "y": 80,
+    "w": 230,
+    "h": 60,
+    "shape": "box",
+    "sub": "many holes (h+)"
+   },
+   {
+    "id": "n",
+    "label": "n side",
+    "x": 450,
+    "y": 80,
+    "w": 230,
+    "h": 60,
+    "shape": "box",
+    "sub": "many electrons (e-)"
+   },
+   {
+    "id": "dep",
+    "label": "Depletion zone",
+    "x": 290,
+    "y": 80,
+    "w": 140,
+    "h": 60,
+    "shape": "round",
+    "sub": "none yet",
+    "tone": "muted"
+   },
+   {
+    "id": "h1",
+    "label": "h+",
+    "x": 70,
+    "y": 170,
+    "w": 40,
+    "h": 30,
+    "shape": "cell"
+   },
+   {
+    "id": "h2",
+    "label": "h+",
+    "x": 130,
+    "y": 170,
+    "w": 40,
+    "h": 30,
+    "shape": "cell"
+   },
+   {
+    "id": "h3",
+    "label": "h+",
+    "x": 190,
+    "y": 170,
+    "w": 40,
+    "h": 30,
+    "shape": "cell"
+   },
+   {
+    "id": "e1",
+    "label": "e-",
+    "x": 500,
+    "y": 170,
+    "w": 40,
+    "h": 30,
+    "shape": "cell"
+   },
+   {
+    "id": "e2",
+    "label": "e-",
+    "x": 560,
+    "y": 170,
+    "w": 40,
+    "h": 30,
+    "shape": "cell"
+   },
+   {
+    "id": "e3",
+    "label": "e-",
+    "x": 620,
+    "y": 170,
+    "w": 40,
+    "h": 30,
+    "shape": "cell"
+   },
+   {
+    "id": "v",
+    "label": "Battery",
+    "x": 290,
+    "y": 300,
+    "w": 140,
+    "h": 56,
+    "shape": "round",
+    "sub": "0 V"
+   },
+   {
+    "id": "cur",
+    "label": "Current",
+    "x": 530,
+    "y": 300,
+    "w": 150,
+    "h": 56,
+    "shape": "round",
+    "sub": "0"
+   }
+  ],
+  "links": [
+   {
+    "from": "p",
+    "to": "dep",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "dep",
+    "to": "n",
+    "label": "",
+    "dashed": false
+   },
+   {
+    "from": "v",
+    "to": "cur",
+    "label": "",
+    "dashed": true
+   }
+  ],
+  "steps": [
+   {
+    "say": "A p-type piece has many mobile holes (h+). An n-type piece has many mobile electrons (e-). Joined into a p-n junction they form a diode.",
+    "focus": [
+     "p",
+     "n"
+    ]
+   },
+   {
+    "say": "At the joint, electrons diffuse into the p side and holes diffuse into the n side. They meet and cancel out (recombine).",
+    "set": {
+     "dep": {
+      "label": "Depletion zone",
+      "tone": "warn",
+      "sub": "forming"
+     }
+    },
+    "move": {
+     "e1": {
+      "x": 380,
+      "y": 170
+     },
+     "h3": {
+      "x": 300,
+      "y": 170
+     }
+    }
+   },
+   {
+    "say": "This leaves fixed charged atoms behind and no mobile carriers: a depletion zone about 0.5 micrometres wide. Its electric field builds a barrier of about 0.7 V in silicon, which stops further diffusion.",
+    "set": {
+     "dep": {
+      "label": "Depletion zone",
+      "tone": "accent",
+      "sub": "0.5 um, barrier 0.7 V"
+     }
+    },
+    "remove": [
+     "e1",
+     "h3"
+    ]
+   },
+   {
+    "say": "Reverse bias: connect the battery so p is negative, 5 V. The field pulls carriers away from the junction and the depletion zone widens.",
+    "set": {
+     "v": {
+      "label": "Battery",
+      "tone": "warn",
+      "sub": "reverse 5 V"
+     },
+     "dep": {
+      "label": "Depletion zone",
+      "tone": "warn",
+      "sub": "wider: 1.5 um"
+     }
+    }
+   },
+   {
+    "say": "The barrier is now bigger, so almost no current flows: only a leakage of about 1 nanoamp. The diode is a closed valve.",
+    "msgs": [
+     {
+      "from": "v",
+      "to": "cur",
+      "label": "~1 nA",
+      "tone": "muted"
+     }
+    ],
+    "set": {
+     "cur": {
+      "label": "Current",
+      "tone": "muted",
+      "sub": "1 nA: blocked"
+     }
+    }
+   },
+   {
+    "say": "Forward bias: flip the battery to +0.7 V. The external voltage cancels the built-in barrier and the depletion zone shrinks.",
+    "set": {
+     "v": {
+      "label": "Battery",
+      "tone": "ok",
+      "sub": "forward 0.7 V"
+     },
+     "dep": {
+      "label": "Depletion zone",
+      "tone": "ok",
+      "sub": "narrow: 0.1 um"
+     },
+     "cur": {
+      "label": "Current",
+      "tone": "ok",
+      "sub": "rising"
+     }
+    }
+   },
+   {
+    "say": "Holes and electrons are pushed into the junction and cross it. Current grows exponentially: each extra 60 mV makes it about 10 times larger. At 0.7 V it can be several mA.",
+    "msgs": [
+     {
+      "from": "p",
+      "to": "dep",
+      "label": "holes",
+      "tone": "ok"
+     },
+     {
+      "from": "n",
+      "to": "dep",
+      "label": "electrons",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "cur": {
+      "label": "Current",
+      "tone": "ok",
+      "sub": "about 5 mA: ON"
+     }
+    },
+    "move": {
+     "h1": {
+      "x": 240,
+      "y": 170
+     },
+     "e2": {
+      "x": 380,
+      "y": 170
+     }
+    }
+   },
+   {
+    "say": "This one-way behaviour makes rectifiers and LEDs. It is also the building block of the transistor: an NMOS has two p-n junctions around its channel.",
+    "set": {
+     "p": {
+      "label": "p side",
+      "tone": "ok",
+      "sub": "h+ flow in"
+     },
+     "n": {
+      "label": "n side",
+      "tone": "ok",
+      "sub": "e- flow in"
+     }
+    }
+   },
+   {
+    "say": "Failure case: reverse voltage too high (for example 50 V on a 5 V diode). Carriers gain enough energy to knock out more carriers (avalanche breakdown). Current explodes and the diode can burn out.",
+    "set": {
+     "v": {
+      "label": "Battery",
+      "tone": "bad",
+      "sub": "reverse 50 V"
+     },
+     "dep": {
+      "label": "Depletion zone",
+      "tone": "bad",
+      "sub": "breakdown"
+     },
+     "cur": {
+      "label": "Current",
+      "tone": "bad",
+      "sub": "avalanche: huge"
+     }
+    }
+   }
+  ]
+ }
+]
