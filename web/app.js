@@ -3,7 +3,13 @@
    Standalone mode: window.DATA is embedded by tools/build.py; progress is kept in this browser only. */
 (async function(){
 "use strict";
+// standalone page: tools/build.py embeds the content gzip-compressed; web/inflate.js decodes it into a promise
+if(!window.DATA && window.DTS_DATA){
+  try{ window.DATA = await window.DTS_DATA; }
+  catch(e){ document.body.innerHTML = `<div style="padding:40px;font-family:system-ui">Could not unpack the content of this page: ${String(e && e.message || e)}. Try a current version of Chrome, Edge, Firefox or Safari.</div>`; return; }
+}
 const STANDALONE = !!window.DATA;
+const RICH = window.DTSRich;
 const $ = id => document.getElementById(id);
 const esc = s => String(s==null?"":s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const lc = l => `var(--l${l})`;
@@ -155,7 +161,7 @@ await Store.init();
 /* ---------- local fallbacks (standalone) ---------- */
 function readText(id){
   if(isDes(id)){ const d=DES_FULL[id.slice(7)]; return d ? DESIGN_SECS.flatMap(s=>d.rd[s]||[]).join(" ") : ""; }
-  const r=READS[id]; return r ? SECTIONS.flatMap(s=>r.rd[s]||[]).join(" ") : ""; }
+  const r=READS[id]; const t = r ? SECTIONS.flatMap(s=>r.rd[s]||[]).join(" ") : ""; return RICH ? RICH.plain(t) : t; }
 function localSearch(q){
   const s=q.trim().toLowerCase(); if(!s) return [];
   const terms = s.split(/\s+/).filter(Boolean);
@@ -293,8 +299,8 @@ function renderPanel(){
     <h2>${esc(n.label)}</h2>
     ${n.st?`<p class="status">${esc(n.st)}</p>`:""}
     <p class="mech">${esc(n.m)}</p>
-    ${n.b?`<p class="byte">${esc(n.b)}</p>`:""}
-    ${n.q?`<p class="quip" style="--c:${lc(n.l)}"><b>The intuition</b>${esc(n.q)}</p>`:""}
+    ${n.b?`<p class="byte">${RI(n.b, {heuristics:false})}</p>`:""}
+    ${n.q?`<p class="quip" style="--c:${lc(n.l)}"><b>The intuition</b>${RI(n.q, {heuristics:false})}</p>`:""}
     <div class="btnrow"><button type="button" class="btn primary" data-read="${n.id}">Read · ${n.rm} min</button>${!inPath?`<button type="button" class="btn" data-explore="${n.id}">Break this down</button>`:""}<button type="button" class="btn${bm?" on":""}" style="--c:${lc(n.l)}" data-bookmark="${n.id}" aria-pressed="${bm}">${bm?"★ Saved":"☆ Save"}</button></div>`;
   h += `<h3>Neighbourhood</h3>${egoSVG(n)}`;
   h += `<h3>Everything underneath · ${total} concepts</h3>`;
@@ -331,7 +337,7 @@ function renderTours(){
   const idx = DATA.tours.map((x,i)=>i), jr = idx.filter(i=>isJourney(DATA.tours[i])), rest = idx.filter(i=>!isJourney(DATA.tours[i]));
   $("v-tours").innerHTML = `<div class="tlist">${jr.length?`<div class="cat tgrp">Journeys: what happens when…</div>${jr.map(card).join("")}<div class="cat tgrp">More tours</div>`:""}${rest.map(card).join("")}</div>
   <div class="tsteps"><h2>${esc(t.title)}</h2><p class="sub">${esc(t.sub)} · ${t.steps.length} steps from L${N[t.steps[0][0]].l} to L${N[t.steps[t.steps.length-1][0]].l}</p><div class="btnrow" style="margin:-4px 0 14px"><button type="button" class="btn primary" data-rtour="0">Read the tour · ${t.steps.reduce((s,x)=>s+N[x[0]].rm,0)} min</button></div>
-  ${t.steps.map((s,i)=>{ const n=N[s[0]]; return `<button type="button" class="step" style="--c:${lc(n.l)}" data-tstep="${i}" aria-pressed="${i===state.tstep}"><span class="rail"><span class="dot"></span></span><span class="body"><span class="sl"><span class="sn">${esc(n.label)}</span><span class="tag">L${n.l} · ${esc(LAYERS[n.l].n)}</span>${markHTML(n.id)}</span><span class="sx">${esc(s[1])}</span></span></button>`; }).join("")}</div>`;
+  ${t.steps.map((s,i)=>{ const n=N[s[0]]; return `<button type="button" class="step" style="--c:${lc(n.l)}" data-tstep="${i}" aria-pressed="${i===state.tstep}"><span class="rail"><span class="dot num" aria-hidden="true">${i+1}</span></span><span class="body"><span class="sl"><span class="sn">${esc(n.label)}</span><span class="tag">L${n.l} · ${esc(LAYERS[n.l].n)}</span>${markHTML(n.id)}</span><span class="sx">${RI(s[1])}</span></span></button>`; }).join("")}</div>`;
 }
 
 /* ---------------- courses ---------------- */
@@ -372,7 +378,7 @@ async function renderLibrary(){
   const q = state.libQ.trim().toLowerCase();
   const list = LIB.filter(w=>(state.libKind==="all"||w.k===state.libKind) && (!q || (w.t+" "+w.w).toLowerCase().includes(q) || w.by.some(id=>label(id).toLowerCase().includes(q))));
   el.innerHTML = `<h2 class="vh">Library</h2><p class="vsub">Every source cited in the map, grouped by work and ranked by how many concepts rely on it. ${LIB.length} works; the ones at the top give the most understanding per hour.</p>
-    <div class="filters" role="group" aria-label="Kind">${kinds.map(k=>`<button type="button" data-libkind="${k}" aria-pressed="${state.libKind===k}">${k==="all"?"All":KIND[k]+"s"} <span class="mono" style="opacity:.7">${k==="all"?LIB.length:LIB.filter(w=>w.k===k).length}</span></button>`).join("")}
+    <div class="filters" role="group" aria-label="Kind">${kinds.map(k=>`<button type="button" data-libkind="${k}" aria-pressed="${state.libKind===k}">${k==="all"?"All":k==="docs"?"Docs":KIND[k]+"s"} <span class="mono" style="opacity:.7">${k==="all"?LIB.length:LIB.filter(w=>w.k===k).length}</span></button>`).join("")}
     <input id="libq" type="search" placeholder="Filter by title, author or concept" value="${esc(state.libQ)}" style="padding:4px 10px;border:1px solid var(--line-strong);border-radius:999px;background:var(--surface);color:var(--fg);font:inherit;font-size:12.5px;min-width:220px"></div>
     <ul class="lib">${list.slice(0,state.libN).map(w=>`<li><span class="rk">${esc(KIND[w.k]||w.k)}</span><span><a href="${esc(refURL(w))}" target="_blank" rel="noopener noreferrer">${esc(w.t)}</a>${w.u?"":` <span class="via" style="font-family:var(--font-mono);font-size:10.5px;color:var(--muted)">${w.k==="paper"?"via Scholar":"via search"}</span>`}<span class="who">${esc(w.w)}</span><span class="by">${w.by.slice(0,8).map(id=>`<button type="button" class="chip" style="--c:${lc(layerOf(id))}" ${/^L\d$/.test(id)?`data-essay="${id[1]}"`:`data-read="${id}"`}><span class="sw"></span>${esc(label(id))}</button>`).join("")}${w.by.length>8?`<span class="mono" style="font-size:11px;color:var(--muted)">+${w.by.length-8}</span>`:""}</span></span><span class="cnt">${w.by.length} concept${w.by.length===1?"":"s"}</span></li>`).join("")}</ul>
     ${list.length>state.libN?`<button type="button" class="btn" data-libmore style="margin-top:12px">Show more (${list.length-state.libN} left)</button>`:""}`;
@@ -396,11 +402,11 @@ async function nextReview(){
   if(!item){ REV.q.shift(); return nextReview(); }
   const i = item.indexOf(" || "), box = Store.me.review[key][0];
   REV.cur = {key, id, qi:+qi, a:item.slice(i+4)}; REV.shown=false;
-  el.innerHTML = `<div class="rev-card" style="--c:${lc(N[id].l)}"><p class="rev-meta"><span class="lpill" style="--c:${lc(N[id].l)}"><span class="sw"></span>L${N[id].l}</span> ${esc(N[id].label)} · box ${box} of 5 · ${REV.q.length} left</p><p class="rev-q">${esc(item.slice(0,i))}</p><div id="rev-a"></div><div class="btnrow" id="rev-btns"><button type="button" class="btn on" data-revshow>Show answer</button><button type="button" class="btn" data-read="${id}">Open the read</button></div></div>`;
+  el.innerHTML = `<div class="rev-card" style="--c:${lc(N[id].l)}"><p class="rev-meta"><span class="lpill" style="--c:${lc(N[id].l)}"><span class="sw"></span>L${N[id].l}</span> ${esc(N[id].label)} · box ${box} of 5 · ${REV.q.length} left</p><p class="rev-q">${RI(item.slice(0,i))}</p><div id="rev-a"></div><div class="btnrow" id="rev-btns"><button type="button" class="btn on" data-revshow>Show answer</button><button type="button" class="btn" data-read="${id}">Open the read</button></div></div>`;
 }
 function showReviewAnswer(){
   if(!REV.cur) return; REV.shown=true;
-  $("rev-a").innerHTML = `<p class="rev-ans">${esc(REV.cur.a)}</p>`;
+  $("rev-a").innerHTML = RP(REV.cur.a, {cls:"rev-ans"});
   $("rev-btns").innerHTML = `<button type="button" class="btn on" data-revgrade="1">I knew it</button><button type="button" class="btn" data-revgrade="0">Not yet</button>`;
 }
 async function gradeReview(knew){
@@ -455,13 +461,131 @@ function renderYou(){
 function refsHTML(refs){
   return `<ul class="refs">${refs.map(r=>`<li><span class="rk">${esc(KIND[r.k]||r.k)}</span><span><a href="${esc(refURL(r))}" target="_blank" rel="noopener noreferrer">${esc(r.t)}</a>${r.u?"":`<span class="via">${r.k==="paper"?"via Scholar":"via search"}</span>`}<span class="rw">${esc(r.w)}</span></span></li>`).join("")}</ul>`;
 }
-function P(list, cls){ return (list||[]).map((p,i)=>`<p${i===0&&cls?` class="${cls}"`:""}>${esc(p)}</p>`).join(""); }
-function termsHTML(list){ return list&&list.length ? `<dl class="terms">${list.map(t=>{const i=t.indexOf(" — "); return i<0?`<div><dt>${esc(t)}</dt></div>`:`<div><dt>${esc(t.slice(0,i))}</dt><dd>${esc(t.charAt(i+3).toUpperCase()+t.slice(i+4))}</dd></div>`;}).join("")}</dl>` : ""; }
-function diagramHTML(list){ return list&&list.length ? `<figure class="diagram"><pre>${esc(list.join("\n"))}</pre></figure>` : ""; }
-function mistakesHTML(list){ return list&&list.length ? `<div class="mistakes">${list.map(p=>`<p>${esc(p)}</p>`).join("")}</div>` : ""; }
-function quizHTML(list, id){ const inDeck = id && Store.me.review[id+"#0"]; return list&&list.length ? `<p class="stand-sum">Try to answer each one in your head first, then open it to check. ${id?(inDeck?"These questions are in your review deck; they come back in the You tab when they are due.":`<button type="button" class="btn" data-enroll="${id}" style="margin-left:4px">Add to my review deck</button>`):""}</p><ol class="quiz">${list.map(q=>{const i=q.indexOf(" || "); return `<li><details><summary>${esc(q.slice(0,i))}</summary><p>${esc(q.slice(i+4))}</p></details></li>`;}).join("")}</ol>` : ""; }
-function qaHTML(list, note){ return list&&list.length ? `${note?`<p class="stand-sum">${note}</p>`:""}<ol class="quiz qa">${list.map(q=>{const i=q.indexOf(" || "); return `<li><details><summary>${esc(q.slice(0,i))}</summary><p>${esc(q.slice(i+4))}</p></details></li>`;}).join("")}</ol>` : ""; }
-function tradeoffsHTML(list){ return list&&list.length ? `<div class="tradeoffs">${list.map(p=>`<p>${esc(p)}</p>`).join("")}</div>` : ""; }
+/* ---------- rich text (web/rich.js, content/FORMAT.md) ---------- */
+const RI = (t, o) => RICH ? RICH.inline(t, Object.assign({blocks:false}, o)) : esc(t);
+const RP = (t, o) => RICH ? RICH.para(t, o) : `<p${o&&o.cls?` class="${o.cls}"`:""}>${esc(t)}</p>`;
+function P(list, cls){ return (list||[]).map((p,i)=>RP(p, {cls: i===0 ? cls : ""})).join(""); }
+// a short first sentence that names the paragraph's topic ("Average load.", "Hot keys and hot partitions.") becomes a run-in head
+const ABBR = /(?:\b[A-Za-z]|\be\.g|\bi\.e|\bvs|\betc|\bapprox|\bNo|\bFig|\bSt|\bDr)\.$/;
+function runin(p){
+  if(p.startsWith("```") || p.startsWith("\\[")) return null;
+  const m = p.match(/^([^.?!:\n]{2,72}[.?:])\s+(?=[A-Z0-9"(`\\])/); if(!m) return null;
+  const h = m[1], n = h.split(/\s+/).length;
+  if(n > 9 || /,\s(?!\d)/.test(h) || ABBR.test(h) || /^(Step \d|Choose|choose|People|In fact|Key idea|Rule of thumb|Warning)\b/.test(h) || /[`\\]/.test(h)) return null;
+  return [h, p.slice(m[0].length)];
+}
+function RIN(p, o){ const r = runin(p); return r ? RP(r[1], Object.assign({}, o, {pre:`<strong class="ri">${RI(r[0])}</strong> `})) : RP(p, o); }
+function PR(list){ return (list||[]).map(p=>RIN(p)).join(""); }
+function termsHTML(list){ return list&&list.length ? `<dl class="terms">${list.map(t=>{const i=t.indexOf(" — "); return i<0?`<div><dt>${RI(t)}</dt></div>`:`<div><dt>${RI(t.slice(0,i))}</dt><dd>${RI(t.charAt(i+3).toUpperCase()+t.slice(i+4))}</dd></div>`;}).join("")}</dl>` : ""; }
+function diagramHTML(list){ return list&&list.length ? `<figure class="diagram"><pre tabindex="0" aria-label="Diagram">${esc(list.join("\n"))}</pre></figure>` : ""; }
+// "Common misunderstandings": the first sentence (up to "In fact") is the myth, the rest is the fact
+function mythFact(p){
+  let myth, fact, lab = "In fact";
+  const m = p.match(/^([\s\S]*?[.?!])\s+(In fact|In reality|Actually|In practice),?\s+([\s\S]*)$/);
+  if(m){ myth = m[1]; fact = m[3]; lab = m[2]; }
+  else { const k = p.search(/[.?!]\s+(?=[A-Z])/); if(k < 0) return `<div class="mf mf-solo">${RP(p)}</div>`; myth = p.slice(0, k+1); fact = p.slice(k+1).trim(); lab = "What is true"; }
+  fact = fact.charAt(0).toUpperCase() + fact.slice(1);
+  return `<div class="mf"><div class="mf-myth"><span class="mf-l"><span class="mf-x" aria-hidden="true"></span>Myth</span>${RP(myth)}</div><div class="mf-fact"><span class="mf-l"><span class="mf-ok" aria-hidden="true"></span>${esc(lab)}</span>${RP(fact)}</div></div>`;
+}
+function mistakesHTML(list){ return list&&list.length ? `<div class="mistakes">${list.map(mythFact).join("")}</div>` : ""; }
+// "Kafka broker loss: ..." inside a paragraph: short labels at the start of a sentence become bold
+function labels(p){
+  if(p.includes("**") || p.startsWith("```")) return p;
+  return p.replace(/(^|[.;]\s+)([A-Z][A-Za-z0-9 /'()+-]{2,44}?):(?=\s)/g, (a, pre, l) => l.split(/\s+/).length <= 6 && !/[`\\]/.test(l) ? `${pre}**${l}:**` : a);
+}
+function failuresHTML(list){ return list&&list.length ? `<div class="fails">${list.map(p=>{
+  const r = runin(p) || (()=>{ const m = p.match(/^([A-Z][^:.`\\]{2,48}):\s+([\s\S]+)$/); return m && m[1].split(/\s+/).length <= 6 ? [m[1], m[2].charAt(0).toUpperCase() + m[2].slice(1)] : null; })();
+  return r ? `<div class="fc"><h3 class="fc-t">${RI(r[0].replace(/[.:]$/,""))}</h3>${RP(labels(r[1]))}</div>` : `<div class="fc">${RP(labels(p))}</div>`; }).join("")}</div>` : ""; }
+// "It depends: trade-offs": a decision card per paragraph; "Choose X when ..." sentences become the options
+const CHOOSE = /^(Choose|choose|Prefer|prefer|Pick|pick)\s+([\s\S]{2,90}?)(\s+(?:when|if|for|because|unless|where|while|as long as|only when|over)\b[\s\S]*)$/;
+function decisionHTML(p){
+  let title = "", body = p;
+  const r = runin(p); if(r && !/^(Choose|choose|Prefer|Use)\b/.test(r[0])){ title = r[0].replace(/[.:]$/,""); body = r[1]; }
+  const chunks = body.split(/(?<=[.;!?])\s+(?=(?:Choose|choose|Prefer|prefer)\b)/);
+  let intro = /^(Choose|choose|Prefer|prefer)\b/.test(chunks[0]) ? "" : chunks.shift();
+  // a one-sentence lead before the options ("Bloom filter, cuckoo or xor filter, or an exact set.") is the card's title
+  if(!title && intro && chunks.length && !/[.?!]\s/.test(intro.trim().slice(0,-1)) && intro.split(/\s+/).length <= 14){ title = intro.trim().replace(/[.:]$/,""); intro = ""; }
+  const opts = chunks.map(c=>{ c = c.replace(/;$/, "."); c = c.charAt(0).toUpperCase() + c.slice(1); const m = c.match(CHOOSE);
+    return `<li>${m && !/[`*\\]/.test(m[2]) ? RP(`${m[1].charAt(0).toUpperCase()+m[1].slice(1)} **${m[2]}**${m[3]}`) : RP(c)}</li>`; });
+  return `<div class="dc">${title?`<h3 class="dc-t">${RI(title)}</h3>`:""}${intro?RP(intro, {cls:"dc-intro"}):""}${opts.length?`<ul class="dc-opts">${opts.join("")}</ul>`:""}</div>`;
+}
+function tradeoffsHTML(list){ return list&&list.length ? `<div class="tradeoffs">${list.map(decisionHTML).join("")}</div>` : ""; }
+// worked examples: "Step 3: ..." paragraphs get a numbered marker on a rail; short topic sentences become run-in heads
+function exampleHTML(list){
+  return `<div class="example">${(list||[]).map(p=>{ const m = p.match(/^Step\s+(\d+)\s*[.:)—-]?\s+([\s\S]*)$/);
+    return m ? `<div class="ex-step"><span class="ex-n" aria-hidden="true">${m[1]}</span>${RP(m[2].charAt(0).toUpperCase()+m[2].slice(1), {pre:`<span class="sr">Step ${m[1]}: </span>`})}</div>` : RIN(p); }).join("")}</div>`;
+}
+function quizHTML(list, id){ const inDeck = id && Store.me.review[id+"#0"]; return list&&list.length ? `<p class="stand-sum">Try to answer each one in your head first, then open it to check. ${id?(inDeck?"These questions are in your review deck; they come back in the You tab when they are due.":`<button type="button" class="btn" data-enroll="${id}" style="margin-left:4px">Add to my review deck</button>`):""}</p><ol class="quiz">${list.map(q=>{const i=q.indexOf(" || "); return `<li><details><summary>${RI(q.slice(0,i))}</summary>${RP(q.slice(i+4))}</details></li>`;}).join("")}</ol>` : ""; }
+// interview questions: expandable cards, numbered, with the answer outline inside
+function qaHTML(list, note){ return list&&list.length ? `${note?`<p class="stand-sum">${note}</p>`:""}<ol class="qa-list">${list.map((q,k)=>{const i=q.indexOf(" || "); return `<li class="qa-card"><details><summary><span class="qa-n" aria-hidden="true">Q${k+1}</span><span class="qa-q">${RI(q.slice(0,i))}</span><span class="qa-tg" aria-hidden="true"></span></summary><div class="qa-a"><span class="qa-l">Answer outline</span>${RP(q.slice(i+4))}</div></details></li>`;}).join("")}</ol>` : ""; }
+// key terms used in the text: the first use in each section gets a dotted underline and the definition on hover, focus or tap
+function termIndex(terms){
+  const out = [];
+  (terms||[]).forEach(t=>{ const i = t.indexOf(" — "); if(i<0) return; const label = t.slice(0,i), def = t.slice(i+3);
+    label.replace(/\s*\(.*?\)\s*/g," ").trim().split(/\s+(?:and|or)\s+|\s*\/\s*|,\s*/).forEach(nm=>{ nm = nm.trim(); if(nm.length>=3 && nm.length<=40) out.push({name:nm, label, def}); }); });
+  return out.sort((a,b)=>b.name.length-a.name.length);
+}
+function markTerms(root, terms){
+  const list = termIndex(terms); if(!list.length) return;
+  const reEsc = x => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`(?<![\\w-])(${list.map(t=>reEsc(t.name)).join("|")})(?:s|es)?(?![\\w-])`, "gi");
+  const byName = {}; list.forEach(t=>{ const k = t.name.toLowerCase(); byName[k] = byName[k] || t; });
+  root.querySelectorAll(".rd-sec").forEach(sec=>{
+    if(/^rs-(terms|deeper|notes|stands|built|side|down|here|concepts|quiz|watch)$/.test(sec.id)) return;
+    const used = new Set();
+    const walker = document.createTreeWalker(sec, NodeFilter.SHOW_TEXT, {acceptNode(n){
+      const p = n.parentElement; if(!p || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+      return p.closest("code,pre,math,.fx,.tm,h2,h3,a,button,summary,.mf-l,.qa-l,.co-l,.ri,.dmath,figure,.srow,.sgrp,.rd-next,.sr") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT; }});
+    const nodes = []; while(walker.nextNode()) nodes.push(walker.currentNode);
+    nodes.forEach(n=>{
+      const text = n.nodeValue; re.lastIndex = 0; let m, last = 0, frag = null;
+      while((m = re.exec(text))){
+        const t = byName[m[1].toLowerCase()]; if(!t || used.has(t.label)) continue;
+        if(/^[A-Z0-9]{2,}$/.test(t.name) && m[1]!==t.name) continue;      // all-capital terms (BPE, FSDP) match only in capitals
+        used.add(t.label); frag = frag || document.createDocumentFragment();
+        frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+        const b = document.createElement("button"); b.type = "button"; b.className = "tm"; b.textContent = m[0];
+        b.dataset.term = t.label; b.dataset.def = t.def; b.setAttribute("aria-describedby", "tm-tip");
+        frag.appendChild(b); last = m.index + m[0].length;
+      }
+      if(frag){ frag.appendChild(document.createTextNode(text.slice(last))); n.parentNode.replaceChild(frag, n); }
+    });
+  });
+}
+const TIP = { el:null, for:null, t:null };
+function tipShow(b){
+  if(!TIP.el){ TIP.el = document.createElement("div"); TIP.el.id = "tm-tip"; TIP.el.className = "tm-tip"; TIP.el.setAttribute("role","tooltip"); TIP.el.hidden = true; document.body.appendChild(TIP.el); }
+  clearTimeout(TIP.t); TIP.for = b;
+  TIP.el.innerHTML = `<b>${esc(b.dataset.term)}</b>${RI(b.dataset.def.charAt(0).toUpperCase() + b.dataset.def.slice(1))}`; TIP.el.hidden = false;
+  const w = Math.min(340, innerWidth - 24); TIP.el.style.maxWidth = w + "px";
+  const r = b.getBoundingClientRect(), tw = TIP.el.offsetWidth, th = TIP.el.offsetHeight, above = r.top - th - 10 > 60;
+  TIP.el.style.left = Math.max(12, Math.min(innerWidth - tw - 12, r.left + r.width/2 - tw/2)) + "px";
+  TIP.el.style.top = (above ? r.top - th - 8 : r.bottom + 8) + "px";
+  TIP.el.classList.toggle("below", !above);
+  document.querySelectorAll(".tm[aria-expanded]").forEach(x=>x.removeAttribute("aria-expanded")); b.setAttribute("aria-expanded","true");
+}
+function tipHide(now){ clearTimeout(TIP.t); const go = ()=>{ if(TIP.el) TIP.el.hidden = true; if(TIP.for) TIP.for.removeAttribute("aria-expanded"); TIP.for = null; }; if(now) go(); else TIP.t = setTimeout(go, 150); }
+const tipOpen = () => !!(TIP.el && !TIP.el.hidden);
+document.addEventListener("mouseover", e=>{ const b = e.target.closest && e.target.closest(".tm"); if(b && matchMedia("(hover:hover)").matches) tipShow(b); else if(TIP.for && !(e.target.closest && e.target.closest(".tm-tip")) && document.activeElement!==TIP.for) tipHide(); });
+document.addEventListener("focusin", e=>{ const b = e.target.closest && e.target.closest(".tm"); if(b) tipShow(b); else if(TIP.for) tipHide(true); });
+document.addEventListener("click", e=>{ const b = e.target.closest && e.target.closest(".tm"); if(b){ if(TIP.for===b && tipOpen() && !matchMedia("(hover:hover)").matches) tipHide(true); else tipShow(b); } else if(TIP.for && !(e.target.closest && e.target.closest(".tm-tip"))) tipHide(true); });
+// side table of contents with the current section (wide screens), and the current section in the reader bar
+function sideTOC(el){
+  const old = el.querySelector(".rd-side"); if(old) old.remove();
+  const toc = el.querySelector(".rd-wrap .toc"); if(!toc) return;
+  const nav = document.createElement("nav"); nav.className = "rd-side"; nav.setAttribute("aria-label", "On this page");
+  nav.innerHTML = `<p class="rs-h">On this page</p><ol>${[...toc.querySelectorAll("a")].map(a=>`<li><a href="${a.getAttribute("href")}" data-jump="${a.dataset.jump}">${a.innerHTML}</a></li>`).join("")}</ol>`;
+  el.appendChild(nav); spy.last = undefined;
+}
+function spy(){
+  const el = $("reader"); if(!el || el.hidden) return;
+  const secs = el.querySelectorAll(".rd-sec"); let cur = null;
+  for(const s of secs){ if(s.getBoundingClientRect().top < 150) cur = s; else break; }
+  const id = cur ? cur.id : null;
+  if(spy.last === id) return; spy.last = id;
+  el.querySelectorAll(".rd-side a").forEach(a=>{ if(a.dataset.jump===id) a.setAttribute("aria-current","location"); else a.removeAttribute("aria-current"); });
+  const rc = $("rcur"); if(rc){ const h = cur && cur.querySelector("h2 .h2-t"); rc.textContent = h ? h.textContent : ""; }
+}
 
 /* step-by-step animation: "== caption" starts a frame, the following lines are its drawing */
 const ANIM = {}; let animSeq = 0, animObs = null;
@@ -526,7 +650,7 @@ function fillTry(root){
   if(!root || !window.DTSAlgo || !window.DTSAlgo.forConcept) return;
   root.querySelectorAll("[data-trycon]").forEach(p=>{ const v=window.DTSAlgo.forConcept(p.dataset.trycon); p.innerHTML = v.map(x=>`<button type="button" data-tryviz="${esc(x.id)}">Try it yourself: ${esc(x.title)}</button>`).join(""); p.hidden = !v.length; });
 }
-function sec(id, no, title, body){ return body ? `<section class="rd-sec" id="rs-${id}"><h2><span class="no">${no}</span>${title}</h2>${body}</section>` : ""; }
+function sec(id, no, title, body, tag){ return body ? `<section class="rd-sec" id="rs-${id}" aria-labelledby="rh-${id}"><h2 id="rh-${id}"><span class="no">${no}</span><span class="h2-t">${title}</span>${tag?`<span class="h2-tag">${tag}</span>`:""}</h2>${body}</section>` : ""; }
 function srow(id, reason, dash, meta){ const m=N[id]; return `<button type="button" class="srow" style="--c:${lc(m.l)}" data-read="${id}"><span class="bar${dash?" dash":""}"></span><span><span class="sn">${esc(m.label)}</span><span class="sm">${meta||"L"+m.l}</span>${markHTML(id)}<span class="sr">${esc(reason)}</span></span></button>`; }
 function groupByLayer(list, key){
   const g=[[],[],[],[],[],[]]; list.forEach(e=>g[N[e[key]].l].push(e));
@@ -557,7 +681,7 @@ function nodeRead(n, r, ctx){
   let h = `<div class="rd-eye"><span class="lpill" style="--c:${lc(n.l)}"><span class="sw"></span>L${n.l} · ${esc(LAYERS[n.l].n)}</span><span>${esc(n.cat)}</span>${n.y?`<span class="mono">${n.y.startsWith("-")?esc(n.y.slice(1))+" BCE":esc(n.y)}</span>`:""}<span class="mono">${n.rm} min read</span>${n.deep?`<span class="kind" style="margin:0">deep read</span>`:""}</div>
   <h1>${esc(n.label)}</h1><p class="rd-sub">${esc(n.m)}</p>${n.st?`<p class="status">${esc(n.st)}</p>`:""}`;
   h += actionsHTML(n.id, lc(n.l));
-  if(ctx) h += `<div class="rd-ctx"><b>${esc(ctx.k)}</b>${esc(ctx.t)}</div>`;
+  if(ctx) h += `<div class="rd-ctx"><b>${esc(ctx.k)}</b>${RI(ctx.t)}</div>`;
   h += ladderHTML(n);
   if(USES[n.id]) h += `<p class="ladder-cap">Appears in design questions: ${USES[n.id].map(did=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-design="${did}">${esc(DES[did].title)}</button>`).join(", ")}.</p>`;
   if(TAUGHT[n.id]) h += `<p class="ladder-cap">Taught in Stanford ${TAUGHT[n.id].map(code=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-course="${code}">${esc(courseLabel(code))}</button>`).join(", ")}.</p>`;
@@ -569,16 +693,16 @@ function nodeRead(n, r, ctx){
   if(rd.history) h += sec("history", NO(), "How we got here", P(rd.history));
   h += sec("how", NO(), "How it works", P(rd.how) + diagramHTML(rd.diagram) + animHTML(rd.animation));
   if((r.scenes||[]).length) h += sec("watch", NO(), "Watch it work", watchHTML(n.id, r.scenes));
-  if(rd.example) h += sec("example", NO(), "A worked example", `<div class="example">${P(rd.example)}</div>`);
+  if(rd.example) h += sec("example", NO(), "A worked example", exampleHTML(rd.example));
   if(downs.length||insp.length) h += sec("stands", NO(), "What it stands on",
     `<p class="stand-sum">${esc(n.label)} rests directly on ${downs.length} idea${downs.length===1?"":"s"}. Counting everything beneath those, it stands on ${tot} concepts across ${lays.length} layer${lays.length===1?"":"s"} (${lays.map(l=>"L"+l).join(", ")}). Each line says what that lower layer contributes.</p>` +
     groupByLayer(downs,"t") + (insp.length?`<div class="sgrp" style="--c:var(--muted)"><div class="sh"><span class="sw"></span>Borrowed ideas (analogies, not mechanisms)</div>${insp.map(e=>srow(e.t,e.r,true)).join("")}</div>`:""));
-  h += sec("intuition", NO(), "Why it makes sense", (rd.intuition&&rd.intuition.length?`<p class="rd-quote">${esc(rd.intuition[0])}</p>`+P(rd.intuition.slice(1)):""));
+  h += sec("intuition", NO(), "Why it makes sense", (rd.intuition&&rd.intuition.length?RP(rd.intuition[0], {cls:"rd-quote", noCallout:true})+P(rd.intuition.slice(1)):""));
   if(rd.mistakes) h += sec("mistakes", NO(), "Common misunderstandings", mistakesHTML(rd.mistakes));
   if(rd.tradeoffs) h += sec("tradeoffs", NO(), "It depends: trade-offs", tradeoffsHTML(rd.tradeoffs));
   h += sec("friction", NO(), "Where it still hurts", P(rd.friction));
   if(rd.practice) h += sec("practice", NO(), "In practice", P(rd.practice));
-  if(rd.interview) h += sec("interview", NO(), "In the interview", qaHTML(rd.interview, "Questions a staff-level interviewer asks about this. Say your answer out loud first, then open it to compare."));
+  if(rd.interview) h += sec("interview", NO(), "In the interview", qaHTML(rd.interview, "Questions a staff-level interviewer asks about this. Say your answer out loud first, then open it to compare."), "Staff level");
   if(rd.quiz) h += sec("quiz", NO(), "Check yourself", quizHTML(rd.quiz, n.id));
   if(ups.length) h += sec("built", NO(), "What's built on it", `<p class="stand-sum">${ups.length} concept${ups.length===1?"":"s"} use ${esc(n.label)} directly.</p>` + groupByLayer(ups,"s"));
   if(n.side.length) h += sec("side", NO(), "Neighbours", n.side.map(s=>srow(s.o, s.r, false, SIDE[s.t]||s.t)).join(""));
@@ -598,13 +722,13 @@ function essayRead(l, r){
   if(rd.terms) h += sec("terms",NO(),"Key terms", termsHTML(rd.terms));
   if(rd.history) h += sec("history",NO(),"How we got here", P(rd.history));
   h += sec("how",NO(),"How the layers below support it", P(rd.how) + diagramHTML(rd.diagram) + animHTML(rd.animation));
-  if(rd.example) h += sec("example",NO(),"A worked example", `<div class="example">${P(rd.example)}</div>`);
-  h += sec("intuition",NO(),"Why it makes sense", rd.intuition&&rd.intuition.length?`<p class="rd-quote">${esc(rd.intuition[0])}</p>`+P(rd.intuition.slice(1)):"");
+  if(rd.example) h += sec("example",NO(),"A worked example", exampleHTML(rd.example));
+  h += sec("intuition",NO(),"Why it makes sense", rd.intuition&&rd.intuition.length?RP(rd.intuition[0], {cls:"rd-quote", noCallout:true})+P(rd.intuition.slice(1)):"");
   if(rd.mistakes) h += sec("mistakes",NO(),"Common misunderstandings", mistakesHTML(rd.mistakes));
   if(rd.tradeoffs) h += sec("tradeoffs",NO(),"It depends: trade-offs", tradeoffsHTML(rd.tradeoffs));
   h += sec("friction",NO(),"Where it still hurts", P(rd.friction));
   if(rd.practice) h += sec("practice",NO(),"How to use this layer", P(rd.practice));
-  if(rd.interview) h += sec("interview",NO(),"In the interview", qaHTML(rd.interview));
+  if(rd.interview) h += sec("interview",NO(),"In the interview", qaHTML(rd.interview), "Staff level");
   if(rd.quiz) h += sec("quiz",NO(),"Check yourself", quizHTML(rd.quiz));
   h += sec("here",NO(),"What lives here", `<p class="stand-sum">The most depended-on concepts in this layer, then everything by area. Each opens its own read.</p><div class="sgrp" style="--c:${lc(l)}"><div class="sh"><span class="sw"></span>Most depended-on</div>${top.map(n=>srow(n.id, n.m, false, n.indeg+" use it")).join("")}</div>` +
     cats.map(c=>`<div class="agrp"><h3>${esc(c)}</h3><div class="chips">${byLayer[l].filter(n=>n.cat===c).sort(byLabel).map(n=>`<button type="button" class="chip${hubSet.has(n.id)?" hub":""}" style="--c:${lc(l)}" data-read="${n.id}"><span class="sw"></span>${esc(n.label)}${markHTML(n.id)}</button>`).join("")}</div></div>`).join(""));
@@ -644,6 +768,15 @@ function designConceptsHTML(d){
     `<h3 class="cm-h">Concept map</h3><p class="stand-sum">Rows are layers, from tools (top) to first principles (bottom). Lines are the map's "built on" links between these concepts.</p>${conceptMapSVG(ids)}` +
     `<div class="btnrow" style="margin-top:10px"><button type="button" class="btn primary" data-dstudy="${d.id}">Study these concepts · ${ids.length} reads · ${mins} min</button></div>`;
 }
+// API and data model paragraphs: a leading call signature, {field, ...} shapes and quoted keys such as "rl:{rule_id}:{id}" read as code
+function codeish(p){
+  if(p.includes("`") || p.startsWith("```")) return p;
+  p = p.replace(/^([a-z_][\w.]*\([^()]{0,80}\))(?=[\s:.,])/, "`$1`")
+       .replace(/(\sreturns?\s+)(\{[^{}]{1,90}\})/g, "$1`$2`")
+       .replace(/"([^"\s`]{2,60})"/g, (a, k) => /[:{}\/_#]/.test(k) ? "`" + k + "`" : a);
+  // snake_case field names (ad_id, event_ts) outside the code spans made above
+  return p.split(/(`[^`]*`)/).map((x, i) => i % 2 ? x : x.replace(/(^|[\s(,=])([a-z][a-z0-9]*(?:_[a-z0-9]+)+)(?=[\s),.;:=]|$)/g, "$1`$2`")).join("");
+}
 function designRead(d){
   const rd = d.rd, nc = d.concepts.filter(id=>N[id]).length;
   let h = `<div class="rd-eye"><span class="lpill" style="--c:var(--fg)"><span class="sw"></span>System design</span><span>${esc(d.category)}</span>${d.level?`<span>${esc(d.level)}</span>`:""}<span class="mono">${d.rm} min read</span><span>${nc} concepts</span></div>
@@ -653,16 +786,16 @@ function designRead(d){
   h += `<nav class="toc" aria-label="Sections">${toc.map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
   let no=0; const NO=()=>String(++no).padStart(2,"0");
   h += sec("summary", NO(), "Summary", P(rd.summary,"lead"));
-  if(rd.requirements) h += sec("requirements", NO(), "Requirements", P(rd.requirements));
-  if(rd.estimates) h += sec("estimates", NO(), "Back-of-the-envelope estimates", `<div class="example estimates">${P(rd.estimates)}</div>`);
-  if(rd.api) h += sec("api", NO(), "API", `<div class="apilist">${rd.api.map(p=>{ const m=p.match(/^((?:GET|POST|PUT|PATCH|DELETE)[^.]*?)\.\s(.*)$/); return m?`<p><code>${esc(m[1])}</code> ${esc(m[2])}</p>`:`<p>${esc(p)}</p>`; }).join("")}</div>`);
-  if(rd.datamodel) h += sec("datamodel", NO(), "Data model", P(rd.datamodel));
-  if(rd.design||rd.diagram||rd.animation) h += sec("design", NO(), "High-level design", P(rd.design) + diagramHTML(rd.diagram) + animHTML(rd.animation));
-  if(rd.deepdive) h += sec("deepdive", NO(), "Deep dives", P(rd.deepdive));
+  if(rd.requirements) h += sec("requirements", NO(), "Requirements", PR(rd.requirements));
+  if(rd.estimates) h += sec("estimates", NO(), "Back-of-the-envelope estimates", `<div class="example estimates">${PR(rd.estimates)}</div>`);
+  if(rd.api) h += sec("api", NO(), "API", `<div class="apilist">${rd.api.map(p=>{ const m=p.match(/^((?:GET|POST|PUT|PATCH|DELETE)\s+\S+?(?:\s+\([^)]{1,40}\))?)\.?\s+([A-Z][\s\S]*)$/); return m?RP(m[2], {pre:`<code class="ep">${esc(m[1])}</code> `}):RIN(codeish(p)); }).join("")}</div>`);
+  if(rd.datamodel) h += sec("datamodel", NO(), "Data model", rd.datamodel.map(p=>RIN(codeish(p))).join(""));
+  if(rd.design||rd.diagram||rd.animation) h += sec("design", NO(), "High-level design", PR(rd.design) + diagramHTML(rd.diagram) + animHTML(rd.animation));
+  if(rd.deepdive) h += sec("deepdive", NO(), "Deep dives", rd.deepdive.map(p=>RIN(labels(p))).join(""));
   if(rd.tradeoffs) h += sec("tradeoffs", NO(), "It depends: trade-offs", tradeoffsHTML(rd.tradeoffs));
-  if(rd.failures) h += sec("failures", NO(), "Failure modes", mistakesHTML(rd.failures));
-  if(rd.evolution) h += sec("evolution", NO(), "Evolution: from 1,000 to 1 billion users", P(rd.evolution));
-  if(rd.followups) h += sec("followups", NO(), "Interview follow-ups", qaHTML(rd.followups, "What the interviewer asks next. Answer out loud first, then open it to compare."));
+  if(rd.failures) h += sec("failures", NO(), "Failure modes", failuresHTML(rd.failures));
+  if(rd.evolution) h += sec("evolution", NO(), "Evolution: from 1,000 to 1 billion users", rd.evolution.map(p=>RIN(labels(p))).join(""));
+  if(rd.followups) h += sec("followups", NO(), "Interview follow-ups", qaHTML(rd.followups, "What the interviewer asks next. Answer out loud first, then open it to compare."), "Staff level");
   h += sec("concepts", NO(), "Concepts it uses", designConceptsHTML(d));
   if(d.refs&&d.refs.length) h += sec("deeper", NO(), "Sources", refsHTML(d.refs));
   return h;
@@ -672,7 +805,7 @@ function renderDesign(){
   if(!DESIGNS.length){ el.innerHTML = `<h2 class="vh">System design</h2><p class="vsub">No design questions yet. Add files to content/design/ and run python3 tools/build.py.</p>`; return; }
   const cats = DES_CATS.filter(c=>DESIGNS.some(d=>d.category===c)).concat([...new Set(DESIGNS.map(d=>d.category))].filter(c=>!DES_CATS.includes(c)));
   const card = d => { const ids=d.concepts.filter(id=>N[id]), g=[0,1,2,3,4,5].map(l=>ids.filter(id=>N[id].l===l).length);
-    return `<button type="button" class="dcard" data-design="${d.id}"><span class="tt">${esc(d.title)}</span><span class="ts">${esc(d.level||"")} · ${d.rm} min · ${ids.length} concepts</span><span class="dsum">${esc(d.summary||"")}</span><span class="under" aria-hidden="true">${g.map((k,l)=>k?`<span style="background:${lc(l)};flex:${k}"></span>`:"").join("")}</span></button>`; };
+    return `<button type="button" class="dcard" data-design="${d.id}"><span class="tt">${esc(d.title)}</span><span class="ts">${esc(d.level||"")} · ${d.rm} min · ${ids.length} concepts</span><span class="dsum">${esc(RICH?RICH.plain(d.summary||""):d.summary||"")}</span><span class="under" aria-hidden="true">${g.map((k,l)=>k?`<span style="background:${lc(l)};flex:${k}"></span>`:"").join("")}</span></button>`; };
   el.innerHTML = `<h2 class="vh">System design</h2><p class="vsub">${DESIGNS.length} interview question${DESIGNS.length===1?"":"s"}, each worked through: requirements, estimates with the arithmetic, API, data model, the design, deep dives, trade-offs, failure modes and the follow-up questions. Every design links to the concepts it uses, so you can study what it stands on.</p>` +
     cats.map(c=>`<h3 class="ysec">${esc(c)}</h3><div class="dgrid">${DESIGNS.filter(d=>d.category===c).map(card).join("")}</div>`).join("");
 }
@@ -718,10 +851,12 @@ async function renderReader(){
     else { col="var(--fg)"; title="Reading list"; mins=null; await Promise.all(c.ids.map(id=>Store.read(id))); if(R.cur!==c) return; body = pathRead(c.ids); }
   } catch(e){ body = `<p class="empty">Could not load this read: ${esc(e.message)}</p>`; }
   el.style.setProperty("--c", col);
-  el.innerHTML = `<div class="rd-bar"><button type="button" class="btn" data-rback>${R.hist.length?"← Back":"← Close"}</button><span class="rt">${esc(title)}${mins?`<span class="mono">${mins} min</span>`:""}</span>${c.type==="node"?`<button type="button" class="btn" data-rmap="${c.id}">Show in map</button>`:""}<button type="button" class="btn" data-rclose aria-label="Close reader">✕</button><span class="rd-prog" id="rprog"></span></div><article class="rd-wrap">${body}<p class="foot">${DATA.nodes.length} concepts, ${DATA.stats.refs} sources and about ${Math.round(DATA.stats.words/1000)}k words of reading in this map. Links marked "via Scholar" or "via search" open a search for that title. Facts checked as of October 2026.</p></article>`;
+  el.innerHTML = `<div class="rd-bar"><button type="button" class="btn" data-rback>${R.hist.length?"← Back":"← Close"}</button><span class="rt"><span class="rt-t">${esc(title)}</span>${mins?`<span class="mono">${mins} min</span>`:""}<span class="rd-cur" id="rcur" aria-hidden="true"></span></span>${c.type==="node"?`<button type="button" class="btn" data-rmap="${c.id}">Show in map</button>`:""}<button type="button" class="btn" data-rclose aria-label="Close reader">✕</button><span class="rd-prog" id="rprog"></span></div><article class="rd-wrap">${body}<p class="foot">${DATA.nodes.length} concepts, ${DATA.stats.refs} sources and about ${Math.round(DATA.stats.words/1000)}k words of reading in this map. Links marked "via Scholar" or "via search" open a search for that title. Facts checked as of October 2026.</p></article>`;
   el.scrollTop = 0; updProg();
   const h1 = el.querySelector("h1"); if(h1){ h1.tabIndex=-1; try{ h1.focus({preventScroll:true}); }catch(e){} }
   const id = curId(); if(id) fillNotes(id);
+  try{ const rr = c.type==="node" ? READS[c.id] : c.type==="layer" ? READS["L"+c.l] : null; if(rr && rr.rd && rr.rd.terms) markTerms(el.querySelector(".rd-wrap"), rr.rd.terms); }catch(e){}
+  sideTOC(el); spy();
   animWatch(el);
   const sp = mountScenes(el, c.scene);
   if(c.scene && sp){ const w=$("rs-watch"); if(w) w.scrollIntoView({block:"start"}); try{ sp.root.focus({preventScroll:true}); }catch(e){} }
@@ -751,7 +886,8 @@ function openRead(c, opts={}){
 }
 function closeRead(){ flushTime(); animStopAll(); R.t0=0; R.open=false; R.hist=[]; $("reader").hidden=true; document.body.style.overflow=""; try{history.replaceState(null,"",viewHash())}catch(e){} render(false); if(R.ret&&R.ret.focus) try{R.ret.focus({preventScroll:true})}catch(e){} }
 function backRead(){ if(R.hist.length){ flushTime(); R.cur=R.hist.pop(); R.secs=0; R.t0=performance.now(); try{history.replaceState(null,"",hashFor(R.cur))}catch(e){} renderReader(); } else closeRead(); }
-$("reader").addEventListener("scroll", updProg, {passive:true});
+let spyRaf = 0;
+$("reader").addEventListener("scroll", ()=>{ updProg(); if(!spyRaf) spyRaf = requestAnimationFrame(()=>{ spyRaf = 0; spy(); }); if(tipOpen()){ if(document.activeElement===TIP.for) tipShow(TIP.for); else tipHide(true); } }, {passive:true});
 const pathSeq = () => ({name:"Your path", ids:state.path.slice()});
 function refreshMarks(){ if(R.open){ const a=$("reader").querySelector(".rd-actions"); const id=curId(); if(a&&id){ a.outerHTML = actionsHTML(id, getComputedStyle($("reader")).getPropertyValue("--c")); } } else render(false); }
 
@@ -829,6 +965,7 @@ document.addEventListener("click", async e=>{
   } catch(err){ toast("Something went wrong: "+err.message); }
 });
 document.addEventListener("keydown", e=>{
+  if(e.key==="Escape" && tipOpen()){ e.preventDefault(); const f = TIP.for; tipHide(true); if(f) f.focus(); return; }
   if(e.key==="Escape" && R.open && document.activeElement!==$("q")){ e.preventDefault(); return backRead(); }
   if(e.key==="Enter" && e.target.closest && e.target.closest("[data-gsel]")){ select(e.target.closest("[data-gsel]").dataset.gsel); }
   if(e.key==="Enter" && e.target.closest && e.target.closest("[data-gread]")){ openRead({type:"node", id:e.target.closest("[data-gread]").dataset.gread}, {seq:null}); }
@@ -841,7 +978,7 @@ document.addEventListener("keydown", e=>{
 
 /* ---------------- search ---------------- */
 const q=$("q"), sres=$("sres"); let hits=[], hi=0, sq=0;
-const snipHTML = s => esc(s).replace(/\u0002/g,"<mark>").replace(/\u0003/g,"</mark>");
+const snipHTML = s => esc(RICH ? RICH.plain(s) : s).replace(/\u0002/g,"<mark>").replace(/\u0003/g,"</mark>");
 async function doSearch(){
   const s=q.value.trim(); if(!s){ sres.hidden=true; return; }
   const my = ++sq; const res = await Store.search(s); if(my!==sq) return;

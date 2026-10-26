@@ -1,0 +1,886 @@
+[
+ {
+  "id": "usb-enumeration",
+  "concept": "usb",
+  "title": "Plugging in a keyboard: enumeration, then polling",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "hw",
+    "label": "Computer",
+    "x": 10,
+    "y": 20,
+    "w": 420,
+    "h": 360
+   }
+  ],
+  "actors": [
+   {
+    "id": "drv",
+    "label": "Kernel driver",
+    "x": 30,
+    "y": 60,
+    "w": 130,
+    "h": 56,
+    "shape": "box",
+    "sub": "usb core"
+   },
+   {
+    "id": "xhci",
+    "label": "xHCI controller",
+    "x": 270,
+    "y": 60,
+    "w": 140,
+    "h": 56,
+    "shape": "box",
+    "sub": "host, root hub"
+   },
+   {
+    "id": "ram",
+    "label": "RAM rings",
+    "x": 30,
+    "y": 280,
+    "w": 200,
+    "h": 56,
+    "shape": "db",
+    "sub": "TRBs and events"
+   },
+   {
+    "id": "dev",
+    "label": "Keyboard",
+    "x": 540,
+    "y": 60,
+    "w": 140,
+    "h": 56,
+    "shape": "box",
+    "sub": "low speed"
+   },
+   {
+    "id": "cfg",
+    "label": "Descriptors",
+    "x": 540,
+    "y": 250,
+    "w": 150,
+    "h": 70,
+    "shape": "note",
+    "sub": "descriptors"
+   }
+  ],
+  "links": [
+   {
+    "from": "drv",
+    "to": "ram"
+   },
+   {
+    "from": "xhci",
+    "to": "ram",
+    "dashed": true
+   },
+   {
+    "from": "drv",
+    "to": "xhci"
+   },
+   {
+    "from": "xhci",
+    "to": "dev"
+   }
+  ],
+  "steps": [
+   {
+    "say": "The keyboard is plugged in. Its pull-up resistor on D- raises that wire, which tells the root hub that a low-speed device is attached.",
+    "msgs": [
+     {
+      "from": "dev",
+      "to": "xhci",
+      "label": "D- pulled up",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "dev": {
+      "label": "Keyboard",
+      "sub": "address 0",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "The host waits for contacts to settle, then drives a reset for at least 10 ms. The device now listens at the default address 0.",
+    "msgs": [
+     {
+      "from": "xhci",
+      "to": "dev",
+      "label": "RESET 10 ms+",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "xhci": {
+      "label": "xHCI controller",
+      "sub": "port reset",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "Host asks for the first 8 bytes of the device descriptor, only to learn the packet size of endpoint 0.",
+    "msgs": [
+     {
+      "from": "xhci",
+      "to": "dev",
+      "label": "GET_DESC(8 bytes)",
+      "tone": "accent"
+     },
+     {
+      "from": "dev",
+      "to": "xhci",
+      "label": "8 B: ep0 max 8",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "cfg": {
+      "label": "Descriptors",
+      "sub": "max packet 8",
+      "tone": "muted"
+     }
+    }
+   },
+   {
+    "say": "The host gives the device a free address from 1 to 127, here 7. From now on only this device answers to token packets with address 7.",
+    "msgs": [
+     {
+      "from": "xhci",
+      "to": "dev",
+      "label": "SET_ADDRESS 7",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "dev": {
+      "label": "Keyboard",
+      "sub": "address 7",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Now the host reads the full 18-byte device descriptor: vendor ID, product ID, USB version, and class 0, meaning 'look at the interface'.",
+    "msgs": [
+     {
+      "from": "xhci",
+      "to": "dev",
+      "label": "GET_DESCRIPTOR(18)",
+      "tone": "accent"
+     },
+     {
+      "from": "dev",
+      "to": "xhci",
+      "label": "VID, PID, bcdUSB",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "cfg": {
+      "label": "Descriptors",
+      "sub": "VID/PID known",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "The configuration descriptor lists the interface and endpoints: class 3 (HID), boot keyboard, one interrupt IN endpoint of 8 bytes every 10 ms.",
+    "msgs": [
+     {
+      "from": "dev",
+      "to": "xhci",
+      "label": "HID, ep1 IN, 10 ms",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "cfg": {
+      "label": "Descriptors",
+      "sub": "HID, ep1 IN, 10 ms",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "SET_CONFIGURATION tells the device it may draw its declared current, up to 500 mA. Before this it was limited to 100 mA.",
+    "msgs": [
+     {
+      "from": "xhci",
+      "to": "dev",
+      "label": "SET_CONFIG 1",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "dev": {
+      "label": "Keyboard",
+      "sub": "configured",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "The controller wrote the results into the event ring by DMA and raises one interrupt. The driver reads the whole story without touching individual packets.",
+    "msgs": [
+     {
+      "from": "xhci",
+      "to": "ram",
+      "label": "events by DMA",
+      "tone": "muted"
+     },
+     {
+      "from": "xhci",
+      "to": "drv",
+      "label": "MSI-X interrupt",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "drv": {
+      "label": "Kernel driver",
+      "sub": "binds usbhid",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Steady state: the host polls the interrupt endpoint every 10 ms. The keyboard answers NAK, 'nothing new', which costs the CPU nothing.",
+    "msgs": [
+     {
+      "from": "xhci",
+      "to": "dev",
+      "label": "IN token",
+      "tone": "muted"
+     },
+     {
+      "from": "dev",
+      "to": "xhci",
+      "label": "NAK",
+      "tone": "muted"
+     }
+    ],
+    "set": {
+     "xhci": {
+      "label": "xHCI controller",
+      "sub": "hardware polls",
+      "tone": "normal"
+     }
+    }
+   },
+   {
+    "say": "A key is pressed. At the next poll the keyboard answers with its 8-byte report (key code 0x04 for A). Average wait: 5 ms, half the interval.",
+    "msgs": [
+     {
+      "from": "xhci",
+      "to": "dev",
+      "label": "IN token",
+      "tone": "accent"
+     },
+     {
+      "from": "dev",
+      "to": "xhci",
+      "label": "report 00 00 04 ..",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "dev": {
+      "label": "Keyboard",
+      "sub": "key A down",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "The controller DMA-writes the report into RAM and interrupts the CPU once. The keyboard never interrupted anything: the host asked, and the host told the CPU.",
+    "msgs": [
+     {
+      "from": "xhci",
+      "to": "ram",
+      "label": "report by DMA",
+      "tone": "ok"
+     },
+     {
+      "from": "xhci",
+      "to": "drv",
+      "label": "interrupt",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "drv": {
+      "label": "Kernel driver",
+      "sub": "KEY_A event",
+      "tone": "ok"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "nfc-load-modulation",
+  "concept": "nfc",
+  "title": "A card powers up and answers without a transmitter",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "field",
+    "label": "13.56 MHz magnetic field (near zone)",
+    "x": 10,
+    "y": 20,
+    "w": 700,
+    "h": 200
+   }
+  ],
+  "actors": [
+   {
+    "id": "rd",
+    "label": "Reader coil",
+    "x": 40,
+    "y": 100,
+    "w": 140,
+    "h": 60,
+    "shape": "box",
+    "sub": "off"
+   },
+   {
+    "id": "card",
+    "label": "Card coil",
+    "x": 440,
+    "y": 100,
+    "w": 140,
+    "h": 60,
+    "shape": "box",
+    "sub": "no power"
+   },
+   {
+    "id": "chip",
+    "label": "Card chip",
+    "x": 440,
+    "y": 290,
+    "w": 140,
+    "h": 56,
+    "shape": "box",
+    "sub": "off"
+   },
+   {
+    "id": "det",
+    "label": "Reader detector",
+    "x": 40,
+    "y": 290,
+    "w": 150,
+    "h": 56,
+    "shape": "box",
+    "sub": "waiting"
+   },
+   {
+    "id": "scope",
+    "label": "Spectrum",
+    "x": 240,
+    "y": 290,
+    "w": 160,
+    "h": 56,
+    "shape": "note",
+    "sub": "carrier only"
+   }
+  ],
+  "links": [
+   {
+    "from": "rd",
+    "to": "det"
+   },
+   {
+    "from": "card",
+    "to": "chip"
+   }
+  ],
+  "steps": [
+   {
+    "say": "The reader drives its coil with a 13.56 MHz alternating current. The wavelength is 22 m, so the coil does not radiate; it fills the space near it with a magnetic field.",
+    "set": {
+     "rd": {
+      "label": "Reader coil",
+      "sub": "13.56 MHz field",
+      "tone": "accent"
+     },
+     "scope": {
+      "label": "Spectrum",
+      "sub": "carrier only",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "The card coil sits in the changing field. Faraday's law makes a voltage appear: about 2.4 V peak for a 5-turn, 30 cm2 coil at 1.5 A/m.",
+    "msgs": [
+     {
+      "from": "rd",
+      "to": "card",
+      "label": "magnetic flux",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "card": {
+      "label": "Card coil",
+      "sub": "emf ~2.4 V",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "A rectifier and regulator turn the voltage into a few milliwatts of DC. After a few milliseconds the chip starts, and it divides the carrier by 128 to get its bit clock.",
+    "msgs": [
+     {
+      "from": "card",
+      "to": "chip",
+      "label": "DC supply",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "chip": {
+      "label": "Card chip",
+      "sub": "awake, clk fc/128",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Reader to card: the reader switches its field off for 2 to 3 microseconds inside each bit (Modified Miller coding, 106 kbit/s). Here it sends REQA, 'is any card there?'",
+    "msgs": [
+     {
+      "from": "rd",
+      "to": "card",
+      "label": "REQA (pauses)",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "rd": {
+      "label": "Reader coil",
+      "sub": "pauses = bits",
+      "tone": "accent"
+     },
+     "chip": {
+      "label": "Card chip",
+      "sub": "decodes REQA",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "Card to reader: the chip has no transmitter. It switches a load across its coil at 847.5 kHz, in a Manchester pattern, to say ATQA.",
+    "msgs": [
+     {
+      "from": "chip",
+      "to": "card",
+      "label": "switch load",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "card": {
+      "label": "Card coil",
+      "sub": "load @847.5 kHz",
+      "tone": "warn"
+     },
+     "chip": {
+      "label": "Card chip",
+      "sub": "sending ATQA",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "Through the mutual coupling, the changing load shows up as a tiny change of voltage on the reader coil.",
+    "msgs": [
+     {
+      "from": "card",
+      "to": "rd",
+      "label": "reflected load",
+      "tone": "warn"
+     }
+    ],
+    "set": {
+     "rd": {
+      "label": "Reader coil",
+      "sub": "voltage ripples",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "In frequency terms the reply is two sidebands at 13.56 MHz plus and minus 847.5 kHz, away from the noisy carrier. A narrow filter can pick them out.",
+    "msgs": [
+     {
+      "from": "rd",
+      "to": "det",
+      "label": "coil voltage",
+      "tone": "muted"
+     }
+    ],
+    "set": {
+     "scope": {
+      "label": "Spectrum",
+      "sub": "carrier+sidebands",
+      "tone": "warn"
+     },
+     "det": {
+      "label": "Reader detector",
+      "sub": "filters sidebands",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "The detector demodulates the bits and checks the CRC. ATQA is accepted; anticollision and SELECT follow, then the payment dialogue of about 100 to 200 ms.",
+    "set": {
+     "det": {
+      "label": "Reader detector",
+      "sub": "ATQA, CRC ok",
+      "tone": "ok"
+     },
+     "scope": {
+      "label": "Spectrum",
+      "sub": "answer decoded",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Pull the card away: the field falls with 1/r3, but the reflected reply falls with about 1/r6. Soon the reply sinks below the noise.",
+    "move": {
+     "card": {
+      "x": 560,
+      "y": 100
+     },
+     "chip": {
+      "x": 560,
+      "y": 290
+     }
+    },
+    "msgs": [
+     {
+      "from": "card",
+      "to": "rd",
+      "label": "reply too weak",
+      "tone": "bad",
+      "lost": true
+     }
+    ],
+    "set": {
+     "det": {
+      "label": "Reader detector",
+      "sub": "below noise: retry",
+      "tone": "bad"
+     },
+     "scope": {
+      "label": "Spectrum",
+      "sub": "sidebands lost",
+      "tone": "bad"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "id": "display-scanout-vsync",
+  "concept": "display",
+  "title": "Scanout and vsync: frames, flips and tearing",
+  "w": 720,
+  "h": 400,
+  "groups": [
+   {
+    "id": "ram",
+    "label": "RAM",
+    "x": 190,
+    "y": 10,
+    "w": 170,
+    "h": 220
+   }
+  ],
+  "actors": [
+   {
+    "id": "gpu",
+    "label": "GPU / compositor",
+    "x": 10,
+    "y": 85,
+    "w": 130,
+    "h": 56,
+    "shape": "box",
+    "sub": "draws frames"
+   },
+   {
+    "id": "a",
+    "label": "Buffer A",
+    "x": 205,
+    "y": 40,
+    "w": 140,
+    "h": 56,
+    "shape": "box",
+    "sub": "frame N"
+   },
+   {
+    "id": "b",
+    "label": "Buffer B",
+    "x": 205,
+    "y": 140,
+    "w": 140,
+    "h": 56,
+    "shape": "box",
+    "sub": "empty"
+   },
+   {
+    "id": "ctrl",
+    "label": "Display ctrl",
+    "x": 430,
+    "y": 85,
+    "w": 130,
+    "h": 56,
+    "shape": "box",
+    "sub": "scanout idle"
+   },
+   {
+    "id": "panel",
+    "label": "Panel",
+    "x": 610,
+    "y": 85,
+    "w": 100,
+    "h": 56,
+    "shape": "box",
+    "sub": "LCD / OLED"
+   },
+   {
+    "id": "clock",
+    "label": "Timeline",
+    "x": 190,
+    "y": 290,
+    "w": 340,
+    "h": 60,
+    "shape": "note",
+    "sub": "vblank every 16.7 ms (60 Hz)"
+   }
+  ],
+  "links": [
+   {
+    "from": "gpu",
+    "to": "b"
+   },
+   {
+    "from": "ctrl",
+    "to": "panel"
+   }
+  ],
+  "steps": [
+   {
+    "say": "The display controller reads frame N from buffer A by DMA, line by line, and sends the pixels to the panel on a 148.5 MHz pixel clock.",
+    "msgs": [
+     {
+      "from": "a",
+      "to": "ctrl",
+      "label": "DMA lines",
+      "tone": "ok"
+     },
+     {
+      "from": "ctrl",
+      "to": "panel",
+      "label": "pixels",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "a": {
+      "label": "Buffer A",
+      "sub": "being scanned out",
+      "tone": "ok"
+     },
+     "ctrl": {
+      "label": "Display ctrl",
+      "sub": "line 0 of 1080",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "The scan takes 16 ms for the visible lines, then a 0.7 ms vertical blank. It never waits for anyone.",
+    "set": {
+     "ctrl": {
+      "label": "Display ctrl",
+      "sub": "line 540 of 1080",
+      "tone": "ok"
+     },
+     "clock": {
+      "label": "Timeline",
+      "sub": "t = 8 ms",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "Meanwhile the GPU draws frame N+1 into buffer B, the one nobody is reading.",
+    "msgs": [
+     {
+      "from": "gpu",
+      "to": "b",
+      "label": "draw",
+      "tone": "accent"
+     }
+    ],
+    "set": {
+     "b": {
+      "label": "Buffer B",
+      "sub": "frame N+1, drawing",
+      "tone": "accent"
+     }
+    }
+   },
+   {
+    "say": "Frame N+1 is finished early. With vsync the GPU may not swap now, because the controller is still reading A. It waits for the vertical blank.",
+    "set": {
+     "b": {
+      "label": "Buffer B",
+      "sub": "ready, waiting",
+      "tone": "warn"
+     },
+     "gpu": {
+      "label": "GPU / compositor",
+      "sub": "waits for vblank",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "At the vertical blank the new buffer address is latched in one step. Scanout now reads B from line 0. Every pixel of the frame comes from one image: no tear.",
+    "msgs": [
+     {
+      "from": "b",
+      "to": "ctrl",
+      "label": "DMA lines",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "a": {
+      "label": "Buffer A",
+      "sub": "free",
+      "tone": "muted"
+     },
+     "b": {
+      "label": "Buffer B",
+      "sub": "being scanned out",
+      "tone": "ok"
+     },
+     "ctrl": {
+      "label": "Display ctrl",
+      "sub": "flip at vblank",
+      "tone": "ok"
+     },
+     "gpu": {
+      "label": "GPU / compositor",
+      "sub": "draws into A",
+      "tone": "normal"
+     },
+     "clock": {
+      "label": "Timeline",
+      "sub": "t = 16.7 ms: flip",
+      "tone": "ok"
+     }
+    }
+   },
+   {
+    "say": "Without vsync the GPU would swap whenever it finished. Say it swaps 5.3 ms into the scan, at about line 358.",
+    "set": {
+     "gpu": {
+      "label": "GPU / compositor",
+      "sub": "swaps now",
+      "tone": "bad"
+     },
+     "clock": {
+      "label": "Timeline",
+      "sub": "t = 5.3 ms",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "Lines 1 to 358 on the screen came from the old frame and the rest from the new one. A moving edge breaks at that line: tearing.",
+    "msgs": [
+     {
+      "from": "ctrl",
+      "to": "panel",
+      "label": "old top, new low",
+      "tone": "bad"
+     }
+    ],
+    "set": {
+     "panel": {
+      "label": "Panel",
+      "sub": "TEAR at line 358",
+      "tone": "bad"
+     }
+    }
+   },
+   {
+    "say": "The price of vsync: if drawing takes 18 ms, the frame misses the vblank at 16.7 ms and the panel shows the old frame again, then waits for 33.3 ms. The rate drops to 30 fps.",
+    "set": {
+     "gpu": {
+      "label": "GPU / compositor",
+      "sub": "frame takes 18 ms",
+      "tone": "warn"
+     },
+     "panel": {
+      "label": "Panel",
+      "sub": "old frame repeated",
+      "tone": "warn"
+     },
+     "clock": {
+      "label": "Timeline",
+      "sub": "flip at 33.3 ms",
+      "tone": "warn"
+     }
+    }
+   },
+   {
+    "say": "Variable refresh rate fixes it: the controller stretches the vertical blank until the frame is ready, so the panel refreshes at 55.6 Hz with no tear and almost no extra wait.",
+    "msgs": [
+     {
+      "from": "b",
+      "to": "ctrl",
+      "label": "flip when ready",
+      "tone": "ok"
+     }
+    ],
+    "set": {
+     "ctrl": {
+      "label": "Display ctrl",
+      "sub": "vblank stretched",
+      "tone": "ok"
+     },
+     "panel": {
+      "label": "Panel",
+      "sub": "55.6 Hz, no tear",
+      "tone": "ok"
+     },
+     "gpu": {
+      "label": "GPU / compositor",
+      "sub": "frame takes 18 ms",
+      "tone": "normal"
+     },
+     "clock": {
+      "label": "Timeline",
+      "sub": "flip at 18 ms",
+      "tone": "ok"
+     }
+    }
+   }
+  ]
+ }
+]

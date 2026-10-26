@@ -8,6 +8,8 @@ Environment: DTS_CONTENT_DB=path   write the database somewhere else (tests use 
              DTS_PRACTICE_FIXTURE=1 also load tests/fixtures/problems_sample.json (UI tests)
              DTS_ANIM_FIXTURE=1 also load tests/fixtures/anim_sample.json (animated scenes for tests)
              DTS_ANIM_DIR=path  read animated scenes from another folder instead of content/anim/
+             DTS_FORMAT_FIXTURE=1 also load tests/fixtures/format_sample.txt and format_design.txt (rich-text browser test)
+             DTS_DIST=path      write the standalone page somewhere else
 """
 import glob, json, os, re, sqlite3, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -103,25 +105,36 @@ def write_db(data, path):
     db.commit(); db.execute("VACUUM"); db.close()
     os.replace(tmp, path)
 
+def _script(js):
+    return "<script>\n" + js.replace("</script", "<\\/script") + "\n</script>"
+
 def standalone(data, out):
-    """Inline web/ (css + js) and the full data into one HTML file."""
+    """Inline web/ (css + js, the Temml maths library) and the full data into one HTML file.
+    The data is embedded compressed: gzip, then base64, in a <script type="application/gzip-base64"> element that
+    web/inflate.js decodes in the browser (DecompressionStream, or its own small inflate on older browsers).
+    Returns (size of the page, size of the JSON before compression)."""
+    import base64, gzip
     web = os.path.join(ROOT, "web")
-    html = open(os.path.join(web, "index.html"), encoding="utf-8").read()
-    css = open(os.path.join(web, "app.css"), encoding="utf-8").read()
-    js = open(os.path.join(web, "app.js"), encoding="utf-8").read()
-    algo = open(os.path.join(web, "algo.js"), encoding="utf-8").read()
-    scene = open(os.path.join(web, "scene.js"), encoding="utf-8").read()
-    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
-    html = html.replace('<link rel="stylesheet" href="app.css">', "<style>\n" + css + "\n</style>")
-    html = html.replace('<script src="app.js"></script>', "<script>window.DATA=" + payload + ";</script>\n<script>\n" + js + "\n</script>")
-    html = html.replace('<script src="scene.js"></script>', "<script>\n" + scene.replace("</script", "<\\/script") + "\n</script>")
-    html = html.replace('<script src="algo.js"></script>', "<script>\n" + algo.replace("</script", "<\\/script") + "\n</script>")
-    assert "window.DATA" in html and "<style>" in html and 'src="algo.js"' not in html and 'src="scene.js"' not in html, "index.html placeholders changed"
+    read = lambda *p: open(os.path.join(web, *p), encoding="utf-8").read()
+    html = read("index.html")
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    b64 = base64.b64encode(gzip.compress(payload, 9, mtime=0)).decode("ascii")
+    data_tag = '<script id="dts-data" type="application/gzip-base64">' + b64 + "</script>\n" + _script(read("inflate.js"))
+    html = html.replace('<link rel="stylesheet" href="app.css">', "<style>\n" + read("app.css") + "\n</style>")
+    for name, body in (("vendor/temml.min.js", "/* Temml 0.13.5 (MIT License, https://temml.org), LaTeX to MathML */\n" + read("vendor", "temml.min.js")),
+                       ("rich.js", read("rich.js")), ("scene.js", read("scene.js")), ("algo.js", read("algo.js"))):
+        tag = '<script src="%s"></script>' % name
+        assert tag in html, "index.html placeholder changed: " + tag
+        html = html.replace(tag, _script(body))
+    tag = '<script src="app.js"></script>'
+    assert tag in html, "index.html placeholder changed: " + tag
+    html = html.replace(tag, data_tag + "\n" + _script(read("app.js")))
+    assert "<style>" in html and '<script src="' not in html, "index.html placeholders changed"
     # the hosted page gets its own document shell, so drop ours
     html = re.sub(r"(?is)<!doctype html>\s*|</?html[^>]*>\s*|</?head>\s*|</?body>\s*", "", html)
     html = re.sub(r'<meta charset="utf-8">\s*', "", html)
     open(out, "w", encoding="utf-8").write(html)
-    return len(html)
+    return len(html.encode("utf-8")), len(payload)
 
 PRACTICE_KEYS = ("id", "title", "pattern", "difficulty", "statement", "fn", "params", "tests", "starter", "solution")
 FIXTURE = os.path.join(ROOT, "tests", "fixtures", "problems_sample.json")
@@ -145,6 +158,8 @@ def load_practice():
     return out, errs
 
 ANIM_FIXTURE = os.path.join(ROOT, "tests", "fixtures", "anim_sample.json")
+FORMAT_FIXTURE = os.path.join(ROOT, "tests", "fixtures", "format_sample.txt")    # rich-text sample reads (DTS_FORMAT_FIXTURE=1)
+FORMAT_DESIGN = os.path.join(ROOT, "tests", "fixtures", "format_design.txt")
 
 def load_scenes(node_ids):
     """Animated scenes: every content/anim/*.json (a JSON list of scenes; DTS_ANIM_DIR points elsewhere), validated with
@@ -174,7 +189,8 @@ def main():
     args = sys.argv[1:]
     t0 = time.time()
     try:
-        data = kg.load()
+        fx = os.environ.get("DTS_FORMAT_FIXTURE")
+        data = kg.load(extra=[FORMAT_FIXTURE] if fx else (), extra_designs=[FORMAT_DESIGN] if fx else ())
     except kg.ContentError as e:
         print("CONTENT ERRORS:\n  " + str(e).replace("\n", "\n  "), file=sys.stderr); sys.exit(1)
     data["practice"], perrs = load_practice()
@@ -194,9 +210,9 @@ def main():
     write_db(data, db)
     print(f"wrote {os.path.relpath(db, ROOT)} ({os.path.getsize(db)//1024} KB)")
     if "--no-html" not in args:
-        out = os.path.join(ROOT, "dist", "down-the-stack.html")
-        size = standalone(data, out)
-        print(f"wrote {os.path.relpath(out, ROOT)} ({size//1024} KB)")
+        out = os.environ.get("DTS_DIST") or os.path.join(ROOT, "dist", "down-the-stack.html")
+        size, raw = standalone(data, out)
+        print(f"wrote {os.path.relpath(out, ROOT)} ({size//1024} KB; content {raw//1024} KB before gzip + base64)")
     print(f"done in {time.time()-t0:.1f}s")
 
 if __name__ == "__main__":

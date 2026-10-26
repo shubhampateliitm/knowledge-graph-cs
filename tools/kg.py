@@ -12,6 +12,9 @@ Source files (plain text, easy to diff and edit):
                              terms: "Term — definition" per line;  quiz: "question || answer" per line
                              diagram: preformatted lines (leading spaces kept, max 72 columns)
                              mistakes: one misunderstanding per paragraph
+                             rich text (content/FORMAT.md): a line that is only ```lang opens a code block that runs to a
+                             line that is only ``` (kept verbatim as one paragraph, max 72 columns); \\[ ... \\] is display
+                             maths (always its own paragraph, may span lines); \\( ... \\) inline maths; `code`; **bold**
   content/reads/long/*.txt   "@@ id" replaces a read with a long one; "@@+ id" extends an existing read.
                              Every read touched here is marked as a deep read.
 Layer essays use the ids L0 .. L5.
@@ -62,6 +65,72 @@ def _file_lines(path):
             yield path, ln, line.rstrip("\n")
 
 
+# ---- rich text (v9): fenced code blocks and display maths ----
+FENCE_RE = re.compile(r"^```([A-Za-z0-9+#-]*)$")
+CODE_LANGS = {"sql", "python", "scala", "java", "js", "ts", "go", "rust", "c", "bash", "json", "yaml", "text"}
+LANG_ALIAS = {"py": "python", "javascript": "js", "typescript": "ts", "sh": "bash", "shell": "bash", "console": "bash",
+              "yml": "yaml", "cpp": "c", "c++": "c", "kotlin": "java", "": "text", "txt": "text", "plain": "text"}
+CODE = "\x00code:"            # marks a collapsed fenced block in the line stream (never in real content)
+NO_CODE = ("terms",) + ("quiz", "interview", "followups")
+
+
+def _rich_stream(items, errs, width=72):
+    """Collapse fenced code blocks and multi-line display maths into single stream items.
+    items: list of tuples whose [0], [1], [2] are file, line number and the raw line (extra fields pass through).
+    A fenced block becomes one item whose line is CODE + "```lang\n...code...\n```" (indentation of the opening
+    fence removed, inner lines verbatim, blank lines and '# ' lines kept). Lines inside a fence are never section keys."""
+    out, i, n = [], 0, len(items)
+    while i < n:
+        it = items[i]; f, ln, line = it[0], it[1], it[2]
+        m = FENCE_RE.match(line.strip())
+        if m:
+            lang = m.group(1).lower(); lang = LANG_ALIAS.get(lang, lang)
+            if lang not in CODE_LANGS: errs.append(f"{f}:{ln} unknown code block language {m.group(1)!r} (use {', '.join(sorted(CODE_LANGS))})")
+            ind = line.expandtabs(4)[:len(line.expandtabs(4)) - len(line.expandtabs(4).lstrip())]
+            body, j, closed = [], i + 1, False
+            while j < n and items[j][0] == f:
+                raw = items[j][2].expandtabs(4)
+                if raw.strip() == "```": closed = True; break
+                if raw.startswith("@@ ") or raw.startswith("@@+ "): break
+                if ind and raw.startswith(ind): raw = raw[len(ind):]
+                raw = raw.rstrip()
+                if len(raw) > width: errs.append(f"{f}:{items[j][1]} code block line longer than {width} columns")
+                body.append(raw); j += 1
+            if not closed:
+                errs.append(f"{f}:{ln} code block is not closed (a line that is only ``` ends it)"); i = j; continue
+            while body and not body[-1].strip(): body.pop()
+            while body and not body[0].strip(): body.pop(0)
+            if not body: errs.append(f"{f}:{ln} empty code block")
+            out.append((f, ln, CODE + "```" + lang + "\n" + "\n".join(body) + "\n```") + tuple(it[3:])); i = j + 1; continue
+        st = line.strip()
+        if st.startswith("\\[") and "\\]" not in st:
+            parts, j = [st], i + 1
+            while j < n and items[j][0] == f and "\\]" not in items[j][2] and items[j][2].strip() and not items[j][2].startswith("@@"):
+                parts.append(items[j][2].strip()); j += 1
+            if j < n and items[j][0] == f and "\\]" in items[j][2]:
+                parts.append(items[j][2].strip())
+                out.append((f, ln, " ".join(parts)) + tuple(it[3:])); i = j + 1; continue
+            errs.append(f"{f}:{ln} display maths \\[ is not closed with \\]")
+        out.append(it); i += 1
+    return out
+
+
+def split_display(text):
+    """A paragraph with \\[ ... \\] inside it becomes several: text before, the display maths, text after."""
+    if "\\[" not in text: return [text]
+    out = []
+    for piece in re.split(r"(\\\[.*?\\\])", text):
+        piece = piece.strip()
+        if piece: out.append(piece)
+    return out
+
+
+def check_rich(text, where, errs):
+    if text.startswith("```"): return
+    if text.count("\\(") != text.count("\\)"): errs.append(f"{where} unbalanced inline maths \\( ... \\)")
+    if text.count("\\[") != text.count("\\]"): errs.append(f"{where} unbalanced display maths \\[ ... \\]")
+
+
 def check_animation(lines):
     """An animation is a list of frames; each frame starts with '== caption' and has at least one drawing line."""
     if not lines: return []
@@ -84,10 +153,14 @@ DESIGN_RE = re.compile(r"^(" + "|".join(DESIGN_SECTIONS) + r"|ref|title|category
 def load_designs(nodes, errs, extra=()):
     """content/design/*.txt: '@@ id' then title:, category:, level:, concepts: id, id, ... and the design sections."""
     designs, cur, sec, cur_file = [], None, None, None
-    lines = list(_lines("content/design/*.txt")) + [x for e in extra for x in _file_lines(e)]
-    for f, ln, line in lines:
+    lines = _rich_stream(list(_lines("content/design/*.txt")) + [x for e in extra for x in _file_lines(e)], errs)
+    for idx, (f, ln, line) in enumerate(lines):
         if f != cur_file: cur_file, cur, sec = f, None, None
         raw = line.rstrip(); line = line.strip(); where = f"{f}:{ln}"
+        if raw.startswith(CODE):
+            if cur is None or sec is None: errs.append(f"{where} code block before any section"); continue
+            if sec in RAW or sec in NO_CODE: errs.append(f"{where} code blocks are not allowed in {sec}"); continue
+            cur["rd"][sec].append(raw[len(CODE):]); continue
         if not line or line.startswith("# "): continue
         if line.startswith("@@ "):
             cur = dict(id=line[3:].strip(), title="", category="", level="", concepts=[], rd={s: [] for s in DESIGN_SECTIONS}, refs=[])
@@ -108,13 +181,14 @@ def load_designs(nodes, errs, extra=()):
                 if p[0] not in REF_KINDS: errs.append(f"{where} unknown ref kind {p[0]!r}")
                 cur["refs"].append(dict(k=p[0], t=p[1], w=p[2], u="|".join(p[3:]).strip())); continue
             sec = key
-            if val: cur["rd"][sec].append(val)
+            if val:
+                for t in split_display(val): check_rich(t, where, errs); cur["rd"][sec].append(t)
             continue
         if sec is None: errs.append(f"{where} paragraph before any section"); continue
         if sec in RAW:
             if len(raw) > 72: errs.append(f"{where} {sec} line longer than 72 columns")
             cur["rd"][sec].append(line if line.startswith("== ") else raw); continue
-        cur["rd"][sec].append(line)
+        for t in split_display(line) if sec not in NO_CODE else [line]: check_rich(t, where, errs); cur["rd"][sec].append(t)
     seen = set()
     for d in designs:
         if d["id"] in seen: errs.append(f"duplicate design {d['id']}")
@@ -245,10 +319,15 @@ def load(root=None, extra=(), extra_designs=()):
             [(f, ln, l, False) for f, ln, l in _lines("content/reads/more/*.txt")] + \
             [(f, ln, l, True) for f, ln, l in _lines("content/reads/long/*.txt")] + \
             [(f, ln, l, True) for x in extra for f, ln, l in _file_lines(x)]
+    files = _rich_stream(files, errs)
     rd = sec = None; cur_file = None
-    for f, ln, line, is_long in files:
+    for idx, (f, ln, line, is_long) in enumerate(files):
         if f != cur_file: cur_file, rd, sec = f, None, None   # a read never continues into the next file
         raw = line.rstrip(); line = line.strip(); where = f"{f}:{ln}"
+        if raw.startswith(CODE):
+            if rd is None or sec is None: errs.append(f"{where} code block before any section"); continue
+            if sec in RAW or sec in NO_CODE: errs.append(f"{where} code blocks are not allowed in {sec}"); continue
+            rd["rd"][sec].append(raw[len(CODE):]); continue
         if not line or line.startswith("# "): continue
         if line.startswith("@@+ ") or line.startswith("@@ "):
             ext = line.startswith("@@+ ")
@@ -276,14 +355,16 @@ def load(root=None, extra=(), extra_designs=()):
             rd["refs"].append(dict(k=kind, t=title, w=who, u=url)); continue
         if m:
             sec = m.group(1)
-            if m.group(2): rd["rd"][sec].append(m.group(2))
-            elif sec not in RAW: errs.append(f"{where} empty {sec}: line")
+            if m.group(2):
+                for t in split_display(m.group(2)) if sec not in NO_CODE else [m.group(2)]: check_rich(t, where, errs); rd["rd"][sec].append(t)
+            elif sec not in RAW and not (idx + 1 < len(files) and files[idx + 1][0] == f and files[idx + 1][2].startswith(CODE)):
+                errs.append(f"{where} empty {sec}: line")   # allowed only when a code block follows directly
             continue
         if sec is None: errs.append(f"{where} paragraph before any section"); continue
         if sec in RAW:
             if len(raw) > 72: errs.append(f"{where} {sec} line longer than 72 columns")
             rd["rd"][sec].append(line if line.startswith("== ") else raw); continue
-        rd["rd"][sec].append(line)
+        for t in split_display(line) if sec not in NO_CODE else [line]: check_rich(t, where, errs); rd["rd"][sec].append(t)
 
     layer_reads = []
     for L in range(6):

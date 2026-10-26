@@ -18,6 +18,10 @@ const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const ease = t => t<.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2, 3)/2;
 const clone = o => JSON.parse(JSON.stringify(o));
 const SPEEDS = [0.5, 1, 2];
+// text size rule: message, link and group labels are BASE drawing units at full size. When the drawing is shown small they grow so
+// they stay MINPX on screen, but only as far as the scene has room (no label covers a box or another label). A scene with too
+// little room for readable labels at the fitted size opens zoomed (it scrolls inside its frame); "Fit" shows all of it.
+const BASE = 11, MINPX = 10, GROWS = [1.6, 1.5, 1.4, 1.3, 1.2, 1.1, 1];
 const live = new Set();
 let uid = 0;
 
@@ -78,14 +82,15 @@ function wrap(text, size, kind, weight, maxW, maxLines){
   if(lines.length > maxLines || lines.some(l=>tw(l, size, kind, weight) > maxW)) return null;
   return lines;
 }
-// label and sub-label lines that fit inside the actor; bigger than the base size when the drawing is shown small (phones)
-function layout(a, scale){
+// label and sub-label lines that fit inside the actor; grow > 1 starts bigger (drawing shown small), then shrinks until it fits
+function layout(a, grow){
   const mono = a.shape==="cell", kind = mono ? "mono" : "body";
-  const base = mono ? 13.5 : 14, sbase = 11.5;
+  const base = mono ? 13.5 : 14, sbase = 11.5, g = clamp(grow||1, 1, 1.6);
   const padX = a.shape==="circle" ? a.w*.17 : a.shape==="note" ? 12 : 8;
-  const aw = Math.max(16, a.w - 2*padX), ah = Math.max(12, a.h - (a.shape==="db" ? Math.min(11, a.h*.2) + 8 : 6));
-  let L = Math.min(base*1.55, Math.max(base, 10.5/scale)), S = Math.min(sbase*1.55, Math.max(sbase, 9.5/scale));
-  const floorL = base*.7, floorS = sbase*.75;
+  const e = a.shape==="db" ? Math.min(11, a.h*.2) : 0;
+  const aw = Math.max(16, a.w - 2*padX), ah = Math.max(12, a.h - (a.shape==="db" ? e + 8 : 6));
+  let L = base*g, S = sbase*g;
+  const floorL = base*.7, floorS = sbase*.83;
   let last = null;
   for(let i=0; i<16; i++){
     const ll = a.label ? wrap(a.label, L, kind, 600, aw, 3) : [];
@@ -93,10 +98,19 @@ function layout(a, scale){
     if(ll && sl){
       const hgt = ll.length*L*1.12 + (sl.length ? 2 + sl.length*S*1.16 : 0);
       last = {L, S, ll, sl, kind};
-      if(hgt <= ah) return last;
+      let fits = hgt <= ah;
+      // a cylinder's text is centred e/2 + 1.5 low; its top (about .2 L above the first line box) must clear the top ellipse (2e)
+      if(fits && e) fits = hgt + .4*L <= a.h - 3*e + 3.8;
+      if(fits && a.shape==="circle"){   // the corners of the text block must stay inside the ellipse
+        const bw = Math.max(0, ...ll.map(t=>tw(t, L, kind, 600)), ...sl.map(t=>tw(t, S, "body", 400)));
+        fits = (bw/a.w)**2 + ((hgt/2 + .25*L)/(a.h/2))**2 <= .97;   // the block's top reaches about .25 L above its line boxes
+      }
+      if(fits) return last;
     }
     if(L<=floorL && S<=floorS) break;
-    L = Math.max(floorL, L*.92); S = Math.max(floorS, S*.92);
+    // shrinking from a grown size tries the full-size pair exactly, so growing never ends smaller than not growing
+    const nL = Math.max(floorL, L*.92), nS = Math.max(floorS, S*.92);
+    if(L > base+.01 && nL < base){ L = base; S = Math.min(S, sbase); } else { L = nL; S = nS; }
   }
   return last || {L, S, ll:a.label?[a.label]:[], sl:a.sub?[a.sub]:[], kind};
 }
@@ -133,7 +147,7 @@ function shapeSVG(a){
 function textSVG(a, lay){
   const w = a.w, h = a.h, lh = lay.L*1.12, sh = lay.S*1.16;
   const total = lay.ll.length*lh + (lay.sl.length ? 2 + lay.sl.length*sh : 0);
-  let y = (h - total)/2 + (a.shape==="db" ? Math.min(11, h*.2)/2 : 0), out = "";
+  let y = (h - total)/2 + (a.shape==="db" ? Math.min(11, h*.2)/2 + 1.5 : 0), out = "";
   if(lay.ll.length){
     out += `<text class="sc-lab${lay.kind==="mono"?" mono":""}" font-size="${r1(lay.L)}" text-anchor="middle">` + lay.ll.map((t,i)=>`<tspan x="${w/2}" y="${r1(y + lh*i + lay.L*.8)}">${esc(t)}</tspan>`).join("") + `</text>`;
     y += lay.ll.length*lh + 2;
@@ -142,11 +156,56 @@ function textSVG(a, lay){
   return out;
 }
 
+// labels of repeated messages (same sender and receiver in one step) stack outwards instead of covering each other
+function repeats(msgs){ const seen = {}; return msgs.map(m=>{ const k = m.from + ">" + m.to; seen[k] = (seen[k]||0) + 1; return seen[k] - 1; }); }
+
+/* ---------------- room: the biggest label growth with no collisions in any step ---------------- */
+// mirrors where Stage draws link labels, message pills (of the step that led to each state) and group labels
+function labelRects(sc, st, prev, step, f){
+  const W = +sc.w || 720, H = +sc.h || 400, fs = BASE*f, out = {labels:[], groups:[]};
+  const pos = id => st.a[id] || (prev && prev.a[id]);
+  for(const l of st.links){ const A = st.a[l.from], B = st.a[l.to]; if(!l.label || !A || !B) continue;
+    const s = seg(A, B, st.links.some(x=>x.from===l.to && x.to===l.from) ? 5 : 0, 5), w = tw(l.label, fs, "body", 500);
+    const x = (s.x1+s.x2)/2 + s.sx*fs*.9, y = (s.y1+s.y2)/2 + s.sy*fs*.9 + fs*.35;
+    out.labels.push({x:x-w/2, y:y-fs, w, h:fs*1.25}); }
+  const ms = ((step && step.msgs) || []).filter(m=>m && m.from!==m.to), rp = repeats(ms);
+  ms.forEach((m, i)=>{ const A = pos(m.from), B = pos(m.to); if(!m.label || !A || !B) return;
+    const linked = st.links.some(l=>(l.from===m.from && l.to===m.to) || (l.from===m.to && l.to===m.from)), s = seg(A, B, linked ? 11 : 7, 4);
+    const f2 = m.lost ? .5 : 1, ex = s.x1 + (s.x2-s.x1)*f2, ey = s.y1 + (s.y2-s.y1)*f2, px = m.lost ? ex : (s.x1+ex)/2, py = m.lost ? ey : (s.y1+ey)/2;
+    const w = tw(String(m.label), fs, "mono", 500) + fs*1.1, h = fs*1.65, off = s.off + h/2 + 5 + rp[i]*(h + 4);
+    const x = clamp(px + s.sx*off, w/2 + 2, W - w/2 - 2), y = clamp(py + s.sy*off, h/2 + 2, H - h/2 - 2);
+    out.labels.push({x:x-w/2, y:y-h/2, w, h}); });
+  for(const g of sc.groups || []){ const t = String(g.label||"").toUpperCase(); if(!t) continue;
+    out.groups.push({x:(+g.x||0)+12, y:(+g.y||0)+8 + fs*.75 - fs, w:tw(t, fs, "mono", 400) + t.length*fs*.07, h:fs*1.25}); }
+  return out;
+}
+const ovl = (a, b) => [Math.min(a.x+a.w, b.x+b.w) - Math.max(a.x, b.x), Math.min(a.y+a.h, b.y+b.h) - Math.max(a.y, b.y)];
+function clean(sc, sts, f){
+  const steps = sc.steps || [], n = steps.length, W = +sc.w || 720, H = +sc.h || 400;
+  for(let k = n ? 1 : 0; k <= n; k++){
+    const st = sts[k], A = st.order.map(id=>st.a[id]), r = labelRects(sc, st, sts[k-1], steps[k-1], f), L = r.labels;
+    for(const q of L){
+      if(q.x < -1 || q.y < -1 || q.x+q.w > W+1 || q.y+q.h > H+1) return false;
+      for(const a of A){ const [ox, oy] = ovl(q, a); if(ox > 0 && oy > 0 && ox*oy > .05*q.w*q.h) return false; } }
+    for(let i=0; i<L.length; i++) for(let j=i+1; j<L.length; j++){ const [ox, oy] = ovl(L[i], L[j]); if(ox > 1 && oy > 1) return false; }
+    for(const q of r.groups) for(const a of A){ const [ox, oy] = ovl(q, a); if(ox > 0 && oy > 0) return false; }
+  }
+  return true;
+}
+let ROOM = new WeakMap();
+function roomOf(sc, sts){
+  if(!ROOM.has(sc)){ let small = 99; const seen = new Set();   // smallest text inside a box at full size: boxes that are tight on text
+    for(const st of sts) for(const id of st.order){ const a = st.a[id], key = [a.shape, a.w, a.h, a.label, a.sub].join("\u0001"); if(seen.has(key)) continue; seen.add(key);
+      const lay = layout(a, 1); if(a.label) small = Math.min(small, lay.L); if(a.sub) small = Math.min(small, lay.S); }
+    ROOM.set(sc, {f:GROWS.find(f=>clean(sc, sts, f)) || 1, small}); }
+  return ROOM.get(sc);
+}
+
 /* ---------------- stage: draws one state, animates one step ---------------- */
 class Stage {
   constructor(svg, sc){
     this.svg = svg; this.sc = sc; this.W = +sc.w || 720; this.H = +sc.h || 400; this.id = "scn" + (++uid);
-    this.scale = 1; this.speed = 1; this.tok = 0; this.raf = 0; this.dying = []; this.busy = false;
+    this.scale = 1; this.grow = 1; this.speed = 1; this.tok = 0; this.raf = 0; this.dying = []; this.busy = false;
     this.nodes = {}; this.lnodes = {}; this.disp = {a:{}, order:[], links:[]}; this.base = this.disp; this.ghostMsgs = [];
     svg.setAttribute("viewBox", `0 0 ${this.W} ${this.H}`);
     svg.classList.add("sc-svg");
@@ -156,8 +215,9 @@ class Stage {
       `<g class="sc-links"></g><g class="sc-ghosts"></g><g class="sc-actors"></g><g class="sc-rings"></g><g class="sc-fx"></g>`;
     this.L = {}; ["links","ghosts","actors","rings","fx"].forEach(k=>this.L[k] = svg.querySelector(".sc-"+k));
   }
-  setScale(s){ s = clamp(Math.round(s*20)/20, .2, 2); if(s===this.scale) return false; this.scale = s; return true; }
-  get fs(){ return clamp(10/this.scale, 11, 17); }          // message label size
+  setScale(s, g){ s = clamp(Math.round(s*100)/100, .2, 2); g = clamp(Math.round((g||1)*100)/100, 1, 1.6);
+    if(s===this.scale && g===this.grow) return false; this.scale = s; this.grow = g; return true; }
+  get fs(){ return BASE*this.grow; }                       // message, link and group label size
   get dotR(){ return clamp(3.6/this.scale, 6, 9); }
   later(fn, ms){ const tok = this.tok; setTimeout(()=>{ if(tok===this.tok) fn(); }, ms); }
   tween(dur, frame, end, next){
@@ -193,9 +253,9 @@ class Stage {
     if(n.tone!==a.tone){ if(n.tone){ n.g.classList.remove("t-"+n.tone); changed = true; } n.g.classList.add("t-"+a.tone); n.tone = a.tone; }
     const skey = a.shape+"|"+a.w+"|"+a.h;
     if(n.skey!==skey){ n.shp.innerHTML = shapeSVG(a); n.g.setAttribute("data-shape", a.shape); n.skey = skey; }
-    const tkey = a.label+"\u0001"+a.sub+"\u0001"+a.w+"\u0001"+a.h+"\u0001"+this.scale;
+    const tkey = a.label+"\u0001"+a.sub+"\u0001"+a.w+"\u0001"+a.h+"\u0001"+this.grow;
     if(n.tkey!==tkey){ const textChanged = n.tkey && n.tkey.split("\u0001").slice(0,2).join("\u0001") !== a.label+"\u0001"+a.sub;
-      if(textChanged) changed = true; n.txt.innerHTML = textSVG(a, layout(a, this.scale)); n.tkey = tkey; }
+      if(textChanged) changed = true; n.txt.innerHTML = textSVG(a, layout(a, this.grow)); n.tkey = tkey; }
     n.g.dataset.label = a.label; n.g.dataset.sub = a.sub;
     if(changed && animated) this.flash(n.g, "chg");
     return n;
@@ -213,7 +273,7 @@ class Stage {
     }
     n.l = l; n.line.classList.toggle("dash", l.dashed);
     if(n.txt.textContent!==l.label) n.txt.textContent = l.label;
-    n.txt.setAttribute("font-size", r1(clamp(9.5/this.scale, 11, 16)));
+    n.txt.setAttribute("font-size", r1(this.fs));
     return n;
   }
   placeLink(n){
@@ -235,16 +295,17 @@ class Stage {
   msgSeg(m){ const A = this.pos(m.from), B = this.pos(m.to); if(!A || !B) return null;
     const linked = this.disp.links.some(l=>(l.from===m.from && l.to===m.to) || (l.from===m.to && l.to===m.from));
     return seg(A, B, linked ? 11 : 7, 4); }
-  labelAt(s, x, y){ const off = s.off + this.fs*1.65/2 + 5; return [x + s.sx*off, y + s.sy*off]; }
+  labelAt(s, x, y, rep){ const h = this.fs*1.65, off = s.off + h/2 + 5 + (rep||0)*(h + 4); return [x + s.sx*off, y + s.sy*off]; }
   drawGhosts(fresh){
     let h = "";
-    for(const m of this.ghostMsgs){
+    const rp = repeats(this.ghostMsgs);
+    for(const [gi, m] of this.ghostMsgs.entries()){
       const s = this.msgSeg(m); if(!s) continue;
       const tone = toneOf(m.tone), f = m.lost ? .5 : 1, ex = s.x1 + (s.x2-s.x1)*f, ey = s.y1 + (s.y2-s.y1)*f;
       const mx = (s.x1+ex)/2, my = (s.y1+ey)/2, cls = fresh && fresh.has(m) ? " gin" : "";
       h += `<g class="sc-gh t-${tone}${cls}${m.lost?" lost":""}"><line x1="${r1(s.x1)}" y1="${r1(s.y1)}" x2="${r1(ex)}" y2="${r1(ey)}"${m.lost?"":` marker-end="url(#${this.id}-${tone})"`}/>`;
       if(m.lost){ const d = 7; h += `<g class="sc-x"><line x1="${r1(ex-d)}" y1="${r1(ey-d)}" x2="${r1(ex+d)}" y2="${r1(ey+d)}"/><line x1="${r1(ex-d)}" y1="${r1(ey+d)}" x2="${r1(ex+d)}" y2="${r1(ey-d)}"/></g>`; }
-      const [lx, ly] = this.labelAt(s, m.lost ? ex : mx, m.lost ? ey : my);
+      const [lx, ly] = this.labelAt(s, m.lost ? ex : mx, m.lost ? ey : my, rp[gi]);
       if(m.label) h += this.pill(lx, ly, String(m.label), tone, m.lost ? " lost" : "");
       h += `</g>`;
     }
@@ -266,7 +327,7 @@ class Stage {
   show(state, step, prev){
     this.cancel();
     this.svg.classList.add("sc-instant");
-    const gfs = r1(clamp(9/this.scale, 11, 18));
+    const gfs = r1(this.fs);
     this.svg.querySelectorAll(".sc-gl").forEach(t=>{ if(t.getAttribute("font-size")!==String(gfs)){ t.setAttribute("font-size", gfs); t.setAttribute("y", r1(+t.dataset.y + gfs*.75)); } });
     for(const id in this.nodes) if(!state.a[id]){ this.nodes[id].g.remove(); delete this.nodes[id]; }
     this.disp = clone(state); this.base = prev || state;
@@ -308,14 +369,14 @@ class Stage {
     run();
   }
   travel(list, next){
-    const fx = this.L.fx, r = this.dotR, items = [];
-    for(const m of list){
+    const fx = this.L.fx, r = this.dotR, items = [], rp = repeats(this.ghostMsgs.concat(list)).slice(this.ghostMsgs.length);
+    for(const [li, m] of list.entries()){
       const s = this.msgSeg(m); if(!s) continue;
       const tone = toneOf(m.tone), g = document.createElementNS(NS, "g");
       g.setAttribute("class", `sc-mv t-${tone}`);
       g.innerHTML = `<line class="sc-trail" x1="${r1(s.x1)}" y1="${r1(s.y1)}" x2="${r1(s.x1)}" y2="${r1(s.y1)}"/><circle class="sc-dot" r="${r1(r)}" cx="${r1(s.x1)}" cy="${r1(s.y1)}"/>` + (m.label ? this.pill(s.x1, s.y1, String(m.label), tone, "") : "");
       fx.appendChild(g);
-      items.push({m, s, g, line:g.querySelector("line"), dot:g.querySelector("circle"), pill:g.querySelector(".sc-pill")});
+      items.push({m, s, g, rep:rp[li], line:g.querySelector("line"), dot:g.querySelector("circle"), pill:g.querySelector(".sc-pill")});
     }
     if(this.onWave && items.length) this.onWave(items.reduce((t,it)=>t + (it.s.x1+it.s.x2)/2, 0)/items.length);
     const len = Math.max(0, ...items.map(it=>Math.hypot(it.s.x2-it.s.x1, it.s.y2-it.s.y1)));
@@ -328,7 +389,7 @@ class Stage {
         it.dot.setAttribute("cx", r1(x)); it.dot.setAttribute("cy", r1(y));
         it.line.setAttribute("x2", r1(x)); it.line.setAttribute("y2", r1(y));
         if(it.m.lost) it.g.style.opacity = p > .75 ? String(1 - (p-.75)/.25*.6) : "";
-        if(it.pill){ const w = +it.pill.firstChild.getAttribute("width"), h = fs*1.65, [lx, ly] = this.labelAt(it.s, x, y);
+        if(it.pill){ const w = +it.pill.firstChild.getAttribute("width"), h = fs*1.65, [lx, ly] = this.labelAt(it.s, x, y, it.rep);
           it.pill.setAttribute("transform", `translate(${r1(clamp(lx, w/2+2, this.W-w/2-2))},${r1(clamp(ly, h/2+2, this.H-h/2-2))})`); }
       }
     }, ()=>{
@@ -405,19 +466,24 @@ class Player {
     this.root.addEventListener("keydown", e=>this.onKey(e));
     this.measure();
     if("ResizeObserver" in window){ this.ro = new ResizeObserver(()=>this.measure()); this.ro.observe(this.box); }
-    if(document.fonts && document.fonts.ready) document.fonts.ready.then(()=>{ for(const k in FONT) delete FONT[k]; if(!this.stage.busy && this.root.isConnected) this.redraw(); });
+    if(document.fonts && document.fonts.ready) document.fonts.ready.then(()=>{ for(const k in FONT) delete FONT[k]; ROOM = new WeakMap(); if(!this.stage.busy && this.root.isConnected){ this.measure(); this.redraw(); } });
     this.redraw(); this.ui();
     live.add(this);
   }
+  // fit the width with labels grown to MINPX on screen if the scene has room for that; otherwise (dense scene) open zoomed
   measure(){
     const cw = this.box.clientWidth; if(!cw) return;
-    const fit = cw / this.stage.W, small = fit < .7;
+    const W = this.stage.W, fit = cw / W, need = s => Math.max(1, MINPX/(BASE*s));
+    const R = roomOf(this.sc, this.states), room = R.f, dense = need(fit) > room + .001, small = fit < .7 || dense;
     const zb = this.root.querySelector(".sc-zoom"); zb.hidden = !small;
-    if(!small && this.zoom) this.setZoom(false);
-    this.svg.style.width = this.zoom ? Math.round(this.stage.W*.8) + "px" : "";
-    if(this.stage.setScale(this.zoom ? .8 : fit)){ if(this.stage.busy) this.stale = true; else this.redraw(); }
+    const zoom = small && (this.userZoom!=null ? this.userZoom : dense);
+    if(zoom!==this.zoom){ this.zoom = zoom; zb.setAttribute("aria-pressed", String(zoom)); zb.textContent = zoom ? "Fit" : "Zoom in"; this.box.classList.toggle("zoomed", zoom); }
+    // zoomed: big enough for MINPX labels and for the tightest box text to be about MINPX too, never past full size
+    const z = clamp(Math.max(MINPX/(BASE*room), .95*MINPX/R.small), .8, 1), s = zoom ? Math.max(z, fit) : fit;
+    this.svg.style.width = zoom ? Math.round(W*s) + "px" : "";
+    if(this.stage.setScale(s, Math.min(need(s), room))){ if(this.stage.busy) this.stale = true; else this.redraw(); }
   }
-  setZoom(on){ this.zoom = on; const zb = this.root.querySelector(".sc-zoom"); zb.setAttribute("aria-pressed", String(on)); zb.textContent = on ? "Fit" : "Zoom in"; this.box.classList.toggle("zoomed", on); this.measure(); }
+  setZoom(on){ this.userZoom = on; this.measure(); }
   redraw(){ if(this.n) this.stage.show(this.states[this.k], this.steps[this.k-1], this.states[this.k-1]); else this.stage.show(this.states[0], null, null); }
   ui(){
     const k = Math.max(1, this.k), st = this.steps[k-1] || {};

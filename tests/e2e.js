@@ -164,6 +164,58 @@ const shots = process.argv[3] || null;
   await page.goto(base + '#algo/dijkstra'); await page.waitForSelector('#av-stage svg .gn');
   for (let i = 0; i < 4; i++) await page.click('[data-aact="next"]');
   ok(/\d/.test(await page.textContent('#av-stage .av-table')), 'deep link #algo/dijkstra steps with a distance table');
+  // B-tree: descent, splits, a root split, search, and keys typed by the reader
+  const goFrame = async re => { const i = await page.evaluate(src => window.DTSAlgo._P.frames.findIndex(f => new RegExp(src).test(f.msg)), re.source);
+    if (i > 0) { await page.evaluate(i => { window.DTSAlgo._P.k = i - 1; }, i); await page.click('[data-aact="next"]'); } return i; };
+  await page.goto(base + '#algo/btree'); await page.waitForSelector('#av-stage svg.av-bt .bn');
+  const btm = await page.evaluate(() => window.DTSAlgo._P.frames.map(f => f.msg));
+  ok(btm.length > 30 && /empty B-tree/.test(await page.textContent('#av-msg')) && await page.locator('[data-aviz="btree"][aria-pressed="true"]').count() === 1, 'B-tree: #algo/btree records ' + btm.length + ' steps from an empty tree');
+  ok(btm.some(m => /^Leaf is full: with \d+ it has 4 keys/.test(m)) && btm.some(m => /Split the leaf at median \d+: .*Push \d+ up into the parent/.test(m)), 'B-tree: a full leaf splits at its median and pushes it up');
+  ok(btm.some(m => /^Split the root at median \d+.*grows one level taller \(height 3\)/.test(m)), 'B-tree: a root split grows the tree');
+  ok(btm.some(m => /holds 17: found after 3 node visits/.test(m)) && btm.some(m => /no 13.*not found \(3 node visits\)/.test(m)), 'B-tree: search finds 17 and misses 13, counting node visits');
+  await goFrame(/^Split the root/);
+  ok(await page.locator('#av-stage .bn.split').count() === 2 && await page.locator('#av-stage .bk.up').count() === 1 && (await page.textContent('#av-code li.on')).includes('new root'), 'B-tree: the split step marks both halves, the median and the pseudocode line');
+  await goFrame(/go down to child/);
+  ok(await page.locator('#av-stage .btok').count() === 1 && await page.locator('#av-stage line.hot').count() === 1 && /\d+ node visits/.test(await page.textContent('#av-count')), 'B-tree: the descent shows the key travelling down the highlighted edge');
+  await page.fill('[data-alin="key"]', '42'); await page.click('[data-alive="ins"]');
+  ok((await page.inputValue('[data-ain="ops"]')).endsWith('insert 42') && /^insert 42: start at the root/.test(await page.evaluate(() => { const P = window.DTSAlgo._P; return P.frames.find(f => f.s.seek === P.frames[P.frames.length - 1].s.seek - 1).msg; })), 'B-tree: Insert adds the typed key to the operations');
+  const jump = await page.evaluate(() => { const P = window.DTSAlgo._P, i = P.frames.findIndex(f => f.s.seek === 17); return [i, P.k]; });
+  ok(jump[0] > 0 && jump[1] >= jump[0] && jump[1] <= jump[0] + 2, 'B-tree: the player jumps to the new insert (' + jump.join(' / ') + ')');
+  ok((await page.getAttribute('[data-aact="play"]', 'aria-pressed')) === 'true', 'B-tree: the new insert plays on its own');
+  await page.click('[data-aact="play"]');
+  await page.fill('[data-alin="key"]', 'abc'); await page.click('[data-alive="ins"]');
+  ok(/Type a key/.test(await page.textContent('.av-err')), 'B-tree: a bad key shows a plain error');
+  // Raft: elections, votes, replication, commit, crash, repair; same seed, same run
+  await page.goto(base + '#algo/raft'); await page.waitForSelector('#av-stage svg.rf-ring .rf-s');
+  const rf = await page.evaluate(() => window.DTSAlgo._P.frames.map(f => ({ m: f.msg, t: f.s.t, lead: f.s.lead, n: f.s.M.length, term: f.s.lead >= 0 ? f.s.S[f.s.lead].term : 0 })));
+  const sig = await page.evaluate(() => { const V = window.DTSAlgo._V.find(v => v.id === 'raft'), a = window.DTSAlgo._run(V, window.DTSAlgo._init(V)), b = window.DTSAlgo._run(V, window.DTSAlgo._init(V)); return [JSON.stringify(a.frames) === JSON.stringify(b.frames), a.frames.length]; });
+  ok(sig[0] && sig[1] === rf.length, 'Raft: the seed makes every run identical (' + rf.length + ' steps)');
+  ok(rf.some(f => /timer ran out\. It becomes a candidate for term 1/.test(f.m)) && rf.some(f => /votes? for S\d in term 1/.test(f.m)) && rf.some(f => /3 of 5 votes, a majority: it is the leader for term 1/.test(f.m)), 'Raft: timeout, candidate, votes, leader by majority');
+  ok(rf.some(f => /stored on 3 of 5 servers, a majority: it is committed/.test(f.m)) && rf.some(f => /learn that entries up to \d are committed/.test(f.m)), 'Raft: an entry commits once a majority stores it');
+  const rcrash = rf.findIndex(f => /crashes \(it was the leader\)/.test(f.m));
+  ok(rcrash > 0 && rf.slice(rcrash).some(f => /it is the leader for term [2-9]/.test(f.m)), 'Raft: a new leader is elected after the leader crashes');
+  ok(rf.some(f => /drops x=4: it conflicts/.test(f.m)) && rf.some(f => /does not match the leader's at index/.test(f.m)) && rf.some(f => /steps back to index \d for S\d/.test(f.m)), 'Raft: out-of-date and conflicting logs are repaired');
+  const fly = rf.findIndex(f => f.n >= 4);
+  await page.evaluate(i => { window.DTSAlgo._P.k = i - 1; }, fly); await page.click('[data-aact="next"]');
+  ok(await page.locator('#av-stage .rf-m').count() >= 4 && await page.locator('#av-stage .rf-tm').count() >= 1, 'Raft: messages travel as dots and election timers show as rings');
+  const li = rf.findIndex(f => f.lead >= 0 && f.t > 40);
+  await page.evaluate(i => { window.DTSAlgo._P.k = i - 1; }, li); await page.click('[data-aact="next"]');
+  const lead = rf[li].lead, t0 = rf[li].t;
+  ok((await page.textContent(`[data-alive="s${lead}"]`)) === `Crash S${lead + 1}`, 'Raft: crash buttons follow the shown step');
+  await page.click(`[data-alive="s${lead}"]`); await page.click('[data-aact="play"]');
+  const rf2 = await page.evaluate(() => window.DTSAlgo._P.frames.map(f => ({ m: f.msg, t: f.s.t })));
+  ok((await page.inputValue('[data-ain="ev"]')).endsWith(`${t0 + 1} crash S${lead + 1}`) && rf2.some(f => f.t === t0 + 1 && /crashes \(it was the leader\)/.test(f.m)) && rf2.slice(0, li + 1).every((f, i) => f.m === rf[i].m), 'Raft: "Crash" adds an event right after the current step and keeps the past');
+  ok(rf2.some(f => f.t > t0 + 1 && /it is the leader for term/.test(f.m)), 'Raft: the crash leads to a new election');
+  await page.fill('[data-alin="x"]', '42'); await page.click('[data-alive="write"]'); await page.click('[data-aact="play"]');
+  ok(/write x=42$/.test(await page.inputValue('[data-ain="ev"]')) && await page.evaluate(() => window.DTSAlgo._P.frames.some(f => /Client writes x=42/.test(f.msg))), 'Raft: "Client writes x" adds a write');
+  const li2 = await page.evaluate(() => { const P = window.DTSAlgo._P; for (let i = P.frames.length - 2; i > 0; i--) if (P.frames[i].s.lead >= 0 && P.frames[i].s.part === null) return i; return -1; });
+  await page.evaluate(i => { window.DTSAlgo._P.k = i - 1; }, li2); await page.click('[data-aact="next"]');
+  ok(!(await page.isDisabled('[data-alive="part"]')) && (await page.textContent('[data-alive="part"]')) === 'Partition leader', 'Raft: "Partition leader" is offered while there is a leader');
+  await page.click('[data-alive="part"]'); await page.click('[data-aact="play"]');
+  ok(/partition leader$/.test(await page.inputValue('[data-ain="ev"]')) && await page.evaluate(() => window.DTSAlgo._P.frames.some(f => /cut off from the other four/.test(f.msg))), 'Raft: "Partition leader" cuts the leader off');
+  await page.click('[data-apreset="1"]');
+  const pr = await page.evaluate(() => window.DTSAlgo._P.frames.map(f => f.msg).join(' | '));
+  ok(/cut off/.test(pr) && /Lost|lost|✕/.test(pr) && /heals/.test(pr) && /steps down to follower|back to follower/.test(pr), 'Raft: the partition preset loses messages, elects a new leader and heals');
   // practice with the sample problems (build with DTS_PRACTICE_FIXTURE=1)
   await page.goto(base + '#practice/list'); await page.waitForSelector('.pr-row, .alg .vsub');
   if (await page.$('[data-aprob="sample-valid-brackets"]')) {
@@ -258,13 +310,20 @@ const shots = process.argv[3] || null;
     ok(await rp.locator('#rs-watch .scene .sc-fx > *').count() === 0 && await rp.locator('#rs-watch .sc-a[data-id="rto"]').count() === 1 && await rp.locator('#rs-watch .scene .sc-gh').count() === 1, 'reduced motion jumps to the end state without travel');
     await rctx.close();
   } else console.log('  - scene fixture not built in (set DTS_ANIM_FIXTURE=1); skipped scene checks');
+  // reduced motion in a visualizer: a live action jumps to its first step and does not play
+  const vctx = await browser.newContext({ viewport: { width: 1280, height: 900 }, reducedMotion: 'reduce' });
+  const vp = await vctx.newPage(); vp.on('pageerror', e => errors.push('pageerror: ' + e.message));
+  await vp.goto(base + '#algo/btree'); await vp.waitForSelector('#av-stage svg.av-bt');
+  await vp.fill('[data-alin="key"]', '42'); await vp.press('[data-alin="key"]', 'Enter');
+  ok(/^insert 42: start at the root/.test(await vp.textContent('#av-msg')) && (await vp.getAttribute('[data-aact="play"]', 'aria-pressed')) === 'false', 'reduced motion: Insert (Enter) jumps to the new key without playing');
+  await vctx.close();
   // mobile
   await page.setViewportSize({ width: 390, height: 844 }); await page.goto(base + '#explore'); await page.waitForSelector('.col .item');
   const sw = await page.evaluate(() => document.documentElement.scrollWidth);
   ok(sw <= 392, 'no horizontal page scroll on phone width (' + sw + ')');
   if (shots) await page.screenshot({ path: shots + '/5-mobile.png' });
   const sceneHashes = (await page.evaluate(() => (window.__dts.SCENES || []).some(s => s.id === 'sample-tcp-handshake'))) ? ['#animations', '#scene/sample-tcp-handshake', '#scene/sample-lru-eviction'] : [];
-  for (const h of ['#design', '#algo/merge', '#algo/dijkstra', '#practice/list', '#design/url-shortener'].concat(sceneHashes)) {
+  for (const h of ['#design', '#algo/merge', '#algo/dijkstra', '#algo/btree', '#algo/raft', '#practice/list', '#design/url-shortener'].concat(sceneHashes)) {
     await page.goto(base + h); await page.waitForTimeout(350);
     const w = await page.evaluate(() => Math.max(document.documentElement.scrollWidth, document.getElementById('reader').hidden ? 0 : document.getElementById('reader').scrollWidth));
     ok(w <= 392, 'no horizontal page scroll on phone width at ' + h + ' (' + w + ')');
@@ -272,10 +331,15 @@ const shots = process.argv[3] || null;
   if (sceneHashes.length) {
     await page.goto(base + '#scene/sample-tcp-handshake'); await page.waitForSelector('#rs-watch .scene .sc-a');
     const z = page.locator('#rs-watch .scene .sc-zoom');
-    ok(await z.isVisible(), 'phone: zoom button offered for a small drawing');
-    await z.click(); await page.waitForTimeout(200);
+    const auto = (await z.getAttribute('aria-pressed')) === 'true';
+    ok(await z.isVisible(), 'phone: zoom button offered for a small drawing' + (auto ? ' (it opens zoomed: the labels need the room)' : ''));
+    if (!auto) { await z.click(); await page.waitForTimeout(200); }
+    const minPx = await page.evaluate(() => { const svg = document.querySelector('#rs-watch .sc-stage svg'), a = svg.getScreenCTM().a; return Math.min(...[...svg.querySelectorAll('.sc-pill text, .sc-lt, .sc-gl')].filter(t => t.textContent.trim()).map(t => +t.getAttribute('font-size') * a)); });
+    ok(minPx >= 9.9, 'phone: zoomed labels are at least 10 px (' + minPx.toFixed(1) + ')');
     const zw = await page.evaluate(() => { const b = document.querySelector('#rs-watch .sc-stage'); return [b.scrollWidth > b.clientWidth, document.documentElement.scrollWidth, document.getElementById('reader').scrollWidth]; });
     ok(zw[0] && zw[1] <= 392 && zw[2] <= 392, 'phone: zoomed drawing scrolls inside its frame, not the page (' + zw.join(',') + ')');
+    await z.click(); await page.waitForTimeout(200);
+    ok((await z.textContent()) === 'Zoom in' && await page.evaluate(() => { const b = document.querySelector('#rs-watch .sc-stage'); return b.scrollWidth <= b.clientWidth + 1; }), 'phone: Fit shows the whole drawing');
     await page.click('#rs-watch .scene [data-sc="next"]'); await page.waitForTimeout(100);
     ok((await page.textContent('#rs-watch .scene .sc-k')).trim() === 'step 2 of 7', 'phone: Next works');
     if (shots) await page.screenshot({ path: shots + '/8-scene-phone.png' });

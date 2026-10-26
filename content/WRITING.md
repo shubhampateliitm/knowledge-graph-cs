@@ -117,3 +117,22 @@ explain the real mechanism and connect it clearly to the computing concepts buil
   staff-level interviewer asks (follow-ups, failure cases, scaling limits, "why not X?"); answers 2–5 sentences.
   Required for L0–L3. Different from `quiz:` (self-check recall); interview questions are harder and open-ended.
 - Do NOT write `animation:` sections in reads. Animations are separate scene files (content/anim/), made by other writers.
+
+## Rich text (v9)
+
+The full rules are in `content/FORMAT.md`. In short:
+
+- Maths: `\( ... \)` inline and `\[ ... \]` as its own paragraph line (LaTeX, rendered as MathML). Use it for real
+  formulas, not for arithmetic in worked examples or for prices.
+- Code: backticks for `identifiers`; a block is a line that is only ```lang (sql, python, scala, java, js, ts, go,
+  rust, c, bash, json, yaml, text), the code, then a line that is only ```. Max 72 columns. Lines inside a block are
+  never read as section keys, so `how:` or `# comment` inside code is safe. A key line may be empty (`example:`) only
+  when a code block follows directly. Code blocks are not allowed in `terms:`, `quiz:`, `interview:` or `followups:`.
+- `**bold**` for the one key phrase of a paragraph; a paragraph starting `Key idea:`, `Rule of thumb:` or `Warning:`
+  becomes a callout.
+- The app also styles un-marked text: formulas such as "T(n) = 2T(n/2) + O(n)" get the maths font, SQL written in a
+  sentence is highlighted (and laid out as a block when longer than about 70 characters), "People often think X. In
+  fact Y." becomes a myth / fact card, "Choose X when ..." sentences become decision options, "Step 1: ..." paragraphs
+  get numbered markers, and a short first sentence ("Average load.") becomes a bold run-in head. Keep writing in
+  these shapes; they are what the reader's visual cues are built on.
+- `python3 tools/checkread.py <file>` reports unclosed code blocks, lines over 72 columns and unbalanced `\(` / `\[`.

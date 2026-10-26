@@ -19,7 +19,7 @@ Tabs:
 
 - **Tours**: complete descents; "What happens when…" journeys come first.
 - **Design**: system design interview questions (requirements, estimates, API, data model, design with diagram and animation, deep dives, trade-offs, failure modes, evolution, follow-ups). Each links to the concepts it uses (chips, a concept map by layer, and "Study these concepts" as a reading sequence); every concept lists the design questions that use it.
-- **Algorithms**: three parts. 23 step-by-step visualizers (sorting, binary search, two pointers, sliding window, BFS/DFS, Dijkstra, topological sort, union–find, heaps, hash tables, LRU, Bloom filter, consistent hashing, trie, DP tables) with pseudocode, narration, counters and your own input; and **Practice** problems grouped by pattern, with a code editor, tests run in a Web Worker (2-second limit), hint / approach / solution and follow-ups; and **Animations**, a gallery of every animated scene grouped by layer (`#animations`), each opening its concept's read at that scene (`#scene/<id>` links there directly).
+- **Algorithms**: three parts. 25 step-by-step visualizers (sorting, binary search, two pointers, sliding window, BFS/DFS, Dijkstra, topological sort, union–find, heaps, hash tables, LRU, Bloom filter, consistent hashing, Raft, trie, B-tree, DP tables; the B-tree and Raft ones also take live actions: insert a key, crash a server) with pseudocode, narration, counters and your own input; and **Practice** problems grouped by pattern, with a code editor, tests run in a Web Worker (2-second limit), hint / approach / solution and follow-ups; and **Animations**, a gallery of every animated scene grouped by layer (`#animations`), each opening its concept's read at that scene (`#scene/<id>` links there directly).
 
 A **Courses** view maps the Stanford BS and MS curriculum (CS 103 to CS 336) onto the graph: pick a course and study its concepts in order.
 
@@ -49,7 +49,9 @@ content/anim/         *.json                                  animated scenes (J
 tools/kg.py           parser + validator (every node has a read, every edge has a reason, every node reaches L5)
 tools/build.py        content -> data/content.db (SQLite + FTS5) and dist/down-the-stack.html (single shareable file)
 server/server.py      local API + static web server (Python standard library only)
-web/                  the app (index.html, app.css, app.js, algo.js = Algorithms tab, scene.js = animated scene player); works against the API or with embedded data
+web/                  the app (index.html, app.css, app.js, algo.js = Algorithms tab, scene.js = animated scene player,
+                      rich.js = maths / code / SQL / formula formatting, inflate.js = unpacks the standalone page's
+                      compressed content, vendor/temml.min.js = Temml 0.13.5 LaTeX-to-MathML); works against the API or with embedded data
 tests/                test_api.py (unittest), e2e.js (Playwright browser test), fixtures/problems_sample.json and fixtures/anim_sample.json
 data/                 content.db (rebuilt) and user.db (your progress, bookmarks, notes; never rebuilt)
 ```
@@ -91,6 +93,12 @@ python3 -m unittest discover -s tests -v          # API (builds into a temp DB w
 DTS_PRACTICE_FIXTURE=1 DTS_ANIM_FIXTURE=1 python3 tools/build.py   # include the sample problems and scenes (tests/fixtures/), for the browser test
 node tests/e2e.js http://localhost:8787/          # browser (needs Playwright); or file://.../dist/down-the-stack.html
 python3 tools/build.py                            # rebuild without the samples afterwards
+# rich text (maths, code, SQL, cards) and the compressed standalone page:
+DTS_FORMAT_FIXTURE=1 DTS_CONTENT_DB=/tmp/fmt.db DTS_DIST=/tmp/fmt.html python3 tools/build.py
+DTS_CONTENT_DB=/tmp/fmt.db DTS_USER_DB=/tmp/fmt_user.db python3 server/server.py --port 8790 &
+node tests/e2e_format.js http://localhost:8790/ /tmp/fmt.html
 ```
+
+Rich text inside reads (LaTeX maths, code blocks, bold, callouts) is described in `content/FORMAT.md`. The standalone page embeds the content gzip-compressed and base64-encoded (about 7.5 MB instead of 16 MB); the browser unpacks it with DecompressionStream, or with web/inflate.js on older browsers.
 
 `DTS_CONTENT_DB` and `DTS_USER_DB` point the build and the server at other database files; `DTS_ANIM_DIR` reads scenes from another folder.

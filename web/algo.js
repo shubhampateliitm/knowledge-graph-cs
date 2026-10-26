@@ -20,7 +20,8 @@ class Rec {
   }
 }
 const COUNT = {cmp:"comparisons", swp:"swaps", wr:"writes", vis:"visited", relax:"edge updates", cells:"cells filled", probe:"probes",
-               hit:"hits", miss:"misses", evict:"evictions", moved:"keys moved", steps:"pointer steps", set:"bits set", fp:"false positives"};
+               hit:"hits", miss:"misses", evict:"evictions", moved:"keys moved", steps:"pointer steps", set:"bits set", fp:"false positives",
+               split:"splits", elect:"elections started", msg:"messages", commit:"entries committed"};
 
 /* ---------------- small helpers ---------------- */
 function nums(str, lo, hi, max){
@@ -526,6 +527,206 @@ def({ id:"conshash", group:"Probabilistic & distributed", title:"Consistent hash
     const counts = s.servers.map(x=>`<span class="kv" style="border-color:${col(x)}"><span class="sw" style="background:${col(x)}"></span>${esc(x)}: ${s.keys.filter(k=>k.o===x).length} keys</span>`).join("");
     return `<div class="av-ring"><svg class="av-svg" viewBox="0 0 300 300" style="max-width:300px" role="img" aria-label="Hash ring">${g}</svg><div class="ring-side">${counts||'<span class="nil mono">no servers</span>'}${s.moved?`<p class="av-aux">Big dots with a ring moved to a new server.</p>`:""}</div></div>`; } });
 
+/* ---- Raft ---- */
+const RF = {n:5, lat:3, hb:6, to:[16, 30], maj:3};
+function prng(seed){ let a = (seed*2654435761 + 1013904223) >>> 0; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ t>>>15, t | 1); t ^= t + Math.imul(t ^ t>>>7, t | 61); return ((t ^ t>>>14) >>> 0) / 4294967296; }; }
+const RAFT_EV = "40 write x=1, 62 crash follower, 70 write x=2, 76 write x=3, 113 write x=4, 114 crash leader, 165 write x=5, 190 restart all";
+function raftParse(str){
+  const out = String(str||"").split(/[,;\n]+/).map(x=>x.trim()).filter(Boolean).map(tk=>{
+    const m = tk.match(/^(\d+)\s+(.+)$/); if(!m) throw new Error(`Start each event with a time, like "40 write x=1". Could not read "${tk}".`);
+    const t = +m[1], a = m[2].trim().toLowerCase().replace(/\s+/g, " "); let e;
+    if(t > 600) throw new Error("Use times from 0 to 600.");
+    if((e = a.match(/^write (?:x ?= ?)?(\d{1,2})$/))) return {t, a:"write", v:+e[1]};
+    if((e = a.match(/^(crash|restart) (s[1-5]|leader|follower|all)$/))) return {t, a:e[1], who:e[2]};
+    if(a==="partition leader" || a==="partition") return {t, a:"part"};
+    if(a==="heal") return {t, a:"heal"};
+    throw new Error(`Could not read "${tk}". Use: write x=5, crash S2, crash leader, crash follower, restart S2, restart all, partition leader, heal.`);
+  });
+  if(out.length > 40) throw new Error("At most 40 events.");
+  return out.map((e,i)=>[e,i]).sort((a,b)=>a[0].t-b[0].t || a[1]-b[1]).map(x=>x[0]);
+}
+const raftStr = evs => evs.map(e=>e.t + " " + (e.a==="write" ? "write x=" + e.v : e.a==="part" ? "partition leader" : e.a==="heal" ? "heal" : e.a + " " + (/^s\d$/.test(e.who) ? e.who.toUpperCase() : e.who))).join(", ");
+const SN = i => "S" + (i+1);
+function raftRun(v, R){
+  const seed = nums(v.seed, 0, 9999, 1)[0], rnd = prng(seed), evs = raftParse(v.ev);
+  const END = (evs.length ? evs[evs.length-1].t : 0) + 70;
+  const to = () => RF.to[0] + Math.floor(rnd()*(RF.to[1]-RF.to[0]+1));
+  const S = Array.from({length:RF.n}, ()=>({term:0, role:"F", voted:null, log:[], commit:0, up:true, timer:0, tmax:0, votes:[], next:[], match:[], last:[], hb:0}));
+  S.forEach(s=>{ s.tmax = s.timer = to(); });
+  let M = [], mid = 0, part = null, pend = [], idle = true;
+  const lastT = s => s.log.length ? s.log[s.log.length-1].t : 0;
+  const cut = (a, b) => part!==null && (a===part) !== (b===part);
+  const send = (t, f, to2, ty, o) => { R.inc("msg"); M.push(Object.assign({id:mid++, f, to:to2, ty, sent:t, at:t+RF.lat, lost:cut(f, to2) ? "cut" : ""}, o)); };
+  const top = skipCut => { let b = -1; S.forEach((s,i)=>{ if(s.up && s.role==="L" && !(skipCut && i===part) && (b<0 || s.term > S[b].term)) b = i; }); return b; };
+  const sendAE = (t, L, i) => { const s = S[L], pv = s.next[i]-1; s.last[i] = t; send(t, L, i, "AE", {term:s.term, pv, pt:pv ? s.log[pv-1].t : 0, ents:s.log.slice(pv).map(e=>({t:e.t, v:e.v})), lc:s.commit}); };
+  const ents = l => l.map(e=>"x=" + e.v).join(", ");
+  const snap = (t, vis) => ({t, seek:t, part, lead:top(false),
+    S:S.map(s=>({term:s.term, role:s.role, up:s.up, log:s.log.map(e=>[e.t, e.v]), commit:s.commit, timer:s.timer, tmax:s.tmax, votes:s.votes.length, next:s.role==="L" ? s.next.slice() : null})),
+    M:vis.map(m=>({id:m.id, f:m.f, to:m.to, ty:m.ty, p:m.p, ok:m.ok, lost:m.lost, n:m.ents ? m.ents.length : 0}))});
+  for(let t=0; t<=END; t++){
+    const ev = [], say = (line, txt, pri) => ev.push({line, txt, pri}), grp = {};
+    const group = (k, line, pri, who, fn) => { if(!grp[k]){ grp[k] = {who:[], fn}; ev.push({line, pri, g:grp[k]}); } grp[k].who.push(who); };   // "S1 and S2 vote for S3"
+    const names = l => l.length===1 ? SN(l[0]) : l.slice(0,-1).map(SN).join(", ") + " and " + SN(l[l.length-1]);
+    const arrived = M.filter(m=>m.at===t), vis = [];
+    M = M.filter(m=>m.at > t);
+    for(const m of arrived){
+      if(m.lost) continue;
+      const d = S[m.to], j = m.to, f = m.f;
+      if(!d.up){ m.lost = "down"; m.p = 1; vis.push(m); continue; }
+      m.p = 1; vis.push(m);
+      if(m.term > d.term){ const was = d.role; d.term = m.term; d.voted = null; d.role = "F"; d.votes = [];
+        if(was!=="F"){ d.timer = d.tmax = to(); const tm = m.term; group("d"+tm, 10, 2.5, j, w=>w.length===1 ? `${SN(w[0])} sees term ${tm}, newer than its own: it steps down to follower.` : `${names(w)} see term ${tm}, newer than their own: they step down to followers.`); } }
+      if(m.ty==="RV"){
+        const up2 = m.lt > lastT(d) || (m.lt===lastT(d) && m.li >= d.log.length);
+        let ok = false, why = "";
+        if(m.term < d.term) why = "old"; else if(d.voted!==null && d.voted!==f) why = "voted"; else if(!up2) why = "behind"; else ok = true;
+        if(ok){ d.voted = f; d.timer = d.tmax = to(); const tm = d.term; group("v"+f+"/"+tm, 3, 1.2, j, w=>`${names(w)} vote${w.length===1?"s":""} for ${SN(f)} in term ${tm}.`); }
+        else { const tm = d.term, mt = m.term, vf = d.voted; group("n"+f+why+tm, 3, 1.6, j, w=>{ const one = w.length===1, who = one ? SN(w[0]) + " says" : names(w) + " say";
+          return why==="old" ? `${who} no to ${SN(f)}: its term ${mt} is old.` : why==="voted" ? `${who} no to ${SN(f)}: ${one ? `it already voted for ${SN(vf)}` : "they already voted"} in term ${tm}.`
+            : `${who} no to ${SN(f)}: ${SN(f)}'s log is behind, so as leader it could lose committed entries.`; }); }
+        send(t, j, f, "VR", {term:d.term, ok});
+      } else if(m.ty==="VR"){
+        if(d.role==="C" && m.term===d.term && m.ok && !d.votes.includes(f)){ d.votes.push(f);
+          if(d.votes.length >= RF.maj){ d.role = "L"; d.next = S.map(()=>d.log.length+1); d.match = S.map(()=>0); d.last = []; d.hb = 0;
+            say(5, `${SN(j)} has ${d.votes.length} of 5 votes, a majority: it is the leader for term ${d.term}.`, 3); }
+          else say(5, `${SN(j)} has ${d.votes.length} votes (its own included); it needs 3.`, .9); }
+      } else if(m.ty==="AE"){
+        if(m.term < d.term){ send(t, j, f, "AR", {term:d.term, ok:false, match:0}); say(10, `${SN(j)} ignores ${SN(f)}: its term ${m.term} is older than ${d.term}.`, 1.5); continue; }
+        if(d.role==="C"){ d.role = "F"; d.votes = []; const tm = m.term; group("b"+f, 10, 1.5, j, w=>`${names(w)} hear${w.length===1?"s":""} from leader ${SN(f)} in term ${tm}: back to follower.`); }
+        d.timer = d.tmax = to();
+        if(!(m.pv===0 || (d.log.length >= m.pv && d.log[m.pv-1].t===m.pt))){
+          send(t, j, f, "AR", {term:d.term, ok:false, match:0, pv:m.pv});
+          say(8, `${SN(j)}'s log does not match the leader's at index ${m.pv} (${d.log.length < m.pv ? "it has nothing there" : `it has term ${d.log[m.pv-1].t} there, not ${m.pt}`}), so it says no.`, 2); continue; }
+        const added = []; let dropped = [];
+        m.ents.forEach((e,k)=>{ const idx = m.pv + k + 1, c = d.log[idx-1];
+          if(c && c.t!==e.t){ dropped = d.log.slice(idx-1); d.log.length = idx-1; }
+          if(!d.log[idx-1]){ d.log.push({t:e.t, v:e.v}); added.push(idx); } });
+        if(dropped.length) say(8, `${SN(j)} drops ${ents(dropped)}: ${dropped.length===1?"it conflicts":"they conflict"} with the leader's log and ${dropped.length===1?"was":"were"} never committed.`, 2.6);
+        if(added.length) say(7, `${SN(j)} stores ${added.length===1?"entry " + added[0]:"entries " + added[0] + "–" + added[added.length-1]} and says ok.`, 1.7);
+        const last = m.pv + m.ents.length, c2 = Math.min(m.lc, last);
+        if(c2 > d.commit){ d.commit = c2; group("c"+c2, 9, .8, j, w=>`${names(w)} learn${w.length===1?"s":""} that entries up to ${c2} are committed.`); }
+        send(t, j, f, "AR", {term:d.term, ok:true, match:last});
+      } else if(m.ty==="AR"){
+        if(d.role!=="L" || m.term!==d.term) continue;
+        if(m.ok){ d.match[f] = Math.max(d.match[f], m.match); d.next[f] = d.match[f]+1;
+          for(let n = d.log.length; n > d.commit; n--){
+            const cnt = 1 + S.filter((x,i)=>i!==j && d.match[i] >= n).length;
+            if(d.log[n-1].t===d.term && cnt >= RF.maj){ const old = d.commit; d.commit = n; R.inc("commit", n-old);
+              say(9, n-old===1 ? `Entry ${n} (x=${d.log[n-1].v}) is stored on ${cnt} of 5 servers, a majority: it is committed.` : `Entries ${old+1}–${n} are stored on ${cnt} of 5 servers, a majority: committed.`, 3); break; } } }
+        else if(m.pv!==undefined && d.next[f]===m.pv+1){ d.next[f] = Math.max(1, d.next[f]-1); say(8, `${SN(f)} said no, so leader ${SN(j)} steps back to index ${d.next[f]} for ${SN(f)} and tries again.`, 2.2); sendAE(t, j, f); }
+      }
+    }
+    // the script: client writes, crashes, restarts, partitions
+    for(const e of evs.filter(e=>e.t===t)){
+      if(e.a==="write"){ const L = top(true);
+        if(L<0){ pend.push(e.v); say(11, `Client writes x=${e.v}, but it cannot reach a leader right now. It will retry when there is one.`, 3); continue; }
+        S[L].log.push({t:S[L].term, v:e.v}); say(11, `Client writes x=${e.v}. Leader ${SN(L)} adds it to its log at index ${S[L].log.length} (term ${S[L].term}); the next AppendEntries carries it.`, 3); continue; }
+      if(e.a==="part"){ const L = top(false); if(L<0){ say(-1, "There is no leader to cut off.", 2); continue; }
+        part = L; say(-1, `The network splits: leader ${SN(L)} is cut off from the other four. Messages across the split are lost (✕).`, 3); continue; }
+      if(e.a==="heal"){ if(part!==null){ part = null; say(-1, "The network heals: all five servers can talk again.", 3); } continue; }
+      let ids = [];
+      if(e.who==="leader"){ const L = top(false); if(L>=0) ids = [L]; }
+      else if(e.who==="follower"){ for(let i=RF.n-1;i>=0;i--) if(S[i].up && S[i].role!=="L"){ ids = [i]; break; } }
+      else if(e.who==="all") ids = S.map((x,i)=>i);
+      else ids = [+e.who.slice(1)-1];
+      if(e.a==="crash"){ ids = ids.filter(i=>S[i].up); if(!ids.length){ say(-1, e.who==="leader" ? "There is no leader to crash." : "That server is already down.", 2); continue; }
+        ids.forEach(i=>{ const s = S[i], was = s.role; s.up = false; s.role = "F"; s.votes = [];
+          say(-1, `${SN(i)} crashes${was==="L"?" (it was the leader)":""}. It stops sending and answering; its term, vote and log stay on disk.`, 3); }); }
+      else { ids = ids.filter(i=>!S[i].up); if(!ids.length){ say(-1, "Nothing to restart: that server is up.", 2); continue; }
+        ids.forEach(i=>{ const s = S[i]; s.up = true; s.commit = 0; s.timer = s.tmax = to(); });
+        say(-1, `${ids.map(SN).join(" and ")} restart${ids.length===1?"s":""} as follower${ids.length===1?"":"s"}. Term, vote and log come back from disk; the commit index starts at 0 until a leader sends a newer one.`, 3); }
+    }
+    if(pend.length){ const L = top(true); if(L>=0){ pend.forEach(x=>S[L].log.push({t:S[L].term, v:x})); say(11, `The client retries ${pend.map(x=>"x="+x).join(", ")}: leader ${SN(L)} adds ${pend.length===1?"it":"them"} to its log.`, 2.8); pend = []; } }
+    // timers: followers and candidates count down; the leader sends AppendEntries every few ticks
+    S.forEach((s,i)=>{ if(!s.up) return;
+      if(s.role==="L"){ if(--s.hb <= 0){ s.hb = RF.hb; const any = S.some((o,k)=>k!==i && s.next[k] <= s.log.length);
+          S.forEach((o,k)=>{ if(k!==i && !(t - s.last[k] < RF.hb)) sendAE(t, i, k); });   // skip a follower that was just sent a retry
+          say(6, any ? `Leader ${SN(i)} sends AppendEntries with the entries each follower is missing.` : `Leader ${SN(i)} sends heartbeats (empty AppendEntries), so no one starts an election.`, any ? 1.5 : .5); }
+        return; }
+      if(--s.timer > 0) return;
+      const again = s.role==="C"; s.term++; s.role = "C"; s.voted = i; s.votes = [i]; s.timer = s.tmax = to(); R.inc("elect");
+      const tm = s.term;
+      group("e"+again+tm, 1, 3, i, w=>w.length===1 ? (again ? `${SN(i)} got no majority in time (split vote or lost messages). It starts a new election for term ${tm}.` : `${SN(i)} heard nothing from a leader before its timer ran out. It becomes a candidate for term ${tm}, votes for itself and asks the others for votes.`)
+        : (again ? `${names(w)} got no majority in time. They start new elections for term ${tm}.` : `${names(w)} heard nothing from a leader before their timers ran out. They become candidates for term ${tm}, vote for themselves and ask for votes.`));
+      S.forEach((o,k)=>{ if(k!==i) send(t, i, k, "RV", {term:s.term, li:s.log.length, lt:lastT(s)}); }); });
+    M.forEach(m=>{ m.p = Math.min(m.lost==="cut" ? .5 : 1, (t - m.sent)/RF.lat); vis.push(m); });
+    if(t===0){ R.step(0, "Five servers start as followers in term 0, with no leader. Each one waits a random time (the ring around it) before it starts an election.", snap(t, vis)); continue; }
+    if(!ev.length && !vis.length){ if(!idle) R.step(0, "Nothing is moving. Every server that is up waits; its election timer (the ring) runs down.", snap(t, vis)); idle = true; continue; }
+    idle = false;
+    ev.forEach(e=>{ if(e.g) e.txt = e.g.fn(e.g.who); });
+    ev.sort((a,b)=>b.pri-a.pri);
+    const types = new Set(vis.filter(m=>!m.lost).map(m=>m.ty)), fly = [];
+    if(types.has("RV")) fly.push("vote requests"); if(types.has("VR")) fly.push("votes");
+    if(vis.some(m=>m.ty==="AE" && m.ents.length && !m.lost)) fly.push("entries"); else if(types.has("AE")) fly.push("heartbeats");
+    if(types.has("AR")) fly.push("replies to the leader");
+    // the most important event, plus up to two more that matter on their own
+    const say3 = ev.filter((e,i)=>i===0 || e.pri >= Math.min(1.5, ev[0].pri)).slice(0, 3);
+    const txt = ev.length ? say3.map(e=>e.txt).join(" ") : fly.length ? `In flight: ${fly.join(", ")}.` : "Lost messages vanish.";
+    R.step(ev.length ? ev[0].line : -1, txt, snap(t, vis));
+  }
+  const L = top(false);
+  R.step(-1, `End at time ${END}. ${L>=0 ? `${SN(L)} leads term ${S[L].term}; ${S[L].commit} entr${S[L].commit===1?"y is":"ies are"} committed.` : "There is no leader right now."}`, snap(END, []));
+}
+def({ id:"raft", group:"Probabilistic & distributed", title:"Raft: leader election and log replication", concepts:["raft","consensus","leaderelect","replication","quorum"],
+  text:"Five servers keep the same log of commands. Time is split into terms with at most one leader each. A follower that hears nothing from a leader for a random time becomes a candidate and asks for votes; a majority (3 of 5) makes it leader. The leader adds client writes to its log and copies them with AppendEntries; an entry is committed once a majority stores it. A server only votes for a candidate whose log is at least as up to date, so a new leader always has every committed entry, and it repairs followers whose logs differ.",
+  inputs:[{k:"seed", label:"Random seed", def:"7", w:5},{k:"ev", label:"Events (time and action)", def:RAFT_EV}],
+  presets:[{name:"Crash and repair", v:{seed:"7", ev:RAFT_EV}},{name:"Partition the leader", v:{seed:"7", ev:"40 write x=1, 60 partition leader, 66 write x=2, 120 write x=3, 150 heal"}},{name:"Split vote", v:{seed:"14", ev:"80 write x=1"}}],
+  random:()=>({seed:String(rint(1,9999))}), counters:["elect","msg","commit"],
+  live:{ title:"Change what happens next", fields:[{k:"x", label:"x =", def:"7", w:3, mode:"numeric"}],
+    buttons:[{id:"write", label:"Client writes x", primary:true},{id:"part", label:"Partition leader"},"Crash or restart:",{id:"s0", label:"Crash S1"},{id:"s1", label:"Crash S2"},{id:"s2", label:"Crash S3"},{id:"s3", label:"Crash S4"},{id:"s4", label:"Crash S5"}],
+    note:"Each button adds an event right after the current step to the events above, drops the later ones, and plays on from there. The seed keeps every run the same." },
+  liveState(s){ const o = {part:{label:s.part!==null ? "Heal partition" : "Partition leader", disabled:s.part===null && s.lead<0}};
+    s.S.forEach((x,i)=>{ o["s"+i] = {label:(x.up ? "Crash " : "Restart ") + SN(i)}; }); return o; },
+  act(vals, id, fv, f){
+    const T = f ? f.s.t : 0, evs = raftParse(vals.ev).filter(e=>e.t <= T), at = T + 1;
+    if(at > 600) throw new Error("The simulation stops at time 600.");
+    if(id==="write"){ const x = String(fv.x||"").trim(); if(!/^\d{1,2}$/.test(x)) throw new Error("Type a value for x from 0 to 99."); evs.push({t:at, a:"write", v:+x}); }
+    else if(id==="part") evs.push(f && f.s.part!==null ? {t:at, a:"heal"} : {t:at, a:"part"});
+    else { const i = +id.slice(1), up = f ? f.s.S[i].up : true; evs.push({t:at, a:up ? "crash" : "restart", who:"s" + (i+1)}); }
+    return {v:Object.assign({}, vals, {ev:raftStr(evs)}), seek:at};
+  },
+  code:["every server starts as a follower with a random election timeout","timeout with no leader: become candidate, term + 1, vote for self","  send RequestVote(term, last log index and term) to all","on RequestVote: vote yes if the term is current, no vote yet in this term,","  and the candidate's log is at least as up to date as mine","votes from a majority (3 of 5): become leader","leader: send AppendEntries (new entries, or empty heartbeat) often","on AppendEntries: if my log matches at prevIndex, store the entries, reply ok","  else reply no; leader moves nextIndex back by one and retries (repair)","entry of the current term on a majority: committed","any message with a newer term: step down to follower","client write: leader adds x = v to its log"],
+  run(v, R){ raftRun(v, R); },
+  draw(s){ return raftDraw(s); } });
+const RPOS = Array.from({length:5}, (x,i)=>{ const a = -Math.PI/2 + i*2*Math.PI/5; return [Math.round(160 + 104*Math.cos(a)), Math.round(158 + 104*Math.sin(a))]; });
+const tcol = t => t ? SCOL[(t-1) % SCOL.length] : "var(--line-strong)";
+function raftDraw(s){
+  const R0 = 27, lead = s.lead;
+  let g = "", m = "";
+  if(s.part!==null){ const [x,y] = RPOS[s.part]; g += `<circle cx="${x}" cy="${y}" r="${R0+15}" class="rf-cut"/>`; }
+  s.S.forEach((sv,i)=>{ const [x,y] = RPOS[i], role = !sv.up ? "down" : sv.role==="L" ? "leader" : sv.role==="C" ? "candidate" : "follower";
+    const cls = !sv.up ? "down" : sv.role==="L" ? "lead" : sv.role==="C" ? "cand" : "fol";
+    let arc = "";
+    if(sv.up && sv.role!=="L" && sv.tmax){ const C = 2*Math.PI*(R0+5), f = Math.max(0, Math.min(1, sv.timer/sv.tmax));
+      arc = `<circle cx="${x}" cy="${y}" r="${R0+5}" class="rf-tm" style="stroke-dasharray:${(C*f).toFixed(1)} ${C.toFixed(1)}" transform="rotate(-90 ${x} ${y})"/>`; }
+    const ly = y > 158 ? y + R0 + 20 : y - R0 - 13, sub = role + (sv.role==="C" && sv.up ? ` · ${sv.votes} vote${sv.votes===1?"":"s"}` : "");
+    g += `<g class="rf-s ${cls}">${arc}<circle cx="${x}" cy="${y}" r="${R0}" class="rf-c" style="--tc:${tcol(sv.term)}"/><text x="${x}" y="${y-2}" text-anchor="middle" class="rf-n">${SN(i)}</text><text x="${x}" y="${y+12}" text-anchor="middle" class="sub">term ${sv.term}</text>`
+      + (!sv.up ? `<path d="M${x+15},${y-26} l9,9 m0,-9 l-9,9" class="rf-x"/>` : "")
+      + `<text x="${x}" y="${ly}" text-anchor="middle" class="rf-role">${sub}</text></g>`; });
+  s.M.forEach(q=>{ const [ax,ay] = RPOS[q.f], [bx,by] = RPOS[q.to], L = Math.hypot(bx-ax, by-ay), ux = (bx-ax)/L, uy = (by-ay)/L, side = q.f < q.to ? 1 : -1;
+    const ox = -uy*5*side, oy = ux*5*side, x1 = ax + ux*(R0+4) + ox, y1 = ay + uy*(R0+4) + oy, x2 = bx - ux*(R0+4) + ox, y2 = by - uy*(R0+4) + oy;
+    const x = x1 + (x2-x1)*q.p, y = y1 + (y2-y1)*q.p;
+    const kind = q.ty==="RV" ? "rv" : q.ty==="VR" ? (q.ok ? "yes" : "no") : q.ty==="AE" ? (q.n ? "ae ent" : "ae") : (q.ok ? "ar" : "ar no");
+    const shape = q.ty==="AE" && q.n ? `<rect x="${(x-6).toFixed(1)}" y="${(y-6).toFixed(1)}" width="12" height="12" rx="2"/>` : `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${q.ty==="AR"||q.ty==="VR"?4.5:5.5}"/>`;
+    m += `<g class="rf-m ${kind}${q.lost?" lost":""}" data-flip="m${q.id}">${shape}${q.lost ? `<path d="M${(x-5).toFixed(1)},${(y-5).toFixed(1)} l10,10 m0,-10 l-10,10" class="rf-x"/>` : ""}</g>`; });
+  const ring = `<svg class="av-svg rf-ring" viewBox="0 0 320 312" role="img" aria-label="Five Raft servers in a ring. ${lead>=0 ? SN(lead) + " is the leader in term " + s.S[lead].term : "No leader"}.">${g}${m}</svg>`;
+  // logs: one row per server, a cell per entry, coloured by term; the bar under a row reaches its commit index
+  const maxLen = Math.max(6, ...s.S.map(x=>x.log.length)), CW = 30, LX = 46, W = LX + maxLen*CW + 6, RH = 44, H = 22 + 5*RH;
+  let lg = "";
+  for(let j=0;j<maxLen;j++) lg += `<text x="${LX + j*CW + CW/2}" y="14" text-anchor="middle" class="sub">${j+1}</text>`;
+  s.S.forEach((sv,i)=>{ const y = 22 + i*RH, nx = lead>=0 && i!==lead && s.S[lead].next ? s.S[lead].next[i] : 0;
+    lg += `<g class="rf-row${sv.up?"":" down"}${i===lead?" lead":""}"><text x="6" y="${y+16}" class="rf-n">${SN(i)}</text><text x="6" y="${y+29}" class="sub">${!sv.up?"down":sv.role==="L"?"leader":"c " + sv.commit}</text>`;
+    sv.log.forEach(([t,v],j)=>{ const x = LX + j*CW, cm = j < sv.commit;
+      lg += `<g class="rf-e${cm?" cm":""}" style="--tc:${tcol(t)}"><rect x="${x+1}" y="${y}" width="${CW-2}" height="32" rx="4"/><text x="${x+CW/2}" y="${y+14}" text-anchor="middle">x=${v}</text><text x="${x+CW/2}" y="${y+27}" text-anchor="middle" class="t">t${t}</text></g>`; });
+    if(sv.commit) lg += `<rect x="${LX+1}" y="${y+34}" width="${sv.commit*CW-2}" height="3.5" rx="1.5" class="rf-cbar"/>`;
+    if(nx && sv.up) lg += `<path d="M${LX + (nx-1)*CW + CW/2 - 4},${y+43} l4,-5 l4,5 z" class="rf-next"><title>leader's next index for ${SN(i)}: ${nx}</title></path>`;
+    lg += `</g>`; });
+  const logs = `<svg class="av-svg rf-logs" viewBox="0 0 ${W} ${H}" style="width:${W}px" role="img" aria-label="Logs of the five servers">${lg}</svg>`;
+  const legend = `<p class="av-aux rf-key"><span><i class="rf-k rv"></i>vote request</span><span><i class="rf-k yes"></i>vote yes</span><span><i class="rf-k no"></i>no (vote or reply)</span><span><i class="rf-k ae"></i>heartbeat</span><span><i class="rf-k ent"></i>AppendEntries with entries</span><span><i class="rf-k ar"></i>reply</span><span><i class="rf-k x">✕</i>lost</span></p>`;
+  const lab = lead>=0 ? `leader ${SN(lead)}, term ${s.S[lead].term}` : "no leader";
+  return `<div class="av-raft"><div class="rf-left">${ring}</div><div class="rf-right"><div class="av-h mono">Logs · solid = committed</div><div class="rf-logw">${logs}</div><p class="av-aux">Cells show the command and its term (colour = term). The green bar ends at each server's commit index (c); ▲ is where the leader will send next.</p></div></div>${legend}<p class="av-aux mono">time ${s.t} · ${lab}${s.part!==null?` · ${SN(s.part)} is cut off`:""}</p>`;
+}
+
 def({ id:"trie", group:"Data structures", title:"Trie: insert and search", concepts:["trees","fst","invindex"],
   text:"A trie stores words letter by letter along paths from the root, so words with a common prefix share nodes. Insert and search cost O(length of the word), independent of how many words are stored, and \"all words starting with ca\" is one walk down. Autocomplete, routing tables (longest prefix match) and the term dictionaries in search engines build on it.",
   inputs:[{k:"ops", label:"Operations", def:"insert car, insert cat, insert cart, insert care, insert dog, insert do, search cat, search ca, prefix ca, search cow"}],
@@ -553,6 +754,106 @@ def({ id:"trie", group:"Data structures", title:"Trie: insert and search", conce
   draw(s){ const nodes = {}, on = new Set(s.path||[]);
     Object.entries(s.T).forEach(([id,n])=>{ nodes[id] = {label:n.c, end:n.end, kids:Object.keys(n.kids).sort().map(c=>String(n.kids[c])), cls:(+id===s.cur?(s.miss?"miss":s.ok?"done":"cur"):on.has(+id)?"cmp":""), ecls:on.has(+id)?"hot":""}; });
     return treeSVG(nodes, ["0"], {label:"Trie", ux:34, uy:50, r:14}) + `<p class="av-aux">A double circle marks the end of a word.</p>`; } });
+
+/* ---- B-tree ---- */
+const BT_OPS = "insert 10 20 5 6 12 30 7 17 3 4 25 28 15 1 9, search 17, search 13";
+function btParse(str){
+  const out = [];
+  ops(str).forEach(o=>{ if(!["insert","search"].includes(o[0]) || o.length < 2) throw new Error('Write "insert 10 20 5" or "search 17".');
+    o.slice(1).forEach(x=>{ const k = Number(x); if(!Number.isInteger(k) || k < 0 || k > 999) throw new Error(`Keys are whole numbers from 0 to 999. Could not read "${x}".`); out.push([o[0], k]); }); });
+  if(out.filter(x=>x[0]==="insert").length > 32) throw new Error("At most 32 inserts, so the tree stays readable.");
+  return out;
+}
+const btFmt = keys => `[${keys.join(", ")}]`;
+const btWhy = (keys, k, i) => i===0 ? `${k} < ${keys[0]}` : i===keys.length ? `${k} > ${keys[keys.length-1]}` : `${k} is between ${keys[i-1]} and ${keys[i]}`;
+function btKeys(N){ return Object.values(N).flatMap(n=>n.keys); }
+def({ id:"btree", group:"Data structures", title:"B-tree: insert, split and search", concepts:["btree","indexing","trees"],
+  text:"A B-tree keeps sorted keys in wide nodes: each node holds up to M keys and M + 1 children, and all leaves are at the same depth. Insert walks down to a leaf and puts the key there. A leaf that gets one key too many splits at its median: the median moves up into the parent, which may split too. When the root splits, the tree grows one level at the top. In a database each node is one disk page with hundreds of keys, so a lookup reads only 3 or 4 pages.",
+  inputs:[{k:"m", label:"Max keys per node (M)", def:"3", w:4},{k:"ops", label:"Operations", def:BT_OPS}],
+  presets:[{name:"Ascending keys", v:{m:"3", ops:"insert 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16, search 11"}},{name:"2-3 tree (M = 2)", v:{m:"2", ops:BT_OPS}}],
+  random:()=>{ const ks = [...new Set(Array.from({length:rint(12,16)},()=>rint(1,99)))]; return {ops:"insert " + ks.join(" ") + ", search " + ks[rint(0,ks.length-1)] + ", search " + rint(1,99)}; },
+  counters:["vis","split"], clabel:{vis:"node visits"},
+  live:{ title:"Try a key", fields:[{k:"key", label:"Key", def:"", w:4, mode:"numeric"}], buttons:[{id:"ins", label:"Insert", primary:true},{id:"find", label:"Search"},{id:"rnd", label:"Insert a random key"}],
+    note:"The key is added to the operations above and the tree animates it from the root." },
+  act(vals, id, fv, f){
+    const list = btParse(vals.ops), have = new Set(f && f.s.N ? btKeys(f.s.N) : []);
+    let k;
+    if(id==="rnd"){ const free = Array.from({length:99},(x,i)=>i+1).filter(x=>!have.has(x)); if(!free.length) throw new Error("Every key from 1 to 99 is already in the tree."); k = free[rint(0, free.length-1)]; }
+    else { const t = String(fv.key||"").trim(); if(!/^\d{1,3}$/.test(t)) throw new Error("Type a key: a whole number from 0 to 999."); k = +t; }
+    const cmd = id==="find" ? "search" : "insert";
+    return {v:Object.assign({}, vals, {ops:(String(vals.ops||"").trim() ? String(vals.ops).trim() + ", " : "") + cmd + " " + k}), seek:list.length};
+  },
+  code:["insert(k): node = root","while node is not a leaf:","  go to the child whose key range holds k","put k into the leaf, in sorted order","while node has more than M keys:","  split it at the median key: left half, right half","  push the median up into the parent","  if node was the root: the median is a new root (tree grows)","search(k): node = root","  if k is a key of node: found","  else go to the child whose range holds k (leaf: not found)"],
+  run(v, R){ const M = nums(v.m, 2, 5, 1)[0], list = btParse(v.ops), N = {}; let nid = 0;
+    const mk = (keys, kids) => { const id = "n" + (nid++); N[id] = {keys, kids:kids||[]}; return id; };
+    let root = mk([]);
+    const height = () => { let h = 1, x = root; while(N[x].kids.length){ x = N[x].kids[0]; h++; } return h; };
+    const S = (op, o) => Object.assign({N, root, M, seek:op, h:height(), n:btKeys(N).length}, o);
+    R.step(0, `An empty B-tree. Each node holds at most ${M} keys and ${M+1} children.`, S(-1, {}));
+    list.forEach(([cmd, k], op) => {
+      let x = root; const path = [x];
+      if(cmd==="search"){ let n = 0;
+        for(;;){ n++; R.inc("vis"); const nd = N[x], pre = n===1 ? `search ${k}: start at the root. ` : "";
+          if(nd.keys.includes(k)){ R.step(9, `${pre}${btFmt(nd.keys)} holds ${k}: found after ${n} node visit${n===1?"":"s"}.`, S(op, {cur:x, path:path.slice(), tok:{k, at:x, q:true}, kh:{[k]:"done"}, found:true})); return; }
+          if(!nd.kids.length){ R.step(10, `${pre}Leaf ${btFmt(nd.keys)} has no ${k}, and there is no child to go to: not found (${n} node visit${n===1?"":"s"}).`, S(op, {cur:x, path:path.slice(), tok:{k, at:x, q:true}, miss:x})); return; }
+          const i = nd.keys.filter(y=>y<k).length;
+          R.step(10, `${pre}At ${btFmt(nd.keys)}: ${btWhy(nd.keys, k, i)}, so go down to child ${i+1}.`, S(op, {cur:x, path:path.slice(), tok:{k, at:x, q:true}, ek:[x, i]}));
+          x = nd.kids[i]; path.push(x); } }
+      // insert: walk down to a leaf
+      for(let first = true;; first = false){ R.inc("vis"); const nd = N[x], pre = first ? `insert ${k}: start at the root. ` : "";
+        if(nd.keys.includes(k)){ R.step(9, `${pre}${k} is already in ${btFmt(nd.keys)}. A B-tree keeps each key once, so nothing changes.`, S(op, {cur:x, path:path.slice(), kh:{[k]:"done"}})); return; }
+        if(!nd.kids.length){ R.step(1, nd.keys.length ? `${pre}${btFmt(nd.keys)} is a leaf, so ${k} goes here.` : `insert ${k}: the tree is empty, so ${k} goes into the root leaf.`, S(op, {cur:x, path:path.slice(), tok:{k, at:x}})); break; }
+        const i = nd.keys.filter(y=>y<k).length;
+        R.step(2, `${pre}At ${btFmt(nd.keys)}: ${btWhy(nd.keys, k, i)}, so go down to child ${i+1}.`, S(op, {cur:x, path:path.slice(), tok:{k, at:x}, ek:[x, i]}));
+        x = nd.kids[i]; path.push(x); }
+      const leaf = N[x]; leaf.keys.push(k); leaf.keys.sort((a,b)=>a-b);
+      if(leaf.keys.length <= M){ R.step(3, `The leaf has room: ${k} goes in, in order: ${btFmt(leaf.keys)}.`, S(op, {cur:x, path:path.slice(), kh:{[k]:"new"}})); return; }
+      const med0 = leaf.keys[Math.floor((leaf.keys.length-1)/2)];
+      R.step(4, `Leaf is full: with ${k} it has ${leaf.keys.length} keys, one more than M = ${M}. It must split at its median ${med0}.`, S(op, {cur:x, over:x, path:path.slice(), kh:{[k]:"new", [med0]:"piv"}}));
+      let node = x, pi = path.length-1, what = "the leaf";
+      while(N[node].keys.length > M){
+        const nd = N[node], mid = Math.floor((nd.keys.length-1)/2), med = nd.keys[mid];
+        const right = mk(nd.keys.slice(mid+1), nd.kids.length ? nd.kids.slice(mid+1) : []);
+        nd.keys = nd.keys.slice(0, mid); if(nd.kids.length) nd.kids = nd.kids.slice(0, mid+1);
+        R.inc("split");
+        if(pi===0){ root = mk([med], [node, right]);
+          R.step(7, `Split ${what} at median ${med}: ${btFmt(nd.keys)} and ${btFmt(N[right].keys)}. ${what==="the root" ? "" : "It was the root, so "}${med} becomes a new root${what==="the root" ? ", so" : " and"} the tree grows one level taller (height ${height()}).`, S(op, {cur:root, split:[node, right], kh:{[med]:"up"}}));
+          break; }
+        const par = path[pi-1], pn = N[par], ci = pn.kids.indexOf(node);
+        pn.keys.splice(ci, 0, med); pn.kids.splice(ci+1, 0, right);
+        R.step(6, `Split ${what} at median ${med}: ${btFmt(nd.keys)} and ${btFmt(N[right].keys)}. Push ${med} up into the parent: ${btFmt(pn.keys)}.`, S(op, {cur:par, split:[node, right], kh:{[med]:"up"}}));
+        node = par; pi--; what = pi===0 ? "the root" : "this node";
+        if(pn.keys.length > M){ const m2 = pn.keys[Math.floor((pn.keys.length-1)/2)];
+          R.step(4, `Now the parent has ${pn.keys.length} keys, more than M = ${M}: it must split too, at median ${m2}.`, S(op, {cur:par, over:par, kh:{[m2]:"piv"}})); }
+      } });
+    R.step(0, `Done: ${btKeys(N).length} keys, height ${height()}, ${Object.keys(N).length} nodes. Every leaf is at the same depth.`, S(list.length, {})); },
+  draw(s){ return btDraw(s); } });
+function btDraw(s){
+  const CW = 26, CH = 28, PAD = 3, GAP = 12, UY = 70, TOP = 38, MX = 8, N = s.N, P = {}; let cur = MX;
+  const width = id => Math.max(1, N[id].keys.length)*CW + 2*PAD;
+  const lay = (id, d) => { const n = N[id];
+    if(!n.kids.length){ const w = width(id); P[id] = {x:cur + w/2, d, w}; cur += w + GAP; return; }
+    n.kids.forEach(c=>lay(c, d+1)); cur += GAP*.5;
+    P[id] = {x:(P[n.kids[0]].x + P[n.kids[n.kids.length-1]].x)/2, d, w:width(id)}; };
+  lay(s.root, 0);
+  const maxD = Math.max(...Object.values(P).map(p=>p.d)), W = Math.max(200, Math.round(cur - GAP*1.5 + MX)), H = TOP + maxD*UY + CH + 14;
+  const Y = d => TOP + d*UY, onPath = new Set(s.path||[]), split = new Set(s.split||[]), kh = s.kh || {};
+  let e = "", n = "", t = "";
+  Object.entries(P).forEach(([id,p])=>{ const nd = N[id], left = p.x - p.w/2;
+    nd.kids.forEach((c,i)=>{ const q = P[c]; if(!q) return; const hot = (onPath.has(id) && onPath.has(c)) || (s.ek && s.ek[0]===id && s.ek[1]===i);
+      e += `<line x1="${left + PAD + i*CW}" y1="${Y(p.d)+CH}" x2="${q.x}" y2="${Y(q.d)}" class="${hot?"hot":""}"/>`; });
+    const cls = [id===s.cur?"cur":"", id===s.over?"over":"", id===s.miss?"miss":"", split.has(id)?"split":"", onPath.has(id)&&id!==s.cur?"path":""].filter(Boolean).join(" ");
+    n += `<g class="bn ${cls}"><rect x="${left}" y="${Y(p.d)}" width="${p.w}" height="${CH}" rx="6"/>`;
+    for(let j=1;j<nd.keys.length;j++) n += `<line class="sep" x1="${left+PAD+j*CW}" y1="${Y(p.d)+5}" x2="${left+PAD+j*CW}" y2="${Y(p.d)+CH-5}"/>`;
+    n += `</g>`;
+    nd.keys.forEach((k,j)=>{ const x = left + PAD + j*CW;
+      t += `<g class="bk ${kh[k]||""}" data-flip="k${k}"><rect x="${x+2}" y="${Y(p.d)+3}" width="${CW-4}" height="${CH-6}" rx="4"/><text x="${x+CW/2}" y="${Y(p.d)+CH/2+4.5}" text-anchor="middle">${k}</text></g>`; });
+    if(!nd.keys.length) t += `<text x="${p.x}" y="${Y(p.d)+CH/2+4}" text-anchor="middle" class="sub">empty</text>`; });
+  if(s.tok && P[s.tok.at]){ const p = P[s.tok.at], lab = s.tok.q ? s.tok.k + "?" : String(s.tok.k), w = 12 + lab.length*8;
+    t += `<g class="btok${s.tok.q?" q":""}" data-flip="${s.tok.q?"tok":"k"+s.tok.k}"><rect x="${p.x-w/2}" y="${Y(p.d)-27}" width="${w}" height="21" rx="10.5"/><text x="${p.x}" y="${Y(p.d)-12.5}" text-anchor="middle">${esc(lab)}</text></g>`; }
+  const svg = `<svg class="av-svg av-bt" viewBox="0 0 ${W} ${H}" style="max-width:${Math.round(W*1.2)}px;min-width:${Math.round(W*.82)}px" role="img" aria-label="B-tree with ${s.n} keys and height ${s.h}">${e}${n}${t}</svg>`;
+  return `<div class="av-btw">${svg}</div><p class="av-aux mono">M = ${s.M} keys per node · ${s.n} keys · height ${s.h} · ${Object.keys(N).length} node${Object.keys(N).length===1?"":"s"}</p>`;
+}
 
 /* ---- dynamic programming ---- */
 function dpDraw(s){
@@ -627,7 +928,8 @@ const NOTE = {Sorting:"Bars are values. Orange: being compared. Purple: just mov
 
 /* ---------------- player ---------------- */
 const SPEEDS = [1600, 1000, 650, 380, 170];
-const P = { id:null, vals:null, frames:[], k:0, t:null, speed:2, err:"" };
+const P = { id:null, vals:null, frames:[], k:0, t:null, speed:2, err:"", live:{}, shown:-1 };
+const reducedMotion = () => !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches);
 const byId = id => V.find(x=>x.id===id);
 function initVals(v){ const o = {}; (v.inputs||[]).forEach(i=>o[i.k] = i.def); return Object.assign(o, v.init ? JSON.parse(JSON.stringify(v.init)) : {}); }
 function runViz(v, vals){
@@ -639,7 +941,8 @@ function load(id, vals){
   const v = byId(id) || V[0]; stop();
   const r = runViz(v, vals || initVals(v));
   if(r.err){ P.err = r.err; if(P.id!==v.id){ P.id = v.id; P.vals = initVals(v); P.frames = runViz(v, P.vals).frames || []; P.k = 0; } return; }
-  P.id = v.id; P.vals = vals || initVals(v); P.frames = r.frames; P.k = 0; P.err = "";
+  if(P.id!==v.id) P.live = {};
+  P.id = v.id; P.vals = vals || initVals(v); P.frames = r.frames; P.k = 0; P.err = ""; P.shown = -1;
 }
 function stop(){ clearInterval(P.t); P.t = null; const b = document.querySelector('[data-aact="play"]'); if(b){ b.textContent = "Play"; b.setAttribute("aria-pressed","false"); } }
 function play(){
@@ -651,13 +954,26 @@ function play(){
     P.k++; showFrame(); }, SPEEDS[P.speed]);
   showFrame();
 }
+/* moving parts: an SVG element with data-flip="key" glides from where the same key was in the previous frame (one step forward only) */
+function flipGrab(stage){ const m = {}; stage.querySelectorAll("[data-flip]").forEach(el=>{ const r = el.getBoundingClientRect(); m[el.dataset.flip] = [r.left + r.width/2, r.top + r.height/2]; }); return m; }
+function flipPlay(stage, old){
+  const dur = Math.min(520, SPEEDS[P.speed]*.75);
+  stage.querySelectorAll("[data-flip]").forEach(el=>{ const o = old[el.dataset.flip], svg = el.ownerSVGElement; if(!o || !svg || !el.animate) return;
+    const r = el.getBoundingClientRect(), sr = svg.getBoundingClientRect(), vb = svg.viewBox && svg.viewBox.baseVal, k = vb && vb.width ? sr.width / vb.width : 1;
+    const dx = (o[0] - r.left - r.width/2)/k, dy = (o[1] - r.top - r.height/2)/k; if(Math.abs(dx) < .5 && Math.abs(dy) < .5) return;
+    el.animate([{transform:`translate(${dx}px,${dy}px)`}, {transform:"translate(0px,0px)"}], {duration:dur, easing:"cubic-bezier(.3,.7,.3,1)"}); });
+}
 function showFrame(){
   const v = byId(P.id), f = P.frames[P.k], stage = $("av-stage"); if(!v || !stage) return;
   if(!f){ stage.innerHTML = ""; return; }
-  stage.innerHTML = v.draw(f.s, P.vals, f);
+  const old = P.k===P.shown+1 && !reducedMotion() ? flipGrab(stage) : null;
+  stage.innerHTML = v.draw(f.s, P.vals, f); P.shown = P.k;
+  if(old) flipPlay(stage, old);
+  if(v.liveState) Object.entries(v.liveState(f.s)).forEach(([id,o])=>{ const b = document.querySelector(`[data-alive="${id}"]`); if(!b) return;
+    if(o.label!==undefined && b.textContent!==o.label) b.textContent = o.label; b.disabled = !!o.disabled; });
   $("av-msg").textContent = f.msg;
   $("av-k").textContent = `step ${P.k+1} of ${P.frames.length}`;
-  $("av-count").innerHTML = (v.counters||[]).map(k=>`<span><b>${f.c[k]||0}</b> ${COUNT[k]||k}</span>`).join("");
+  $("av-count").innerHTML = (v.counters||[]).map(k=>`<span><b>${f.c[k]||0}</b> ${(v.clabel&&v.clabel[k])||COUNT[k]||k}</span>`).join("");
   document.querySelectorAll("#av-code li").forEach((li,i)=>{ li.classList.toggle("on", i===f.line); if(i===f.line) li.setAttribute("aria-current","step"); else li.removeAttribute("aria-current"); });
   const back = document.querySelector('[data-aact="back"]'), next = document.querySelector('[data-aact="next"]');
   if(back) back.disabled = P.k===0; if(next) next.disabled = P.k>=P.frames.length-1;
@@ -665,6 +981,13 @@ function showFrame(){
 function chipsHTML(ids){
   const N = app().N;
   return `<div class="chips">${ids.filter(id=>N[id]).map(id=>`<button type="button" class="chip" style="--c:var(--l${N[id].l})" data-read="${id}"><span class="sw"></span>${esc(N[id].label)}</button>`).join("")}</div>`;
+}
+/* live controls: act on the running animation (insert a key, crash a server); the visualizer re-runs and jumps to the new part */
+function liveHTML(v){
+  if(!v.live) return "";
+  const L = v.live, fields = (L.fields||[]).map(i=>`<label class="av-f short"><span>${esc(i.label)}</span><input type="text" data-alin="${i.k}" value="${esc(P.live[i.k]===undefined?i.def:P.live[i.k])}" spellcheck="false" autocomplete="off" inputmode="${i.mode||"text"}" style="width:${i.w+3}ch"></label>`).join("");
+  const btns = (L.buttons||[]).map(b=>typeof b==="string" ? `<span class="av-lab">${esc(b)}</span>` : `<button type="button" class="btn${b.primary?" primary":""}" data-alive="${b.id}">${esc(b.label)}</button>`).join("");
+  return `<div class="av-live" role="group" aria-label="${esc(L.title)}"><div class="av-h mono">${esc(L.title)}</div><div class="av-livein">${fields}<div class="btnrow">${btns}</div></div>${L.note?`<p class="av-aux">${esc(L.note)}</p>`:""}</div>`;
 }
 function vizHTML(v){
   const ins = (v.inputs||[]).map(i=>`<label class="av-f${i.w?" short":""}"><span>${esc(i.label)}</span><input type="text" data-ain="${i.k}" value="${esc(P.vals[i.k]===undefined?i.def:P.vals[i.k])}" spellcheck="false" autocomplete="off"${i.w?` style="width:${i.w+3}ch"`:""}></label>`).join("");
@@ -680,6 +1003,7 @@ function vizHTML(v){
         <div class="av-ctl"><button type="button" class="btn" data-aact="back">← Back</button><button type="button" class="btn primary" data-aact="play" aria-pressed="false">Play</button><button type="button" class="btn" data-aact="next">Next →</button><button type="button" class="btn" data-aact="reset">Reset</button>
           <label class="av-speed"><span>Speed</span><input type="range" min="0" max="4" step="1" value="${P.speed}" id="av-speed" aria-label="Speed"></label><span class="mono av-k" id="av-k"></span></div>
         <div class="av-count" id="av-count"></div>
+        ${liveHTML(v)}
         ${NOTE[v.group]?`<p class="av-aux">${esc(NOTE[v.group])}</p>`:""}
       </div>
       <div class="av-side"><div class="av-h mono">Pseudocode</div><ol class="av-code" id="av-code">${v.code.map(l=>`<li><code>${esc(l)}</code></li>`).join("")}</ol></div>
@@ -847,6 +1171,15 @@ function bind(el){
       if(d.atab){ stop(); st.tab = d.atab; return render(el, st); }
       if(d.aviz){ stop(); st.viz = d.aviz; P.err = ""; render(el, st); const m = el.querySelector(".alg-main"); if(m && matchMedia("(max-width: 900px)").matches) m.scrollIntoView({block:"start"}); return; }
       if(d.acell!==undefined){ const v = byId(P.id); if(!v.click) return; const nv = v.click(P.vals, +d.acell); if(nv) rerun(Object.assign({}, P.vals, nv)); return; }
+      if(d.alive){ const v = byId(P.id); if(!v.act) return; const fv = {};
+        el.querySelectorAll("[data-alin]").forEach(i=>{ fv[i.dataset.alin] = P.live[i.dataset.alin] = i.value; });
+        let r; try { r = v.act(P.vals, d.alive, fv, P.frames[P.k]); } catch(err){ P.err = err.message || String(err); stop(); return render(el, st); }
+        if(!r) return;
+        stop(); load(P.id, r.v);
+        if(!P.err){ const i = P.frames.findIndex(f=>f.s.seek >= r.seek); P.k = i<0 ? P.frames.length-1 : i; }
+        render(el, st); const again = el.querySelector(`[data-alive="${d.alive}"]`); if(again && !again.disabled) again.focus();
+        if(!P.err && !reducedMotion()) play();
+        return; }
       if(d.apreset!==undefined){ const v = byId(P.id); return rerun(Object.assign({}, P.vals, v.presets[+d.apreset].v)); }
       if(d.adiff){ PR.diff = d.adiff; return render(el, st); }
       if(d.aprob!==undefined){ st.prob = d.aprob || null; render(el, st); el.scrollIntoView({block:"start"}); return; }
@@ -884,6 +1217,7 @@ function bind(el){
       PR.esc = false; return;
     }
     if(e.target.matches && e.target.matches("[data-ain]") && e.key==="Enter"){ e.preventDefault(); return rerun(readInputs()); }
+    if(e.target.matches && e.target.matches("[data-alin]") && e.key==="Enter"){ e.preventDefault(); const b = el.querySelector(".av-live [data-alive]"); if(b) b.click(); return; }
     if(e.target.id==="av-stage" && (e.key==="ArrowLeft"||e.key==="ArrowRight")){ e.preventDefault(); stop(); P.k = Math.max(0, Math.min(P.frames.length-1, P.k + (e.key==="ArrowLeft"?-1:1))); showFrame(); }
   });
 }
