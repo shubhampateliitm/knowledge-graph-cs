@@ -361,6 +361,75 @@ const shots = process.argv[3] || null;
     await page.click('[data-aprob=""]'); await page.waitForSelector('.pr-row');
     ok((await page.textContent('[data-aprob="sample-valid-brackets"]')).includes('solved'), 'solved mark shows in the list');
   } else console.log('  - practice fixture not built in (set DTS_PRACTICE_FIXTURE=1); skipped practice checks');
+  // practice in other languages: the selector, Python by default, Copy test program for Go, Python run with Pyodide
+  const lp = await page.evaluate(() => (window.__dts.DATA.practice.find(p => p.sig && p.langs && p.langs.python && p.langs.go && !p.sig.design) || {}).id);
+  if (lp) {
+    await page.evaluate(() => { try { localStorage.removeItem('dts:lang:v1'); } catch (e) {} });
+    await page.goto(base + '#practice/' + lp); await page.waitForSelector('#pr-code');
+    const P = await page.evaluate(id => window.__dts.DATA.practice.find(p => p.id === id), lp);
+    const order = await page.$$eval('.pr-langs [data-codelang]', bs => bs.map(b => b.dataset.codelang).join(','));
+    ok(order === 'python,go,cpp,rust,scala,javascript', 'languages: selector in order Python, Go, C++, Rust, Scala, JavaScript (' + order + ')');
+    ok(await page.getAttribute('#pr-code', 'data-lang') === 'python' && await page.getAttribute('.pr-langs [data-codelang="python"]', 'aria-pressed') === 'true'
+       && (await page.inputValue('#pr-code')) === P.langs.python.starter && !!(await page.$('[data-aact="run"]')), 'languages: Python is the default, with its starter and Run tests');
+    ok(/Write .*\(.*\) -> /.test(await page.textContent('.pr-sig')) && /Pyodide/.test(await page.textContent('.pr-sig')), 'languages: the Python signature line says where the code runs');
+    await page.click('.pr-langs [data-codelang="go"]');
+    const cmd = await page.evaluate(id => window.DTSHarness.command(window.__dts.DATA.practice.find(p => p.id === id), 'go'), lp);
+    ok(await page.getAttribute('#pr-code', 'data-lang') === 'go' && (await page.inputValue('#pr-code')) === P.langs.go.starter && !(await page.$('[data-aact="run"]'))
+       && (await page.textContent('.pr-sig')).includes('not run inside the app') && (await page.textContent('.pr-sig')).includes(cmd), 'languages: Go shows its starter and the go run command, and no Run button');
+    await page.fill('#pr-code', P.langs.go.solution);
+    await page.click('[data-aact="copyprog"]'); await page.waitForSelector('#pr-prog', { state: 'attached' });
+    const prog = await page.inputValue('#pr-prog');
+    const want = await page.evaluate(([id, code]) => window.DTSHarness.program(window.__dts.DATA.practice.find(p => p.id === id), 'go', code), [lp, P.langs.go.solution]);
+    ok(prog === want && prog.startsWith('// Down the Stack practice') && prog.includes(P.langs.go.solution.trim().split('\n')[0]) && prog.includes('func main()')
+       && (await page.textContent('.pr-cmdline')).trim() === cmd, 'languages: Copy test program gives your code plus the tests, and the command (' + prog.split('\n').length + ' lines)');
+    await page.click('[data-areveal="solution"]');
+    ok((await page.textContent('#pr-solution')).trim() === P.langs.go.solution.trim() && /\(Go\)/.test(await page.textContent('[data-areveal="solution"]')), 'languages: Show solution shows the Go solution');
+    await page.click('[data-areveal="solution"]');
+    await page.click('.pr-langs [data-codelang="python"]');
+    ok(await page.evaluate(() => localStorage.getItem('dts:lang:v1')) === 'python' && (await page.inputValue('#pr-code')) === P.langs.python.starter, 'languages: back to Python, the choice is remembered');
+    await page.click('.pr-langs [data-codelang="go"]');
+    ok((await page.inputValue('#pr-code')) === P.langs.go.solution, 'languages: code is kept per language');
+    await page.click('.pr-langs [data-codelang="python"]');
+    // Python in the browser: the pinned Pyodide from cdn.jsdelivr.net when it can be reached, else an offline stub of it
+    const pyBase = await page.evaluate(() => window.DTSAlgo.python.base);
+    const online = !process.env.DTS_E2E_PY_STUB && await page.evaluate(async u => { try { const r = await fetch(u + 'pyodide.js', { cache: 'no-store' }); return r.ok; } catch (e) { return false; } }, pyBase);
+    if (!online) {
+      const stub = "self.loadPyodide = async function(){ await new Promise(function(r){ setTimeout(r, 400); }); var out = function(){};\n" +
+        "  return { setStdout: function(o){ out = o.batched; }, setStderr: function(){}, globals: { v: {}, set: function(k, x){ this.v[k] = x; } },\n" +
+        "    runPython: function(){ var g = this.globals.v; if (/while True/.test(g._dts_user)) { for (;;) {} }\n" +
+        "      var n = (g._dts_prog.match(/^    \\(\\[/mg) || []).length, good = !/pass\\s*$/.test(g._dts_user);\n" +
+        "      out('DTS-RESULT ' + JSON.stringify({lang: 'python', pass: good ? n : 0, total: n, error: null, results: Array.from({length: n}, function(){ return {ok: good, got: good ? '\"stub\"' : 'null', ms: 0}; })})); } }; };\n//";
+      await page.evaluate(s => { const P = window.DTSAlgo.python; if (P.w) P.w.terminate(); P.w = null; P.ready = false; P.base = 'data:text/javascript;charset=utf-8,' + encodeURIComponent(s); }, stub);
+      console.log('  - ' + (process.env.DTS_E2E_PY_STUB ? 'DTS_E2E_PY_STUB is set' : 'cdn.jsdelivr.net is not reachable from this browser') + ': Python checks run against an offline stub of Pyodide');
+    }
+    const label = online ? 'Pyodide' : 'Pyodide stub';
+    await page.click('[data-aact="run"]');
+    const loadingText = await page.waitForSelector('#pr-out .pr-loading', { timeout: 5000 }).then(h => h.textContent()).catch(() => '');
+    ok(/Loading Python \(~10 MB, once\)/.test(loadingText), 'python: the first run shows "Loading Python (~10 MB, once)"');
+    await page.waitForSelector('#pr-out .pr-res', { timeout: 150000 });
+    ok(/0 of \d+ tests pass/.test(await page.textContent('.pr-res')) && await page.locator('.pr-tests li.bad').count() === P.tests.length, label + ': the starter fails every test');
+    await page.fill('#pr-code', P.langs.python.solution); await page.click('[data-aact="run"]');
+    await page.waitForSelector('#pr-out .pr-res.good', { timeout: 60000 }).catch(() => {});
+    ok((await page.textContent('.pr-res')).includes(P.tests.length + ' of ' + P.tests.length + ' tests pass') && !(await page.$('#pr-out .pr-loading')), label + ': the solution passes every test, without loading again');
+    await page.waitForTimeout(300);
+    ok((await page.textContent('#pr-solved')).includes('solved'), label + ': passing all tests marks the problem solved');
+    if (online) {
+      await page.fill('#pr-code', 'def ' + P.sig.name + '(*args):\n    return 1 // 0\n'); await page.click('[data-aact="run"]');
+      await page.waitForSelector('#pr-out .pr-res', { timeout: 60000 });
+      ok(/ZeroDivisionError: integer division or modulo by zero \(line 2 of your code\)/.test(await page.textContent('.pr-tests')), 'python: an exception shows its type and the line of your code');
+      await page.fill('#pr-code', 'def ' + P.sig.name + '(:\n'); await page.click('[data-aact="run"]');
+      await page.waitForFunction(() => /SyntaxError/.test(document.querySelector('#pr-out').textContent), null, { timeout: 60000 });
+      ok(/line 1 of your code/.test(await page.textContent('#pr-out')), 'python: a syntax error names the line');
+    }
+    await page.fill('#pr-code', 'def ' + P.sig.name + '(*args):\n    while True:\n        pass\n'); const t0 = Date.now(); await page.click('[data-aact="run"]');
+    await page.waitForFunction(() => /Stopped after 5 seconds/.test(document.querySelector('#pr-out').textContent), null, { timeout: 20000 }).catch(() => {});
+    const took = (Date.now() - t0) / 1000;
+    ok(/Stopped after 5 seconds/.test(await page.textContent('#pr-out')) && took < 12, label + ': an infinite loop is stopped after 5 seconds (' + took.toFixed(1) + ' s)');
+    await page.fill('#pr-code', P.langs.python.solution); await page.click('[data-aact="run"]');
+    await page.waitForSelector('#pr-out .pr-res.good', { timeout: 150000 }).catch(() => {});
+    ok(!!(await page.$('#pr-out .pr-res.good')), label + ': Python runs again after a stopped run (a new worker)');
+    if (shots) { await page.screenshot({ path: shots + '/9-practice-python.png' }); }
+  } else console.log('  - no practice problem with sig and langs yet; skipped language checks');
   // animated scenes (build with DTS_ANIM_FIXTURE=1 for the two samples in tests/fixtures/anim_sample.json)
   if (await page.evaluate(() => (window.__dts.SCENES || []).some(s => s.id === 'sample-tcp-handshake'))) {
     await page.goto(base + '#scene/sample-tcp-handshake'); await page.waitForSelector('#reader #rs-watch .scene svg .sc-a');
@@ -430,6 +499,82 @@ const shots = process.argv[3] || null;
     ok(await rp.locator('#rs-watch .scene .sc-fx > *').count() === 0 && await rp.locator('#rs-watch .sc-a[data-id="rto"]').count() === 1 && await rp.locator('#rs-watch .scene .sc-gh').count() === 1, 'reduced motion jumps to the end state without travel');
     await rctx.close();
   } else console.log('  - scene fixture not built in (set DTS_ANIM_FIXTURE=1); skipped scene checks');
+  // problem map (a build with content/problemmap/map.json, or DTS_PROBLEMMAP=tests/fixtures/problemmap_sample.json)
+  const hasPM = await page.evaluate(() => { const D = window.__dts.DATA; return !!(D.pm_summary || (D.problemmap && D.problemmap.concepts)); });
+  if (hasPM) {
+    await page.goto(base + '#problems'); await page.waitForSelector('#pm-svg .pm-n', { timeout: 20000 });
+    const pm = await page.evaluate(() => { const I = window.DTSPM._I(); return { ideas: I.ideas.length, probs: I.P.length, nodes: document.querySelectorAll('#pm-svg .pm-n').length, allG: document.querySelectorAll('#pm-svg g').length }; });
+    ok(pm.nodes === pm.ideas && pm.allG < pm.ideas + 40, `problem map draws its ${pm.ideas} ideas as SVG nodes, not its ${pm.probs} problems (${pm.allG} groups)`);
+    const lv = await page.evaluate(() => { const y = id => +document.querySelector(`.pm-n[data-pmidea="${id}"] rect`).getAttribute('y'); const I = window.DTSPM._I(); const lo = I.ideas.find(d => d.l === 0), hi = I.ideas.find(d => d.l === I.maxL); return y(lo.id) > y(hi.id); });
+    ok(lv, 'problem map: level 0 is drawn at the bottom');
+    ok((await page.locator('#tab-problems').isVisible()) && (await page.locator('#strip .pmband').count()) === 1, 'problem map: tab and a band below L5 in the layer strip');
+    if (shots) await page.screenshot({ path: shots + '/10-problem-map.png' });
+    const idea = await page.evaluate(() => { const I = window.DTSPM._I(); return (I.byId.hashmap && I.byId.hashmap.probs.length ? I.byId.hashmap : I.ideas.slice().sort((a, b) => b.probs.length - a.probs.length)[0]).id; });
+    await page.locator(`.pm-n[data-pmidea="${idea}"]`).dispatchEvent('click'); await page.waitForSelector('#panel .pm-ladder .pm-row');
+    ok((await page.locator(`.pm-n.sel[data-pmidea="${idea}"]`).count()) === 1 && (await page.locator('#pm-svg .pm-e.hot').count()) > 0, 'problem map: clicking an idea selects it and lights the lines it builds on');
+    ok((await page.textContent('#panel .pm-steph')).startsWith('Start here') && await page.evaluate(() => { const d = [...document.querySelectorAll('#panel .pm-step .pm-steph .mono')].map(x => +x.textContent.replace(/\D/g, '')); return d.every((x, i) => !i || x > d[i - 1]); }), 'idea panel: a ladder of problems, shallowest step first');
+    ok((await page.locator('#panel .pm-row a[href*="leetcode.com/problems/"]').count()) > 0, 'idea panel: LeetCode links');
+    ok(/#problems\/idea\//.test(await page.evaluate(() => location.hash)), 'idea selection is in the address (#problems/idea/...)');
+    await page.click('[data-pmdiff="2"]'); await page.waitForTimeout(100);
+    const hard = await page.evaluate(() => [document.querySelectorAll('.pm-n.off').length, [...document.querySelectorAll('#panel .pm-row .pr-d')].every(x => x.textContent === 'Hard')]);
+    ok(hard[0] > 0 && hard[1], 'difficulty filter dims ideas with no Hard problems and filters the ladder (' + hard[0] + ' dimmed)');
+    await page.click('[data-pmdiff="-1"]'); await page.selectOption('#pm-fam', '0'); await page.waitForTimeout(100);
+    const fam = await page.evaluate(() => { const I = window.DTSPM._I(); return [...document.querySelectorAll('.pm-n:not(.off)')].every(g => I.byId[g.dataset.pmidea].f === 0); });
+    ok(fam, 'family filter keeps one family lit');
+    await page.selectOption('#pm-fam', '-1');
+    await page.click('[data-pmworked]'); await page.waitForTimeout(100);
+    ok(await page.evaluate(() => { const I = window.DTSPM._I(); return [...document.querySelectorAll('.pm-n:not(.off)')].every(g => I.byId[g.dataset.pmidea].worked > 0) && document.querySelectorAll('.pm-n:not(.off)').length > 0; }), '"Has a worked problem" keeps only ideas with a practice problem');
+    await page.click('[data-pmworked]');
+    await page.fill('#pm-q', 'two sum'); await page.waitForSelector('#pm-sres [data-pmprob="1"]');
+    ok(true, 'search finds a problem by title');
+    await page.click('#pm-sres [data-pmprob="1"]'); await page.waitForSelector('#panel svg.pm-mini');
+    ok((await page.textContent('#panel h2')).includes('Two Sum') && (await page.locator('#panel .pm-mn.me').count()) === 1 && (await page.locator('#panel .pm-mn[data-pmprob]').count()) >= 2, 'problem view: a mini-DAG with prerequisites below and unlocks above');
+    const mini = await page.evaluate(() => { const me = document.querySelector('#panel .pm-mn.me rect'), y = +me.getAttribute('y'); const ns = [...document.querySelectorAll('#panel .pm-mn[data-pmprob]')]; const pre = window.DTSPM._I().byN[1].p; return ns.every(g => pre.includes(+g.dataset.pmprob) ? +g.querySelector('rect').getAttribute('y') > y : +g.querySelector('rect').getAttribute('y') < y); });
+    ok(mini, 'problem view: prerequisites drawn below, unlocks above');
+    ok((await page.locator('#panel .pm-path li').count()) >= 2 && !(await page.locator('#panel .pm-path li').first().locator('.pm-pdot').count() === 0), 'problem view: learning path from a root');
+    ok((await page.locator('#panel [data-pmpractice="two-sum"]').count()) > 0, 'problem view: link to the worked practice problem');
+    await page.fill('#pm-q', '');
+    await page.click('#panel .btnrow [data-pmdone="1"]'); await page.waitForTimeout(250);
+    ok((await page.getAttribute('#panel .btnrow [data-pmdone="1"]', 'aria-pressed')) === 'true', 'mark a problem as solved');
+    await page.reload(); await page.waitForSelector('#panel .btnrow [data-pmdone="1"]', { timeout: 20000 });
+    ok((await page.getAttribute('#panel .btnrow [data-pmdone="1"]', 'aria-pressed')) === 'true', 'solved mark survives a reload (deep link #problems/1)');
+    await page.click('[data-view="you"]'); await page.waitForSelector('#pm-next .pm-row');
+    const nx = await page.evaluate(() => { const I = window.DTSPM._I(), done = window.DTSPM.done(); return [...document.querySelectorAll('#pm-next .pm-pt')].map(b => +b.dataset.pmprob).filter(n => I.byN[n].p.length).every(n => I.byN[n].p.every(m => done.has(m))); });
+    ok(nx, 'You: next problems have all their prerequisites solved');
+    await page.click('[data-view="problems"]'); await page.waitForSelector('#panel .btnrow [data-pmdone="1"]');
+    await page.click('#panel .btnrow [data-pmdone="1"]'); await page.waitForTimeout(200);
+    // keyboard: arrow keys move between ideas, Enter opens one
+    await page.locator('.pm-n[tabindex="0"]').focus(); const before = await page.evaluate(() => document.activeElement.dataset.pmidea);
+    await page.keyboard.press('ArrowUp'); const after = await page.evaluate(() => document.activeElement.dataset.pmidea);
+    await page.keyboard.press('Enter'); await page.waitForTimeout(150);
+    ok(before && after && before !== after && (await page.locator(`.pm-n.sel[data-pmidea="${after}"]`).count()) === 1, 'keyboard: arrows move between ideas, Enter selects');
+    // pins: a concept read lists the problems that use it
+    const cid = await page.evaluate(() => { const N = window.__dts.N, c = (window.__dts.DATA.pm_summary || window.__dts.DATA.problemmap).concepts; return N.hashtables && c.hashtables ? 'hashtables' : Object.keys(c).find(k => N[k]); });
+    await page.goto(base + '#read/' + cid); await page.waitForSelector('#rs-problems .pm-row', { timeout: 20000 });
+    ok((await page.locator('#rs-problems .pm-row').count()) >= 1 && (await page.locator('#reader .toc a[data-jump="rs-problems"]').count()) === 1, 'concept read: "Problems that use this" with rows and a TOC entry');
+    if (await page.locator('#rs-problems [data-pmpinmore]').count()) { const n0 = await page.locator('#rs-problems .pm-row').count(); await page.click('#rs-problems [data-pmpinmore]'); ok((await page.locator('#rs-problems .pm-row').count()) > n0, 'concept read: Show all'); }
+    const pin = await page.getAttribute('#rs-problems .pm-row .pm-pt', 'data-pmprob');
+    await page.click('#rs-problems .pm-row .pm-pt'); await page.waitForSelector('#panel svg.pm-mini');
+    ok(await page.locator('#reader').isHidden() && (await page.textContent('#panel h2')).startsWith('#' + pin), 'concept pin opens the problem in the map');
+    await page.goto(base + '#practice/two-sum'); await page.waitForSelector('.pm-links [data-pmidea]', { timeout: 20000 });
+    ok(true, 'practice problem links to its idea in the map');
+    await page.goto(base + '#algo/twoptr'); await page.waitForSelector('.av .pm-links [data-pmidea]', { timeout: 20000 });
+    ok(true, 'visualizer links to its ideas in the map');
+    await page.goto(base + '#patterns'); await page.waitForTimeout(400);
+    ok((await page.locator('.pt-all .pm-links [data-pmidea]').count()) > 0, 'pattern templates link to ideas in the map');
+    // reduced motion: picking an idea does not animate the scroll
+    const pctx = await browser.newContext({ viewport: { width: 390, height: 844 }, reducedMotion: 'reduce', colorScheme: 'dark' });
+    const pp = await pctx.newPage(); pp.on('pageerror', e => errors.push('pageerror: ' + e.message));
+    await pp.goto(base + '#problems'); await pp.waitForSelector('#pm-svg .pm-n', { timeout: 20000 });
+    const ph = await pp.evaluate(() => { const f = document.getElementById('pm-frame'); return [document.documentElement.scrollWidth, f.scrollWidth > f.clientWidth, f.scrollTop > 0]; });
+    ok(ph[0] <= 392 && ph[1], 'phone: the map scrolls inside its frame, no horizontal page scroll (' + ph[0] + ')');
+    ok(ph[2], 'phone: the map opens at the foundations (scrolled to the bottom)');
+    await pp.locator('.pm-n').first().dispatchEvent('click'); await pp.waitForSelector('#panel .pm-steph');
+    await pp.click('#panel .pm-row .pm-pt'); await pp.waitForSelector('#panel svg.pm-mini');
+    ok(await pp.evaluate(() => document.documentElement.scrollWidth) <= 392, 'phone: idea ladder and problem view fit the width');
+    if (shots) await pp.screenshot({ path: shots + '/11-problem-phone.png' });
+    await pctx.close();
+  } else console.log('  - no problem map in this build; skipped problem map checks');
   // reduced motion in a visualizer: a live action jumps to its first step and does not play
   const vctx = await browser.newContext({ viewport: { width: 1280, height: 900 }, reducedMotion: 'reduce' });
   const vp = await vctx.newPage(); vp.on('pageerror', e => errors.push('pageerror: ' + e.message));

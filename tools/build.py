@@ -11,6 +11,8 @@ Environment: DTS_CONTENT_DB=path   write the database somewhere else (tests use 
              DTS_ANIM_DIR=path  read animated scenes from another folder instead of content/anim/
              DTS_FORMAT_FIXTURE=1 also load tests/fixtures/format_sample.txt and format_design.txt (rich-text browser test)
              DTS_DIST=path      write the standalone page somewhere else
+             DTS_PROBLEMMAP=path read the problem map from another file instead of content/problemmap/map.json
+                                (tests use tests/fixtures/problemmap_sample.json; a missing file just means no problem map)
 """
 import glob, json, os, re, sqlite3, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -52,6 +54,12 @@ CREATE TABLE templates (pattern TEXT PRIMARY KEY, ord INTEGER NOT NULL, body TEX
 -- animated scenes (content/anim/*.json, format in content/anim/README.md): one JSON object per row, in file order
 CREATE TABLE scenes (id TEXT PRIMARY KEY, concept TEXT NOT NULL REFERENCES nodes(id), ord INTEGER NOT NULL, title TEXT NOT NULL, steps INTEGER NOT NULL, body TEXT NOT NULL);
 CREATE INDEX scenes_concept ON scenes(concept, ord);
+-- problem map (content/problemmap/map.json, built by tools/merge_problemmap.py): one full JSON entry per problem;
+-- the compact form the app loads (/api/problemmap, the standalone page) and its per-concept summary are in meta
+-- ('problemmap', 'problemmap_summary'). Absent when there is no map.json.
+CREATE TABLE pm_problems (n INTEGER PRIMARY KEY, idea TEXT NOT NULL, family TEXT NOT NULL, depth INTEGER NOT NULL, slug TEXT NOT NULL, body TEXT NOT NULL);
+CREATE INDEX pm_problems_idea ON pm_problems(idea, depth);
+CREATE TABLE pm_ideas (id TEXT PRIMARY KEY, ord INTEGER NOT NULL, family TEXT NOT NULL, level INTEGER NOT NULL, body TEXT NOT NULL);
 -- search owners: node ids, layer essays 'L0'..'L5' and design questions 'design/<id>'
 CREATE VIRTUAL TABLE search USING fts5(owner UNINDEXED, label, mechanism, body, tokenize = 'porter unicode61');
 """
@@ -106,12 +114,63 @@ def write_db(data, path):
         db.execute("INSERT INTO templates VALUES (?,?,?)", (name, i, json.dumps(t, ensure_ascii=False)))
     for i, s in enumerate(data.get("scenes", [])):
         db.execute("INSERT INTO scenes VALUES (?,?,?,?,?,?)", (s["id"], s["concept"], i, s.get("title", ""), len(s["steps"]), json.dumps(s, ensure_ascii=False)))
+    pm = data.get("problemmap_full")
+    if pm:
+        db.executemany("INSERT INTO pm_problems VALUES (?,?,?,?,?,?)", [(q["n"], q["idea"], q["family"], q["depth"], q["slug"], json.dumps(q, ensure_ascii=False)) for q in pm["problems"]])
+        db.executemany("INSERT INTO pm_ideas VALUES (?,?,?,?,?)", [(d["id"], i, d["family"], d["level"], json.dumps(d, ensure_ascii=False)) for i, d in enumerate(pm["ideas"])])
+        db.executemany("INSERT INTO meta VALUES (?,?)", [("problemmap", json.dumps(data["problemmap"], ensure_ascii=False, separators=(",", ":"))),
+                                                         ("problemmap_summary", json.dumps(data["pm_summary"], ensure_ascii=False, separators=(",", ":")))])
     db.execute("INSERT INTO search(search) VALUES ('optimize')")
     db.commit(); db.execute("VACUUM"); db.close()
     os.replace(tmp, path)
 
 def _script(js):
     return "<script>\n" + js.replace("</script", "<\\/script") + "\n</script>"
+
+PROBLEMMAP = os.path.join(ROOT, "content", "problemmap", "map.json")
+PM_COLS = ["n", "title", "slug", "difficulty", "family", "idea", "uses", "prereqs", "new", "depth", "concepts", "tags"]
+PM_DIFF = ["Easy", "Medium", "Hard"]
+
+def load_problemmap(path=None):
+    """content/problemmap/map.json (or DTS_PROBLEMMAP). Returns (map or None, errors). A missing file is not an error:
+    the app simply has no problem map until tools/merge_problemmap.py has written one."""
+    path = path or os.environ.get("DTS_PROBLEMMAP") or PROBLEMMAP
+    if not os.path.exists(path): return None, []
+    try: m = json.load(open(path, encoding="utf-8"))
+    except ValueError as e: return None, [f"{os.path.relpath(path, ROOT)}: invalid JSON: {e}"]
+    if not isinstance(m, dict) or not all(isinstance(m.get(k), list) for k in ("families", "ideas", "problems")):
+        return None, [f"{os.path.relpath(path, ROOT)}: needs families, ideas and problems lists"]
+    ideas = {d["id"] for d in m["ideas"]}; fams = {f["id"] for f in m["families"]}
+    bad = [q.get("n") for q in m["problems"] if q.get("idea") not in ideas or q.get("family") not in fams]
+    if bad: return None, [f"{os.path.relpath(path, ROOT)}: problems with unknown idea or family, e.g. {bad[:8]}"]
+    return m, []
+
+def compact_problemmap(m):
+    """The form the app loads: families and ideas as small objects, problems as rows (column names in "cols"); families,
+    ideas, difficulties and tags are indexes. Per problem "concepts" holds only the concepts the problem adds beyond its
+    primary idea's (the app derives the rest), "unlocks" is derived from prereqs. Also returns the per-concept summary
+    that /api/graph carries: {concept id: [problems about it, problems that also use it]}."""
+    fi = {f["id"]: i for i, f in enumerate(m["families"])}
+    ii = {d["id"]: i for i, d in enumerate(m["ideas"])}
+    ic = {d["id"]: d["concepts"] for d in m["ideas"]}
+    tags = sorted({t for q in m["problems"] for t in q.get("tags", [])})
+    ti = {t: i for i, t in enumerate(tags)}
+    rows = []
+    for q in sorted(m["problems"], key=lambda q: q["n"]):
+        extra = [c for c in q.get("concepts", []) if c not in ic[q["idea"]]]
+        rows.append([q["n"], q["title"], q["slug"], PM_DIFF.index(q["difficulty"]) if q["difficulty"] in PM_DIFF else 1, fi[q["family"]], ii[q["idea"]],
+                     [ii[u] for u in q.get("uses", []) if u in ii], q.get("prereqs", []), q.get("new", ""), q.get("depth", 0), extra, [ti[t] for t in q.get("tags", [])]])
+    st = dict(m.get("stats") or {})
+    st.setdefault("problems", len(rows)); st.setdefault("ideas", len(m["ideas"]))
+    compact = dict(v=1, stats=st, cols=PM_COLS, diffs=PM_DIFF, tags=tags,
+                   families=[dict(id=f["id"], name=f["name"], description=f.get("description", ""), complete=bool(f.get("complete", True))) for f in m["families"]],
+                   ideas=[dict(id=d["id"], name=d["name"], f=fi[d["family"]], l=d["level"], b=d.get("builds_on", []), c=d.get("concepts", []),
+                               a=d.get("anchor"), s=d.get("summary", ""), nc=d.get("new_concept")) for d in m["ideas"]],
+                   p=rows)
+    concepts = {c: [len(v.get("primary", [])), len(v.get("uses", []))] for c, v in (m.get("concepts") or {}).items()}
+    summary = dict(problems=len(rows), catalog=st.get("catalog", len(rows)), ideas=len(m["ideas"]), families=len(m["families"]),
+                   missing_families=st.get("missing_families", []), concepts=concepts)
+    return compact, summary
 
 def standalone(data, out):
     """Inline web/ (css + js, the Temml maths library) and the full data into one HTML file.
@@ -122,12 +181,12 @@ def standalone(data, out):
     web = os.path.join(ROOT, "web")
     read = lambda *p: open(os.path.join(web, *p), encoding="utf-8").read()
     html = read("index.html")
-    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    payload = json.dumps({k: v for k, v in data.items() if k != "problemmap_full"}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     b64 = base64.b64encode(gzip.compress(payload, 9, mtime=0)).decode("ascii")
     data_tag = '<script id="dts-data" type="application/gzip-base64">' + b64 + "</script>\n" + _script(read("inflate.js"))
     html = html.replace('<link rel="stylesheet" href="app.css">', "<style>\n" + read("app.css") + "\n</style>")
     for name, body in (("vendor/temml.min.js", "/* Temml 0.13.5 (MIT License, https://temml.org), LaTeX to MathML */\n" + read("vendor", "temml.min.js")),
-                       ("rich.js", read("rich.js")), ("scene.js", read("scene.js")), ("algo.js", read("algo.js"))):
+                       ("rich.js", read("rich.js")), ("scene.js", read("scene.js")), ("langharness.js", read("langharness.js")), ("algo.js", read("algo.js")), ("pm.js", read("pm.js"))):
         tag = '<script src="%s"></script>' % name
         assert tag in html, "index.html placeholder changed: " + tag
         html = html.replace(tag, _script(body))
@@ -135,10 +194,12 @@ def standalone(data, out):
     assert tag in html, "index.html placeholder changed: " + tag
     html = html.replace(tag, data_tag + "\n" + _script(read("app.js")))
     assert "<style>" in html and '<script src="' not in html, "index.html placeholders changed"
-    # the hosted page gets its own document shell, so drop ours
-    html = re.sub(r"(?is)<!doctype html>\s*|</?html[^>]*>\s*|</?head>\s*|</?body>\s*", "", html)
-    html = re.sub(r'<meta charset="utf-8">\s*', "", html)
+    # dist/down-the-stack.html is a complete document (doctype + UTF-8) for opening from disk;
+    # dist/artifact.html drops the shell because the hosted page gets its own document shell
     open(out, "w", encoding="utf-8").write(html)
+    shell = re.sub(r"(?is)<!doctype html>\s*|</?html[^>]*>\s*|</?head>\s*|</?body>\s*", "", html)
+    shell = re.sub(r'<meta charset="utf-8">\s*', "", shell)
+    open(os.path.join(os.path.dirname(out), "artifact.html"), "w", encoding="utf-8").write(shell)
     return len(html.encode("utf-8")), len(payload)
 
 PRACTICE_KEYS = ("id", "title", "pattern", "difficulty", "statement", "fn", "params", "tests", "starter", "solution")
@@ -159,8 +220,30 @@ def load_practice():
             if miss: errs.append(f"{os.path.relpath(f, ROOT)}: problem {p.get('id') if isinstance(p, dict) else p!r} missing {', '.join(miss)}"); continue
             if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(p["id"])): errs.append(f"{os.path.relpath(f, ROOT)}: bad problem id {p['id']!r}"); continue
             if p["id"] in seen: continue
+            if p.get("sig") is not None or p.get("langs") is not None:
+                bad = check_langs_entry(p)
+                if bad:
+                    errs.append(f"{os.path.relpath(f, ROOT)}: problem {p['id']}: {bad}; kept as JavaScript only (fix it, then python3 tools/check_langs.py --ids {p['id']})")
+                    p = {k: v for k, v in p.items() if k not in ("sig", "langs")}
             seen.add(p["id"]); out.append(p)
     return out, errs
+
+LANG_IDS = ("python", "go", "cpp", "rust", "scala")
+
+def check_langs_entry(p):
+    """The other languages of a practice problem (content/PRACTICE_LANGS.md): a valid sig that fits the tests, and langs with a
+    starter and a solution per language. Returns an error message, or "" when it is fine. (Running the solutions is
+    tools/check_langs.py's job; the build only checks the shape.)"""
+    import langharness
+    if not isinstance(p.get("sig"), dict) or not isinstance(p.get("langs"), dict): return "sig and langs go together"
+    try: langharness.prepare(p)
+    except langharness.HarnessError as e: return "bad sig: " + str(e)
+    L = p["langs"]
+    if "python" not in L: return "langs has no python"
+    for k, v in L.items():
+        if k not in LANG_IDS: return f"unknown language {k!r} in langs"
+        if not isinstance(v, dict) or not all(isinstance(v.get(x), str) and v[x].strip() for x in ("starter", "solution")): return f"langs.{k} needs a starter and a solution"
+    return ""
 
 TEMPLATES = os.path.join(ROOT, "content", "practice", "templates.json")
 TEMPLATE_LANGS = ("python", "javascript", "go", "cpp", "rust", "scala")
@@ -236,10 +319,17 @@ def main():
     if aerrs:
         print("ANIMATION ERRORS (fix them, or check one file with python3 tools/checkanim.py <file>):\n  " + "\n  ".join(aerrs), file=sys.stderr); sys.exit(1)
     data["stats"]["scenes"] = len(data["scenes"])
+    pm, pmerrs = load_problemmap()
+    for e in pmerrs: print("problem map: skipped " + e, file=sys.stderr)
+    if pm:
+        data["problemmap_full"] = pm
+        data["problemmap"], data["pm_summary"] = compact_problemmap(pm)
+    data["stats"]["problemmap"] = len(pm["problems"]) if pm else 0
     st = data["stats"]
     print(f"content ok: {st['nodes']} concepts {st['per_layer']}, {st['edges']} links, {st['side']} side links, "
           f"{st['tours']} tours, {st['courses']} courses, {st['words']:,} words, {st['refs']} sources ({st['urls']} with direct links), {st['deep']} deep reads, "
-          f"{st['designs']} design questions, {st['practice']} practice problems, {st['templates']} pattern templates, {st['scenes']} animated scenes")
+          f"{st['designs']} design questions, {st['practice']} practice problems, {st['templates']} pattern templates, {st['scenes']} animated scenes, "
+          f"{st['problemmap']} problems in the problem map" + ("" if pm else " (no content/problemmap/map.json yet)"))
     if "--check" in args: return
     os.makedirs(os.path.join(ROOT, "data"), exist_ok=True); os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)
     db = os.environ.get("DTS_CONTENT_DB") or os.path.join(ROOT, "data", "content.db")

@@ -84,3 +84,23 @@ A JSON list of objects:
 Inputs and outputs must be plain JSON (arrays, numbers, strings, booleans, null). Represent trees as level-order
 arrays with null, linked lists as arrays, graphs as edge lists. Solutions must pass all tests (check with
 `node tools/check_practice.js`).
+
+The fields above are the **JavaScript** version (fn, params, starter, solution). Python (the main language), Go, C++,
+Rust and Scala come from two more fields:
+
+    "sig": {"name": "two_sum", "params": [["nums", "list[int]"], ["target", "int"]], "returns": "list[int]"},
+    "langs": {"python": {"starter": "...", "solution": "..."}, "go": {...}, "cpp": {...}, "rust": {...}, "scala": {...}}
+
+- `sig` types the existing tests: `int`, `long`, `float`, `bool`, `str`, `list[T]`, `optional[T]`, `tree` (a
+  level-order list with null in the tests; TreeNode in the code), `linkedlist` (a list in the tests; ListNode in the
+  code). `"returns": "void"` with `"inplace": k` compares parameter k after the call. `"tol"` sets the float tolerance
+  (default 1e-6, relative). `name` is snake_case (Python and Rust); Go, C++ and Scala use its camelCase.
+- Design (class) problems keep the `[operations, arguments]` tests and use
+  `{"design": "LRUCache", "init": [["capacity", "int"]], "methods": [{"name": "get", "params": [["key", "int"]], "returns": "int"}, ...]}`
+  with method names spelled as in the tests (`void` methods expect null).
+- `langs` has a LeetCode-style starter that compiles and runs, and a reference solution, for each of the five.
+- The test program for any language comes from `sig` + `tests` (`tools/langharness.py`, and `web/langharness.js` in the
+  browser). Python runs in the browser with Pyodide; the others are copied out and run in a terminal.
+- Writers add languages in patch files `content/drafts/practice_langs_K.json` (a list of `{id, sig, langs}`), check
+  them with `python3 tools/check_langs.py <patch> --starters`, and the coordinator merges them with
+  `python3 tools/apply_lang_patches.py <patch>`. Full rules and examples: `content/PRACTICE_LANGS.md`.

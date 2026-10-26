@@ -1,0 +1,896 @@
+@@ prefixsums
+value: A prefix sum array stores, for every position i of an array, the total of everything up to i. After one pass over the data, the sum of any range is the difference of two stored numbers, so it costs one subtraction instead of a loop. If you must answer q range-sum queries on an array of n numbers, the plain loop costs up to \( O(nq) \); with a prefix array it costs \( O(n + q) \). For n = 1,000,000 and q = 1,000,000 queries, that is the difference between up to \( 10^{12} \) additions and about two million operations.
+The difference array is the same idea turned around. Instead of asking "what is the sum of this range?" you ask "add v to every element of this range", many times, and read the final array only once. You write +v at the start of the range and −v just after its end, and one prefix-sum pass at the end turns those marks into the final values. Each update costs \( O(1) \), however long the range is. This is how booking systems, line sweeps and "how many intervals cover this point" problems are solved in one pass.
+Prefix sums sit on two foundations. From calculus (L4) comes the picture: a prefix sum is a discrete integral and a difference array is a discrete derivative, and the two undo each other exactly like the fundamental theorem of calculus. From Big-O analysis (L3) comes the trade: you spend one \( O(n) \) pass and \( O(n) \) memory once, and every later query drops from \( O(n) \) to \( O(1) \). The idea is the base of many things above it: Fenwick and segment trees (prefix sums that can be updated), line sweeps in computational geometry, pre-aggregated totals in star-tree indexes, window functions in SQL, and the parallel scan operation on GPUs.
+terms: Prefix sum — an array P where P[i] is the sum of the first i elements; P[0] = 0 by convention.
+Range sum — the sum of a[l] … a[r]; with a prefix array it equals P[r + 1] − P[l].
+Difference array — an array D where D[i] = a[i] − a[i − 1]; its prefix sum gives back a.
+Scan — the name used in parallel computing and APL for a prefix operation; "inclusive" scan includes the current element, "exclusive" scan does not.
+Invertible operation — an operation with an undo (subtraction for addition, XOR for XOR); prefix tricks work only for these.
+Summed-area table — the two-dimensional prefix sum, used to get the sum of any rectangle in a grid in constant time.
+Sentinel — the extra leading zero in P that removes special cases for ranges starting at index 0.
+Hash-map trick — storing how often each prefix value has been seen, to count ranges with a target sum in one pass.
+history: The idea is as old as cumulative totals in accounting, but it entered programming through the scan operator. Kenneth Iverson's APL (described in "A Programming Language", 1962) had the operator `+\`, which gives the running sums of a vector in one symbol. In the 1980s, researchers asked how to compute scans in parallel: Ladner and Fischer (1980) gave a parallel prefix circuit, and Hillis and Steele (1986) showed scans on the Connection Machine. Guy Blelloch's report "Prefix Sums and Their Applications" (1990) argued that scan is a basic parallel primitive, as important as addition, and showed how to use it for sorting, graph algorithms and lexical analysis. Today the same primitive runs inside GPU libraries and in the window functions of SQL engines.
+The two-dimensional version came from graphics. Franklin Crow introduced summed-area tables in 1984 to filter textures quickly: the average colour of any rectangle needs only four lookups. In 2001, Viola and Jones used the same table under the name "integral image" so that each rectangle feature in their face detector cost a few lookups; the detector ran at about 15 frames per second on a 700 MHz Pentium III.
+For data structures, the problem was that a prefix array is static: one change to a[i] forces you to update all later prefix values, which is \( O(n) \). Peter Fenwick's 1994 paper "A New Data Structure for Cumulative Frequency Tables", which was about arithmetic compression, solved this with a tree stored in a flat array (now called a Fenwick tree or binary indexed tree), where both update and prefix query cost \( O(\log n) \). Prefix sums on their own stay the right tool when the data does not change.
+how: Start with an array \( a_0, \dots, a_{n-1} \). Build \( P \) with \( P_0 = 0 \) and \( P_{i+1} = P_i + a_i \). This is one pass, \( O(n) \) time and \( O(n) \) memory. Then, for any range from l to r inclusive,
+\[ \sum_{i=l}^{r} a_i = P_{r+1} - P_{l} \]
+The reason is simple. \( P_{r+1} \) contains everything before index r + 1, and \( P_l \) contains everything before index l. The difference removes the common part and leaves exactly the elements l to r. The extra zero at the front is the sentinel: without it, a range starting at 0 would need a special case. In Python, `itertools.accumulate` or `numpy.cumsum` builds P in one line.
+```python
+from itertools import accumulate
+
+class RangeSum:                      # LeetCode 303
+    def __init__(self, nums):
+        self.P = [0] + list(accumulate(nums))
+
+    def query(self, l, r):           # inclusive, 0-based
+        return self.P[r + 1] - self.P[l]
+```
+The same algebra works for any operation that has an inverse. For XOR the inverse is XOR itself, so `X[r+1] ^ X[l]` gives the XOR of a range (LeetCode 1310). For counting, P can hold how many elements so far satisfy a property. For products, the inverse is division, which works only when no element is zero (or when you use modular inverses with a prime modulus). It does not work for minimum and maximum, because nothing "un-takes" a maximum; those problems need the range-minimum structures of the next layer (sparse tables, segment trees).
+The two-dimensional version uses inclusion and exclusion. Define \( S[i][j] \) as the sum of the rectangle from the corner (0,0) to (i−1, j−1), then \( S[i][j] = g[i-1][j-1] + S[i-1][j] + S[i][j-1] - S[i-1][j-1] \). The last term is subtracted because the first two terms both include the overlap. The sum of a rectangle with corners (r1, c1) and (r2, c2) is then \( S[r_2+1][c_2+1] - S[r_1][c_2+1] - S[r_2+1][c_1] + S[r_1][c_1] \). This is LeetCode 304, and it costs four lookups per query.
+The next step is the one that makes prefix sums an interview favourite. A range sum equals k when \( P_j - P_i = k \), which is the same as \( P_i = P_j - k \). So while scanning, keep a hash map of how many times each prefix value has been seen. At each position j, the number of ranges ending at j with sum k is `seen[P_j - k]`. Hash-table lookups are expected \( O(1) \), so the whole count takes \( O(n) \), and it works with negative numbers, where a sliding window fails.
+```python
+from collections import defaultdict
+
+def subarray_sum(nums, k):           # LeetCode 560
+    seen = defaultdict(int)
+    seen[0] = 1                      # the empty prefix
+    s = ans = 0
+    for x in nums:
+        s += x
+        ans += seen[s - k]           # earlier prefixes that fit
+        seen[s] += 1
+    return ans
+```
+The same template solves many problems by changing what is stored. For "sum divisible by k" (LeetCode 974 and 523), store prefix sums modulo k: two equal remainders mean the range between them is a multiple of k. For "equal numbers of 0 and 1" (LeetCode 525), turn each 0 into −1, and the longest range with sum 0 is the answer; store only the first index where each prefix value was seen. For "nice subarrays" with exactly k odd numbers (LeetCode 1248), map each number to 1 if odd and 0 if even, then count ranges with sum k.
+Now the difference array. Define \( D_i = a_i - a_{i-1} \) with \( a_{-1} = 0 \). Then a is the prefix sum of D. Adding v to all of \( a_l \dots a_r \) changes D in only two places: \( D_l \) increases by v, because the jump at the start is larger, and \( D_{r+1} \) decreases by v, because the jump at the end is smaller. All other differences stay the same. So you apply any number of range updates in \( O(1) \) each, then one prefix pass rebuilds the final array.
+```python
+def apply_updates(n, updates):       # LeetCode 370, 1109, 1094
+    D = [0] * (n + 1)                # one spare slot for r + 1
+    for l, r, v in updates:
+        D[l] += v
+        D[r + 1] -= v
+    out, run = [], 0
+    for i in range(n):
+        run += D[i]
+        out.append(run)
+    return out
+```
+Prefix sums and difference arrays are inverse operations, which is where calculus (L4) gives the right mental model. A prefix sum accumulates change into a level, like integration; a difference array extracts change from a level, like differentiation. A range update is a "derivative" that is zero everywhere except at two points, which is why it is cheap; the final prefix sum is the integration that spreads those two points across the whole range. Big-O analysis (L3) says what you bought: queries or updates become \( O(1) \) in exchange for a one-time \( O(n) \) pass, and the cost moves to the moment you finally read the data.
+diagram:
+  index i :    0    1    2    3    4    5    6    7
+  a       :    3    1    4    1    5    9    2    6
+  P (i+1) : 0  3    4    8    9   14   23   25   31
+            ^                      ^    ^
+          P[0]                  P[2]   P[6]
+
+  sum a[2..5] = P[6] - P[2] = 23 - 4 = 19      (4+1+5+9)
+
+  add +2 to a[1..4]:   D[1] += 2,  D[5] -= 2
+  D :   0  +2   0   0   0  -2   0   0
+  prefix(D) :  0  2  2  2  2  0  0  0     <- the update, spread out
+example: Take the array a = [3, 1, 4, 1, 5, 9, 2, 6]. The prefix array with the leading zero is P = [0, 3, 4, 8, 9, 14, 23, 25, 31]. To get the sum of a[2..5], which is 4 + 1 + 5 + 9, compute P[6] − P[2] = 23 − 4 = 19. To get the sum of the whole array, P[8] − P[0] = 31. To get a single element, a[7] = P[8] − P[7] = 31 − 25 = 6. Every query needs one subtraction, whatever the range length.
+Now count ranges with sum 2 in [1, 1, 1] (LeetCode 560 with k = 2), using the hash-map trick. Start with seen = {0: 1}, s = 0, answer = 0. Read 1: s = 1; seen[1 − 2] = seen[−1] = 0, so the answer stays 0; record seen[1] = 1. Read 1: s = 2; seen[2 − 2] = seen[0] = 1, so the answer becomes 1 (the range [1, 1] at positions 0–1); record seen[2] = 1. Read 1: s = 3; seen[3 − 2] = seen[1] = 1, so the answer becomes 2 (the range at positions 1–2). The result is 2, which is correct. The entry seen[0] = 1 matters: it represents the empty prefix and allows ranges that start at index 0.
+Next, a difference array. Take 8 flights (positions 0 to 7) with zero seats booked, and three bookings: add 2 to positions 1–4, add 3 to positions 3–6, add −1 to positions 0–2. Write into D (size 9): booking 1: D[1] += 2, D[5] −= 2. Booking 2: D[3] += 3, D[7] −= 3. Booking 3: D[0] −= 1, D[3] += 1. Now D = [−1, 2, 0, 4, 0, −2, 0, −3, 0]. Running sums give −1, 1, 1, 5, 5, 3, 3, 0. Check position 3: booking 1 (positions 1–4) covers it, +2; booking 2 (positions 3–6) covers it, +3; booking 3 (positions 0–2) does not. The total is 5, which matches. Three updates cost six writes in total, and the length of each range never appears in the cost.
+Classic problems, in the order that teaches the idea. LeetCode 1480 (Running Sum of 1d Array) is the prefix sum itself. 303 (Range Sum Query, Immutable) is the query formula, and 304 (Range Sum Query 2D, Immutable) is the 2D table. 724 (Find Pivot Index) and 238 (Product of Array Except Self) use prefix and suffix values from both ends. 560 (Subarray Sum Equals K) adds the hash map, and 525, 523, 974 and 1248 are variations of the same template. 370 (Range Addition), 1109 (Corporate Flight Bookings) and 1094 (Car Pooling) are the difference array. 307 (Range Sum Query, Mutable) is where the plain prefix array fails and a Fenwick tree takes over.
+intuition: The odometer of a car: the distance of any trip is the odometer at the end minus the odometer at the start, and you never need to re-drive the road.
+A running total stores everything that happened before a point in one number. Two such numbers share the same history up to the earlier point, so subtracting them cancels the shared history and leaves only what happened between them. The difference array is the same idea read in reverse: instead of storing the level, you store only the places where the level changes, and a long range is just a "turn on" mark and a "turn off" mark. Work that looks repeated (the same elements added again and again by overlapping ranges) is done once and shared.
+mistakes: People often think a prefix array can answer sums while the data changes. In fact one change at index i must update every later prefix value, which costs \( O(n) \). For data with updates, use a Fenwick tree or segment tree, which keep \( O(\log n) \) for both update and query. A prefix array is for static data, or for data that is built once and read many times.
+People often think a sliding window is always the same as prefix sums. In fact a sliding window needs monotonic behaviour: with only non-negative numbers, adding elements never decreases the sum, so you can move the left pointer safely. With negative numbers, the sum can go up and down, so the window argument breaks. Prefix sums with a hash map do not need the sign of the numbers.
+People often think prefix tricks work for any range aggregate. In fact they need an inverse. Sum, XOR and counts have one. Minimum, maximum, gcd and "number of distinct values" do not, because subtracting one prefix from another cannot remove the elements you want to drop. Those need sparse tables, segment trees or other structures.
+friction: The first limit is that the data must be static. Every update to a prefix array can touch up to n values, and a difference array forces you to finish all updates before you read anything: you cannot ask "what is the value now?" between updates without a pass. Interleaved updates and queries are exactly the case where you need a Fenwick tree (\( O(\log n) \) each) or a segment tree.
+The second limit is numeric. Prefix sums of 32-bit integers overflow easily: a million values of 5,000 sum to \( 5 \times 10^9 \), which is more than \( 2^{31} - 1 \approx 2.1 \times 10^9 \). Use 64-bit integers in languages that have fixed-width integers. With floating-point numbers the problem is subtler. A range sum computed as the difference of two large prefix values can lose most of its significant digits (catastrophic cancellation): if the prefix values are near \( 10^{12} \) and the range sum is about 1, a double with about 16 digits keeps only about 4 digits of the answer. For floating-point data, either use a compensated sum such as Kahan summation, or a segment tree, or accept the loss with eyes open.
+The third limit is memory and shape. The table costs \( O(n) \) extra memory, and the 2D table costs \( O(rc) \), as large as the data. In \( d \) dimensions a range query needs \( 2^d \) lookups with alternating signs. Prefix arrays also do not help with queries that are not ranges, such as "sum of elements with value above 10".
+practice: In data work the same pattern is everywhere. A cumulative distribution is a prefix sum of a histogram, and a weighted random choice builds prefix sums of the weights and binary searches a random number (LeetCode 528). A running total of impressions against a daily budget is a prefix sum over events ordered by time, and the byte offset of the k-th record in a log file is a prefix sum of record sizes. In Spark or Databricks, use window functions with an explicit frame and a `PARTITION BY` key; an unpartitioned running total runs on one machine, because a scan over partitioned data needs two passes (local sums, then partition offsets).
+Reach for a prefix array when you see "sum (or count, or XOR) over a range" with many queries and data that does not change. Reach for the hash-map version when you see "count or find ranges whose total equals, or is a multiple of, something", especially with negative numbers. Reach for a difference array when you see "apply the same change to a whole range" many times and read the result once: flight bookings, car-pooling capacity, meeting-room counts, painting segments, and any line sweep that tracks how many intervals are open at a point.
+Write the convention first: P has n + 1 entries, P[0] = 0, and the range sum is P[r + 1] − P[l]. Test with a one-element array, an empty range and a range that starts at 0. Use 64-bit integers by default. In Python the integers do not overflow, but in Java, C++ and Go they do.
+tradeoffs: Choose a plain prefix array when the data is static and queries are many: build time \( O(n) \), query \( O(1) \), and the code is five lines. Choose a Fenwick tree when values change between queries and you need prefix or range sums: \( O(\log n) \) per operation, only \( n \) extra words, and about ten lines of code. Choose a segment tree when you also need operations without an inverse (minimum, maximum, gcd) or range updates with lazy propagation: it costs about 2 to 4 times the memory and more code, and each operation is \( O(\log n) \).
+Choose a difference array when you have many range updates and one read at the end. If reads are interleaved with updates, each read forces a full pass, so use a Fenwick tree with range updates or a lazy segment tree. The deciding number is the ratio of reads to updates: one read per thousand updates favours the difference array by a large factor; a read after every update makes it lose.
+Choose the hash-map prefix method over a sliding window when numbers can be negative or when the condition is "equals k" or "divisible by k". Choose the sliding window when numbers are non-negative and the condition is monotone ("sum at least k", "at most k distinct"), because it uses \( O(1) \) memory instead of \( O(n) \) for the map. You give up either memory (the map) or generality (the window).
+interview: You are given an array with positive and negative numbers. Count the ranges with sum k. Why does a sliding window fail, and what do you do instead? || With negative numbers, extending the window can lower the sum and shrinking it can raise it, so there is no rule for moving the left pointer. Use prefix sums with a hash map: at each j, add `seen[P_j − k]` to the answer, then record P_j. This is \( O(n) \) time and \( O(n) \) memory. Do not forget `seen[0] = 1` for ranges that start at index 0.
+How would you answer range-sum queries when elements are also updated? || A prefix array needs \( O(n) \) per update, so use a Fenwick tree (binary indexed tree) with \( O(\log n) \) for both point update and prefix query, or a segment tree. If updates are rare and batched, rebuild the prefix array after each batch (cost \( O(n) \) per batch). Pick by the update-to-query ratio.
+You must apply 10^6 updates of the form "add v to positions l..r" on an array of 10^6 elements and then print the array. What is the best approach and the cost? || A difference array: each update is two writes, \( O(1) \), and one final prefix pass is \( O(n) \), so the total is \( O(n + u) \) with u updates, about two million operations. The naive loop is up to \( 10^{12} \). This works because no reads are needed between updates.
+Why can you not use prefix sums for range-maximum queries, and what do you use? || Prefix sums rely on an inverse operation (subtraction) to cancel the shared part. Maximum has no inverse: knowing the maximum of the first 100 elements and of the first 50 does not tell you the maximum of elements 51 to 100. Use a sparse table for static data (\( O(n \log n) \) build, \( O(1) \) query) or a segment tree if there are updates.
+quiz: What is the formula for the sum of a[l..r] using a prefix array P that has a leading zero? || \( P[r+1] - P[l] \). P[r+1] holds the total of elements 0 to r, P[l] holds the total of elements 0 to l − 1, and the difference is exactly elements l to r.
+Why does adding v to a whole range cost only two writes in a difference array? || Because a is the prefix sum of D. Raising D[l] by v raises every value from l onward by v, and lowering D[r+1] by v cancels that rise from r + 1 onward, so only positions l to r change. One prefix pass at the end spreads the marks.
+For a = [2, −1, 3, 4, −2], what are P and the sum of a[1..3]? || P = [0, 2, 1, 4, 8, 6]. The sum of a[1..3] is P[4] − P[1] = 8 − 2 = 6, which matches −1 + 3 + 4 = 6.
+Why does the hash-map method for LeetCode 560 need seen[0] = 1 at the start? || It stands for the empty prefix before the first element. Without it, a range that starts at index 0 and has sum k would not be counted, since its start prefix is 0 and no entry for 0 exists yet.
+When should you pick a Fenwick tree instead of a prefix array, and what do you pay? || When values are updated between queries. A Fenwick tree makes point updates and prefix sums both \( O(\log n) \), instead of \( O(n) \) updates, but queries become \( O(\log n) \) rather than \( O(1) \).
+ref: book | Introduction to Algorithms, 4th ed. | Cormen, Leiserson, Rivest & Stein, 2022 |
+ref: paper | Prefix Sums and Their Applications | Guy E. Blelloch, CMU technical report CMU-CS-90-190, 1990 |
+ref: paper | A New Data Structure for Cumulative Frequency Tables | Peter M. Fenwick, Software: Practice and Experience, 1994 |
+ref: paper | Summed-Area Tables for Texture Mapping | Franklin C. Crow, SIGGRAPH 1984 |
+ref: paper | Parallel Prefix Computation | Richard E. Ladner & Michael J. Fischer, Journal of the ACM, 1980 |
+ref: docs | Parallel Prefix Sum (Scan) with CUDA, GPU Gems 3, chapter 39 | Harris, Sengupta & Owens, NVIDIA, 2007 | https://developer.nvidia.com/gpugems/gpugems3/part-vi-gpu-computing/chapter-39-parallel-prefix-sum-scan-cuda
+ref: course | Range Queries (Competitive Programmer's Handbook, ch. 9) | Antti Laaksonen, 2018 | https://cses.fi/book/book.pdf
+@@ twopointers
+value: Many problems ask for a pair or a range with some property: two numbers that add up to a target, the shortest range with a given sum, the longest piece of text with no repeated letter. The direct way tries every pair or every range, which is \( O(n^2) \) steps for n items. The two-pointer technique replaces that with one pass of \( O(n) \) steps. You keep two indexes into the sequence, and each step moves one of them in one direction, never back. For n = 1,000,000 items, that is about two million moves instead of \( 5 \times 10^{11} \) pair checks.
+It works because each move throws away candidates that provably cannot be part of a better answer. That proof is the real content of the technique. In the "two ends" form, the sorted order (from the sorting concept, L3) lets you say "this left element is too small for every remaining partner, so drop it". In the "window" form, the property must be monotone: if a range is valid, every smaller range inside it is also valid, so the left end can only move right. The reasoning behind both is a small proof by induction on an invariant (the proofs and order theory concepts, L4): the answer always lies between the two pointers.
+This is the engine inside things you meet in systems. The merge step of merge sort, the sort-merge join of a database, the sliding window of a stream processor and the sliding-window rate limiter all move two positions through ordered data and never look back. It is also one of the most common interview patterns, because the code is short and the correctness argument is easy to test.
+terms: Pointer — here simply an integer index into an array or string, not a memory address.
+Opposite-ends pointers — one index starts at the left end, one at the right end, and they move towards each other.
+Same-direction pointers — both indexes move left to right; the slow one marks where something starts, the fast one scans ahead.
+Sliding window — the range between a left index and a right index; the right end grows and the left end shrinks to keep a condition true.
+Invariant — a statement that is true before and after every step (for example "no valid pair uses an index outside [l, r]"); it is the proof of correctness.
+Monotone condition — a condition where growing the window can only make it "more satisfied" (or only "less"), never flip back and forth.
+Fast and slow pointers — two pointers on a linked list or sequence that move at different speeds, used to find the middle or a cycle.
+Merge — walking two sorted sequences together, always taking the smaller head, to produce one sorted sequence.
+history: The oldest example is the merge. John von Neumann wrote a merge sort for the EDVAC computer in 1945: two sorted runs, one index on each, always copy the smaller head. Every external sort and every sort-merge join since then uses the same two-index walk. Database systems made it central: sort-merge join was one of the standard join methods in the first relational systems of the 1970s, because it reads each sorted input once.
+String matching added a second use. The Knuth–Morris–Pratt algorithm (1977) scans a text with one index and a pattern with another, and after a mismatch it moves the pattern index back using a precomputed table instead of moving the text index back. The text pointer never goes backwards, which gives \( O(n + m) \) time. Floyd's cycle-finding algorithm (the "tortoise and hare", attributed to Robert Floyd in the late 1960s) put two pointers on a linked list, one moving one step and one moving two, and found cycles with \( O(1) \) memory.
+The window form grew with stream and network systems. Sliding windows appear in TCP (RFC 793, 1981) for flow control, in stream processors for "events in the last five minutes", and in rate limiters. As a named interview pattern, "two pointers" and "sliding window" became standard preparation once online judges such as LeetCode gathered hundreds of problems that fit them. A related theoretical point is 3SUM: three numbers that add to zero can be found in \( O(n^2) \) with one sort and a two-pointer scan, and Gajentaan and Overmars (1995) showed that many geometry problems are at least as hard as 3SUM, and the \( O(n^2) \) bound is widely believed to be close to optimal.
+how: There are three shapes. All of them rest on one idea: at each step, a pointer moves past an element that cannot belong to any better answer than the ones you have already seen.
+Shape 1: opposite ends on sorted data. To find two numbers in a sorted array that add to a target t, put l at the start and r at the end. Look at \( s = a[l] + a[r] \). If \( s = t \), you are done. If \( s < t \), then a[l] is too small: even paired with the largest remaining element a[r], the sum is below t, and every other partner is smaller than a[r]. So a[l] can be discarded and l moves right. If \( s > t \), the mirror argument discards a[r]. The invariant is "any valid pair has both indexes in [l, r]". Each step shrinks [l, r] by one, so there are at most n − 1 steps. Sorting (L3) is what gives the order that makes each discard safe, at a cost of \( O(n \log n) \) when the input is not yet sorted.
+```python
+def two_sum_sorted(a, t):            # LeetCode 167
+    l, r = 0, len(a) - 1
+    while l < r:
+        s = a[l] + a[r]
+        if s == t:
+            return l, r
+        if s < t:
+            l += 1                   # a[l] too small for any partner
+        else:
+            r -= 1                   # a[r] too large for any partner
+    return None
+```
+The same shape solves 3Sum (LeetCode 15: sort, fix one number, run the two-ends scan on the rest, \( O(n^2) \) total), 3Sum Closest (16), 4Sum (18), palindrome checks (125), and Container With Most Water (11). In the last one, the water held between lines at l and r is \( \min(h_l, h_r) \times (r - l) \). The scan moves the shorter line inward. Moving the taller one cannot help: the width shrinks and the height is still limited by the shorter line. So every discarded line has a proof that no better container uses it with any narrower partner.
+Shape 2: same direction, a read pointer and a write pointer. To remove duplicates from a sorted array in place (LeetCode 26), or move all zeros to the end (283), a fast pointer reads every element and a slow pointer marks the end of the "good" prefix. The fast pointer copies an element to the slow position only when it is wanted. Partitioning in quicksort and the three-way partition for the Dutch national flag (75, with three pointers) are the same idea. Fast and slow pointers with different speeds find the middle of a linked list (876) and a cycle in it (141, 142); the linked-list concept (L3) explains why those lists cannot be indexed directly, so pointer speed is the only tool.
+Shape 3: the sliding window. The right pointer adds one element at a time. When the window breaks a rule, the left pointer moves right until the window is valid again. This needs a monotone rule: if [l, r] is valid then any smaller window inside it is valid too (for example "all letters distinct", "sum less than a limit with non-negative numbers", "at most k distinct values"). Then, for each r, the best l only increases as r grows, so l never goes back. Each index enters the window once and leaves once, so the total work is at most 2n steps. This is an amortized argument: one step of the right pointer may cause many moves of the left pointer, but the total number of left moves is at most n.
+```python
+def sliding_window(a):               # template: "expand, then shrink"
+    l = 0
+    state = ...                      # counts or sums for a[l..r]
+    best = 0
+    for r, x in enumerate(a):
+        add(state, x)                # the window grows on the right
+        while not valid(state):      # the rule is broken
+            remove(state, a[l])      # shrink from the left
+            l += 1
+        best = max(best, r - l + 1)  # or min, or count
+    return best
+```
+Counting is a useful variant. If every window ending at r with start in [l, r] is valid, then there are \( r - l + 1 \) valid windows ending at r, and you add that to a total. For "exactly k" conditions (LeetCode 992, 930), use the identity \( \text{exactly}(k) = \text{atMost}(k) - \text{atMost}(k-1) \), because "at most" is monotone and "exactly" is not.
+Shape 4: two sequences, one pointer each. To merge two sorted lists, or to intersect two sorted lists of intervals (LeetCode 88, 21, 986), keep one index on each and advance the one with the smaller head. A sort-merge join does exactly this with two sorted inputs on the join key. The extra detail is duplicates: when both sides have several rows with the same key, the join must output every pair, so it remembers the start of the group on one side and re-reads it, instead of only moving forward.
+Two ideas to keep. First, the correctness check is always the invariant: write down what is true about the answer and the pointers, check that each move keeps it true, and check that the loop ends. Second, the cost check is that each pointer moves at most n times. If a pointer can move back, as in naive string matching, the linear bound is lost.
+diagram:
+  Shape 1: opposite ends, a = [1, 3, 4, 6, 8, 11], target 10
+
+   step   l  r   a[l]+a[r]   action
+    1     0  5     12        too big   -> r = 4
+    2     0  4      9        too small -> l = 1
+    3     1  4     11        too big   -> r = 3
+    4     1  3      9        too small -> l = 2
+    5     2  3     10        found (2, 3)
+
+  Shape 3: window, a = [2, 3, 1, 2, 4, 3], shortest with sum >= 7
+
+   r=3  window [0..3] sum 8   record 4, shrink -> [1..3] sum 6
+   r=4  window [1..4] sum 10  record 4, shrink -> [2..4] sum 7
+        record 3, shrink -> [3..4] sum 6
+   r=5  window [3..5] sum 9   record 3, shrink -> [4..5] sum 7
+        record 2, shrink -> [5..5] sum 3
+example: Shape 1, with the diagram's numbers: a = [1, 3, 4, 6, 8, 11], target 10. Start l = 0, r = 5: 1 + 11 = 12 is larger than 10, so drop 11 (r = 4). Now 1 + 8 = 9 is smaller, so drop 1 (l = 1). 3 + 8 = 11 is larger, drop 8 (r = 3). 3 + 6 = 9 is smaller, drop 3 (l = 2). 4 + 6 = 10 matches, so the answer is indexes (2, 3). That took 5 checks, while the all-pairs method has 15 pairs; for n = 1,000,000 it is the difference between about one million steps and \( 5 \times 10^{11} \).
+Shape 3, LeetCode 209: the shortest range of [2, 3, 1, 2, 4, 3] with sum at least 7. Keep a running sum s and a left index l = 0. Add 2 (s = 2), 3 (s = 5), 1 (s = 6), 2 (s = 8). Now s ≥ 7, so record length 4 (positions 0 to 3), drop a[0] = 2 (s = 6, l = 1). Add 4 (s = 10): valid with length 4; drop 3 (s = 7, l = 2), still valid, record length 3 (positions 2 to 4: 1 + 2 + 4); drop 1 (s = 6, l = 3). Add 3 (s = 9): valid with length 3; drop 2 (s = 7, l = 4), still valid, record length 2 (4 + 3); drop 4 (s = 3, l = 5). The end. The answer is 2. Each of the 6 elements was added once and dropped at most once.
+Another window, LeetCode 3: the longest substring without a repeated letter in "abcabcbb" grows to "abc" (3); each repeated letter forces the left end past its earlier copy, so the window never exceeds length 3. Classic problems, in teaching order. 167 (Two Sum II) and 125 (Valid Palindrome) are the pure forms. 26, 27 and 283 are read and write pointers. 11 (Container With Most Water) and 42 (Trapping Rain Water) need the "move the weaker side" argument. 15, 16 and 18 add a sort and an outer loop. 141, 142, 876 and 19 (Remove Nth Node From End) use fast and slow pointers. 209, 3, 424, 904, 713 and 1004 are variable windows. 76 (Minimum Window Substring), 567 and 438 are windows with letter counts. 992 and 930 use the "at most" difference. 239 (Sliding Window Maximum) needs a monotonic queue, which is the next concept in this group.
+intuition: Two people reading the same sorted guest list from both ends, each stepping inward, never needing to walk back because the names they passed cannot be what they are looking for.
+The technique is natural because order creates one-sided knowledge. In a sorted array, when the current pair is too small, you know exactly which end is to blame, and you know it for all future partners at once. One comparison therefore eliminates a whole row of the table of pairs, not a single cell. A window works for the same reason: if a window is already too big, no larger window with the same left end can be valid, so the left end can be dropped for good. The pointers are a way to walk through the table of all pairs along a path that visits only \( O(n) \) cells, and the invariant says the answer is never off that path.
+mistakes: People often think two pointers works on any array. In fact it needs a reason for each discard, which usually means sorted data or a monotone condition. On an unsorted array, two-sum cannot use opposite ends; use a hash set (\( O(n) \) memory) or sort first (and lose the original indexes).
+People often think a sliding window works whenever the question says "subarray". In fact with negative numbers, "sum at least k" is not monotone: adding an element can lower the sum, and shrinking can raise it. Use prefix sums with a hash map for those problems, or a deque-based method for the shortest range with sum at least k (LeetCode 862).
+People often think the nested `while` inside the `for` makes a sliding window quadratic. In fact the left pointer only moves right and never passes n, so over the whole run the `while` body executes at most n times in total. The cost is \( O(n) \) amortized, as long as the work inside each move is \( O(1) \). If removing an element costs \( O(\log n) \) because the state is a sorted structure (as in LeetCode 480, sliding window median), the total becomes \( O(n \log n) \).
+People often think merging with two pointers is trivial for joins. In fact, when both inputs have repeated keys, the matching rows must be combined as a cross product, so the join must buffer a group of equal keys and replay it. A naive "advance the smaller side" loop silently drops results.
+friction: The technique has a narrow door. If the data is not sorted and the condition is not monotone, nothing about a pointer move can be proved, and the method gives wrong answers without any error. Bugs are common at the boundaries: should the loop test `l < r` or `l <= r`, should a window be inclusive at both ends, and what happens with an empty input or a single element. A good habit is to write the invariant in a comment above the loop and to test arrays of length 0, 1 and 2.
+In streaming systems the window is defined by time, not by element count, and events arrive late and out of order. A simple "evict while the oldest timestamp is too old" loop assumes the data is ordered by time; with late data you need watermarks (the windowing concept), and the pointer picture is only a model. A sliding-window rate limiter that keeps every request timestamp uses \( O(\text{limit}) \) memory per client; approximate versions store two counters and weight them to save memory at the price of a small error.
+practice: When you see "pair", "triple", "longest", "shortest" or "count of ranges", ask two questions: is the input sorted, or can it be sorted cheaply, and is the condition monotone as the range grows? If yes, a pointer technique gives \( O(n) \) after the sort. If no, think of prefix sums with a hash map, a monotonic deque, or binary search on the answer.
+Write the invariant first, then the loop. Decide what each pointer means (inclusive or exclusive), what the loop condition is, and what you do when the condition is met (record the answer, then move which pointer). Test with all equal values, one element, and the answer at the very start or very end.
+In production code the same patterns appear without the name. Deduplication of a sorted stream is a read/write pointer. A merge of two sorted files or two sorted Kafka partitions by timestamp is a two-sequence walk. Spark's sort-merge join, its usual choice for large equi-joins that cannot be broadcast, does it after sorting both sides, spilling to disk if needed. A rate limiter of "at most 100 requests per rolling minute" keeps a deque of timestamps: on each request, pop from the front while the oldest is older than 60 seconds, then accept if the length is below 100 and append. Each timestamp is pushed and popped once, which is the same amortized argument as the window.
+tradeoffs: Choose two pointers over a hash set for two-sum when the data is already sorted or must be processed with \( O(1) \) extra memory; choose a hash set when the data is unsorted and you need the original indexes, since sorting first costs \( O(n \log n) \) and loses the positions. The deciding factors are memory (\( O(1) \) against \( O(n) \)) and whether sorting is already paid for.
+Choose a sliding window over prefix sums with a hash map when all numbers are non-negative and the condition is monotone: it needs \( O(1) \) memory against \( O(n) \), and it streams. Choose prefix sums with a hash map when numbers can be negative or the condition is "exactly k" or "divisible by k"; you pay memory for generality.
+Choose a monotonic deque instead of a heap for sliding-window maximum or minimum: \( O(n) \) against \( O(n \log n) \), at the cost of a trickier invariant. Choose a heap with lazy deletion when elements leave in an order that is not simply first-in-first-out.
+interview: Why is the sliding-window loop \( O(n) \) even though it has a `while` inside a `for`? || The left pointer only moves forward and never beyond n, so across the whole run the inner loop body runs at most n times. Each element enters once and leaves once, giving at most 2n steps. This is an amortized bound, not a worst case per iteration.
+In two-sum on a sorted array, why is it safe to move the left pointer when the sum is too small? || Every remaining partner of a[l] is at most a[r], so the best sum a[l] can reach is a[l] + a[r], which is already too small. Therefore a[l] cannot be part of any valid pair in [l, r] and can be discarded. The invariant "all valid pairs are inside [l, r]" is preserved.
+Your sliding window fails on an array with negative numbers. Why, and what is the fix? || The window needs a monotone rule, and with negative numbers growing the window can lower the sum, so you cannot decide which end to move. Use prefix sums with a hash map for "sum equals k", or a monotonic deque over prefix sums for "shortest range with sum at least k" (LeetCode 862). Both are \( O(n) \).
+How do you count subarrays with exactly k distinct integers using windows? || "Exactly k" is not monotone but "at most k" is. Count windows with at most k and subtract the count with at most k − 1. For each right end, the number of valid windows ending there is r − l + 1. Total time \( O(n) \) with a count map.
+Where do two pointers hide in a sort-merge join, and what goes wrong with duplicate keys? || One pointer walks each sorted input; the one with the smaller key advances. When keys are equal on both sides, all rows with that key on the left must match all rows with that key on the right, so the join buffers the right group and replays it for each left row. Without that, rows would be lost and the result would be incomplete.
+quiz: What condition must hold for a sliding window to be correct? || The rule must be monotone: if a window is valid, every smaller window inside it is valid too (or the reverse, consistently). Then the left end never needs to move backwards.
+Why does moving the left pointer in sorted two-sum never skip the answer? || When a[l] + a[r] is below the target, a[l] paired with any other remaining element is even smaller, because all of them are at most a[r]. So a[l] has no valid partner left and can be removed safely.
+How many pointer moves does a sliding window make on an array of n elements at most? || At most 2n: the right pointer moves n times and the left pointer moves at most n times, since neither goes backwards.
+For a = [2, 3, 1, 2, 4, 3] and target 7, what is the shortest range with sum at least 7? || The range [4, 3] at positions 4 to 5, with length 2. A window method finds it with a running sum and each element added and removed at most once.
+When would you pick a hash set over two pointers for a pair problem? || When the input is unsorted and you need original indexes or must keep the order: the hash set costs \( O(n) \) memory but only \( O(n) \) time, while two pointers would need an \( O(n \log n) \) sort that destroys the positions.
+ref: book | Introduction to Algorithms, 4th ed. | Cormen, Leiserson, Rivest & Stein, 2022 |
+ref: book | Algorithms, 4th ed. (sorting and merging; Knuth–Morris–Pratt) | Robert Sedgewick & Kevin Wayne, 2011 | https://algs4.cs.princeton.edu/
+ref: book | The Art of Computer Programming, Vol. 3: Sorting and Searching (merging) | Donald E. Knuth, 1998 |
+ref: paper | Fast Pattern Matching in Strings | Knuth, Morris & Pratt, SIAM Journal on Computing, 1977 |
+ref: paper | On a class of O(n²) problems in computational geometry | Anka Gajentaan & Mark H. Overmars, Computational Geometry, 1995 |
+ref: spec | RFC 793: Transmission Control Protocol (sliding window) | Jon Postel, IETF, 1981 | https://www.rfc-editor.org/rfc/rfc793
+ref: course | Sliding window and two pointers problem lists | LeetCode, ongoing | https://leetcode.com/tag/two-pointers/
+@@ binsearch
+value: Binary search finds one position in a sorted sequence by asking one question at the middle and then forgetting half of the sequence. Each question halves the number of candidates, so n candidates need only about \( \log_2 n \) questions: about 20 for a million items, 30 for a billion, 40 for a trillion. Linear search would need up to n questions. This is the difference between a lookup that is instant at any scale and one that grows with the data.
+The more useful view is wider than "search in a sorted array". Binary search finds the boundary where a yes/no condition flips from false to true. The sorted array is one case: the condition is "is a[i] at least x?". But the condition can be anything that is false for small inputs and true for large ones: "can a ship with capacity c carry all the packages in 5 days?", "does the build at commit i fail?", "is the square of m at least 2?". If you can write the test and the answer space is ordered, you can bisect, even when no array exists. This second form, "binary search on the answer", turns many optimisation problems into a sequence of yes/no checks.
+Three lower concepts give the technique its meaning. Sorting (L3) is what creates the order that makes one comparison worth half the data. Order theory (L4) states the exact requirement: a monotone condition over a totally ordered set. Asymptotic analysis (L4) says why the result is so strong: \( T(n) = T(n/2) + O(1) \) solves to \( O(\log n) \). The technique then sits inside B-tree nodes, SSTable and Kafka log indexes, Python's `bisect`, C++ `lower_bound` and `git bisect`.
+terms: Sorted array — an array where a[i] ≤ a[i + 1] for all i; the precondition for searching by value.
+Monotone predicate — a yes/no function that is false for every input up to some point and true for every input after it (FFFTTT); it never flips back.
+Lower bound — the first index whose value is not less than x (Python `bisect_left`, C++ `lower_bound`).
+Upper bound — the first index whose value is greater than x (Python `bisect_right`, C++ `upper_bound`).
+Half-open interval [lo, hi) — a range that includes lo and excludes hi; it makes loops and empty ranges easy to reason about.
+Search on the answer — binary search over the possible results of an optimisation problem, using a feasibility check as the predicate.
+Loop invariant — a statement true at every iteration (here: "the first true position lies in [lo, hi]"); it proves the loop correct.
+Overflow — an integer result too large for its type; the classic bug in `(lo + hi) / 2` for 32-bit integers.
+history: The idea was described in 1946 by John Mauchly, in the Moore School Lectures on computers, as a way to search a sorted file. The method is older in mathematics: Bernard Bolzano used repeated halving of an interval in 1817 to prove that a continuous function that changes sign has a root, and numerical bisection is still taught from that proof. Donald Knuth noted in "The Art of Computer Programming" volume 3 that the first published binary search was in 1946, but that a version that was correct for every array size did not appear until 1962.
+That gap is famous. In "Programming Pearls" (1986), Jon Bentley said that when he asked professional programmers to write a binary search from a clear specification, about 90% of them found bugs in code they had believed correct once it was tested, even though the idea takes minutes to explain. In 2006, Joshua Bloch of Google published "Nearly all binary searches and mergesorts are broken": the line `mid = (low + high) / 2` can overflow a 32-bit integer when the array has more than about \( 2^{30} \) elements. He had written the version in Java's `Arrays.binarySearch`, and the same bug had been in Bentley's proven-correct program, so it had been there for about nine years. The fix is `mid = low + (high - low) / 2`.
+Variants came for different costs. Interpolation search guesses the position from the value and is faster on uniform keys. Fibonacci search uses only addition and subtraction. Eytzinger and B-tree-like layouts reorder the array so the first few probes stay in cache; Khuong and Morin (2017) measured large speed-ups over the textbook layout on big arrays. `git bisect`, added to Git in 2005, applies the same idea to the commit history to find the first bad commit.
+how: The cleanest form of binary search ignores arrays and values and talks only about a predicate. Suppose `pred(i)` is false for every index below some boundary b and true from b onwards, and you want b. Keep two numbers `lo` and `hi` so that b is always in the half-open range \( [lo, hi] \). While `lo < hi`, test the middle. If `pred(mid)` is true, then b is at most mid, so set `hi = mid`. If it is false, then b is above mid, so set `lo = mid + 1`. When `lo == hi`, that is the boundary. Each test halves the range, so the loop runs \( \lceil \log_2 (hi - lo + 1) \rceil \) times.
+```python
+def first_true(lo, hi, pred):
+    """Smallest i in [lo, hi] with pred(i) True; hi if none."""
+    while lo < hi:
+        mid = lo + (hi - lo) // 2    # never (lo + hi) // 2 in C or Java
+        if pred(mid):
+            hi = mid                 # boundary is mid or to the left
+        else:
+            lo = mid + 1             # boundary is right of mid
+    return lo
+```
+Searching a sorted array is this template with a particular predicate. `lower_bound(a, x)` uses `pred(i) = a[i] >= x` on the range \( [0, n] \), so it returns n when every element is smaller. `upper_bound` uses `a[i] > x`. Exact search is then a lower bound followed by one check. The count of x in the array is `upper_bound − lower_bound`. Python's `bisect_left` and `bisect_right` are these two functions, and they exist in the standard library so that you never write your own.
+```python
+def lower_bound(a, x):               # same as bisect.bisect_left
+    lo, hi = 0, len(a)
+    while lo < hi:
+        mid = lo + (hi - lo) // 2
+        if a[mid] < x:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+def contains(a, x):
+    i = lower_bound(a, x)
+    return i < len(a) and a[i] == x
+```
+Why does it work? Sorting (L3) gives the order: if a[mid] < x then every element left of mid is also below x, so none of them can be the first element at least x. Order theory (L4) says what is really needed: the predicate must be monotone on a totally ordered set. If the predicate is not monotone, there is no safe half to throw away, and the loop returns an arbitrary boundary. The loop invariant, "the first true position is in [lo, hi]", is true at the start (hi is always a safe answer) and each branch keeps it true while the range shrinks. That is a three-line proof by induction, and it is the reason to prefer this template to ad-hoc versions with `lo <= hi` and `mid ± 1` in several places.
+The second form searches the answer. In LeetCode 875 (Koko Eating Bananas), Koko eats k bananas per hour from one pile at a time, and must finish piles of sizes p in h hours. The hours needed at speed k are \( \sum \lceil p_i / k \rceil \), which can only go down as k goes up. So "feasible(k)" is false for small k and true for large k. Bisect on k between 1 and the largest pile. The same pattern solves 1011 (Capacity to Ship Packages), 410 (Split Array Largest Sum), 1482 (Minimum Days to Make Bouquets), 774 and others. The cost is \( O(\log R) \) checks, each costing the time of the feasibility test; for R = \( 10^9 \) that is 30 checks. This is why the form is so powerful: if you can check a candidate answer in \( O(n) \), you can find the best one in \( O(n \log R) \).
+Other shapes fit the same template. In a rotated sorted array such as [4, 5, 6, 7, 0, 1, 2], `a[mid] > a[hi]` means the minimum is to the right (LeetCode 153, then 33 and 81). A mountain array has a peak where `a[i] > a[i + 1]` flips (162, 852). The median of two sorted arrays (4) bisects on the cut position in the smaller array. For real numbers, do not loop until two values are equal; use a fixed 60 iterations or a tolerance (for \( \sqrt{2} \), test `mid * mid < 2`).
+Inside systems the same function appears constantly. A B-tree or B+tree page holds sorted keys and the lookup binary searches inside the page (the B-tree concept, L2). Kafka stores a sparse index of (offset, file position) pairs per log segment; to read from offset x it binary searches the index for the greatest entry not above x, then scans forward from that file position (the log-segments concept, L2). An SSTable keeps a sparse index of block start keys, found by bisection. `git bisect` asks you to mark a good and a bad commit; it tests the middle commit and halves the range, so a history of 1,000 commits needs at most 10 tests.
+diagram:
+  lower_bound(a, 8) on a = [1, 3, 3, 5, 8, 8, 8, 13]
+
+  index:   0  1  2  3  4  5  6  7   8
+  a:       1  3  3  5  8  8  8  13  (end)
+  a>=8:    F  F  F  F  T  T  T  T   T      <- monotone, FFFF TTTTT
+
+  step  lo  hi  mid  a[mid]  test       action
+   1    0   8    4     8     8 >= 8     hi = 4
+   2    0   4    2     3     3 <  8     lo = 3
+   3    3   4    3     5     5 <  8     lo = 4
+   -    4   4   done                    answer index 4
+
+  Search on the answer, Koko (piles 3 6 7 11, h = 8 hours)
+  speed k:    1   2   3   4   5   6  ...  11
+  feasible:   F   F   F   T   T   T  ...   T    smallest k = 4
+example: Take the array [1, 3, 3, 5, 8, 8, 8, 13] and search for the first 8 (the diagram has the steps). Start with lo = 0 and hi = 8 (the end position, which is allowed as an answer). The middle is index 4, which holds 8; since 8 is not less than 8, the boundary is at 4 or earlier, so hi = 4. The middle of [0, 4] is index 2, which holds 3, smaller than 8, so lo = 3. The middle of [3, 4] is index 3, which holds 5, so lo = 4. Now lo = hi = 4 and the answer is index 4. Only three comparisons were needed for eight elements, and the answer is the first of the three equal 8s. Searching for 9 returns 7 (the position of 13), and searching for 100 returns 8, the end. If the same lookup used `upper_bound`, the answer would be 7, one position after the last 8, and the count of 8s is 7 − 4 = 3.
+Classic problems, in teaching order: 704 and 35 are the plain form; 34 is the lower and upper bound pair; 69 and 367 search a numeric answer; 153, 33, 81 and 162 use a cleverer predicate; 875, 1011, 410, 1482, 2226 and 1760 search on the answer with a feasibility check; 4 is the hardest common case; 528 bisects on prefix sums.
+Now the search on the answer, LeetCode 875: piles [3, 6, 7, 11] and h = 8 hours. The hours needed at speed k is \( \lceil 3/k \rceil + \lceil 6/k \rceil + \lceil 7/k \rceil + \lceil 11/k \rceil \). Search k in [1, 11]. Middle k = 6 gives 1 + 1 + 2 + 2 = 6 hours, which is feasible (6 ≤ 8), so hi = 6. Middle k = 3 gives 1 + 2 + 3 + 4 = 10 hours, too slow, so lo = 4. Middle of [4, 6] is k = 5, which gives 1 + 2 + 2 + 3 = 8, feasible, so hi = 5. Middle of [4, 5] is k = 4, which gives 1 + 2 + 2 + 3 = 8, feasible, so hi = 4. The answer is k = 4. Four feasibility checks of 4 piles each, against up to 11 checks with a linear scan. With 100,000 piles and speeds up to \( 10^9 \), the bisection needs about 30 checks of 100,000 operations, three million in total, while a linear scan over speeds would need up to \( 10^{14} \).
+A rotated array, LeetCode 153 on [4, 5, 6, 7, 0, 1, 2]. Set lo = 0, hi = 6. Middle index 3 holds 7, which is greater than the last element 2, so the minimum is to the right: lo = 4. Middle of [4, 6] is index 5, which holds 1 and is not greater than a[6] = 2, so hi = 5. Middle of [4, 5] is index 4, which holds 0, not greater than a[5] = 1, so hi = 4. The minimum is at index 4, the value 0.
+intuition: The game of guessing a number between 1 and 1,000: each "higher" or "lower" answer removes half of the numbers, so 10 questions are enough for anyone.
+Binary search is natural because every answer carries the most information it can. A yes/no question can give at most one bit, and the middle question gives exactly one bit, since it splits the remaining candidates into two equal sets. Reaching one candidate out of n needs \( \log_2 n \) bits, so no method that uses only comparisons can do better in the worst case. The sorted order is what lets a single comparison speak for a whole half at once, so the technique is not a trick but a match between the question you can ask and the information you need.
+mistakes: People often think binary search needs a sorted array. In fact it needs a monotone predicate. A rotated array, a mountain array and the space of possible answers are all searchable, because "is the boundary left of mid?" can be answered from one probe even when the array as a whole is not sorted.
+People often think `mid = (lo + hi) / 2` is fine. In fact in C, C++ and Java it overflows when lo + hi exceeds the largest integer (about 2.1 billion for 32 bits), which happens with arrays above about a billion elements. The result is a negative index and a crash or a wrong answer. Use `lo + (hi - lo) / 2`. Python integers do not overflow, but the habit is free.
+People often think the choice between `lo < hi` and `lo <= hi`, and between `hi = mid` and `hi = mid - 1`, is a matter of taste. In fact each pair belongs to one consistent interval convention. With a half-open [lo, hi) and `hi = mid` the loop ends when lo == hi. With a closed [lo, hi] and `hi = mid - 1` the loop ends when lo > hi. Mixing the two gives infinite loops (for example `lo = mid` with `mid` rounded down) or skipped answers. Pick one template and keep it.
+People often think binary search is always the fastest way to look things up. In fact a hash table answers an exact lookup in expected \( O(1) \), and for small arrays (under about 16 to 64 elements) a linear scan can win because it is branch-predictable and cache-friendly. Binary search is the right tool when you need order: the nearest value, a range, the rank of a key, or a boundary.
+friction: The textbook array layout is hostile to modern hardware. The first probes of a binary search on a large array are far apart in memory, so on a 1-billion-element array each of the first 20 or so probes may be a cache miss of around 80 to 100 nanoseconds, and the branch on each comparison is close to random, which a CPU mispredicts about half the time at roughly 15 to 20 cycles each. Real systems fight this with wide nodes (B-trees search many keys per page with one cache line or page load), branchless code with conditional moves, prefetching, and Eytzinger or van Emde Boas layouts.
+The monotonicity requirement is also fragile in practice. A feasibility check that depends on randomness, floating-point rounding or a non-monotone heuristic can make the bisection return a wrong boundary without any error. `git bisect` assumes the bug is deterministic and the history has one good-to-bad transition; with a flaky test or a bug that appears, vanishes and reappears, it points at a wrong commit. It also cannot tell that a commit does not build, unless you mark it as skipped.
+practice: Always use the standard library first: `bisect` in Python, `Arrays.binarySearch` or `Collections.binarySearch` in Java (which returns a negative insertion point when the key is missing), `std::lower_bound` and `std::upper_bound` in C++, `sort.Search` in Go. Use the lower-bound semantics, because they return a position, which works for insertion, ranges and counts.
+When you write your own, write down three things first: what the predicate is, what the range is (including whether the answer can be "none"), and which template you use. The generic `first_true(lo, hi, pred)` above handles almost every case. Check that `pred` is monotone on a few small examples. Test the empty range, one element, answer at both ends and all-equal values.
+In data systems, bisection is the reason a sparse index is enough. A sorted file with one index entry per 4 KB block lets you find the right block in \( O(\log (n/\text{block})) \) probes and then scan one block. In Spark and Parquet, row-group min/max statistics are searched in the same way. For debugging, `git bisect run <script>` automates the search with a test script: mark one good and one bad commit, and Git will check out about \( \log_2 N \) commits for you.
+tradeoffs: Choose binary search over a hash table when you need order-based queries (nearest key, range, rank, boundary) or when memory matters: a sorted array has no per-entry overhead. Choose a hash table when you only need exact lookups on a big set and want expected \( O(1) \) instead of \( O(\log n) \), which at a billion keys is 1 probe against 30. You give up ordering and, usually, a more compact memory layout.
+Choose a sorted array with binary search when data is built once and read many times (indexes in immutable files, lookup tables). Choose a balanced tree, skip list or B-tree when the data changes: inserts into a sorted array move \( O(n) \) elements, but a tree gives \( O(\log n) \) inserts at the price of pointers and worse cache behaviour. A B-tree with 256 keys per node cuts the depth of a billion-key search from 30 probes to about 4 node loads.
+Choose search on the answer when each feasibility check is cheap and the answer space is large and ordered. Choose dynamic programming or a greedy method when a direct construction exists, because the extra \( \log R \) factor can be avoided. You give up the simplicity of a single predicate if the check is not monotone.
+interview: Why do most first attempts at binary search have bugs, and how do you write one you can trust? || The bugs come from mixing interval conventions: off-by-one in `hi`, `lo <= hi` versus `lo < hi`, and an overflowing midpoint. Use one invariant, "the answer is in [lo, hi]" with a half-open or closed convention kept consistent, compute `mid = lo + (hi - lo) / 2`, and check that every branch shrinks the range, so the loop must end.
+How do you binary search on the answer? Give an example and its complexity. || Find a monotone predicate over the answer space, such as "can we ship everything in D days with capacity c?" (false for small c, true for large c), and bisect for the first true. The cost is \( O(\log R) \) feasibility checks times the cost of one check; for packages, \( O(n \log(\text{sum})) \) overall. The check must be monotone, which you should argue explicitly.
+How do you find the first and last position of a value in a sorted array with duplicates? || Use lower_bound for the first index with a[i] ≥ x and upper_bound (first index with a[i] > x) minus one for the last. If lower_bound is past the end or a[i] is not x, the value is absent. Both are \( O(\log n) \).
+How would you search a rotated sorted array, and what breaks with duplicates? || Compare a[mid] with a[hi] (or a[lo]) to decide which half is sorted, then check whether the target lies in that half. With duplicates such as [1, 1, 1, 0, 1], a[mid] == a[hi] gives no information, so you can only shrink hi by one, and the worst case becomes \( O(n) \).
+Binary search on a billion-element sorted array is slower than the \( \log_2 n \) = 30 suggests. Why, and what do you do? || Probes jump across memory, so the first ones are cache misses (about 80 to 100 ns each), and the data-dependent branches mispredict about half the time. Options: a B-tree or wide-node layout that touches fewer cache lines, an Eytzinger layout with prefetching, branchless search, or a small in-memory index over the array to narrow the range first.
+quiz: What property must a predicate have for binary search to work? || It must be monotone: false for every input up to some boundary and true for every input from then on (or the reverse), so that one probe tells you which half contains the boundary.
+Why is `mid = (lo + hi) / 2` a bug in Java or C, and what is the fix? || The sum lo + hi can exceed the largest 32-bit integer when the array has more than about a billion elements, giving a negative number. Use `lo + (hi - lo) / 2`, which never exceeds hi.
+About how many comparisons does binary search need for 1,000,000 sorted elements, and why? || About 20, because each comparison halves the candidates and \( 2^{20} = 1{,}048{,}576 \), which is just above one million.
+In LeetCode 875 with piles [3, 6, 7, 11] and h = 8, what is the smallest speed k and how do you check k = 4? || The answer is k = 4. At speed 4 the hours are 1 + 2 + 2 + 3 = 8, which fits in 8 hours. At speed 3 the hours are 1 + 2 + 3 + 4 = 10, which is too many.
+Would you use binary search or a hash table for 10 million keys when the queries are "the largest key not above x"? || Binary search over a sorted array (or a tree). A hash table cannot answer nearest-key or range queries, because it keeps no order. The sorted array gives this query in about 24 probes and uses less memory.
+ref: book | The Art of Computer Programming, Vol. 3: Sorting and Searching (section 6.2.1, searching an ordered table) | Donald E. Knuth, 1998 |
+ref: book | Programming Pearls, 2nd ed. (column 4, writing correct programs) | Jon Bentley, 1999 |
+ref: blog | Extra, Extra - Read All About It: Nearly All Binary Searches and Mergesorts are Broken | Joshua Bloch, Google Research Blog, 2006 | https://research.google/blog/extra-extra-read-all-about-it-nearly-all-binary-searches-and-mergesorts-are-broken/
+ref: paper | Array Layouts for Comparison-Based Searching | Paul-Virak Khuong & Pat Morin, ACM Journal of Experimental Algorithmics, 2017 |
+ref: docs | Python bisect module documentation | Python Software Foundation | https://docs.python.org/3/library/bisect.html
+ref: docs | git bisect documentation | Git project | https://git-scm.com/docs/git-bisect
+ref: book | Introduction to Algorithms, 4th ed. | Cormen, Leiserson, Rivest & Stein, 2022 |
+@@ monostack
+value: A monotonic stack answers one family of questions in a single pass: for every element of a sequence, where is the nearest element to its right (or left) that is larger (or smaller)? Stock prices ask "how many days back was the price higher?" (the stock span). Temperatures ask "how many days until a warmer day?". A histogram asks "how wide can a rectangle grow around this bar?". A naive search from each element costs \( O(n^2) \). A monotonic stack does all n answers in \( O(n) \) total.
+The trick is to keep a stack whose values are always sorted, and to throw away every element that a new arrival makes useless. When a new value x comes, it pops every smaller value from the top of the stack; each popped value has just found the first greater value to its right, and that value is x. Then x is pushed. A monotonic deque is the same idea with removal also allowed at the front, and it gives the maximum or minimum of every sliding window in \( O(n) \) total.
+Three lower concepts carry the idea. Order theory (L4) defines the relation being searched, "greater than", and shows why a dominated element can be dropped for good. The stack and deque from the queues-and-buffers concept (L3) are the data structure itself: push, pop and, for the deque, pop at the other end, each \( O(1) \). Amortized analysis (L3) gives the cost: each element is pushed once and popped at most once, so the loop with a `while` inside a `for` still does at most 2n stack operations. Above it sit sliding-window aggregates in stream processors (the windowing concept) and Andrew's monotone chain for convex hulls (computational geometry).
+terms: Monotonic stack — a stack whose values are kept in sorted order (increasing or decreasing from bottom to top) by popping before pushing.
+Next greater element — for each position, the first element to its right with a larger value.
+Previous smaller element — for each position, the first element to its left with a smaller value.
+Monotonic deque — a double-ended queue kept sorted in the same way, where expired items are also removed from the front.
+Dominated element — an item that can never be the answer to any future query because a newer item is at least as good and will last at least as long.
+Amortized cost — the total cost of all steps divided by the number of steps; here at most 2 operations per element, although one step can pop many items.
+Sentinel — a dummy value added at the end (such as a bar of height 0) that forces every remaining item to be popped and processed.
+Cartesian tree — a binary tree built from a sequence that is a heap by value and keeps the sequence order; it can be built in \( O(n) \) time using this stack.
+history: The idea has no single inventor; it appeared wherever people needed "nearest larger value" cheaply. A classic early use is in the construction of the Cartesian tree, introduced by Jean Vuillemin in 1980 ("A unifying look at data structures"). Gabow, Bentley and Tarjan (1984) used it to link range-minimum queries to lowest common ancestors, and it can be built in linear time with exactly this stack. The "all nearest smaller values" problem was then studied on its own: Berkman, Schieber and Vishkin (1993) gave optimal parallel algorithms for it.
+In geometry, A. M. Andrew published his "monotone chain" convex hull in 1979 (Information Processing Letters). Sort the points by x, then sweep from left to right, keeping a stack of hull points and popping the last one whenever the new point makes a clockwise turn. It is the same pop-while-worse loop, with a cross product instead of a comparison.
+For sliding windows, the deque version was developed for streaming and image filtering. Daniel Lemire's 2006 paper "Streaming maximum-minimum filter using no more than three comparisons per element" gives a deque method that does about three comparisons per element for both maximum and minimum. Today the pattern is standard in competitive programming and interviews, because many problems that look like they need a heap or a segment tree fall to a ten-line stack.
+how: Start with the simplest question: for each element, find the first element to its right that is greater. Keep a stack of indexes whose values are not yet answered. Scan left to right. For the new element x at index i: while the stack is not empty and the value at the top is smaller than x, pop the top index j and record that j's answer is x (or the distance i − j). Then push i.
+```python
+def next_greater(a):                 # LeetCode 496, 503, 739
+    res = [-1] * len(a)
+    st = []                          # indexes; a[st] is non-increasing
+    for i, x in enumerate(a):
+        while st and a[st[-1]] < x:
+            res[st.pop()] = x        # x is its first greater
+        st.append(i)
+    return res                       # items left on st have no answer
+```
+Why is it correct? Look at what is on the stack at any moment: indexes whose values are non-increasing from bottom to top, all still waiting for something larger. When x arrives, the top of the stack is the smallest waiting value. If x beats it, the top's wait is over, and the first greater to its right is x, because every earlier element between them was already smaller and was popped before. If x does not beat the top, it cannot beat anything below it either, because those values are even larger, so the popping stops. The invariant is the sorted order, which order theory (L4) makes exact: the stack holds a descending chain of candidates, and a new element cuts the chain at the first value it cannot beat.
+The cost argument is amortized. One iteration can pop many indexes, but each index is pushed exactly once and popped at most once. So the total number of pops is at most n, and the total work is at most 2n stack operations, which is \( O(n) \). This is the same argument as for a sliding window: the work done by the `while` is paid for by the earlier pushes.
+Variants come from changing two choices. First, direction: scan from the right for "next to the left". Or note that, after popping, the element that remains on top of the stack is the previous greater element, so one pass can give both neighbours. Second, strictness: pop on `<` or on `<=`. This matters when values are equal, and it is the most common source of bugs. A useful rule is to use one strict and one non-strict side when counting ranges, so that each range is assigned to exactly one minimum: for LeetCode 907 (Sum of Subarray Minimums) the left side stops at a strictly smaller value and the right side at a smaller-or-equal value.
+The "contribution" technique makes this powerful. For each element, find the range where it is the minimum: from its previous smaller element to its next smaller element. Then its contribution to a question about ranges is computed from those two boundaries alone. In Largest Rectangle in Histogram (LeetCode 84), the tallest rectangle that uses bar i as its limiting height spans from just after the previous smaller bar to just before the next smaller bar, and its area is \( h_i \times (\text{next smaller} - \text{previous smaller} - 1) \).
+```python
+def largest_rectangle(h):            # LeetCode 84; also 85, 42
+    st, best = [], 0
+    h = h + [0]                      # sentinel pops everything
+    for i, x in enumerate(h):
+        while st and h[st[-1]] >= x:
+            height = h[st.pop()]
+            left = st[-1] if st else -1
+            best = max(best, height * (i - left - 1))
+        st.append(i)
+    return best
+```
+When bar j is popped by bar i, the new top of the stack is the nearest smaller bar to the left of j, and i is the nearest smaller to the right. So the width is exactly `i - left - 1`. The sentinel 0 at the end is smaller than every bar, so all remaining bars are popped and measured.
+The deque version solves sliding-window maximum (LeetCode 239). Keep a deque of indexes whose values are decreasing. For each new element, pop from the back while the back value is not larger than the new one (those values are dominated: the new element is later and at least as big, so it will outlive them and beat them). Push the new index at the back. If the index at the front has fallen out of the window, pop it from the front. The front is always the maximum of the window.
+```python
+from collections import deque
+
+def max_sliding_window(a, k):        # LeetCode 239, also 862, 1425
+    dq, res = deque(), []
+    for i, x in enumerate(a):
+        while dq and a[dq[-1]] <= x:
+            dq.pop()                 # dominated: older and not larger
+        dq.append(i)
+        if dq[0] <= i - k:
+            dq.popleft()             # left the window
+        if i >= k - 1:
+            res.append(a[dq[0]])     # front is the window maximum
+    return res
+```
+Andrew's convex hull has the same loop with a cross-product test instead of a comparison. In streaming systems the deque is used for windowed minimum and maximum aggregates (the windowing concept, L2). Because min and max have no inverse (you cannot "subtract" an old value as you can for a sum), a naive implementation rescans the window on every event, \( O(k) \) each. The deque keeps only the candidates that could still be the answer, so the aggregate costs \( O(1) \) amortized per event and \( O(k) \) memory in the worst case.
+diagram:
+  next greater, a = [2, 1, 2, 4, 3]   (stack shows values)
+
+   i  x   pops (answers)            stack after (bottom -> top)
+   0  2   -                         [2]
+   1  1   -                         [2, 1]
+   2  2   pop 1 -> 2               [2, 2]
+   3  4   pop 2 -> 4, pop 2 -> 4   [4]
+   4  3   -                         [4, 3]
+   end    left: 4, 3  -> -1, -1    result [4, 2, 4, -1, -1]
+
+  sliding max, k = 3, a = [1, 3, -1, -3, 5, 3, 6, 7]  (deque values)
+   i=0 [1]  i=1 [3]  i=2 [3,-1]*  i=3 [3,-1,-3]*  i=4 [5]*  i=5 [5,3]*
+   i=6 [6]*  i=7 [7]*          (* = window full; front is the answer)
+example: Next greater element for a = [2, 1, 2, 4, 3] (the diagram has the same steps). Push index 0 (value 2). Read 1: not larger than 2, push. Stack values [2, 1]. Read 2: larger than 1, so pop 1 and record its answer as 2; the top is now 2, which is not smaller, so push. Stack [2, 2]. Read 4: it beats both 2s, so both get answer 4; push. Stack [4]. Read 3: it does not beat 4, push. Stack [4, 3]. The scan ends; the elements 4 and 3 get −1 (no greater element). The result is [4, 2, 4, −1, −1]. Pushes: 5. Pops: 3. The work is linear.
+Next, LeetCode 739 (Daily Temperatures) on [73, 74, 75, 71, 69, 72, 76, 73]. Day 1 (74) pops day 0 and gives 1. Day 2 (75) pops day 1 and gives 1. Days 3 and 4 (71, 69) are pushed. Day 5 (72) pops day 4 (69) giving 1 and day 3 (71) giving 2; pushed. Day 6 (76) pops day 5 (72) giving 1, then day 2 (75) giving 4. Day 7 (73) is pushed. The remaining days 6 and 7 get 0. The answer is [1, 1, 4, 2, 1, 1, 0, 0].
+The histogram, LeetCode 84, with heights [2, 1, 5, 6, 2, 3] and the sentinel 0. Bars 0 and 1: bar 1 (height 1) pops bar 0 (height 2); the stack is empty, so left = −1 and the width is 1 − (−1) − 1 = 1, area 2. Bars 2 and 3 (5, 6) are pushed. Bar 4 (height 2) pops bar 3 (6): left is bar 2, width 4 − 2 − 1 = 1, area 6; pops bar 2 (5): left is bar 1, width 4 − 1 − 1 = 2, area 10; pushed. Bar 5 (3) is pushed. The sentinel 0 pops bar 5 (3): width 6 − 4 − 1 = 1, area 3; pops bar 4 (2): left is bar 1, width 6 − 1 − 1 = 4, area 8; pops bar 1 (1): stack empty, width 6 − (−1) − 1 = 6, area 6. The best is 10: bars of height 5 and 6 give a rectangle of height 5 and width 2.
+Classic problems, in teaching order. 496, 503 (circular: scan 2n elements) and 739 are the basic next greater. 901 (Online Stock Span) is the previous greater with a streaming input. 84 and 85 (Maximal Rectangle, one histogram per row) use the sentinel. 42 (Trapping Rain Water) can use a stack that adds up horizontal layers. 907 and 2104 (Subarray Ranges) use the contribution rule. 402 (Remove K Digits) and 316 use the stack greedily to build the smallest sequence. 456 (132 Pattern) keeps a decreasing stack. 239, 862 (Shortest Subarray with Sum at least K) and 1425 use the deque.
+intuition: A queue of people at a ticket window where a new, taller person arrives and sends everyone shorter in front of them away: those people were hidden behind the new arrival and could never be seen again.
+The structure keeps only what can still matter. If a newer element is at least as large as an older one, then for every future question about "the nearest large value" or "the maximum of a window that contains both", the older element is never the best answer, because the newer one is closer and lasts at least as long. So the older one can be discarded now. What remains is a short chain of survivors in sorted order, and the survivors are exactly the candidates for future answers. Elements are discarded once, so the total work is linear.
+mistakes: People often think a loop with `while` inside `for` is \( O(n^2) \). In fact the stack is popped at most once per push, so there are at most n pops in the whole run. The cost per element is large only when many earlier elements are cleared, and that can happen only after they were pushed.
+People often think the stack should store values. In fact it should store indexes, because the answer is usually a distance, a width or a position, and you need the index to compute it. You can read the value with `a[index]`. Storing both as a pair is also fine.
+People often think `<` and `<=` do not matter. In fact with equal values they decide whether duplicates get an answer, and for counting problems they decide whether a range is counted once, twice or not at all. Write down which side is strict before coding, and test with an all-equal array such as [2, 2, 2].
+People often think a monotonic stack can answer any range question. In fact it answers questions about the nearest element that beats the current one, and about windows that move forward. It does not give the maximum of an arbitrary range [l, r] on demand, because discarded elements are gone. For arbitrary range queries use a sparse table or a segment tree.
+friction: The technique is specific. It fits "nearest larger or smaller", windows that only move forward, and problems where a dominated element can be forgotten. If the question asks about the k-th largest in a window, or the median, discarded elements may matter again, and you need a heap pair or an order-statistics tree at \( O(\log n) \) per step. If elements can be deleted from the middle of the window (not just from the front), the deque method no longer works.
+The code is short but fragile. The sentinel, the empty-stack case (`left = -1`), strict versus non-strict comparison and index-versus-value confusion each cause bugs that pass most tests and fail on duplicates or a single element. Circular arrays need either a 2n scan with modulo or a second pass. The stack holds results only after the fact: for online problems (a stock-span service answering as prices arrive) you must answer using the state at that moment, which is why the previous-greater version is the online one, while next-greater needs the future and is offline.
+practice: Reach for a monotonic stack whenever you see "next or previous greater or smaller", "how many days until", "span", "the widest range in which this element is the minimum or maximum", or "build the smallest or largest sequence by removing elements". Reach for a monotonic deque when you see "maximum or minimum of every window of size k", or a window defined by time, and when you need "shortest range with sum at least k" with negative numbers (the deque runs over prefix sums).
+Before coding, decide: what is stored (indexes), which direction is scanned, which comparison pops (strict or not), what happens to the elements left at the end (an answer of −1 or a sentinel), and what is recorded at pop time. Test on a sorted ascending array, a sorted descending array, all equal values, and a single element.
+In production, windowed minimum and maximum over a time window (the lowest latency in the last minute, the highest price in the last hour) is a monotonic deque of (timestamp, value) pairs. The front is dropped when its timestamp is older than the window, and the back is dropped by dominated values. Libraries such as pandas and many stream engines implement `rolling().max()` in this way or with a similar structure. Anything that sorts points and sweeps with a stack (convex hull, skyline, and some of the visibility problems) is this pattern with a different notion of "worse".
+tradeoffs: Choose a monotonic stack over brute force whenever the question is about nearest greater or smaller elements: \( O(n) \) against \( O(n^2) \), with \( O(n) \) memory in the worst case. You give up the ability to ask arbitrary range queries afterwards, because the discarded elements are gone.
+Choose a monotonic deque over a heap with lazy deletion for sliding-window maximum: \( O(n) \) against \( O(n \log n) \), and no stale entries to track. Choose the heap when elements leave in an order other than first-in-first-out, or when you need the k-th largest rather than the maximum.
+Choose a sparse table when you need maximum or minimum over arbitrary static ranges: \( O(n \log n) \) build, \( O(1) \) query, \( O(n \log n) \) memory. Choose a segment tree when the values also change (\( O(\log n) \) both). Choose the monotonic stack when the queries are "nearest bigger" or tied to scanning order, where it needs \( O(n) \) memory and a single pass.
+interview: Why is the monotonic stack \( O(n) \) even though it has a `while` loop inside a `for` loop? || Each index is pushed once and popped at most once, so the total number of pops is at most n over the whole run. The inner loop does not start from scratch each time; its work was paid for by earlier pushes. The total is at most 2n operations.
+Walk me through Largest Rectangle in Histogram with a stack. What does popping mean? || Keep a stack of bars with increasing heights. When a bar of smaller height arrives, the bar on top can no longer extend to the right. Popping it, the new stack top is the nearest smaller bar on the left and the arriving bar is the nearest smaller on the right, so the width is `i − left − 1` and the area is height × width. A sentinel 0 at the end flushes the stack. \( O(n) \) time.
+How do you handle duplicates in Sum of Subarray Minimums (LeetCode 907)? || A subarray with equal minimum values must be assigned to exactly one of them. Make the left boundary stop at a strictly smaller value and the right boundary stop at a smaller-or-equal value, or the reverse. Then each subarray is counted once, and the answer is the sum of value × left count × right count, taken modulo \( 10^9 + 7 \).
+How does a monotonic deque give the sliding-window maximum, and why can you drop elements from the back? || The deque holds indexes with decreasing values. A new element makes every smaller earlier element useless: it is later, so it leaves the window later, and it is larger, so it wins while both are present. Drop those from the back, push the new index, drop the front if it left the window, and read the front. \( O(n) \) total.
+How would you compute a one-minute rolling maximum of latency in a stream engine? What fails with late events? || Use a deque of (timestamp, value): drop from the back values that are not larger than the new one, drop from the front when the timestamp is older than 60 seconds, and read the front. A late event can belong in the middle where the deque has already dropped candidates, so you need watermarks to bound lateness or a time-indexed tree structure.
+quiz: What invariant does the monotonic stack maintain, and what happens to a new element? || The values on the stack are sorted (for next-greater, non-increasing from bottom to top). A new element pops every smaller value from the top, and each popped value learns that the new element is its next greater one; then the new element is pushed.
+Why is the total cost linear? || Each element is pushed once and popped at most once, so the total number of stack operations is at most 2n, regardless of how many pops happen in one step.
+What is the result of next greater element on [2, 1, 2, 4, 3]? || [4, 2, 4, −1, −1]. Both 2s get 4, the 1 gets the 2 after it, and 4 and 3 have no greater element to their right.
+In the histogram [2, 1, 5, 6, 2, 3], which rectangle is the largest? || Area 10: height 5 over the two bars 5 and 6 (width 2). Bar 1 (height 1) gives only 6, and height 2 over width 4 gives 8.
+When would you choose a heap or a segment tree instead of a monotonic deque for window queries? || When you need the k-th largest or the median, when elements can leave in a different order than they came, or when the queries are for arbitrary ranges. The deque only works for first-in-first-out windows and for max or min.
+ref: book | Introduction to Algorithms, 4th ed. | Cormen, Leiserson, Rivest & Stein, 2022 |
+ref: paper | Another efficient algorithm for convex hulls in two dimensions | A. M. Andrew, Information Processing Letters, 1979 |
+ref: paper | Streaming Maximum-Minimum Filter Using No More than Three Comparisons per Element | Daniel Lemire, Nordic Journal of Computing, 2006 | https://arxiv.org/abs/cs/0610046
+ref: paper | Scaling and Related Techniques for Geometry Problems | Harold N. Gabow, Jon L. Bentley & Robert E. Tarjan, STOC 1984 |
+ref: paper | Optimal Doubly Logarithmic Parallel Algorithms Based on Finding All Nearest Smaller Values | Berkman, Schieber & Vishkin, Journal of Algorithms, 1993 |
+ref: paper | A Unifying Look at Data Structures | Jean Vuillemin, Communications of the ACM, 1980 |
+ref: docs | Monotonic stack and queue problem lists | LeetCode, ongoing | https://leetcode.com/tag/monotonic-stack/
+@@ linkedlist
+value: A linked list stores a sequence as separate nodes. Each node holds a value and the memory address of the next node; in a doubly linked list it also holds the address of the previous one. The nodes can sit anywhere in memory. The reward is that inserting or removing a node whose position you already hold is a change of two or three pointers, \( O(1) \), with no shifting of other items. An array must move on average half of its elements to do the same. The price is that reaching the k-th item means following k pointers, \( O(k) \), because there is no arithmetic that jumps straight to it.
+That trade makes the list the base of many structures. An LRU cache keeps its entries on a doubly linked list ordered by recency, with a hash map pointing at the nodes, so that "mark as recently used" and "evict the oldest" are both \( O(1) \). A buffer pool keeps free frames and the replacement order of pages on lists. A memory allocator keeps freed blocks of each size on a free list. A hash table with chaining stores each bucket as a list. A skip list is a sorted list with extra express levels. The Linux kernel embeds one list structure, `list_head`, in tasks, files, timers and much else (an intrusive list, with no separate node allocation).
+Two lower concepts explain what a list really is. The stored-program computer (L3) gives the meaning of "address": a pointer is a number that names a memory cell, and following it is a load that cannot start until the previous one finishes. Graph theory (L4) gives the shape: a singly linked list is a path graph, and a list with a cycle is a functional graph (each node has one outgoing edge), which is why cycle detection on lists is the same problem as cycle detection in any such graph.
+terms: Node — one record of the list: a value and one or two pointers.
+Head and tail — the first node and the last node of the list; a list is usually held by a pointer to the head (and sometimes the tail).
+Singly and doubly linked — each node knows only its successor, or both its successor and its predecessor.
+Sentinel (dummy) node — a fake node placed before the head (and after the tail) so that insert and delete never need a special case for the ends.
+Circular list — a list whose last node points back to the first.
+Intrusive list — a list whose pointers live inside the user's own struct, so no separate node is allocated (as in the Linux kernel).
+Pointer chasing — following a chain of addresses, where each load depends on the one before; the cause of the cache cost of lists.
+Free list — a list of unused memory blocks, where the pointer to the next block is stored inside the free block itself.
+history: List processing began in the mid-1950s. Allen Newell, Cliff Shaw and Herbert Simon needed to build symbolic structures of unpredictable size for their Logic Theorist program, and designed the Information Processing Language (IPL, 1955–56) around linked lists. John McCarthy took the idea into Lisp (1958): a Lisp list is a chain of two-pointer cells, "cons" cells, and the language is built on them. Donald Knuth gave linked allocation a full treatment in volume 1 of "The Art of Computer Programming" (1968), including doubly linked and circular lists.
+The structure stayed central as software grew. The Linux kernel has long used an intrusive circular doubly linked list, `list_head`, with macros that recover the containing struct from an embedded node. William Pugh's skip lists (1990) added random express lanes to make a sorted list searchable in \( O(\log n) \). Knuth's "Dancing Links" (2000) showed that removing a node from a doubly linked list, and putting it back later in exact reverse order, is so cheap that it makes backtracking search (Algorithm X for exact cover) fast. Concurrent versions followed: the Michael–Scott queue (1996) and Tim Harris's non-blocking list (2001) are the base of many lock-free containers.
+The mood around lists changed with hardware. As memory latency grew relative to CPU speed, contiguous arrays began to win most contests. In a well-known 2012 talk, Bjarne Stroustrup showed that `std::vector` beat `std::list` even for workloads that favour lists on paper, such as random insertion and removal in the middle, for sequences of hundreds of thousands of elements. Lists survive where their special strengths matter: stable references to elements, cheap splicing, unbounded growth without copying, and structures such as caches and allocators where a node moves between lists constantly.
+how: A singly linked node has two fields: `val` and `next`. A list is a pointer to the first node, `head`; `None` (null) marks the end. To insert a new node after a node p: create the node, set `new.next = p.next`, then `p.next = new`. The order matters: if you set `p.next` first, you lose the rest of the list. To delete the node after p: `p.next = p.next.next`. Both are two pointer writes, whatever the length of the list. To insert at the head: `new.next = head; head = new`. To reach the k-th item you must walk from the head, \( O(k) \), and to find a value you must scan, \( O(n) \).
+Deleting a node you hold needs its predecessor, because the predecessor's `next` must change. In a singly linked list, finding the predecessor is a scan from the head. A doubly linked list stores `prev` too, so `n.prev.next = n.next; n.next.prev = n.prev` deletes any held node in \( O(1) \). The cost is one more pointer per node and a little more care: four writes per insert instead of two. This is why caches and schedulers use doubly linked lists.
+Edge cases (empty list, first node, last node) cause most bugs. Two standard tools remove them. A sentinel node placed before the head means every real node has a predecessor, so inserting at the front and deleting the first node are the same code as the middle case. A circular doubly linked list with one sentinel, where `s.next` is the first item and `s.prev` is the last, makes an empty list `s.next == s` and removes every null check. The Linux `list_head` is exactly this.
+The cost model matters. On a 64-bit machine, each pointer is 8 bytes and a typical `malloc` adds a header of 8 to 16 bytes and rounds up the size. A node holding a 4-byte integer therefore uses 32 bytes or more, against 4 bytes in an array. More important is time: array elements are neighbours, so the CPU's prefetcher streams them at several gigabytes per second, while list nodes allocated at different times may be far apart, so each `next` is a separate load that cannot start until the previous one is done. A cache miss to main memory costs roughly 80 to 100 nanoseconds. Walking one million scattered nodes can cost around 50 to 100 ms; summing a one-million-element array takes about a millisecond. The stored-program model (L3) is the root: an address is just a number, and following it is a dependent load.
+Most interview problems are about pointer manipulation without losing nodes. Reversing a list is the base case: keep `prev`, `cur`, and save `cur.next` before overwriting it.
+```python
+class Node:
+    def __init__(self, val=0, nxt=None):
+        self.val, self.next = val, nxt
+
+def reverse(head):                   # LeetCode 206
+    prev = None
+    while head:
+        nxt = head.next              # save the rest before cutting
+        head.next = prev             # flip one pointer
+        prev, head = head, nxt
+    return prev                      # new head
+```
+A dummy head makes merging two sorted lists (LeetCode 21) short, and it is the building block of merge sort on a list (148, which sorts a list in \( O(n \log n) \) time with no extra array).
+```python
+def merge(a, b):                     # LeetCode 21
+    dummy = tail = Node()
+    while a and b:
+        if a.val <= b.val:
+            tail.next, a = a, a.next
+        else:
+            tail.next, b = b, b.next
+        tail = tail.next
+    tail.next = a or b               # attach the remaining list
+    return dummy.next
+```
+The fast and slow pointer technique (Floyd's cycle finding) uses the graph-theory fact that a list with a cycle is a path (the "tail", μ nodes) leading into a loop of λ nodes. The slow pointer moves one step and the fast pointer moves two. If there is no cycle, fast reaches the end. If there is a cycle, both get inside it, and the gap between them changes by one step each turn, so fast catches slow within λ turns after slow enters. At the meeting, slow has walked k steps and fast 2k, and both are in the loop, so \( 2k - k = k \) is a multiple of λ. Now put one pointer at the head and keep one at the meeting point, and move both one step at a time. After μ steps the first is at the start of the cycle, and the second is at \( k + \mu \), which is the same place, since k is a multiple of λ. They meet exactly at the first node of the cycle (LeetCode 142). Memory is \( O(1) \), against \( O(n) \) for a hash set of visited nodes.
+```python
+def cycle_start(head):               # LeetCode 141 and 142
+    slow = fast = head
+    while fast and fast.next:
+        slow, fast = slow.next, fast.next.next
+        if slow is fast:             # inside the cycle
+            p = head
+            while p is not slow:
+                p, slow = p.next, slow.next
+            return p                 # first node of the cycle
+    return None
+```
+```python
+class LRU:                           # LeetCode 146
+    def __init__(self, cap):
+        self.cap, self.map = cap, {}
+        self.head, self.tail = Node(), Node()    # sentinels
+        self.head.next, self.tail.prev = self.tail, self.head
+
+    def _unlink(self, n):
+        n.prev.next, n.next.prev = n.next, n.prev
+
+    def _push_front(self, n):
+        n.next, n.prev = self.head.next, self.head
+        self.head.next.prev = n
+        self.head.next = n
+
+    def get(self, key):
+        if key not in self.map:
+            return -1
+        n = self.map[key]
+        self._unlink(n); self._push_front(n)
+        return n.val
+
+    def put(self, key, val):
+        if key in self.map:
+            self._unlink(self.map[key])
+        n = self.map[key] = Node(val); n.key = key
+        self._push_front(n)
+        if len(self.map) > self.cap:
+            lru = self.tail.prev     # least recently used
+            self._unlink(lru); del self.map[lru.key]
+```
+diagram:
+  insert X after B in a singly linked list
+
+   [A|*]--->[B|*]--->[C|*]--->null        before
+
+   step 1: X.next = B.next     [X|*]--->[C|*]
+   step 2: B.next = X          [B|*]--->[X|*]--->[C|*]
+
+  doubly linked, circular, with sentinel S
+
+   +-------------------------------------------+
+   v                                           |
+  [S] <---> [A] <---> [B] <---> [C] <----------+
+   S.next = first item,  S.prev = last item
+
+  delete B:  B.prev.next = B.next ;  B.next.prev = B.prev
+
+  Floyd: tail mu = 2 (nodes 0,1), cycle lambda = 5 (nodes 2..6)
+   0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> back to 2
+example: Reverse the list 1 → 2 → 3. Start with prev = None and head at node 1. Step 1: save nxt = node 2; set 1.next = None; now prev = node 1 and head = node 2. Step 2: save nxt = node 3; set 2.next = node 1; prev = node 2, head = node 3. Step 3: save nxt = None; set 3.next = node 2; prev = node 3, head = None. The loop ends and prev (node 3) is the new head: 3 → 2 → 1. Each node was visited once, with three pointer writes in total and no new memory. If you forget to save `nxt` first, writing `head.next = prev` loses the rest of the list.
+Floyd's algorithm on the list in the diagram: nodes 0 to 6, with node 6 pointing back to node 2. The tail before the cycle has μ = 2 nodes (0 and 1) and the cycle has λ = 5 nodes (2 to 6). Move slow by 1 and fast by 2. After step 1: slow 1, fast 2. Step 2: slow 2, fast 4. Step 3: slow 3, fast 6. Step 4: slow 4, fast 3 (6 → 2 → 3). Step 5: slow 5, fast 5. They meet at node 5 after k = 5 steps, which is a multiple of λ = 5, as the argument predicts. Now start p at node 0 and slow at node 5 and move both one step: p = 1 and slow = 6; then p = 2 and slow = 2. They meet at node 2, the first node of the cycle. The total work was about 3n steps and no extra memory.
+Classic problems, in teaching order. 206 (Reverse Linked List) and 21 (Merge Two Sorted Lists) are the base moves; 2, 82 and 83 are single-pass edits; 876, 141 and 142 use fast and slow pointers; 19 and 160 use pointer gaps; 234 (Palindrome Linked List) and 143 (Reorder List) combine middle, reversal and merge; 92 and 25 reverse pieces; 148 (Sort List) is merge sort; 138 (Copy List with Random Pointer) copies a graph-like list; 23 adds a heap; 146 (LRU Cache) is the capstone; 237 deletes a node given only that node.
+intuition: A scavenger hunt: each clue tells you where the next one is, so adding a stop in the middle only means changing one clue, but finding the tenth stop means following nine clues.
+The list is natural when you cannot promise a contiguous block of memory. Its only promise is "I know who is next", which is cheap to change locally (a recency list, a free list, a run queue) and weak for anything that needs a position, because a position can only be discovered by walking. Arrays make the opposite promise: position is free, change is expensive.
+mistakes: People often think a linked list is faster than an array for insertion in the middle. In fact the insertion itself is \( O(1) \) only after you hold the node, and finding it costs \( O(n) \) pointer chasing with cache misses. An array shifts elements with a fast memory move, and for sizes up to hundreds of thousands of elements it often wins in measured time. Lists win when you already hold the node (a cache entry, a task) or when elements are large, stable references matter, or splicing is needed.
+People often think deleting a node needs only the node. In fact in a singly linked list you need its predecessor to change `prev.next`. With a doubly linked list or a pointer to the previous node it is \( O(1) \). (The trick in LeetCode 237 copies the next node's value into this node and deletes the next one; it does not work for the last node and it breaks external references to the next node.)
+People often think a linked list can use binary search if it is sorted. In fact binary search needs \( O(1) \) access to the middle. On a list, reaching the middle costs \( O(n) \), so searching is \( O(n) \) anyway. That is exactly the gap that skip lists fill with extra pointers.
+friction: The first problem is the memory hierarchy. Pointer chasing defeats prefetching and, in a garbage-collected runtime, the nodes may even be moved by the collector. Per-node overhead (an 8-byte pointer, 8 to 16 bytes of allocator header, or an object header of 12 to 16 bytes in Java) means lists of small values use 5 to 10 times the memory of arrays. Java's `LinkedList` is almost never the right choice; `ArrayList` or `ArrayDeque` beat it in most measurements.
+The second problem is concurrency. A lock-free linked list needs atomic compare-and-swap on pointers, and two classic hazards appear: the ABA problem (a node is removed and a new one reuses its address, so a compare-and-swap succeeds when it should not) and safe memory reclamation (when can you free a node that another thread may still be reading?). Solutions such as hazard pointers or epoch-based reclamation are subtle. This is why many concurrent systems use locks or arrays of slots instead.
+practice: Default to arrays or dynamic arrays (`list` in Python, `vector` in C++, `ArrayList` in Java), and use a linked list only for a reason: you hold node references and need \( O(1) \) removal or reordering (LRU, schedulers, timers), you need to splice lists together in \( O(1) \), or the structure is an intrusive list inside your own memory management (allocators, kernels). For a queue, a ring buffer or `collections.deque` (a linked list of blocks in CPython) is usually better than a node-per-item list.
+When you write pointer code, use a dummy head, write the pointer update order on paper (save, then cut, then link), and test with an empty list, one node, two nodes and the operation at both ends. Prefer iterative code. For cycle questions, say first that a hash set solves it in \( O(n) \) memory and then offer Floyd for \( O(1) \) memory. In production, watch for lists that can grow without bound (a free list or a queue with no limit), and monitor the length.
+tradeoffs: Choose an array when you need random access, iteration speed, compact memory, or binary search; choose a linked list when you hold node references and need \( O(1) \) removal, reordering or splicing, as in an LRU cache or a scheduler queue. The deciding numbers are the cache cost (roughly 100 ns per scattered node against about 1 ns per array element in a scan) and how often you must find a node first.
+Choose a singly linked list for stacks, adjacency chains and free lists, where you only ever add and remove at the head: one pointer per node, simplest code. Choose a doubly linked list when you must remove arbitrary held nodes or walk backwards: one more pointer (8 bytes) per node, and four pointer writes per insert instead of two.
+interview: Reverse a linked list iteratively and then recursively. What is the cost of each? || Iteratively: keep prev and cur, save cur.next, point cur.next to prev, advance; \( O(n) \) time and \( O(1) \) space. Recursively: reverse the rest, then set head.next.next = head and head.next = None; \( O(n) \) time but \( O(n) \) stack depth, which overflows on lists of about a million nodes. Prefer the iterative form.
+How do you detect a cycle and find where it starts, using constant memory? || Run slow (one step) and fast (two steps). If they meet, there is a cycle. Then put one pointer at the head and one at the meeting point and move both one step at a time; they meet at the first node of the cycle. It works because the meeting point is a whole number of laps (a multiple of λ) from the head, so after μ more steps from there the second pointer is at the cycle start, the same place the head pointer reaches after μ steps.
+Design an LRU cache with O(1) get and put. Why both a hash map and a doubly linked list? || The map finds a node by key in \( O(1) \). The doubly linked list keeps entries ordered by recency: moving a node to the front and evicting the tail are \( O(1) \) pointer changes, and doubly linked means you can unlink a node given only the node. Sentinel head and tail nodes remove the edge cases. The map stores the node, and the node stores its key, so eviction can delete the map entry.
+Why does the Linux kernel embed `list_head` inside structs instead of allocating separate nodes? || An intrusive list needs no extra allocation, lets one struct sit on several lists, and unlinks a held struct in \( O(1) \) with no search. The macro `container_of` subtracts the member's offset from the embedded node's address to get back to the owning struct.
+When does a linked list lose badly to an array even though the textbook says it should win? || For insert or delete in the middle by position: finding the position is \( O(n) \) pointer chasing with cache misses of 80 to 100 ns each, while an array shifts a contiguous block with fast memory moves. Vectors win for sizes up to hundreds of thousands of elements.
+quiz: What is the cost of inserting after a node you already hold, and what is the cost of reaching the k-th node? || Inserting after a held node is \( O(1) \), two pointer writes. Reaching the k-th node is \( O(k) \), since you must follow k pointers from the head.
+Why does a doubly linked list allow \( O(1) \) deletion of a held node but a singly linked list does not? || Deletion must change the predecessor's `next`. A doubly linked node stores `prev`, so it can find the predecessor directly; a singly linked node must scan from the head to find it.
+In Floyd's algorithm, why do the two pointers meet if there is a cycle? || Once both are in the cycle, fast gains one position on slow each step, so the gap closes by one every turn. The gap is smaller than the cycle length λ, so they meet within λ turns.
+A list has a tail of μ = 3 nodes and a cycle of λ = 4 nodes. After the pointers meet, how do you find the start of the cycle? || Start one pointer at the head and keep one at the meeting point, and move both one step at a time. They meet after μ = 3 steps at the first node of the cycle, because the meeting point is a multiple of λ steps from the head.
+Why is an array usually faster than a linked list for scanning one million integers? || The array is contiguous, so the CPU prefetches and each cache line serves several elements (16 integers of 4 bytes per 64-byte line). A list node is a separate allocation, so each `next` is a dependent load, often a cache miss of 80 to 100 ns, and the node also wastes memory on pointers and allocator headers.
+ref: book | Introduction to Algorithms, 4th ed. (ch. 10, elementary data structures) | Cormen, Leiserson, Rivest & Stein, 2022 |
+ref: book | The Art of Computer Programming, Vol. 1: Fundamental Algorithms (section 2.2, linear lists) | Donald E. Knuth, 1997 |
+ref: paper | Dancing Links | Donald E. Knuth, 2000 | https://arxiv.org/abs/cs/0011047
+ref: paper | Skip Lists: A Probabilistic Alternative to Balanced Trees | William Pugh, Communications of the ACM, 1990 |
+ref: paper | A Pragmatic Implementation of Non-Blocking Linked-Lists | Timothy L. Harris, DISC 2001 |
+ref: docs | Linux kernel linked list API (list_head) | The Linux kernel documentation | https://docs.kernel.org/core-api/list.html
+ref: blog | Learn Rust With Entirely Too Many Linked Lists | Alexis Beingessner and contributors | https://rust-unofficial.github.io/too-many-lists/
+@@ mst
+value: Suppose you must connect n cities with cables, and a cable between two cities has a known cost. You need every city to reach every other city, and you want the lowest total cost. The answer is always a tree: if a set of cables contains a loop, removing one cable of the loop keeps everything connected and saves money. A connected network with no loop has exactly n − 1 cables. The cheapest such tree is the minimum spanning tree (MST). It is one of the few problems where a simple greedy rule ("always take the cheapest safe edge") is provably optimal.
+Beyond cables and pipes, the MST is a general tool. Single-linkage clustering is Kruskal's algorithm stopped early. Image segmentation, HDBSCAN density clustering and many network-design heuristics start from an MST. In approximation algorithms, doubling the edges of an MST and shortcutting repeated visits gives a travelling-salesman tour at most twice the optimum when distances obey the triangle inequality. Graph databases and network protocols use spanning trees to avoid loops, although those trees need not be minimum.
+Four lower concepts do the work. Graph theory (L4) supplies the objects (spanning trees, cuts, cycles) and the cut property that proves the greedy rule. Graph algorithms (L3) supply the scanning machinery: Prim's algorithm is a graph search driven by a priority queue, in the same family as Dijkstra. Union-find (L3) lets Kruskal's algorithm ask "are these two nodes already connected?" in near-constant time. Greedy design (L3) is the strategy, and the cut property is the exchange argument that justifies it.
+terms: Spanning tree — a subset of edges that connects all nodes and has no cycle; it has exactly n − 1 edges.
+Minimum spanning tree (MST) — a spanning tree whose total edge weight is the smallest possible.
+Cut — a split of the nodes into two non-empty sets S and V − S; an edge crosses the cut if its ends are in different sets.
+Cut property — for any cut, the lightest edge that crosses it belongs to some MST (to every MST if weights are distinct).
+Cycle property — in any cycle, the heaviest edge belongs to no MST (when it is strictly heavier than the rest).
+Union-find — a structure that keeps disjoint sets of nodes and supports "find the set of x" and "merge two sets" in almost constant time.
+Safe edge — an edge that can be added to a partial MST without ruling out an optimal solution.
+Bottleneck path — the path between two nodes whose largest edge is as small as possible; the path in the MST is one.
+history: The first algorithm came from an electricity problem. In 1926 the Czech mathematician Otakar Borůvka was asked how to build the cheapest electrical network for Moravia. He published a method in which every connected group of towns repeatedly picks its cheapest outgoing connection and merges, which is the earliest MST algorithm. Vojtěch Jarník found a different method in 1930: grow one tree from a starting node by always adding the cheapest edge leaving it.
+Joseph Kruskal published his algorithm in 1956 ("On the shortest spanning subtree of a graph and the traveling salesman problem"): sort all edges and add each one unless it closes a cycle. Robert Prim published the growing-tree method again in 1957 at Bell Labs, and Edsger Dijkstra found it independently in 1959 in the same paper as his shortest-path algorithm, so the method is called Jarník–Prim or Prim. Graham and Hell's 1985 survey, "On the history of the minimum spanning tree problem", sorted out who did what.
+Speed became the later question. Fredman and Tarjan (1987) used Fibonacci heaps to run Prim in \( O(m + n \log n) \). Karger, Klein and Tarjan (1995) gave a randomized algorithm with expected \( O(m) \) time. Bernard Chazelle (2000) gave a deterministic \( O(m \, \alpha(m, n)) \) algorithm, where \( \alpha \) is the inverse Ackermann function, and Pettie and Ramachandran (2002) found one that is optimal, although its exact running time is still not known. In practice, nearly everyone still uses Kruskal or Prim, because they are simple and fast.
+how: Both classic algorithms rest on one fact from graph theory (L4), the cut property. Pick any way to split the nodes into two sets S and V − S. Among the edges that cross between the sets, let e be the lightest. Then some MST contains e. The proof is an exchange. Take an MST T that lacks e. Adding e to T creates exactly one cycle. That cycle crosses the cut at least twice, so it contains another crossing edge f, and \( w(f) \ge w(e) \) because e is the lightest. Replace f with e: the result is still a spanning tree, and its weight is no larger. So an optimal tree containing e exists. Any algorithm that always adds an edge justified by some cut stays on the way to an MST.
+Kruskal's algorithm applies the cut property to the forest it has built. Sort the edges by weight. Scan them in order. For each edge (u, v), if u and v are in different components, add the edge and merge the components; otherwise skip it, because it would close a cycle. Stop after n − 1 edges. When an edge joins two components A and B, it is the lightest edge leaving A, since every lighter edge was already considered and either used inside a component or skipped as redundant. That is a valid cut, so the edge is safe. The data structure is union-find, which answers "same component?" and merges components in nearly \( O(1) \) amortized (inverse Ackermann). The time is dominated by sorting: \( O(m \log m) = O(m \log n) \).
+```python
+class DSU:
+    def __init__(self, n):
+        self.p = list(range(n))
+        self.size = [1] * n
+
+    def find(self, x):               # path halving
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+
+    def union(self, a, b):           # False if already joined
+        a, b = self.find(a), self.find(b)
+        if a == b:
+            return False
+        if self.size[a] < self.size[b]:
+            a, b = b, a
+        self.p[b] = a                # attach the smaller tree
+        self.size[a] += self.size[b]
+        return True
+
+def kruskal(n, edges):               # edges = [(w, u, v), ...]
+    dsu, total, used = DSU(n), 0, []
+    for w, u, v in sorted(edges):
+        if dsu.union(u, v):
+            total += w
+            used.append((u, v, w))
+            if len(used) == n - 1:
+                break
+    return total, used               # used < n-1 edges: not connected
+```
+Prim's algorithm applies the cut property to one growing tree. Start at any node. Keep a priority queue of edges that leave the tree. Repeatedly pop the lightest one; if its far end is not in the tree, add that node and push its edges. The cut is "tree versus everything else", and the popped edge is the lightest crossing it. With a binary heap the time is \( O(m \log n) \); with a Fibonacci heap it is \( O(m + n \log n) \); for a dense graph an array scan per step gives \( O(n^2) \), which can be best when m is near \( n^2 \). The code is nearly Dijkstra, with one change: the priority is the edge weight, not the distance from the start.
+```python
+import heapq
+
+def prim(n, adj):                    # adj[u] = [(v, w), ...]
+    seen, total, used = [False] * n, 0, []
+    heap = [(0, 0, -1)]              # (weight, node, parent)
+    while heap:
+        w, u, parent = heapq.heappop(heap)
+        if seen[u]:
+            continue                 # stale entry: lazy deletion
+        seen[u] = True
+        total += w
+        if parent >= 0:
+            used.append((parent, u, w))
+        for v, wv in adj[u]:
+            if not seen[v]:
+                heapq.heappush(heap, (wv, v, u))
+    return total, used
+```
+Borůvka's algorithm applies the cut property to every component at once. In each round, every component picks its cheapest outgoing edge, all those edges are added, and components merge. The number of components at least halves each round, so there are at most \( \log_2 n \) rounds, each a linear pass over the edges, for \( O(m \log n) \). It is the natural choice for parallel and distributed systems, since the picks are independent, and it is used inside the faster algorithms above.
+Useful facts follow from the cut and cycle properties. If all weights are distinct, the MST is unique; with ties there may be several, all of the same total weight. The path between two nodes in the MST minimizes the largest edge on the path (the minimum bottleneck path), which solves "path with minimum effort" problems. A maximum spanning tree is found by sorting in descending order. Deleting the k − 1 heaviest edges of an MST leaves k components, which is exactly the result of single-linkage clustering into k groups. For a set of points in the plane, the Euclidean MST uses only edges of the Delaunay triangulation, so it can be found in \( O(n \log n) \) instead of looking at all \( n^2/2 \) pairs.
+diagram:
+  Graph                                 Kruskal: edges sorted by weight
+
+     A ---1--- B                         1 A-B  take
+     |       / |                         2 B-D  take
+     3     4   2                         3 A-C  take
+     |   /     |                         4 B-C  skip (same component)
+     C ---5--- D ---6--- E               5 C-D  skip (cycle)
+     |                   |               6 D-E  take  -> 4 edges, stop
+     +---------7---------+               7 C-E  never examined
+
+  MST: A-B (1), B-D (2), A-C (3), D-E (6)        total = 12
+
+  Prim from A (heap holds edges leaving the tree):
+   {A}          heap: A-B 1, A-C 3            take A-B
+   {A,B}        add B-C 4, B-D 2              take B-D
+   {A,B,D}      add D-C 5, D-E 6              take A-C (3)
+   {A,B,C,D}    add C-E 7                     take D-E (6)
+example: Use the graph in the diagram: nodes A to E, edges A-B 1, A-C 3, B-C 4, B-D 2, C-D 5, C-E 7, D-E 6. Kruskal sorts the edges by weight: 1, 2, 3, 4, 5, 6, 7. Take A-B (1): components {A, B}, {C}, {D}, {E}. Take B-D (2): {A, B, D}. Take A-C (3): {A, B, C, D}. Look at B-C (4): both ends are already in the big component, so skip it. Look at C-D (5): skip. Take D-E (6): all five nodes are joined, and 4 edges are used. The total is 1 + 2 + 3 + 6 = 12. The edge C-E (7) is never examined. Prim from A takes the same four edges in the order A-B, B-D, A-C, D-E and also gets 12. Check the cut property on the last Kruskal step: the cut is {A, B, C, D} against {E}, only C-E (7) and D-E (6) cross it, and the lighter D-E is the one taken.
+Now clustering. Stop Kruskal one merge early, with 2 components left: after taking A-B, B-D and A-C, the groups are {A, B, C, D} and {E}. That is single-linkage clustering into k = 2 groups, and the gap between the groups is 6, the next edge. In SciPy, `scipy.cluster.hierarchy.linkage(X, method="single")` builds the same hierarchy.
+Now the 2-approximation for travelling salesman on points where distances obey the triangle inequality. Any tour of the cities is a cycle; removing one edge leaves a spanning tree, so \( w(\text{MST}) \le w(\text{OPT}) \). Walk around the MST visiting every edge twice (an Euler tour of the doubled tree, length \( 2 \, w(\text{MST}) \)) and shortcut repeated cities: by the triangle inequality shortcuts never lengthen the walk. The resulting tour has length at most \( 2 \, w(\text{MST}) \le 2 \, w(\text{OPT}) \). Christofides (1976) improved the factor to 1.5 by adding a minimum-weight matching on the odd-degree nodes of the MST.
+Classic problems, in teaching order. 684 (Redundant Connection) and 261 (Graph Valid Tree) use only union-find cycle detection, the core of Kruskal. 1584 (Min Cost to Connect All Points) is the plain MST on points; with n = 1,000 there are about 500,000 pairs, and Prim in \( O(n^2) \) needs a million steps. 1135 (Connecting Cities With Minimum Cost) is the same on an edge list. 1319 (Number of Operations to Make Network Connected) counts components. 1168 (Optimize Water Distribution in a Village) uses the virtual node. 1631 (Path With Minimum Effort) and 1102 are bottleneck paths. 1489 (Find Critical and Pseudo-Critical Edges in MST) tests each edge by forcing it in or out. 1697 (Checking Existence of Edge Length Limited Paths) sorts queries and edges together and uses union-find offline.
+intuition: Joining islands with bridges: any time you split the islands into two groups, the cheapest bridge between the groups is worth building, because any plan must cross that gap somewhere and a cheaper crossing is better.
+The greedy rule works because of a local-to-global guarantee. In most problems, a locally cheap choice can ruin the whole plan. Here it cannot: whatever you have chosen so far, the cheapest edge across any cut that respects your choices can replace a dearer crossing edge in any optimal solution without raising the cost. A spanning tree must cross every cut, and the cheapest crossing is always an acceptable one. The three algorithms differ only in which cut they use: Kruskal's cut is "the two components this edge joins", Prim's is "the tree versus the rest", and Borůvka's is "each component versus the rest".
+mistakes: People often think the MST gives the shortest path between nodes. In fact it minimizes the total weight of the network, not any distance between two nodes. The route in an MST between two nodes can be far longer than the shortest path in the graph, as in a ring of n nodes with equal weights, where the MST drops one edge and two neighbours become n − 1 hops apart. A shortest-path tree (Dijkstra) answers the distance question.
+People often think Kruskal and Prim give different trees. In fact if all edge weights are distinct the MST is unique, so they return the same tree. With ties they may return different trees, but always of the same total weight.
+People often think the MST also works for directed graphs. In fact for directed graphs the question is the minimum-cost arborescence (a rooted directed spanning tree), solved by the Chu–Liu/Edmonds algorithm in \( O(nm) \) or better, and the cut property does not apply as stated. A minimum Steiner tree, where you may use extra nodes, is NP-hard.
+friction: The MST is a minimal structure, so it is fragile: it has no redundancy. A tree network loses connectivity when any single link fails, which is why real networks add extra links beyond the MST. Redundancy, capacity limits, degree limits and latency bounds change the problem, and most constrained versions (degree-constrained spanning tree, minimum-diameter spanning tree) are NP-hard.
+For huge graphs, memory is the cost. Kruskal must sort all m edges, which for a complete graph on 100,000 points would be \( 5 \times 10^9 \) edges, impossible in memory; a geometric method (Delaunay for the plane, or a k-nearest-neighbour graph in higher dimensions) or Prim with an implicit graph is needed. In high dimensions, exact Euclidean MST has no known near-linear algorithm, and approximate methods are used. Parallel and external-memory versions use Borůvka-style rounds, because they need to touch the whole graph only a few times.
+practice: Choose by graph density. For sparse graphs with an edge list (m about the same order as n), use Kruskal: sort, union-find, stop at n − 1 edges. For dense graphs or graphs given as a distance matrix (m near \( n^2 \)), use Prim with an array, \( O(n^2) \) with no heap. If you can run in parallel or the graph is distributed, think Borůvka. Do not write your own in production unless needed: SciPy has `scipy.sparse.csgraph.minimum_spanning_tree`, NetworkX has `minimum_spanning_tree`, and Boost has `kruskal_minimum_spanning_tree` and `prim_minimum_spanning_tree`.
+In interviews, say the cut property out loud as your justification, and mention disconnected graphs (the result is a minimum spanning forest, with fewer than n − 1 edges). Use 64-bit sums for the total. Check whether the problem really needs a tree or only connectivity: if so, plain union-find components may be enough. If a problem says "minimize the largest edge", it is a bottleneck problem, and the MST or a binary search with a connectivity check solves it.
+tradeoffs: Choose Kruskal when the graph is sparse and given as an edge list, or when edges arrive pre-sorted: \( O(m \log m) \) and trivial to code with union-find. Choose Prim with a binary heap when the graph is stored as adjacency lists and you want to avoid sorting everything: \( O(m \log n) \). Choose Prim with an array when the graph is dense (m near \( n^2 \)): \( O(n^2) \) beats any sort of \( n^2 \) edges.
+Choose Borůvka when you need parallelism or a distributed run: \( \log n \) rounds, each independent across components. You give up the simplicity of a single sorted scan, and ties need a consistent tie-break (for example by edge index) to avoid cycles.
+Choose an exact MST when the tree itself is the answer (network design, spanning structure). Choose an approximation or a different structure when you need redundancy (add edges, 2-edge-connected spanning subgraphs), short routes (shortest-path tree, or a spanner), or when constraints make the problem NP-hard. Choose single linkage only when chain-like clusters are acceptable; choose k-means, Gaussian mixtures or HDBSCAN when you need compact or density-based clusters.
+interview: State the cut property and use it to prove that Kruskal's algorithm is correct. || For any cut, the lightest edge crossing it belongs to some MST (exchange argument: add it to an MST, remove the other crossing edge on the cycle, and the weight does not increase). When Kruskal adds an edge joining components A and B, it is the lightest edge leaving A among those not yet considered, so it is the lightest crossing the cut (A, rest). Every added edge is safe, and after n − 1 edges the result is a spanning tree.
+Compare Kruskal and Prim. When would you use each? || Kruskal sorts edges and uses union-find: \( O(m \log n) \), best for sparse graphs and edge lists. Prim grows one tree with a heap: \( O(m \log n) \), or \( O(n^2) \) with an array for dense graphs, best for adjacency lists and implicit graphs such as points in a plane. Both give an MST with the same total weight.
+How would you find the MST of 100,000 points in the plane without looking at all pairs? || The Euclidean MST uses only Delaunay triangulation edges, which are \( O(n) \) in number. Build the triangulation in \( O(n \log n) \) and run Kruskal on its roughly 3n edges. For higher dimensions use a k-nearest-neighbour graph as an approximation, or Prim with a spatial index.
+Explain how single-linkage clustering relates to an MST. || Single-linkage merges the two clusters with the closest pair of points at each step, which is exactly Kruskal's choice of the lightest edge between different components. Stopping when k clusters remain, or cutting the k − 1 heaviest MST edges, gives k clusters. The MST edge weights are the merge distances in the dendrogram.
+Given a graph and a new edge, how do you update the MST efficiently? || Add the edge to the MST, which creates one cycle. Find the heaviest edge on that cycle (walk the tree path between its ends, \( O(n) \), or use a link-cut tree or binary lifting for \( O(\log n) \)). If it is heavier than the new edge, swap them; otherwise ignore the new edge.
+quiz: How many edges does a spanning tree of n nodes have, and why? || n − 1. It must connect all nodes, which needs at least n − 1 edges, and any more would create a cycle.
+In Kruskal's algorithm, what does union-find answer, and what is the total running time? || It answers whether the two ends of an edge are already in the same component, in nearly constant time. The total is \( O(m \log m) \), dominated by sorting the edges.
+Using edges A-B 1, B-D 2, A-C 3, B-C 4, C-D 5, D-E 6, C-E 7, what is the MST weight? || 12: edges A-B (1), B-D (2), A-C (3) and D-E (6). B-C and C-D close cycles and C-E is never needed.
+Why does doubling an MST give a 2-approximation for metric TSP? || Removing one edge from the optimal tour leaves a spanning tree, so MST ≤ OPT. A walk that traverses every MST edge twice has length 2 × MST, and shortcutting repeated cities does not lengthen it under the triangle inequality, so the tour is at most 2 × OPT.
+When would you prefer Prim with an adjacency matrix over Kruskal? || When the graph is dense, for example a complete graph on points with m near \( n^2 \). Prim takes \( O(n^2) \) with no sorting, while Kruskal would have to sort about \( n^2/2 \) edges.
+ref: book | Introduction to Algorithms, 4th ed. (ch. 21, minimum spanning trees) | Cormen, Leiserson, Rivest & Stein, 2022 |
+ref: paper | On the Shortest Spanning Subtree of a Graph and the Traveling Salesman Problem | Joseph B. Kruskal, Proceedings of the AMS, 1956 |
+ref: paper | Shortest Connection Networks and Some Generalizations | Robert C. Prim, Bell System Technical Journal, 1957 |
+ref: paper | On the History of the Minimum Spanning Tree Problem | Ronald L. Graham & Pavol Hell, Annals of the History of Computing, 1985 |
+ref: paper | A Minimum Spanning Tree Algorithm with Inverse-Ackermann Type Complexity | Bernard Chazelle, Journal of the ACM, 2000 |
+ref: paper | Fibonacci Heaps and Their Uses in Improved Network Optimization Algorithms | Michael L. Fredman & Robert E. Tarjan, Journal of the ACM, 1987 |
+ref: book | Algorithms, 4th ed. (section 4.3, minimum spanning trees) | Robert Sedgewick & Kevin Wayne, 2011 | https://algs4.cs.princeton.edu/43mst/
+ref: docs | scipy.sparse.csgraph.minimum_spanning_tree | SciPy | https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.csgraph.minimum_spanning_tree.html
+@@ lca
+value: In a rooted tree, the lowest common ancestor (LCA) of two nodes u and v is the deepest node that has both of them in its subtree. It is the point where the two paths up to the root first meet. Many questions about a tree reduce to it: the distance between two nodes is \( d(u) + d(v) - 2\,d(\text{lca}) \), the path between them goes up to the LCA and down again, and "do these two items share a parent group?" is an LCA test. Examples are the nearest common manager in an org chart, the shared directory of two files, the nearest common ancestor of two page elements, the most recent common ancestor of two species in a phylogenetic tree, and the merge base of two commits in Git.
+Finding it by walking up from both nodes costs \( O(\text{depth}) \) per query, which is \( O(n) \) in a path-like tree. With a million queries on a million-node tree, that is up to \( 10^{12} \) steps. The techniques in this concept preprocess the tree once so that every query costs \( O(\log n) \) (binary lifting) or even \( O(1) \) (Euler tour with a range-minimum table).
+Four lower concepts supply the parts. Graph theory (L4) defines ancestors, depth and the unique path between two nodes of a tree. Trees (L3) give the traversals (depth-first and breadth-first) used to compute depths and the order of visits. Binary numbers (L3) are the reason binary lifting works: any distance d is a sum of powers of two (its bits), so a table of 2^k-th ancestors lets you move up by d in \( O(\log d) \) jumps. Range-query structures (L3) provide the second method: the LCA problem is equivalent to range-minimum over an Euler tour, so a sparse table or segment tree answers it.
+terms: Ancestor — a node on the path from a given node up to the root, including the node itself.
+Depth — the number of edges from the root to a node; the root has depth 0.
+Binary lifting — a table up[k][v] holding the \( 2^k \)-th ancestor of v, used to jump up by any distance in \( O(\log n) \) steps.
+Euler tour — the sequence of nodes visited by a depth-first walk that records a node every time the walk enters or returns to it; it has \( 2n - 1 \) entries.
+Sparse table — a table that stores the minimum of every window of length \( 2^j \), so any range minimum is answered by two overlapping windows in \( O(1) \).
+RMQ — range-minimum query: the smallest value (or its position) in a given range of an array.
+Offline query — a query set known in advance, so it can be answered in a clever order; Tarjan's LCA is offline.
+Merge base — in Git, a best common ancestor of two commits; the LCA idea in a graph that is not a tree.
+history: The problem appeared in the early 1970s, when researchers worked on how to answer "nearest common ancestor" questions in trees quickly. Alfred Aho, John Hopcroft and Jeffrey Ullman published "On finding lowest common ancestors in trees" (STOC 1973, journal version 1976), giving the first efficient algorithms. Robert Tarjan's 1979 paper on path compression gave an offline algorithm: with all queries known in advance, a single depth-first pass with union-find answers them in nearly linear time.
+The big theoretical step was constant-time queries. Dov Harel and Robert Tarjan (1984) showed that a tree can be preprocessed in linear time so every query takes \( O(1) \), though the method was complicated. Baruch Schieber and Uzi Vishkin (1988) simplified it. Gabow, Bentley and Tarjan (1984) had already noted that LCA and range-minimum queries are tightly related through the Cartesian tree. Michael Bender and Martín Farach-Colton's paper "The LCA Problem Revisited" (LATIN 2000) gave the version that is now taught: reduce LCA to range-minimum over the Euler tour, and note that adjacent depths differ by exactly 1, which allows a simple linear-time solution.
+In practice the simpler methods won. Binary lifting, which stores jump pointers at every power of two, is a folklore technique that became a standard of competitive programming because it needs few lines and also answers "k-th ancestor". The Euler tour with a sparse table is preferred when queries are numerous. Git needed the idea in a graph with merges: its `merge-base` command and the recursive merge strategy rely on common-ancestor search, and since 2018 the commit-graph file stores generation numbers to cut the work.
+how: There are two standard methods. Both start with one traversal of the tree.
+Binary lifting. Run a breadth-first or depth-first search from the root to compute depth[v] and parent up[0][v] for every node (the root's parent is itself). Then fill the table with one rule: the \( 2^k \)-th ancestor is the \( 2^{k-1} \)-th ancestor of the \( 2^{k-1} \)-th ancestor, so \( \text{up}[k][v] = \text{up}[k-1][\text{up}[k-1][v]] \). The table has \( \lceil \log_2 n \rceil \) rows, so building it costs \( O(n \log n) \) time and memory. For n = 100,000 that is about 17 rows, 1.7 million entries; for n = 1,000,000 it is about 20 million entries, 80 MB with 4-byte integers.
+A query for u and v has two phases. Phase 1 makes the depths equal. Let diff be the depth difference, and write it in binary. For every set bit k of diff, move the deeper node up by \( 2^k \): `u = up[k][u]`. This is the binary-numbers idea (L3): any distance is a sum of powers of two, so at most \( \log_2 n \) jumps are needed. If u and v are now the same node, that is the answer (one was an ancestor of the other). Phase 2 lifts both together. Loop k from the highest row to row 0: if `up[k][u] != up[k][v]`, the \( 2^k \)-th ancestors are still different, so the LCA is higher than both, and it is safe to jump both. If they are equal, the jump would reach or pass the LCA, so skip it. After the loop, u and v are two different children of the LCA, and `up[0][u]` is the answer.
+```python
+def lca(up, depth, u, v):            # LeetCode 236 on a general tree
+    if depth[u] < depth[v]:
+        u, v = v, u
+    diff, k = depth[u] - depth[v], 0
+    while diff:                      # lift u by the bits of diff
+        if diff & 1:
+            u = up[k][u]
+        diff >>= 1
+        k += 1
+    if u == v:
+        return u
+    for k in range(len(up) - 1, -1, -1):
+        if up[k][u] != up[k][v]:     # still below the LCA: jump
+            u, v = up[k][u], up[k][v]
+    return up[0][u]                  # parents of u and v coincide
+```
+Why does phase 2 work? It is a binary search in disguise. The predicate "the ancestors of u and v at distance t above them are the same node" is false for small t and true from the LCA upward, so it is monotone, and the loop finds the largest t for which it is still false by deciding one bit at a time from the top (see the binary search concept). The LCA is the next ancestor. The same table answers "k-th ancestor of v" (LeetCode 1483) by lifting along the bits of k. If each table entry also stores the maximum or sum of the edges it jumps over, the same loops answer path-maximum and path-sum queries between any two nodes in \( O(\log n) \).
+Euler tour and range minimum. Walk the tree depth-first and write down the node every time you enter it and every time you return to it from a child. The result has \( 2n - 1 \) entries. Record first[v], the index of the first appearance of v. Now consider the nodes u and v with first[u] ≤ first[v]. The stretch of the tour between those two positions is a walk from u to v, and it never goes above the LCA but does visit it. So the LCA is the node of smallest depth in tour[first[u] .. first[v]]. That is a range-minimum query (the range-query concept, L3). A sparse table stores the shallowest node of every window of length \( 2^j \); a query takes the two overlapping windows that cover the range and picks the shallower, so it costs \( O(1) \) after \( O(n \log n) \) preprocessing.
+```python
+def euler_tables(adj, root=0):
+    tour, first, depth = [], {}, {root: 0}
+    def dfs(u, p):
+        first[u] = len(tour)
+        tour.append(u)
+        for v in adj[u]:
+            if v != p:
+                depth[v] = depth[u] + 1
+                dfs(v, u)
+                tour.append(u)       # record u again on the way back
+    dfs(root, -1)
+    return tour, first, depth
+
+def build_sparse(tour, depth):
+    best = [tour]                    # best[j][i]: shallowest node in
+    j = 1                            # tour[i .. i + 2^j - 1]
+    while (1 << j) <= len(tour):
+        p, h = best[-1], 1 << (j - 1)
+        best.append([min(p[i], p[i + h], key=depth.get)
+                     for i in range(len(tour) - (1 << j) + 1)])
+        j += 1
+    return best
+
+def lca_rmq(best, first, depth, u, v):
+    l, r = sorted((first[u], first[v]))
+    j = (r - l + 1).bit_length() - 1
+    return min(best[j][l], best[j][r - (1 << j) + 1], key=depth.get)
+```
+Tarjan's offline method needs no table: one depth-first search with union-find answers all known queries in \( O((n + q)\,\alpha(n)) \) time and \( O(n + q) \) memory, but only if the queries are known up front.
+Without parent links, the usual interview solution is a recursion with no preprocessing (LeetCode 236): return the node if it is u or v; if both children return a node, the current node is the LCA; else return the non-empty side. It costs \( O(n) \) per query. For a binary search tree (235), walk down: both values smaller go left, both larger go right, else stop, \( O(\text{height}) \).
+In a directed acyclic graph such as a Git history, "lowest common ancestor" is not unique: two commits can have several common ancestors none of which is an ancestor of the others (after a criss-cross merge). `git merge-base A B` returns one best common ancestor, and `git merge-base --all` lists all of them. The search paints commits reachable from A and from B, walking in commit-date or generation order, until the frontier holds only common ancestors.
+diagram:
+  tree (root 0)                       depth      up[0]  up[1]  up[2]
+          0                           0 : 0       n0: 0   0     0
+        /   \                                     n1: 0   0     0
+       1     2                        1 : 1, 2    n2: 0   0     0
+      / \     \                                   n3: 1   0     0
+     3   4     5                      2 : 3,4,5   n4: 1   0     0
+    /           \                                 n5: 2   0     0
+   6             7                    3 : 6, 7    n6: 3   1     0
+                  \                               n7: 5   2     0
+                   8                  4 : 8       n8: 7   5     0
+
+  Euler tour (2n-1 = 17 entries):
+  idx : 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
+  node: 0 1 3 6 3 1 4 1 0 2 5  7  8  7  5  2  0
+  dep : 0 1 2 3 2 1 2 1 0 1 2  3  4  3  2  1  0
+
+  LCA(6, 4): first[6] = 3, first[4] = 6, range idx 3..6 = 6 3 1 4
+             depths 3 2 1 2, minimum depth 1 -> node 1
+example: Use the tree in the diagram (9 nodes: 1 and 2 are children of 0; 3 and 4 of 1; 5 of 2; 6 of 3; 7 of 5; 8 of 7). The depths are 0, 1, 1, 2, 2, 2, 3, 3, 4 for nodes 0 to 8. Table rows: up[0] is the parent array [0, 0, 0, 1, 1, 2, 3, 5, 7], up[1] (grandparents) is [0, 0, 0, 0, 0, 0, 1, 2, 5], and up[2] and up[3] are all zeros (the 4th ancestor of node 8 is the root, node 0). The table has \( \lceil \log_2 9 \rceil = 4 \) rows.
+Query LCA(6, 8). The depths are 3 and 4, so swap and lift node 8 by diff = 1 (binary 1): up[0][8] = 7. Now u = 7, v = 6, not equal. Phase 2: k = 3 and k = 2: up is 0 for both, equal, skip. k = 1: up[1][7] = 2 and up[1][6] = 1, different, so jump: u = 2, v = 1. k = 0: up[0][2] = 0 and up[0][1] = 0, equal, skip. The answer is up[0][2] = 0, the root. The distance between 6 and 8 is \( 3 + 4 - 2 \times 0 = 7 \): the path 6-3-1-0-2-5-7-8 has 7 edges.
+Query LCA(6, 4). Depths 3 and 2, so lift 6 by 1: up[0][6] = 3. Now u = 3 and v = 4, different. Phase 2: higher rows give 0 and 0, equal, skip; k = 1 gives up[1][3] = 0 and up[1][4] = 0, equal, skip; k = 0 gives 1 and 1, equal, skip. The answer is up[0][3] = 1. With the Euler tour, the same query is the range-minimum shown in the diagram: nodes 6, 3, 1, 4 at depths 3, 2, 1, 2, so the answer is node 1.
+Classic problems, in teaching order. 235 and 236 are the recursive forms; 1644 and 1650 add missing nodes and parent pointers; 1123 combines depth and LCA; 1483 (Kth Ancestor of a Tree Node) is exactly binary lifting; 2096 and 863 use paths and distances through the LCA. Large offline tasks (the "Company Queries" set on CSES, tree-distance and path-maximum problems) use binary lifting or an Euler tour with a sparse table.
+intuition: Two travellers each walk uphill along a trail towards the same summit; the first trail junction they share is the LCA, and binary lifting is a table of "if I walk 1, 2, 4, 8 junctions up, where do I land".
+The structure is natural once distances are written in binary. To find where two paths merge, you want to climb the same amount from both nodes and test whether you have met. Testing after every single step is slow. The table lets you test after big jumps first: if a jump of 64 does not meet, you can safely take it, because the meeting point is higher; if it does meet, you may have gone past the LCA, so try a smaller jump. This is the same logic as binary search and as writing a number in binary: decide the largest power first, then the next. The Euler tour has a separate intuition: the walk between u and v in the tour cannot go above their LCA without having to come back down through it, so the highest point of the walk is the LCA.
+mistakes: People often think the LCA of u and v must be a third node. In fact if u is an ancestor of v, the LCA is u itself. Every correct implementation must handle this case, which is why binary lifting checks `u == v` after equalizing depths.
+People often think binary lifting jumps until the nodes are equal. In fact the second phase jumps only while the ancestors differ, which leaves the nodes just below the LCA, and the answer is their parent. Jumping when the ancestors are equal would overshoot the LCA, and you could not tell how far. Most bugs come from mixing the "equal" and "different" conditions.
+People often think that LCA is always unique. In a tree it is. In a DAG (a Git history after a criss-cross merge, a class hierarchy with multiple inheritance) there can be several lowest common ancestors, so the problem has a set of answers.
+friction: The preprocessing is the cost. Both table methods need \( O(n \log n) \) memory; for a tree with 100 million nodes, a binary lifting table of 27 rows would need about 10 GB with 4-byte integers. Alternatives are the \( O(n) \)-memory Bender–Farach-Colton construction, heavy-light decomposition, or an offline algorithm, all of which take more code and more care. Trees that change are harder: adding leaves is easy for binary lifting (compute the new node's row from its parent in \( O(\log n) \)), but moving a subtree or cutting an edge needs a link-cut tree or Euler-tour trees at \( O(\log n) \) amortized per update.
+Real data is often a DAG, not a tree. Git history, build graphs and package dependency graphs have merge nodes, so common ancestors need a graph search rather than a table, and the cost depends on how far back the common ancestor is. Git needed generation numbers and commit-graph files to make this fast on repositories with millions of commits. Finally, the constant factors matter: a sparse-table query is \( O(1) \) but touches two random memory locations (two cache misses); binary lifting touches about 34. For a billion queries, both numbers are large.
+practice: Choose by the number of queries and by whether the tree is static. For few queries, or for a binary tree without parent links, a recursive search (LeetCode 236) is enough. For many queries on a static tree, preprocess: binary lifting if you also need k-th ancestors or path aggregates, an Euler tour with a sparse table if you only need LCA and queries dominate, and Tarjan's offline algorithm if all queries are known up front and memory is tight.
+Write the plan: choose a root; compute depth and parent with an iterative traversal; build up[k] row by row; handle the root (its parent is itself or a sentinel); and in a forest, add a virtual root. Use \( \lceil \log_2 n \rceil + 1 \) rows. Test with a path (depth \( n - 1 \)), a star, two nodes where one is the ancestor of the other, and u = v.
+In systems, call the library when it exists: `git merge-base A B` gives a best common ancestor of two commits (`--all` lists every one). For hierarchies stored in SQL, a materialized path such as `/1/4/9/` makes the LCA of two rows the longest common prefix of their paths, with no tree algorithm at all.
+tradeoffs: Choose binary lifting when you need the k-th ancestor or path maximum and sum queries as well as LCA, when the code must be short, and when \( O(\log n) \) per query is fine: \( O(n \log n) \) memory and a query of about \( 2 \log_2 n \) steps. Choose the Euler tour with a sparse table when there are very many queries (millions) and you only need the LCA: \( O(1) \) per query for about \( 2n \log_2 2n \) table entries, roughly twice binary lifting's memory.
+Choose Tarjan's offline algorithm when all queries are known in advance and memory is the limit: \( O(n + q) \) memory, near-linear time, no \( \log \) factor. You give up online answers; each new query needs a new run.
+Choose heavy-light decomposition when the tree has hundreds of millions of nodes, or when you also need path updates and queries on values (sum, max with changes): \( O(n) \) memory and \( O(\log n) \) per query, but the code is longer. Choose the recursive method with no preprocessing when there are only a few queries: the table costs \( O(n \log n) \) to build, while each recursive query costs \( O(n) \), so for fewer than about \( \log n \) queries the recursion is cheaper.
+interview: How do you find the LCA of two nodes in a binary tree given only the root? What is the cost? || Recurse: return the current node if it is u or v, or null; recurse on both children; if both return non-null, the current node is the LCA, else return the non-null one. \( O(n) \) time, \( O(h) \) stack. For a BST, walk down comparing values with both nodes, \( O(h) \).
+Explain binary lifting. How do you build the table and answer an LCA query in \( O(\log n) \)? || up[k][v] is the \( 2^k \)-th ancestor, built as up[k][v] = up[k−1][up[k−1][v]], \( O(n \log n) \). A query lifts the deeper node by the depth difference using its bits, returns if equal, then for k from high to low jumps both nodes when their up[k] ancestors differ. The answer is the parent of the resulting nodes.
+Why does the second phase jump only when the ancestors differ? || If up[k][u] equals up[k][v], that ancestor is at or above the LCA, and jumping would reach or pass it. If they differ, the LCA is strictly above both, so the jump is safe. Doing this from the largest k down finds the highest pair of different ancestors, whose parent is the LCA, just as binary search finds the boundary.
+How does LCA reduce to range-minimum, and what does it buy you? || Take an Euler tour of the tree and the first index of each node. The LCA of u and v is the shallowest node in the tour between their first indexes. A sparse table gives \( O(1) \) queries after \( O(n \log n) \) build, better than binary lifting when queries are numerous.
+You must answer the maximum edge weight on the path between two nodes, 10^5 times. How? || Use binary lifting with a second table mx[k][v] holding the maximum edge weight on the jump from v up \( 2^k \) steps. During both phases of the LCA query, take the maximum of the mx values of every jump. \( O(\log n) \) per query, \( O(n \log n) \) memory.
+quiz: What is the formula for the distance between two nodes of a tree using their LCA? || \( d(u) + d(v) - 2\,d(\text{lca}(u, v)) \), where d is the depth: the two paths up to the LCA, each counted once.
+In binary lifting, what does up[k][v] mean and how is the next row computed from the previous one? || It is the \( 2^k \)-th ancestor of v. Row k comes from row k − 1: up[k][v] = up[k−1][up[k−1][v]], since two jumps of \( 2^{k-1} \) make one jump of \( 2^k \).
+For the tree in the example, what are LCA(6, 4) and the distance between 6 and 4? || The LCA is node 1. The depths are 3 and 2, so the distance is 3 + 2 − 2 × 1 = 3 (path 6-3-1-4).
+How many entries does an Euler tour of a tree with n nodes have, and why? || \( 2n - 1 \). Each of the n − 1 edges is walked twice (down and up) and a node is recorded after each step, plus the first record of the root.
+Your tree has 10^8 nodes and you need LCA queries. Why is a binary lifting table a problem, and what is the alternative? || It needs about 27 rows of 10^8 integers, roughly 10 GB, which is too much for many machines. Use an \( O(n) \)-memory approach: heavy-light decomposition (\( O(\log n) \) per query) or the linear-space RMQ method, or process the queries offline with Tarjan's algorithm.
+ref: book | Introduction to Algorithms, 4th ed. (union-find, trees; exercises on LCA) | Cormen, Leiserson, Rivest & Stein, 2022 |
+ref: paper | On Finding Lowest Common Ancestors in Trees | Alfred V. Aho, John E. Hopcroft & Jeffrey D. Ullman, SIAM Journal on Computing, 1976 |
+ref: paper | Fast Algorithms for Finding Nearest Common Ancestors | Dov Harel & Robert E. Tarjan, SIAM Journal on Computing, 1984 |
+ref: paper | The LCA Problem Revisited | Michael A. Bender & Martín Farach-Colton, LATIN 2000 |
+ref: paper | Applications of Path Compression on Balanced Trees | Robert E. Tarjan, Journal of the ACM, 1979 |
+ref: docs | git merge-base documentation | Git project | https://git-scm.com/docs/git-merge-base
+ref: course | Competitive Programmer's Handbook (ch. 18, tree algorithms) | Antti Laaksonen, 2018 | https://cses.fi/book/book.pdf
+@@ combgames
+value: A combinatorial game is a game for two players who move in turn, where both see everything (perfect information), nothing is left to chance, the game must end, and the player who cannot move loses (the "normal play" rule). Chess without the draw rules, Nim, Kayles and many coin-and-stone puzzles are of this kind. The question the theory answers is exact: from this position, does the player to move win with best play by both sides, and what is a winning move? The answer does not depend on skill or luck, only on the position.
+For small games you can find the answer by brute force, labelling each position as winning or losing by working backwards from the end. The surprise is that for a large family of games this brute force can be avoided. The Sprague–Grundy theorem (found independently by Roland Sprague in 1935 and Patrick Grundy in 1939) says that every position of an impartial game, where both players have the same moves, behaves exactly like a pile in the game of Nim. It receives a single number, its Grundy number, and when a game splits into independent parts, the whole game is lost for the player to move exactly when the XOR of the parts' numbers is 0. A game with a huge number of positions can then be solved by analysing each small part separately and combining the numbers with one XOR.
+Four lower concepts are used. Game theory (L4) provides the setting of strategies and best play and the idea of backward induction. Set theory (L4) provides the "minimum excluded value" (mex) of a set of numbers, which is how a Grundy number is defined, and well-founded recursion, which lets us define a value for every position from the positions after it. Boolean algebra (L4) provides XOR, the sum that combines the games; it is addition of bits without carry. Proofs and induction (L4) provide the method: every theorem here is proved by induction on the length of the game. The theory is the base of puzzle analysis in programming contests and interviews, and of the study of larger games, where search methods such as Monte Carlo tree search (L2) take over when exact analysis is impossible.
+terms: Impartial game — a game where both players have the same moves from every position; only whose turn it is differs (Nim is impartial; chess is not, since each player moves only their own pieces).
+Normal play — the rule that the player who cannot move loses; the last player to move wins.
+P-position — a position where the Previous player (the one who just moved) wins, so the player to move loses.
+N-position — a position where the Next player (the one to move) wins.
+Mex (minimum excluded value) — the smallest non-negative integer not in a given set; for example mex{0, 1, 3} = 2 and mex of the empty set is 0.
+Grundy number — the value \( g(P) = \operatorname{mex}\{ g(Q) : Q \text{ is reachable from } P \text{ in one move} \} \); also called the nim-value.
+Nim-sum — the XOR of numbers; the Grundy number of a sum of games is the nim-sum of their Grundy numbers.
+Disjunctive sum — a game made of independent components where, on each turn, a player moves in exactly one component.
+history: The first complete theory is for Nim. Charles Bouton, a Harvard mathematician, published "Nim, a game with a complete mathematical theory" in 1901. He proved that a position is lost for the player to move exactly when the binary digits of the pile sizes add up to an even number in every column, which is the same as XOR equal to zero, and he gave the winning move. He also named the game. Games like Nim are far older, and Kayles was published by the puzzle writer Henry Dudeney in 1907.
+In 1935 the German mathematician Roland Sprague, and independently in 1939 Patrick Michael Grundy in England, proved that this theory applies to every impartial game: each one is equivalent to a Nim pile. Sprague's paper (in Tôhoku Mathematical Journal) went largely unnoticed, and Grundy's short note in the journal Eureka made the idea known, which is why both names stay. Cedric Smith (1966) extended it to games that can loop forever. Richard Guy and Cedric Smith (1956) tabulated Grundy sequences for "octal games", and many were found to repeat with a fixed period.
+John Conway then changed the field. His "On Numbers and Games" (1976) defined games in which the two players have different moves (partizan games), and found that some of them behave like numbers, giving the surreal numbers. Elwyn Berlekamp, Conway and Guy collected the theory in "Winning Ways for your Mathematical Plays" (1982). The theory reached practice in Go: Berlekamp and David Wolfe's "Mathematical Go" (1994) used it to analyse endgames, where the board splits into separate regions that are nearly independent sums. For games too large to solve exactly, the field moved to search, such as Monte Carlo tree search and the AlphaGo family.
+how: Start with the definition of winning and losing, for any finite two-player game with perfect information, normal play and no draws. A position with no moves is a P-position: the player to move cannot move and loses. A position is an N-position if there exists a move to a P-position (the mover can leave the opponent in a lost position). A position is a P-position if every move leads to an N-position. This is a recursion on the positions after the current one, which are strictly closer to the end, so it is well founded (set theory and proofs by induction, L4). The cost is one visit to each position and each move, so \( O(\text{positions} + \text{moves}) \) with memoization.
+Nim shows that this table can be avoided. A position is a list of pile sizes; a move removes any positive number of stones from one pile. Bouton's theorem says the position is a P-position exactly when the nim-sum \( s = a_1 \oplus a_2 \oplus \dots \oplus a_k \) is 0. The proof is induction on the total number of stones, using two facts. First, from a position with \( s = 0 \), any move changes one pile \( a_i \) to a different value, so the XOR becomes \( s \oplus a_i \oplus a_i' \ne 0 \): every move leads to a nonzero nim-sum. Second, from a position with \( s \neq 0 \), a move to \( s = 0 \) exists. Let b be the highest set bit of s. Some pile \( a_i \) has bit b set (otherwise s could not have it). Replace \( a_i \) by \( a_i \oplus s \). This is smaller than \( a_i \), because the highest changed bit is b, which goes from 1 to 0, so it is a legal move, and the new total XOR is 0. The all-zero position has \( s = 0 \) and is a P-position. By induction, the theorem holds. XOR is the right sum because it is addition in the vector space of bits over the field with two elements (Boolean algebra, L4): a column of bits cancels in pairs, which is what a mirror strategy by the second player does.
+Now the general case. Define the Grundy number of a position P recursively:
+\[ g(P) = \operatorname{mex}\{\, g(Q) : P \to Q \,\} \]
+A position with no moves has \( g = 0 \). Then \( g(P) = 0 \) exactly when P is a P-position: if g(P) = 0, no option has value 0, so every move leads to a position with nonzero value (an N-position by induction); if \( g(P) > 0 \), then some option has value 0, so P is an N-position. The theorem of Sprague and Grundy says more: the position P is equivalent to a Nim pile of size \( g(P) \), in any sum of games. For a sum \( G_1 + G_2 + \dots + G_k \) (a move is made in exactly one component),
+\[ g(G_1 + \dots + G_k) = g(G_1) \oplus g(G_2) \oplus \dots \oplus g(G_k) \]
+So the sum is a P-position exactly when the XOR of the component values is 0, and the winning move is the Nim move: pick a component whose value can be reduced to the right target value, which the mex definition guarantees to exist (a position of value g has options of every smaller value). The idea behind the proof is that a position of value g can move to every value below g (that is what mex means) and to no option equal to g, and options with a larger value can be answered by moving back down to g, so such moves gain nothing. Hence it acts as a Nim pile of size g.
+The recipe for solving a game: (1) check that it is impartial, finite and normal-play; (2) split it into independent components if possible; (3) compute the Grundy number of each component by dynamic programming with mex, from small to large; (4) XOR the numbers; (5) nonzero means the first player wins.
+```python
+from functools import lru_cache
+
+def mex(values):
+    m = 0
+    while m in values:
+        m += 1
+    return m
+
+@lru_cache(None)
+def grundy(n, moves=(1, 3, 4)):
+    """Subtraction game: a pile of n, remove one of `moves` stones."""
+    return mex({grundy(n - m, moves) for m in moves if m <= n})
+
+def nim_winning_move(piles):
+    s = 0
+    for p in piles:
+        s ^= p                       # the nim-sum
+    if s == 0:
+        return None                  # P-position: every move loses
+    for i, p in enumerate(piles):
+        if p ^ s < p:                # a pile that can be reduced to p^s
+            return i, p - (p ^ s)    # (pile index, stones to remove)
+```
+Two further examples show the method on games that look different. LeetCode 294 (Flip Game II) lets players flip two adjacent plus signs to minus signs; the player who cannot move loses. A move in a run of n pluses leaves two independent runs of lengths a and b with a + b = n − 2, so the game is a sum of runs and \( g(n) = \operatorname{mex}\{ g(a) \oplus g(b) : a + b = n - 2 \} \). This gives g = 0, 0, 1, 1, 2, 0, 3, 1, … for n = 0, 1, 2, …. Kayles, where a player knocks over one pin or two adjacent pins in a row, has the same structure with mex over a + b = n − 1 and a + b = n − 2.
+The theorem has a clear boundary. It needs the game to be impartial (same moves for both), finite (or at least loop-free), played under normal play (the last mover wins) and a true sum (each move in exactly one component). Under misère play (the last mover loses), the theory changes: Nim is still easy (play as normal Nim, except that a move that would leave only piles of size 1 should leave an odd number of them), but for general games Grundy values are not enough, and a more complex theory is needed (Conway's genus theory, later misère quotients). For partizan games, Conway's values (numbers, switches and temperatures) replace the nim-values.
+diagram:
+  Nim piles 3, 4, 5 in binary
+
+     3 =  0 1 1
+     4 =  1 0 0
+     5 =  1 0 1
+    --------------
+   XOR =  0 1 0   = 2, not zero -> N-position (first player wins)
+
+   highest bit of the XOR is the "2" bit; pile 3 (011) has it
+   3 xor 2 = 1 -> remove 2 stones from pile 3
+   new piles 1, 4, 5:   001 xor 100 xor 101 = 000   -> P-position
+
+  Grundy numbers, subtraction game {1, 3, 4}
+
+   n :  0  1  2  3  4  5  6  7  8  9 10 11 12
+   g :  0  1  0  1  2  3  2  0  1  0  1  2  3     repeats with period 7
+
+   g(5) = mex{ g(4), g(2), g(1) } = mex{ 2, 0, 1 } = 3
+   g(7) = mex{ g(6), g(4), g(3) } = mex{ 2, 2, 1 } = 0
+example: Nim with piles 3, 4, 5 (see the diagram). The nim-sum is \( 3 \oplus 4 \oplus 5 = 011 \oplus 100 \oplus 101 = 010 = 2 \), which is not zero, so the player to move wins. The highest bit of the nim-sum is the "2" bit. Pile 3 (binary 011) has this bit, and \( 3 \oplus 2 = 1 \), so remove 2 stones from the pile of 3, leaving 1, 4, 5. Check: \( 1 \oplus 4 \oplus 5 = 0 \). Whatever the opponent does now, the nim-sum becomes nonzero, and we can restore it to zero. For example, if the opponent takes the pile of 1, the position is 0, 4, 5 with nim-sum 1; we reduce the pile of 5 to 4 (\( 5 \oplus 1 = 4 \)), and the position 4, 4 has nim-sum 0. The mirror strategy now finishes the game. For piles 1, 2, 3 the nim-sum is \( 1 \oplus 2 \oplus 3 = 0 \), so the first player loses against best play.
+Next, a sum of two different games. Two piles are played under the subtraction rule "remove 1, 3 or 4 stones from one pile", with sizes 5 and 7, and a move is made in one pile. The Grundy numbers are in the diagram: g(5) = 3 and g(7) = 0. The nim-sum is \( 3 \oplus 0 = 3 \ne 0 \), so the first player wins. To move to a zero sum we need pile 5 to become a position of value 0 (so that \( 0 \oplus 0 = 0 \)). The options of 5 are 4, 2 and 1 with values 2, 0 and 1, so we move to 2 by removing 3 stones: the position (2, 7) has \( g = 0 \oplus 0 = 0 \). Both piles are now in P-positions of their own, and every move of the opponent can be answered inside the same pile. Brute force over the pair (5, 7) would need a table of 6 × 8 = 48 positions; with Grundy numbers each pile needs only its own 8 values, and the work grows additively instead of multiplicatively. For ten piles of size up to 1,000, a joint table has \( 10^{30} \) positions, while the Grundy method needs 1,000 values.
+Third, a simple game solved by finding the pattern. In LeetCode 292 (Nim Game) a pile of n stones, each player removes 1, 2 or 3, last mover wins. The Grundy numbers are 0, 1, 2, 3, 0, 1, 2, 3, …, that is \( g(n) = n \bmod 4 \). So the first player loses exactly when n is a multiple of 4: otherwise take \( n \bmod 4 \) stones and leave a multiple of 4. LeetCode 1025 (Divisor Game) is solved by the same experiment: print win or lose for n = 1 to 20 by brute force, and see that the first player wins exactly when n is even.
+Classic problems, in teaching order. 292 and 1025 are found by brute force and pattern. 877 (Stone Game) is a first-player win: with an even number of piles she takes all odd-position or all even-position piles, whichever sum is larger. 486 and 1140 are scoring games, so they need minimax dynamic programming over the score difference. 464 (Can I Win) is a bitmask memo. 294 (Flip Game II) is the Grundy decomposition into runs. 2029 (Stone Game IX) is a case analysis modulo 3. Also Kayles and Wythoff's game (losing positions follow the golden ratio).
+intuition: A heap of stones is a promise that a certain number of "tempo moves" remain; the Grundy number says how many tempo moves a position is worth, and two positions with the same worth can be swapped without changing who wins.
+The strong idea is that a game position can be replaced by a single number without losing anything that matters. In Nim, a pile of size g offers moves to every smaller size, so it works as a reserve of g tempo moves that either player may use partly. The mex rule makes any impartial position look the same from outside: it can reach every value below g and cannot reach g. Because XOR is addition without carries, the values of independent components do not interfere with each other, and the question "who wins the sum?" becomes "is the total zero?". This is why the theory is so useful: it turns a search over a product of game trees into arithmetic on small numbers.
+mistakes: People often think that to win the sum of games you win by winning each component. In fact the sum is decided by the XOR of the Grundy values, not by who wins each part. Two components that are both N-positions (each winning for the player to move) can sum to a P-position, as in Nim with two equal piles of 5: each pile alone is a first-player win, but together the nim-sum is 0, and the first player loses.
+People often think the Grundy number of a position is the number of moves to the end, or the maximum depth. In fact it is the mex of the options' values, which depends on which values the options have, not on how long the game lasts. The position with Grundy number 3 has options of value 0, 1 and 2 but may also have options of value 5 or 7; and a long game can have value 0.
+People often think the theory applies to any game with two players. In fact it needs impartial games and normal play. Chess, Go and checkers have different moves for each player, so Sprague–Grundy does not apply to them directly. It also fails for scoring games (Stone Game II) and for misère play, where the last mover loses; applying the mex-and-XOR rule there gives wrong answers (for example, in misère Nim with piles 1, 1 the XOR is 0 but the player to move wins).
+friction: The first limit is scope: impartial, finite, perfect information, normal play, and a sum of independent parts. Real games break these conditions: players have different pieces, the score matters, moves affect several parts at once, there are chance elements or hidden cards, or the play can cycle. For loops, Smith's generalization works; for the others you need minimax with alpha-beta pruning, dynamic programming, or search.
+The second limit is cost. Computing a Grundy number needs all positions below it and all their options: the table size is the number of reachable states, which can be exponential in the board size, and each mex costs time proportional to the number of options. For one pile of size n with move set M, the time is \( O(n \cdot |M|) \), cheap; for a game such as Grundy's game (split a heap into two unequal heaps) it is cheap per entry but no period has been found despite extensive computation, so the table must be extended by brute force. The exact complexity of generalized games is high: deciding the winner of generalized geography is PSPACE-complete (Schaefer, 1978), Hex is PSPACE-complete (Reisch, 1981), and Go on an n × n board is EXPTIME-complete under Japanese ko rules (Robson, 1983).
+practice: Where an engineer meets this: programming contests and interviews (Nim, stone games, flip games), puzzle design, and the analysis of search in game-playing systems. The method is to experiment first. Write a brute-force win(state) with memoization: a state is winning if some move reaches a losing state, and losing if all moves reach winning states. Print results for small sizes and look for a pattern (a period, a power of two, a dependence on parity or on n mod k). If the position splits into independent parts (separate piles, separate runs, separate subtrees), replace win/lose by Grundy numbers and XOR them.
+For states too large for a table, look for structure: symmetry (a second-player mirror strategy), parity, periodicity of Grundy values (subtraction games repeat), or a closed form (the Grundy number of a Nim pile is its size; of a subtraction game with moves 1 to k it is n mod (k + 1)). Always test the formula against brute force for small n before trusting it.
+When the table is too large, search takes over: minimax with alpha-beta pruning and transposition tables is the same win/lose recursion with caching, endgame databases for chess and checkers store the outcome of every position with few pieces (the table computed backwards on real boards), and Monte Carlo tree search (L2) replaces exact analysis by statistics, as in Go programs. To study further, read the impartial-games chapters of Ferguson's notes, then Siegel's "Combinatorial Game Theory".
+tradeoffs: Choose Sprague–Grundy when the game is impartial, finite and splits into independent components: the work is the sum of the component tables instead of their product, which for ten components of 1,000 states each is 10,000 entries instead of \( 10^{30} \). Choose plain memoized win/lose search when the game is a single component or cannot be split, or when you only need the winner and the state space is small enough to fit in memory (up to roughly \( 10^7 \) states in an interview setting).
+Choose minimax with a score (dynamic programming over the score difference) when the players collect points rather than just win or lose, and when moves are not shared by both players (Stone Game II, Predict the Winner). You give up the XOR shortcut, and the table becomes the full state space.
+Choose exact solution for small games, and an approximate method for large ones: alpha-beta search with heuristics when a good evaluation function exists, or Monte Carlo tree search when it does not. You give up the proof of optimality and gain the ability to play games, such as 19 × 19 Go, whose state space of about \( 10^{170} \) positions can never be solved by tables.
+quiz: When is a Nim position a P-position (lost for the player to move), and why? || When the XOR of the pile sizes is 0. From such a position every move changes one pile and makes the XOR nonzero, and from a nonzero XOR there is always a move that restores 0, so the player who faces 0 is eventually left without a move.
+How is the Grundy number of a position defined? || It is the mex (smallest non-negative integer missing) of the Grundy numbers of all positions reachable in one move. A position with no moves has value 0, and a position has value 0 exactly when it is a P-position.
+For the subtraction game {1, 3, 4}, what is g(5) and what is g(7)? || g(5) = mex{g(4), g(2), g(1)} = mex{2, 0, 1} = 3. g(7) = mex{g(6), g(4), g(3)} = mex{2, 2, 1} = 0, so a pile of 7 is a P-position.
+Two piles of sizes 5 and 7 are played in the subtraction game {1, 3, 4}. Who wins and what is the first move? || The first player wins, since \( g(5) \oplus g(7) = 3 \oplus 0 = 3 \ne 0 \). Remove 3 stones from the pile of 5, giving 2 and 7 with values 0 and 0 and a total of 0.
+When would you not use Sprague–Grundy? || When the game is not impartial (different moves for each player, like chess or Go), when it is a scoring game, when it is played under misère rules, or when the components are not independent. Then use minimax or dynamic programming over the score, Conway's partizan theory, or search.
+ref: paper | Nim, a Game with a Complete Mathematical Theory | Charles L. Bouton, Annals of Mathematics, 1901–1902 |
+ref: paper | Über mathematische Kampfspiele | Roland P. Sprague, Tôhoku Mathematical Journal, 1935 |
+ref: paper | Mathematics and Games | Patrick M. Grundy, Eureka, 1939 |
+ref: book | Winning Ways for Your Mathematical Plays (4 vols., 2nd ed.) | Elwyn R. Berlekamp, John H. Conway & Richard K. Guy, 2001–2004 |
+ref: book | On Numbers and Games, 2nd ed. | John H. Conway, 2001 |
+ref: book | Combinatorial Game Theory (Graduate Studies in Mathematics 146) | Aaron N. Siegel, American Mathematical Society, 2013 |
+ref: course | Game Theory, Part I: Impartial Combinatorial Games | Thomas S. Ferguson, UCLA lecture notes | https://www.math.ucla.edu/~tom/Game_Theory/comb.pdf
+ref: paper | Graphs and Composite Games | Cedric A. B. Smith, Journal of Combinatorial Theory, 1966 |

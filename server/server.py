@@ -19,6 +19,10 @@ Serves the web app from web/ and a JSON API:
   GET  /api/practice                   your saved code and solved marks per practice problem (problems are in /api/graph -> practice)
   PUT|DELETE /api/practice/<id>        body {"code": "...", "solved": true|false} (either or both)
   GET  /api/templates                  pattern templates keyed by pattern name (also in /api/graph -> templates)
+  GET  /api/problemmap                 the problem map: families, ideas (the idea DAG) and every problem as a compact row
+                                       (column names in "cols"); 404 when the build has no problem map
+  GET  /api/problem/<n>                one problem in full, with its idea, prerequisites and unlocks (titles included)
+  PUT|DELETE /api/problem/<n>/solved   mark a problem-map problem as solved (or not); returns {"problems": {n: solved_at}}
   GET  /api/export                     all your data as JSON
 
 Content lives in data/content.db (rebuilt by tools/build.py); your own data lives in data/user.db and survives rebuilds.
@@ -56,6 +60,10 @@ USER_SCHEMA = [
     # migration 3: practice problems (your code and whether all tests passed)
     """
     CREATE TABLE practice (problem_id TEXT PRIMARY KEY, code TEXT NOT NULL, solved INTEGER NOT NULL DEFAULT 0 CHECK (solved IN (0,1)), solved_at TEXT, updated_at TEXT NOT NULL);
+    """,
+    # migration 4: problem-map problems you have solved (LeetCode numbers); drives "Next problems"
+    """
+    CREATE TABLE pm_solved (n INTEGER PRIMARY KEY, solved_at TEXT NOT NULL);
     """,
 ]
 
@@ -127,9 +135,19 @@ class Content:
         for s_ in self.scenes: by_concept.setdefault(s_["concept"], []).append(s_)
         for n in nodes: self.reads[n["id"]]["scenes"] = by_concept.get(n["id"], [])
         scene_list = [dict(id=s_["id"], concept=s_["concept"], title=s_.get("title", ""), n=len(s_.get("steps", []))) for s_ in self.scenes]
+        # problem map: the compact form is served as is; full entries per problem answer /api/problem/<n>
+        self.pm_json, self.pm_gz, self.pm, self.pm_ideas, pm_summary = None, None, {}, {}, None
+        if "pm_problems" in has:
+            meta = dict(db.execute("SELECT key, value FROM meta WHERE key IN ('problemmap', 'problemmap_summary')").fetchall())
+            if meta.get("problemmap"):
+                self.pm_json = meta["problemmap"].encode()
+                self.pm_gz = gzip.compress(self.pm_json, 6)
+                pm_summary = json.loads(meta.get("problemmap_summary") or "null")
+                self.pm = {r[0]: json.loads(r[1]) for r in db.execute("SELECT n, body FROM pm_problems")}
+                self.pm_ideas = {r[0]: json.loads(r[1]) for r in db.execute("SELECT id, body FROM pm_ideas ORDER BY ord")}
         db.close()
         self.ids = set(self.reads)
-        self.graph = dict(nodes=nodes, edges=edges, side=side, tours=tours, layers=layers, curriculum=curriculum, designs=design_list, practice=practice, templates=self.templates, scenes=scene_list, stats=self.stats, built_at=self.built_at, mode="server")
+        self.graph = dict(nodes=nodes, edges=edges, side=side, tours=tours, layers=layers, curriculum=curriculum, designs=design_list, practice=practice, templates=self.templates, scenes=scene_list, stats=self.stats, built_at=self.built_at, mode="server", problemmap=pm_summary)
         self.graph_json = json.dumps(self.graph, ensure_ascii=False, separators=(",", ":")).encode()
         self.graph_gz = gzip.compress(self.graph_json, 6)
         self.local = threading.local()
@@ -164,6 +182,16 @@ class Content:
                 seen.add(r["owner"])
                 out.append(dict(id=r["owner"], label=r["label"], snippet=r["snip"], score=round(r["score"], 3)))
         return out[:limit]
+
+    def problem(self, n):
+        """One problem in full, with the titles of its prerequisites and unlocks, its idea and its worked practice problem."""
+        q = self.pm.get(n)
+        if not q: return None
+        brief = lambda m: dict(n=m, title=self.pm[m]["title"], difficulty=self.pm[m]["difficulty"], idea=self.pm[m]["idea"], depth=self.pm[m]["depth"], new=self.pm[m]["new"]) if m in self.pm else dict(n=m)
+        d = self.pm_ideas.get(q["idea"], {})
+        return dict(q, idea_name=d.get("name", q["idea"]), idea_level=d.get("level"), uses_names={u: self.pm_ideas.get(u, {}).get("name", u) for u in q.get("uses", [])},
+                    prereqs_detail=[brief(m) for m in q.get("prereqs", [])], unlocks_detail=[brief(m) for m in q.get("unlocks", [])],
+                    practice=q["slug"] if q["slug"] in self.practice_ids else None)
 
     def library(self, kind=None):
         sql = ("SELECT work_key, kind, title, who, url, owner FROM sources " + ("WHERE kind = ? " if kind else "") + "ORDER BY id")
@@ -206,13 +234,18 @@ class UserData:
                 time={r[0]: r[1] for r in c.execute("SELECT node_id, seconds FROM reading_time")},
                 review={f"{r[0]}#{r[1]}": [r[2], r[3]] for r in c.execute("SELECT node_id, q, box, due FROM review")},
                 practice={r[0]: bool(r[1]) for r in c.execute("SELECT problem_id, solved FROM practice")},
+                problems={str(r[0]): r[1] for r in c.execute("SELECT n, solved_at FROM pm_solved")},
                 recent=[dict(id=r[0], at=r[1]) for r in c.execute("SELECT node_id, max(at) AS at FROM (SELECT node_id, updated_at AS at FROM progress UNION ALL SELECT node_id, last_at FROM reading_time) GROUP BY node_id ORDER BY at DESC LIMIT 12")],
             )
 
     def export(self):
         with self.lock:
             c = self.conn
-            return {t: [dict(r) for r in c.execute(f"SELECT * FROM {t}")] for t in ("progress", "bookmarks", "notes", "reading_time", "review", "practice")}
+            return {t: [dict(r) for r in c.execute(f"SELECT * FROM {t}")] for t in ("progress", "bookmarks", "notes", "reading_time", "review", "practice", "pm_solved")}
+
+    def pm_solved(self):
+        with self.lock:
+            return {"problems": {str(r[0]): r[1] for r in self.conn.execute("SELECT n, solved_at FROM pm_solved")}}
 
     def practice(self):
         with self.lock:
@@ -296,6 +329,14 @@ def make_handler(app, allowed_hosts):
                     if not d: return self.err(404, f"unknown design {m.group(1)!r}")
                     return self.send(200, d)
                 if p == "/api/practice": return self.send(200, app.user.practice())
+                if p == "/api/problemmap":
+                    if not c.pm_json: return self.err(404, "this build has no problem map (run python3 tools/merge_problemmap.py, then tools/build.py)")
+                    return self.send(200, c.pm_json, gz=c.pm_gz)
+                m = re.fullmatch(r"/api/problem/(\d{1,6})", p)
+                if m:
+                    q = c.problem(int(m.group(1)))
+                    if not q: return self.err(404, f"problem {m.group(1)} is not in the problem map")
+                    return self.send(200, q)
                 if p == "/api/templates": return self.send(200, c.templates)
                 if p == "/api/scenes":
                     cid = (qs.get("concept") or [None])[0]
@@ -376,6 +417,14 @@ def make_handler(app, allowed_hosts):
                 elif method == "DELETE": U.q("DELETE FROM practice WHERE problem_id=?", (pid,))
                 else: return self.err(405, "use PUT or DELETE")
                 return self.send(200, U.practice())
+            m = re.fullmatch(r"/api/problem/(\d{1,6})/solved", p)
+            if m:
+                n = int(m.group(1))
+                if n not in app.content.pm: return self.err(404, f"problem {n} is not in the problem map")
+                if method == "PUT": U.q("INSERT OR IGNORE INTO pm_solved VALUES (?,?)", (n, now()))
+                elif method == "DELETE": U.q("DELETE FROM pm_solved WHERE n=?", (n,))
+                else: return self.err(405, "use PUT or DELETE")
+                return self.send(200, U.pm_solved())
             m = re.fullmatch(r"/api/review/([A-Za-z0-9-]+)/(\d{1,2})", p)
             if m:
                 nid, qi = m.group(1), int(m.group(2))

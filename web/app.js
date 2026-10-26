@@ -79,7 +79,7 @@ function today(off){ const d=new Date(); d.setDate(d.getDate()+(off||0)); return
 function lsLoad(){ try{ return JSON.parse(localStorage.getItem(LSKEY))||null; }catch(e){ return null; } }
 function lsSave(u){ try{ localStorage.setItem(LSKEY, JSON.stringify(u)); }catch(e){} }
 const Store = {
-  me: {progress:{}, bookmarks:[], notes:{}, time:{}, recent:[], review:{}},
+  me: {progress:{}, bookmarks:[], notes:{}, time:{}, recent:[], review:{}, problems:{}},
   local: null,
   async init(){
     if(STANDALONE){ this.local = lsLoad() || {progress:{}, bookmarks:[], notes:{}, time:{}}; this.local.review = this.local.review || {}; this.syncLocal(); }
@@ -89,7 +89,7 @@ const Store = {
     const u=this.local, now=new Date().toISOString().slice(0,19);
     const recent = Object.entries(Object.assign({}, ...Object.entries(u.time).map(([k,v])=>({[k]:v.at})), ...Object.entries(u.progress).map(([k,v])=>({[k]:v.at}))))
       .sort((a,b)=>a[1]<b[1]?1:-1).slice(0,12).map(([id,at])=>({id,at}));
-    this.me = {review:u.review||{}, progress:u.progress, bookmarks:u.bookmarks, notes:Object.fromEntries(Object.entries(u.notes).filter(([k,v])=>v.length).map(([k,v])=>[k,v.length])), time:Object.fromEntries(Object.entries(u.time).map(([k,v])=>[k,v.s])), recent};
+    this.me = {problems:u.pm||{}, review:u.review||{}, progress:u.progress, bookmarks:u.bookmarks, notes:Object.fromEntries(Object.entries(u.notes).filter(([k,v])=>v.length).map(([k,v])=>[k,v.length])), time:Object.fromEntries(Object.entries(u.time).map(([k,v])=>[k,v.s])), recent};
     lsSave(u); return now;
   },
   stamp(){ return new Date().toISOString().slice(0,19); },
@@ -106,6 +106,12 @@ const Store = {
     return SCENE_ALL;
   },
   status(id){ const p=this.me.progress[id]; return p?p.status:null; },
+  // problem-map problems marked as solved (LeetCode numbers); server: user DB table pm_solved, standalone: this browser
+  async setPmSolved(n, on){
+    if(STANDALONE){ const u=this.local; u.pm=u.pm||{}; if(on) u.pm[n]=this.stamp(); else delete u.pm[n]; this.syncLocal(); return; }
+    const r = on ? await api("PUT","/api/problem/"+n+"/solved",{}) : await api("DELETE","/api/problem/"+n+"/solved");
+    this.me.problems = r.problems || {};
+  },
   isBookmarked(id){ return this.me.bookmarks.some(b=>b.id===id); },
   async setProgress(id, status){
     if(STANDALONE){ if(status) this.local.progress[id]={status, at:this.stamp()}; else delete this.local.progress[id]; this.syncLocal(); }
@@ -222,7 +228,15 @@ function renderStrip(){
   if(state.view!=="explore" && state.sel) reached.add(N[state.sel].l);
   $("strip").innerHTML = LAYERS.map((L,i)=>{
     const done = byLayer[i].filter(n=>Store.status(n.id)==="read").length, pct = Math.round(100*done/byLayer[i].length);
-    return `${i?'<span class="arrow" aria-hidden="true" style="align-self:center;color:var(--muted)">↓</span>':""}<button type="button" class="lp${reached.has(i)?" reached":""}" style="--c:${lc(i)}" data-layer="${i}" aria-pressed="${state.view==="explore"&&state.start===i}" title="${esc(L.d)}${done?` · ${done} read`:""}"><span class="sw"></span><span class="ln">L${i}</span><span class="nm">${esc(L.n)}</span><span class="ct">${done?done+"/":""}${byLayer[i].length}</span><span class="pg" style="width:${pct}%"></span></button>`; }).join("");
+    return `${i?'<span class="arrow" aria-hidden="true" style="align-self:center;color:var(--muted)">↓</span>':""}<button type="button" class="lp${reached.has(i)?" reached":""}" style="--c:${lc(i)}" data-layer="${i}" aria-pressed="${state.view==="explore"&&state.start===i}" title="${esc(L.d)}${done?` · ${done} read`:""}"><span class="sw"></span><span class="ln">L${i}</span><span class="nm">${esc(L.n)}</span><span class="ct">${done?done+"/":""}${byLayer[i].length}</span><span class="pg" style="width:${pct}%"></span></button>`; }).join("") + pmBand();
+}
+// the problem map sits below the six layers: the bottom of the stack
+const PMS = () => DATA.pm_summary || DATA.problemmap || null;
+const hasPM = () => !!(PMS() && (PMS().problems || (PMS().p||[]).length));
+const pmCount = () => { const s=PMS(); return s ? (s.problems || (s.p||[]).length) : 0; };
+function pmBand(){
+  if(!hasPM()) return "";
+  return `<span class="arrow" aria-hidden="true" style="align-self:center;color:var(--muted)">↓</span><button type="button" class="lp pmband${state.view==="problems"?" reached":""}" data-view="problems" aria-pressed="${state.view==="problems"}" title="Problem map: ${pmCount().toLocaleString("en-US")} LeetCode problems built from the ground up"><span class="sw"></span><span class="nm">Problem map</span><span class="ct">${pmCount().toLocaleString("en-US")}</span></button>`;
 }
 
 /* ---------------- explore ---------------- */
@@ -289,6 +303,7 @@ function egoSVG(n){
 function relList(items, mk){ return `<div class="rel">${items.map(mk).join("")}</div>`; }
 function renderPanel(){
   const p = $("panel");
+  if(state.view==="problems"){ if(window.DTSPM) window.DTSPM.panel(p); else p.innerHTML = `<p class="empty">Loading…</p>`; return; }
   if(!state.sel){ p.innerHTML = introHTML(); return; }
   const n = N[state.sel], u = under(n.id), total = u.reduce((s,a)=>s+a.length,0), upTot = aboveByLayer(n.id).reduce((s,x)=>s+x,0);
   const inPath = state.view==="explore" && state.path.includes(n.id);
@@ -314,6 +329,8 @@ function renderPanel(){
   h += `<h3>Used by · ${ups.length} directly, ${upTot} in total</h3>` + (ups.length ? relList(ups, e=>`<button type="button" data-sel="${e.s}"><span class="bar${e.k==="inspired"?" dash":""}" style="--c:${lc(N[e.s].l)}"></span><span><span class="rn">${esc(N[e.s].label)}</span><span class="kind">L${N[e.s].l}</span><span class="rw">${esc(e.r)}</span></span></button>`) : `<p class="empty">Nothing in this map is built on it yet: it is a top-level product.</p>`);
   if(n.side.length) h += `<h3>Related · ${n.side.length}</h3>` + relList(n.side, s=>`<button type="button" data-sel="${s.o}"><span class="bar" style="--c:${lc(N[s.o].l)}"></span><span><span class="rn">${esc(N[s.o].label)}</span><span class="kind">${SIDE[s.t]||s.t}</span><span class="rw">${esc(s.r)}</span></span></button>`);
   if(TAUGHT[n.id]) h += `<h3>Taught in · Stanford</h3><div class="chips">${TAUGHT[n.id].map(code=>`<button type="button" class="chip" style="--c:var(--fg)" data-course="${code}"><span class="sw"></span>${esc(courseLabel(code))} ${esc(COURSE[code].title)}</button>`).join("")}</div>`;
+  const pmc = hasPM() && (PMS().concepts||{})[n.id];
+  if(pmc) h += `<h3>Problems that use this · ${(pmc[0]+pmc[1]).toLocaleString("en-US")}</h3><p class="pm-panelpin">${pmc[0]} LeetCode problem${pmc[0]===1?" is":"s are"} about it directly and ${pmc[1]} use it along the way. <button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-pmconcept="${n.id}">See them in the problem map</button></p>`;
   if(USES[n.id]) h += `<h3>Appears in design questions · ${USES[n.id].length}</h3><div class="chips">${USES[n.id].map(did=>`<button type="button" class="chip" style="--c:var(--fg)" data-design="${did}"><span class="sw"></span>${esc(DES[did].title)}</button>`).join("")}</div>`;
   const rd = READS[n.id];
   h += `<h3>Go deeper · ${n.nr} source${n.nr===1?"":"s"}</h3>` + (rd ? `<div class="minirefs">${rd.refs.map(r=>`<a href="${esc(refURL(r))}" target="_blank" rel="noopener noreferrer"><span class="rk">${esc(KIND[r.k]||r.k)}</span><span class="rt">${esc(r.t)}</span> <span style="color:var(--muted)">· ${esc(r.w)}</span></a>`).join("")}</div>` : `<p class="empty">Loading sources…</p>`);
@@ -327,6 +344,7 @@ function introHTML(){
   <ol><li><b>Explore:</b> each click opens the next column with what it is built on, and why.</li><li><b>Read:</b> every concept has a read (why it exists, how it works, what it stands on, why it makes sense, where it still hurts) and sources to go deeper. ${deepList.length} are deep reads of 5–12 minutes with history, a worked example and practical advice; the six layer essays take about 10 minutes each.</li><li><b>Tours:</b> ${DATA.tours.length} complete descents, such as Kafka down to quantum tunneling.</li><li><b>Library:</b> every book, paper and article cited, ranked by how many concepts rely on it.</li><li><b>You:</b> what you have read, saved and noted.</li></ol>
   ${read?`<p class="quip" style="--c:var(--l2)"><b>Your progress</b>${read} of ${DATA.nodes.length} concepts read. <button type="button" class="essay-link" style="display:inline;--c:var(--l2)" data-view="you">See your map</button></p>`:""}
   <h3>Start with the six layer essays</h3><div class="legend">${LAYERS.map((L,i)=>`<span class="sw" style="--c:${lc(i)}"></span><span><button type="button" class="essay-link" style="--c:${lc(i)};margin:0;display:inline" data-essay="${i}">L${i} ${esc(L.n)} · ${L.rm} min</button><br>${esc(L.d)}</span>`).join("")}</div>
+  ${hasPM()?`<p class="pm-introband"><button type="button" class="essay-link" style="display:inline;--c:var(--pm)" data-view="problems">Below L5: the problem map</button><br>${pmCount().toLocaleString("en-US")} LeetCode problems built from the ground up, each pinned to the technique it teaches and the concepts it uses.</p>`:""}
   <p class="note">${DATA.nodes.length} concepts, ${DATA.edges.length} links, ${DATA.stats.refs} sources and about ${Math.round(DATA.stats.words/1000)}k words of reading. Versions checked as of October 2026. Dashed links are analogies rather than mechanisms. Press <span class="kbd">/</span> to search.</p></div>`;
 }
 
@@ -366,6 +384,7 @@ function renderAtlas(){
     h += `<section class="asec" style="--c:${lc(l)}"><h2><span class="ln">L${l}</span>${esc(L.n)}<span class="ct">${byLayer[l].length}</span></h2><p class="desc">${esc(L.d)} <button type="button" class="essay-link" style="--c:${lc(l)};display:inline" data-essay="${l}">Read the layer essay · ${L.rm} min</button></p>` +
       cats.map(c=>`<div class="agrp"><h3>${esc(c)}</h3><div class="chips">${byLayer[l].filter(n=>n.cat===c).sort(byLabel).map(n=>`<button type="button" class="chip${hubSet.has(n.id)?" hub":""}" style="--c:${lc(l)}" data-sel="${n.id}" aria-pressed="${state.sel===n.id}"><span class="sw"></span>${esc(n.label)}${markHTML(n.id)}</button>`).join("")}</div></div>`).join("") + `</section>`;
   });
+  if(hasPM()) h += `<section class="asec pm-asec" style="--c:var(--pm)"><h2><span class="ln">↓</span>Problem map<span class="ct">${pmCount().toLocaleString("en-US")}</span></h2><p class="desc">Below first principles: LeetCode problems built from the ground up. Each one names the easier problems it builds on and the technique it adds, and is pinned to the concepts above. <button type="button" class="essay-link" style="--c:var(--pm);display:inline" data-view="problems">Open the problem map</button></p></section>`;
   $("v-atlas").innerHTML = h;
 }
 
@@ -446,6 +465,7 @@ function renderYou(){
       <div class="card"><div class="big">${fmt(secs)}</div><div class="lbl">time spent reading · ${notes} note${notes===1?"":"s"} · ${me.bookmarks.length} saved</div></div>
     </div>
     <h3 class="ysec">Review</h3>${reviewHTML()}
+    ${hasPM()?`<h3 class="ysec">Next problems</h3><div id="pm-next" class="pm-youbox"></div>`:""}
     <h3 style="font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:500;margin:18px 0 8px">Depth reached, layer by layer</h3>
     ${LAYERS.map((L,i)=>{ const d=byLayer[i].filter(n=>readSet.has(n.id)).length; return `<div class="lprog" style="--c:${lc(i)}"><span><b>L${i}</b> ${esc(L.n)}</span><span class="track"><span class="fill" style="display:block;width:${Math.round(100*d/byLayer[i].length)}%"></span></span><span class="num">${d}/${byLayer[i].length}</span></div>`; }).join("")}
     <div style="height:18px"></div>
@@ -454,6 +474,7 @@ function renderYou(){
     ${me.bookmarks.length?`<h3 class="ysec">Saved</h3><div class="ylist">${me.bookmarks.filter(b=>N[b.id]).map(b=>row(b.id)).join("")}</div>`:""}
     ${Object.keys(me.notes).length?`<h3 class="ysec">With your notes</h3><div class="ylist">${Object.keys(me.notes).filter(id=>N[id]).map(id=>row(id, me.notes[id]+" note"+(me.notes[id]===1?"":"s"))).join("")}</div>`:""}
     <div class="btnrow" style="margin-top:18px"><button type="button" class="btn" data-export>${STANDALONE?"Copy my data (JSON)":"Export my data (JSON)"}</button></div>`;
+  if(hasPM() && window.DTSPM) window.DTSPM.fillNext($("pm-next"));
   $("v-you").querySelectorAll(".ysec").forEach(h=>h.setAttribute("style","font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:500;margin:0 0 8px"));
 }
 
@@ -674,6 +695,7 @@ async function fillNotes(id){
   box.innerHTML = list.map(n=>`<div class="note">${esc(n.body)}<div class="nm"><span>${esc((n.updated_at||n.created_at||"").replace("T"," "))}</span><button type="button" data-delnote="${n.id}">Delete</button></div></div>`).join("") +
     `<label for="nt" style="position:absolute;left:-9999px">New note</label><textarea id="nt" placeholder="What did you learn? What will you try? Notes are ${STANDALONE?"saved in this browser":"saved in your local database"}."></textarea><div><button type="button" class="btn primary" data-addnote="${id}">Save note</button></div>`;
 }
+const pmPins = id => { const c = hasPM() && (PMS().concepts||{})[id]; return c ? c[0]+c[1] : 0; };
 function nodeRead(n, r, ctx){
   const rd = r.rd, downs = n.kids.filter(e=>e.k==="builds"), insp = n.kids.filter(e=>e.k==="inspired");
   const ups = n.pars.slice().sort((a,b)=>N[a.s].l-N[b.s].l||byLabel(N[a.s],N[b.s]));
@@ -685,7 +707,7 @@ function nodeRead(n, r, ctx){
   h += ladderHTML(n);
   if(USES[n.id]) h += `<p class="ladder-cap">Appears in design questions: ${USES[n.id].map(did=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-design="${did}">${esc(DES[did].title)}</button>`).join(", ")}.</p>`;
   if(TAUGHT[n.id]) h += `<p class="ladder-cap">Taught in Stanford ${TAUGHT[n.id].map(code=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-course="${code}">${esc(courseLabel(code))}</button>`).join(", ")}.</p>`;
-  const toc = [["value","Why it exists"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How it works"],(r.scenes||[]).length&&["watch","Watch it work"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],rd.tradeoffs&&["tradeoffs","It depends: trade-offs"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],rd.interview&&["interview","In the interview"],rd.quiz&&["quiz","Check yourself"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
+  const toc = [["value","Why it exists"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How it works"],(r.scenes||[]).length&&["watch","Watch it work"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],rd.tradeoffs&&["tradeoffs","It depends: trade-offs"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],rd.interview&&["interview","In the interview"],rd.quiz&&["quiz","Check yourself"],pmPins(n.id)&&["problems","Problems that use this"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
   h += `<nav class="toc" aria-label="Sections">${toc.map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
   let no=0; const NO=()=>String(++no).padStart(2,"0");
   h += sec("value", NO(), "Why it exists", P(rd.value,"lead"));
@@ -704,6 +726,7 @@ function nodeRead(n, r, ctx){
   if(rd.practice) h += sec("practice", NO(), "In practice", P(rd.practice));
   if(rd.interview) h += sec("interview", NO(), "In the interview", qaHTML(rd.interview, "Questions a staff-level interviewer asks about this. Say your answer out loud first, then open it to compare."), "Staff level");
   if(rd.quiz) h += sec("quiz", NO(), "Check yourself", quizHTML(rd.quiz, n.id));
+  if(pmPins(n.id)) h += sec("problems", NO(), "Problems that use this", `<div class="pm-pins" data-pmpins="${n.id}"><p class="empty">Loading the problem map…</p></div>`, pmPins(n.id).toLocaleString("en-US")+" problems");
   if(ups.length) h += sec("built", NO(), "What's built on it", `<p class="stand-sum">${ups.length} concept${ups.length===1?"":"s"} use ${esc(n.label)} directly.</p>` + groupByLayer(ups,"s"));
   if(n.side.length) h += sec("side", NO(), "Neighbours", n.side.map(s=>srow(s.o, s.r, false, SIDE[s.t]||s.t)).join(""));
   h += sec("deeper", NO(), "Go deeper", refsHTML(r.refs));
@@ -857,6 +880,7 @@ async function renderReader(){
   const id = curId(); if(id) fillNotes(id);
   try{ const rr = c.type==="node" ? READS[c.id] : c.type==="layer" ? READS["L"+c.l] : null; if(rr && rr.rd && rr.rd.terms) markTerms(el.querySelector(".rd-wrap"), rr.rd.terms); }catch(e){}
   sideTOC(el); spy();
+  if(window.DTSPM && el.querySelector("[data-pmpins]")) window.DTSPM.fillPins(el);
   animWatch(el);
   const sp = mountScenes(el, c.scene);
   if(c.scene && sp){ const w=$("rs-watch"); if(w) w.scrollIntoView({block:"start"}); try{ sp.root.focus({preventScroll:true}); }catch(e){} }
@@ -872,7 +896,7 @@ function updProg(){
   }
 }
 function hashFor(c){ return c.type==="node" ? "#read/"+c.id : c.type==="layer" ? "#layer/"+c.l : c.type==="design" ? "#design/"+c.id : "#reading-list"; }
-const viewHash = () => state.view==="algorithms" && window.DTSAlgo ? window.DTSAlgo.hash(state.algo) : "#"+state.view;
+const viewHash = () => state.view==="algorithms" && window.DTSAlgo ? window.DTSAlgo.hash(state.algo) : state.view==="problems" && window.DTSPM ? window.DTSPM.hash() : "#"+state.view;
 function openRead(c, opts={}){
   flushTime();
   if(R.open && R.cur && !opts.replace) R.hist.push(R.cur);
@@ -892,20 +916,23 @@ const pathSeq = () => ({name:"Your path", ids:state.path.slice()});
 function refreshMarks(){ if(R.open){ const a=$("reader").querySelector(".rd-actions"); const id=curId(); if(a&&id){ a.outerHTML = actionsHTML(id, getComputedStyle($("reader")).getPropertyValue("--c")); } } else render(false); }
 
 /* ---------------- render ---------------- */
-const VIEWS = ["explore","tours","courses","design","algorithms","atlas","library","you"];
+const VIEWS = ["explore","tours","courses","design","algorithms","problems","atlas","library","you"];
 function render(scrollCols){
+  $("tab-problems").hidden = !hasPM();
   renderStrip();
   const v = state.view;
   document.querySelectorAll(".tabs button").forEach(b=>b.setAttribute("aria-pressed", String(b.dataset.view===v)));
   $("v-explore").hidden = v!=="explore"; $("cols").hidden = v!=="explore";
-  $("v-design").hidden = v!=="design"; $("v-algorithms").hidden = v!=="algorithms";
+  $("v-design").hidden = v!=="design"; $("v-algorithms").hidden = v!=="algorithms"; $("v-problems").hidden = v!=="problems";
   document.querySelector(".desk").classList.toggle("wide", v==="design"||v==="algorithms");
+  document.querySelector(".desk").classList.toggle("pmv", v==="problems");
   $("v-tours").hidden = v!=="tours"; $("v-courses").hidden = v!=="courses"; $("v-atlas").hidden = v!=="atlas"; $("v-library").hidden = v!=="library"; $("v-you").hidden = v!=="you";
   if(v==="explore"){ renderTrail(); renderCols(scrollCols); }
   if(v==="tours") renderTours();
   if(v==="courses") renderCourses();
   if(v==="design") renderDesign();
   if(v==="algorithms") renderAlgoView();
+  if(v==="problems"){ if(window.DTSPM) window.DTSPM.render($("v-problems")); else $("v-problems").innerHTML = `<p class="empty">Loading the problem map…</p>`; }
   if(v==="atlas") renderAtlas();
   if(v==="library") renderLibrary();
   if(v==="you") renderYou();
@@ -914,7 +941,7 @@ function render(scrollCols){
 function revealPanel(){ if(narrow()) $("panel").scrollIntoView({behavior:reduced?"auto":"smooth",block:"start"}); else $("panel").scrollTop = 0; }
 function select(id, opts={}){ state.sel = id; state.expand = {}; render(false); if(opts.reveal!==false) revealPanel(); }
 function exploreFrom(id){ state.view="explore"; state.start=N[id].l; state.filter=""; state.path=[id]; state.sel=id; state.expand={}; try{history.replaceState(null,"","#explore")}catch(e){} render(true); revealPanel(); }
-function setView(v){ state.view=v; try{history.replaceState(null,"",viewHash())}catch(e){} if(v==="tours"){ state.sel = DATA.tours[state.tour].steps[state.tstep][0]; } if(v==="explore"){ state.sel = state.path[state.path.length-1]||null; } render(v==="explore"); if(["library","you","design","algorithms"].includes(v)) $("main").scrollTop=0; }
+function setView(v){ state.view=v; try{history.replaceState(null,"",viewHash())}catch(e){} if(v==="tours"){ state.sel = DATA.tours[state.tour].steps[state.tstep][0]; } if(v==="explore"){ state.sel = state.path[state.path.length-1]||null; } render(v==="explore"); if(["library","you","design","algorithms","problems"].includes(v)) $("main").scrollTop=0; }
 
 document.addEventListener("click", async e=>{
   const j = e.target.closest("a[data-jump]"); if(j){ e.preventDefault(); const t=document.getElementById(j.dataset.jump); if(t) t.scrollIntoView({behavior:reduced?"auto":"smooth",block:"start"}); return; }
@@ -1008,19 +1035,22 @@ function route(initial){
   if(h==="patterns"){ if(R.open) closeRead(); state.view="algorithms"; state.algo.tab="patterns"; render(true); return; }
   const md = h.match(/^design\/(.+)$/);
   if(md && DES[md[1]]){ if(R.open && R.cur.type==="design" && R.cur.id===md[1]) return; if(initial){ state.view="design"; render(true); } return openRead({type:"design", id:md[1]}, {seq:null}); }
+  const mp = h.match(/^problems(?:\/(?:idea\/([a-z0-9-]+)|(\d+)))?$/);
+  if(mp){ if(R.open) closeRead(); state.view="problems"; if(window.DTSPM) window.DTSPM.route(mp[1]?"idea":mp[2]?"prob":null, mp[1]||mp[2]); else state.pmRoute=[mp[1]?"idea":mp[2]?"prob":null, mp[1]||mp[2]]; render(true); return; }
   const ma = h.match(/^(algo|practice)\/(.+)$/);
   if(ma){ if(R.open) closeRead(); state.view="algorithms"; if(ma[1]==="algo"){ state.algo.tab="viz"; state.algo.viz=ma[2]; } else { state.algo.tab="practice"; state.algo.prob=ma[2]; } render(true); return; }
   if(VIEWS.includes(h) || initial){
     if(R.open) closeRead();
     if(VIEWS.includes(h)) state.view = h;
     if(state.view==="tours") state.sel=DATA.tours[state.tour].steps[state.tstep][0];
-    if(initial && ["atlas","library","you","design","algorithms"].includes(state.view)) state.sel=null;
+    if(initial && ["atlas","library","you","design","algorithms","problems"].includes(state.view)) state.sel=null;
     render(true);
   }
 }
 // hooks for web/algo.js (set before the first render, which may already show the Algorithms tab)
-window.__dts = { state, Store, N, R, DATA, LAYERS, STANDALONE, SCENES, api, esc, lc, toast, reduced, openRead, closeRead, select, setView,
-  algoReady(){ if(R.open) fillTry($("reader")); if(state.view==="algorithms" && !R.open) renderAlgoView(); } };
+window.__dts = { state, Store, N, R, DATA, LAYERS, STANDALONE, SCENES, api, esc, lc, toast, reduced, openRead, closeRead, select, setView, render, renderPanel,
+  algoReady(){ if(R.open) fillTry($("reader")); if(state.view==="algorithms" && !R.open) renderAlgoView(); },
+  pmReady(){ if(state.pmRoute){ window.DTSPM.route(state.pmRoute[0], state.pmRoute[1]); state.pmRoute=null; } if(R.open && $("reader").querySelector("[data-pmpins]")) window.DTSPM.fillPins($("reader")); if(!R.open) render(false); } };
 window.addEventListener("hashchange", ()=>route(false));
 route(true);
 })();

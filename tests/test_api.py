@@ -12,7 +12,9 @@ class API(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp()
         # build into a temp content DB, with the sample practice problems and animated scenes, so tests never touch data/
-        env = dict(os.environ, DTS_QUIET="1", DTS_USER_DB=os.path.join(cls.tmp, "user.db"), DTS_CONTENT_DB=os.path.join(cls.tmp, "content.db"), DTS_PRACTICE_FIXTURE="1", DTS_ANIM_FIXTURE="1")
+        env = dict(os.environ, DTS_QUIET="1", DTS_USER_DB=os.path.join(cls.tmp, "user.db"), DTS_CONTENT_DB=os.path.join(cls.tmp, "content.db"), DTS_PRACTICE_FIXTURE="1", DTS_ANIM_FIXTURE="1",
+                   DTS_PROBLEMMAP=os.path.join(ROOT, "tests", "fixtures", "problemmap_sample.json"))
+        cls.env = env
         subprocess.run([sys.executable, os.path.join(ROOT, "tools", "build.py"), "--no-html"], check=True, capture_output=True, env=env)
         cls.port = free_port()
         cls.proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "server", "server.py"), "--port", str(cls.port)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -226,6 +228,84 @@ class API(unittest.TestCase):
         import http.client                                                                                         # path traversal serves the app, never source files
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5); c.request("GET", "/../server/server.py")
         body = c.getresponse().read().decode(); self.assertNotIn("import argparse", body); self.assertIn("<!doctype html>", body)
+
+    # ---------- problem map (tests/fixtures/problemmap_sample.json: 27 problems, closed under prerequisites) ----------
+    def test_problemmap(self):
+        s, g = self.get("/api/graph")
+        pm = g["problemmap"]
+        fx = json.load(open(os.path.join(ROOT, "tests", "fixtures", "problemmap_sample.json")))
+        nI, nP = len(fx["ideas"]), len(fx["problems"])
+        self.assertEqual(pm["problems"], nP); self.assertEqual(pm["ideas"], nI); self.assertEqual(pm["families"], 18)
+        self.assertIn("hashtables", pm["concepts"]); self.assertGreater(pm["concepts"]["hashtables"][0], 0)
+        s, m = self.get("/api/problemmap")
+        self.assertEqual(s, 200)
+        self.assertEqual(m["cols"][:6], ["n", "title", "slug", "difficulty", "family", "idea"])
+        self.assertEqual(len(m["ideas"]), nI); self.assertEqual(len(m["families"]), 18); self.assertEqual(len(m["p"]), nP)
+        C = {k: i for i, k in enumerate(m["cols"])}
+        ns = {r[C["n"]] for r in m["p"]}
+        ids = {d["id"] for d in m["ideas"]}
+        for d in m["ideas"]:
+            self.assertTrue(set(d["b"]) <= ids, d["id"])
+            for b in d["b"]: self.assertLess(next(x["l"] for x in m["ideas"] if x["id"] == b), d["l"])   # builds_on points down
+        for r in m["p"]:
+            self.assertTrue(0 <= r[C["idea"]] < nI and 0 <= r[C["family"]] < 18 and 0 <= r[C["difficulty"]] <= 2)
+            self.assertTrue(set(r[C["prereqs"]]) <= ns, r[0])                                               # the sample is closed
+            for q in r[C["prereqs"]]: self.assertLess(next(x[C["depth"]] for x in m["p"] if x[0] == q), r[C["depth"]])
+        two = next(r for r in m["p"] if r[0] == 1)
+        self.assertEqual((two[C["title"]], two[C["slug"]], m["diffs"][two[C["difficulty"]]]), ("Two Sum", "two-sum", "Easy"))
+
+    def test_problem(self):
+        s, q = self.get("/api/problem/1")
+        self.assertEqual(s, 200)
+        self.assertEqual(q["title"], "Two Sum"); self.assertEqual(q["idea"], "hashmap"); self.assertTrue(q["idea_name"])
+        self.assertEqual([p["n"] for p in q["prereqs_detail"]], q["prereqs"])
+        self.assertEqual(q["prereqs_detail"][0]["title"], "Contains Duplicate")
+        self.assertTrue(q["unlocks"]); self.assertTrue(all(u["title"] for u in q["unlocks_detail"]))
+        self.assertEqual(q["practice"], "two-sum")                                                           # a worked practice problem exists
+        self.assertEqual(self.get("/api/problem/99999")[0], 404)
+        self.assertEqual(self.get("/api/problem/two-sum")[0], 404)
+
+    def test_problem_solved(self):
+        s, r = self.req("PUT", "/api/problem/217/solved", {}); self.assertEqual(s, 200); self.assertIn("217", r["problems"])
+        s, me = self.get("/api/me"); self.assertIn("217", me["problems"])
+        s, r = self.req("PUT", "/api/problem/217/solved", {}); self.assertEqual(len(r["problems"]), 1)        # idempotent
+        self.assertEqual(self.req("PUT", "/api/problem/99999/solved", {})[0], 404)
+        self.assertEqual(self.req("POST", "/api/problem/217/solved", {})[0], 405)
+        self.assertEqual(self.req("PUT", "/api/problem/217/solved", {}, ctype="text/plain")[0], 415)
+        s, ex = self.get("/api/export"); self.assertEqual([x["n"] for x in ex["pm_solved"]], [217])
+        s, r = self.req("DELETE", "/api/problem/217/solved"); self.assertEqual(r["problems"], {})
+
+    def test_pm_js_served(self):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5); c.request("GET", "/pm.js")
+        r = c.getresponse(); body = r.read().decode()
+        self.assertEqual(r.status, 200); self.assertIn("window.DTSPM", body)
+
+    def test_problemmap_absent(self):
+        # a build without content/problemmap/map.json: the loader says "none", and the server still starts and answers
+        sys.path.insert(0, os.path.join(ROOT, "tools")); import build
+        self.assertEqual(build.load_problemmap(os.path.join(self.tmp, "nope.json")), (None, []))
+        bad = os.path.join(self.tmp, "bad.json"); open(bad, "w").write('{"ideas": []}')
+        m, errs = build.load_problemmap(bad); self.assertIsNone(m); self.assertTrue(errs)
+        import sqlite3
+        db2 = os.path.join(self.tmp, "content_nopm.db"); shutil.copy(os.path.join(self.tmp, "content.db"), db2)
+        c = sqlite3.connect(db2); c.executescript("DROP TABLE pm_problems; DROP TABLE pm_ideas; DELETE FROM meta WHERE key LIKE 'problemmap%';"); c.commit(); c.close()
+        port = free_port()
+        env = dict(self.env, DTS_CONTENT_DB=db2, DTS_USER_DB=os.path.join(self.tmp, "user2.db"))
+        proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "server", "server.py"), "--port", str(port)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            def get(path):
+                for _ in range(100):
+                    try:
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as r: return r.status, json.loads(r.read())
+                    except urllib.error.HTTPError as e: return e.code, json.loads(e.read() or b"null")
+                    except Exception: time.sleep(0.05)
+            s, g = get("/api/graph"); self.assertEqual(s, 200); self.assertIsNone(g["problemmap"])
+            self.assertEqual(get("/api/problemmap")[0], 404)
+            self.assertEqual(get("/api/problem/1")[0], 404)
+            s, me = get("/api/me"); self.assertEqual(me["problems"], {})
+        finally:
+            proc.terminate(); proc.wait(5)
 
 if __name__ == "__main__":
     unittest.main()

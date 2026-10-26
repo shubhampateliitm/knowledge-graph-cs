@@ -1883,6 +1883,8 @@ function showFrame(){
   const back = document.querySelector('[data-aact="back"]'), next = document.querySelector('[data-aact="next"]');
   if(back) back.disabled = P.k===0; if(next) next.disabled = P.k>=P.frames.length-1;
 }
+/* links into the problem map (web/pm.js), when this build has one */
+const pmx = (fn, arg) => { try{ return window.DTSPM && window.DTSPM.available() ? window.DTSPM[fn](arg) : ""; }catch(e){ return ""; } };
 function chipsHTML(ids){
   const N = app().N;
   return `<div class="chips">${ids.filter(id=>N[id]).map(id=>`<button type="button" class="chip" style="--c:var(--l${N[id].l})" data-read="${id}"><span class="sw"></span>${esc(N[id].label)}</button>`).join("")}</div>`;
@@ -1906,7 +1908,7 @@ function vizHTML(v){
   const ins = (v.inputs||[]).filter(i=>!i.when || i.when(P.vals)).map(inputHTML).join("");
   const pres = (v.presets||[]).map((p,i)=>`<button type="button" class="btn" data-apreset="${i}">${esc(p.name)}</button>`).join("");
   return `<div class="av" data-viz="${v.id}">
-    <h2 class="vh">${esc(v.title)}</h2><p class="vsub">${esc(fv(v,"text"))}</p>${chipsHTML(v.concepts)}${(()=>{ const T = templates(), ns = Object.keys(T).filter(n=>T[n].viz===v.id || (T[n].viz_more||[]).includes(v.id));
+    <h2 class="vh">${esc(v.title)}</h2><p class="vsub">${esc(fv(v,"text"))}</p>${chipsHTML(v.concepts)}${pmx("vizLink", v.id)}${(()=>{ const T = templates(), ns = Object.keys(T).filter(n=>T[n].viz===v.id || (T[n].viz_more||[]).includes(v.id));
       return ns.length ? `<p class="av-aux av-tpls">Pattern template${ns.length===1?"":"s"}: ${ns.map(n=>`<button type="button" class="linkish" data-aptjump="${esc(n)}">${esc(n)}</button>`).join(" · ")}</p>` : ""; })()}
     <div class="av-in">${ins}<div class="btnrow">${ins?`<button type="button" class="btn primary" data-aact="apply">Run with this input</button>`:""}${pres}${v.random?`<button type="button" class="btn" data-aact="random">Random input</button>`:""}</div></div>
     ${P.err?`<p class="av-err" role="alert">${esc(P.err)}</p>`:""}
@@ -1950,31 +1952,81 @@ function practiceListHTML(){
   if(!all.length) return `<h2 class="vh">Practice</h2><p class="vsub">No practice problems yet. Add JSON files to content/practice/ and run python3 tools/build.py.</p>`;
   const list = all.filter(p=>PR.diff==="All" || p.difficulty===PR.diff), pats = [...new Set(list.map(p=>p.pattern))];
   const done = all.filter(p=>solved(p.id)).length;
-  return `<h2 class="vh">Practice</h2><p class="vsub">${all.length} problems grouped by pattern; ${done} solved. Learn the pattern, not the problem: each one has a hint, the approach and why it works, and follow-up questions an interviewer would ask. Your code runs in your browser with a 2-second limit.</p>
+  return `<h2 class="vh">Practice</h2><p class="vsub">${all.length} problems grouped by pattern; ${done} solved. Learn the pattern, not the problem: each one has a hint, the approach and why it works, and follow-up questions an interviewer would ask. Write Python (it runs in your browser), Go, C++, Rust or Scala (copy the test program and run it in your terminal), or JavaScript.${(n => n < all.length ? ` So far ${n} of ${all.length} problems have all six languages; the others are JavaScript only.` : "")(all.filter(p=>probLangs(p).length > 1).length)}</p>
     <div class="filters" role="group" aria-label="Difficulty">${DIFFS.map(d=>`<button type="button" data-adiff="${d}" aria-pressed="${PR.diff===d}">${d} <span class="mono" style="opacity:.7">${d==="All"?all.length:all.filter(p=>p.difficulty===d).length}</span></button>`).join("")}</div>
     <p class="av-aux">Not sure which pattern a problem needs? <button type="button" class="linkish" data-atab="patterns">Open the "Which pattern?" cheat sheet</button>.</p>
     ${pats.map(pt=>{ const ps = list.filter(p=>p.pattern===pt), [tn, tt] = tplFor(pt), open = PR.tplOpen && PR.tplOpen[pt];
       return `<h3 class="ysec pr-pat" id="pat-${slug(pt)}">${esc(pt)} <span class="mono">${ps.filter(p=>solved(p.id)).length}/${ps.length}</span>${tt ? `<button type="button" class="btn tp-btn" data-atpl="${esc(pt)}" aria-expanded="${!!open}">${open ? "Hide" : "Show"} pattern template</button>` : ""}</h3>${tt && open ? `<div class="pr-tpl">${tplHTML(tn, tt)}</div>` : ""}<div class="pr-list">${ps.map(p=>`<button type="button" class="pr-row" data-aprob="${esc(p.id)}"><span class="pr-t">${esc(p.title)}</span><span class="pr-d ${esc(String(p.difficulty).toLowerCase())}">${esc(p.difficulty)}</span><span class="pr-s" title="${solved(p.id)?"Solved":"Not solved yet"}">${solved(p.id)?"✓ solved":""}</span></button>`).join("")}</div>`; }).join("") || `<p class="empty">No ${esc(PR.diff)} problems.</p>`}`;
 }
 function paras(t){ return String(t||"").split(/\n+/).filter(Boolean).map(x=>`<p>${esc(x)}</p>`).join(""); }
+/* ---- languages of a problem. The top-level fn/starter/solution fields are JavaScript; p.sig + p.langs add Python, Go, C++,
+   Rust and Scala (content/PRACTICE_LANGS.md). Python runs here with Pyodide; JavaScript in a worker; the others are copied
+   out as a test program (web/langharness.js) for the learner's own terminal. */
+const PR_ORDER = ["python", "go", "cpp", "rust", "scala", "javascript"];
+const RUNS_HERE = {python:true, javascript:true};
+const HARN = () => window.DTSHarness;
+function probLangs(p){
+  const L = (p.sig && p.langs && HARN()) ? p.langs : {};
+  return PR_ORDER.filter(l => l === "javascript" ? typeof p.starter === "string" : !!(L[l] && typeof L[l].starter === "string"));
+}
+function probLang(p){ const ids = probLangs(p), want = Lang.get(); return ids.includes(want) ? want : ids[0]; }
+const langLabel = id => (LANGS.find(l=>l.id===id) || {label:id}).label;
+const starterFor = (p, l) => l === "javascript" ? p.starter : p.langs[l].starter;
+const solutionFor = (p, l) => l === "javascript" ? p.solution : p.langs[l].solution;
+/* saved code: a plain string is JavaScript (the original format); several languages are packed as JSON in the same field */
+const MULTI = "{\"dts\":\"multi-v1\"";
+function codesOf(id){
+  const sv = PR.saved && PR.saved[id], c = sv && sv.code;
+  if(!c) return {};
+  if(c.startsWith(MULTI)){ try{ return JSON.parse(c).code || {}; }catch(e){ return {}; } }
+  return {javascript:c};
+}
+function codeFor(p, l){ const c = codesOf(p.id)[l]; return typeof c === "string" && c ? c : starterFor(p, l); }
+function packCodes(p, codes){
+  const keep = {}; Object.keys(codes).forEach(l => { if(codes[l] && probLangs(p).includes(l) && codes[l] !== starterFor(p, l)) keep[l] = codes[l]; });
+  const ks = Object.keys(keep);
+  if(!ks.length) return "";
+  if(ks.length === 1 && ks[0] === "javascript") return keep.javascript;
+  return JSON.stringify({dts:"multi-v1", code:keep});
+}
+function saveCode(p, lang, text){ const codes = codesOf(p.id); codes[lang] = text; return savePractice(p.id, {code:packCodes(p, codes)}); }
+
 function problemHTML(p){
-  const sv = PR.saved && PR.saved[p.id], code = sv && sv.code ? sv.code : p.starter;
+  const langs = probLangs(p), lang = probLang(p), H = HARN(), code = codeFor(p, lang), runs = RUNS_HERE[lang];
   const rev = (k, label, body) => `<div class="pr-rev"><button type="button" class="btn" data-areveal="${k}" aria-expanded="${!!PR.shown[k]}">${PR.shown[k]?"Hide":"Show"} ${label}</button><div class="pr-revb" id="pr-${k}"${PR.shown[k]?"":" hidden"}>${body}</div></div>`;
+  let sigLine, note;
+  if(lang === "javascript"){
+    sigLine = `<code>${esc(p.fn)}(${esc((p.params||[]).join(", "))})</code>`;
+    note = `Runs in your browser with a 2-second limit. Inputs are plain JSON: trees are level-order arrays, linked lists are arrays.`;
+  } else {
+    let s = "";
+    if(lang === "python"){ try{ s = H.signature(p, lang); }catch(e){ s = p.sig.name || p.sig.design || ""; } }
+    else { const nm = H.names(p.sig, lang); s = p.sig.design ? nm.cls : nm.fn; }
+    sigLine = p.sig.design && lang !== "python" ? `the class <code>${esc(s)}</code>` : `<code>${esc(s)}</code>`;
+    note = lang === "python"
+      ? `Runs in your browser with Python 3.13 (Pyodide), 5-second limit. The first run downloads Python (about 10 MB, once). <code>TreeNode</code> and <code>ListNode</code> are defined for you, as on LeetCode.`
+      : `${esc(langLabel(lang))} is not run inside the app. Write your code here, then copy the test program (your code plus every test, in one file) and run it in your terminal: <code class="pr-cmd">${esc(H.command(p, lang))}</code>`;
+  }
+  const btns = (runs ? `<button type="button" class="btn primary" data-aact="run">Run tests</button>` : `<button type="button" class="btn primary" data-aact="copyprog">Copy test program</button>`) +
+    `<button type="button" class="btn" data-aact="starter">Reset to starter code</button>` + (lang === "python" ? `<button type="button" class="btn" data-aact="copyprog">Copy test program</button>` : "") +
+    `<button type="button" class="btn" data-aact="togglesolved">${solved(p.id)?"Mark as not solved":"Mark as solved"}</button>`;
   return `<div class="pr">
     <button type="button" class="btn" data-aprob="">← All problems</button>
     <h2 class="vh" style="margin-top:12px">${esc(p.title)}</h2>
     <p class="pr-meta"><span class="pr-d ${esc(String(p.difficulty).toLowerCase())}">${esc(p.difficulty)}</span> <span>${esc(p.pattern)}</span>${p.link?` · <a href="${esc(p.link)}" target="_blank" rel="noopener noreferrer">open the original ↗</a>`:""} <span class="pr-s" id="pr-solved">${solved(p.id)?"✓ solved":""}</span></p>
-    ${p.concepts&&p.concepts.length?chipsHTML(p.concepts):""}
+    ${p.concepts&&p.concepts.length?chipsHTML(p.concepts):""}${pmx("practiceLink", p.id)}
     <div class="pr-stmt">${paras(p.statement)}</div>
     ${(([tn, tt]) => tt ? rev("template", "pattern template", `<p class="av-aux">The general shape of <b>${esc(tn)}</b> problems, not this problem's answer.</p>` + tplHTML(tn, tt)) : "")(tplFor(p.pattern))}
-    <p class="av-aux">Write <code>${esc(p.fn)}(${esc((p.params||[]).join(", "))})</code> in JavaScript. Tab inserts two spaces; press Esc, then Tab, to leave the editor.</p>
-    <label for="pr-code" class="sr">Your code</label>
-    <textarea id="pr-code" class="pr-code" spellcheck="false" autocomplete="off" autocapitalize="off" data-aprob-id="${esc(p.id)}">${esc(code)}</textarea>
-    <div class="btnrow"><button type="button" class="btn primary" data-aact="run">Run tests</button><button type="button" class="btn" data-aact="starter">Reset to starter code</button><button type="button" class="btn" data-aact="togglesolved">${solved(p.id)?"Mark as not solved":"Mark as solved"}</button><span class="mono av-aux" id="pr-saved" aria-live="polite"></span></div>
+    <div class="pr-langs" role="group" aria-label="Language for your code">${langs.length > 1 ? Lang.selectHTML(lang, langs) : ""}</div>
+    <p class="av-aux pr-sig">Write ${sigLine} in ${esc(langLabel(lang))}. ${note}${langs.length === 1 && lang === "javascript" ? " (This problem is in JavaScript only for now.)" : ""}</p>
+    <label for="pr-code" class="sr">Your ${esc(langLabel(lang))} code</label>
+    <textarea id="pr-code" class="pr-code" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off" data-aprob-id="${esc(p.id)}" data-lang="${lang}">${esc(code)}</textarea>
+    <p class="av-aux pr-keys">Tab inserts ${lang === "go" ? "a tab" : lang === "python" || lang === "cpp" || lang === "rust" ? "four spaces" : "two spaces"}; press Esc, then Tab, to leave the editor.</p>
+    <div class="btnrow">${btns}<span class="mono av-aux" id="pr-saved" aria-live="polite"></span></div>
     <div id="pr-out" aria-live="polite">${PR.out}</div>
     ${rev("hint","hint", paras(p.hint))}
     ${rev("approach","approach", paras(p.approach) + (p.complexity?`<p><b>Complexity:</b> ${esc(p.complexity)}</p>`:""))}
-    ${rev("solution","solution", `<pre class="pr-sol">${esc(p.solution)}</pre>`)}
+    ${rev("solution","solution (" + esc(langLabel(lang)) + ")", `<pre class="pr-sol">${esc(solutionFor(p, lang))}</pre>`)}
     ${p.followups&&p.followups.length?`<h3 class="ysec">Follow-up questions</h3><ol class="pr-fu">${p.followups.map(q=>`<li>${esc(q)}</li>`).join("")}</ol>`:""}
   </div>`;
 }
@@ -2014,26 +2066,99 @@ function runTests(p, code){
     w.postMessage({code, fn:p.fn, tests});
   });
 }
+/* ---- Python in the browser: Pyodide (pinned) from cdn.jsdelivr.net, loaded on the first run into a worker that is kept for
+   later runs. The worker runs the same test program as "Copy test program" with --json. A run over the limit, or a failed
+   load, terminates the worker; the next run starts a new one (the browser cache makes the second load quicker).
+   DTSAlgo.python.base can point at another copy of Pyodide (the browser test uses this for its offline stub). */
+const PY = { base:"https://cdn.jsdelivr.net/npm/pyodide@0.29.5/", limit:5000, loadLimit:120000, w:null, ready:false };
+const PY_DRIVER = [
+  "import sys as _dts_s, json as _dts_j",
+  "try:",
+  "    compile(_dts_user, 'your code', 'exec')",
+  "except SyntaxError as _dts_e:",
+  "    print('DTS-RESULT ' + _dts_j.dumps({'pass': 0, 'total': 0, 'results': [], 'error': 'SyntaxError: %s (line %s of your code)' % (_dts_e.msg, _dts_e.lineno)}))",
+  "else:",
+  "    _dts_s.argv = ['tests.py', '--json']",
+  "    exec(compile(_dts_prog, 'tests.py', 'exec'), {'__name__': '__main__'})"].join("\n");
+const PY_WORKER_SRC = "var DRIVER = " + JSON.stringify(PY_DRIVER) + ";\n" + `
+var py = null, booting = null;
+function boot(base){
+  if (!booting) booting = (async function(){ importScripts(base + "pyodide.js"); py = await loadPyodide({indexURL: base}); })();
+  return booting;
+}
+onmessage = async function(e){
+  var d = e.data;
+  try { await boot(d.base); } catch (err) { booting = null; postMessage({type: "loaderror", error: String(err && err.message || err)}); return; }
+  postMessage({type: "started"});
+  var out = [];
+  py.setStdout({batched: function(s){ out.push(s); }});
+  py.setStderr({batched: function(s){ out.push(s); }});
+  try { py.globals.set("_dts_prog", d.program); py.globals.set("_dts_user", d.user); py.runPython(DRIVER); postMessage({type: "done", out: out}); }
+  catch (err) { postMessage({type: "done", out: out, error: String(err && err.message || err)}); }
+};`;
+function pyResult(d, userStart){
+  const line = (d.out || []).slice().reverse().find(s => String(s).startsWith("DTS-RESULT "));
+  if(line){ try{ const j = JSON.parse(line.slice(11)); return {res:(j.results||[]).map((x,i)=>Object.assign({i}, x)), error:j.error || undefined}; }catch(e){} }
+  const msg = String(d.error || (d.out||[]).join("\n") || "Python stopped without a result.").trim().split("\n").filter(Boolean);
+  const m = /File "tests\.py", line (\d+)/.exec(String(d.error||"")), last = msg[msg.length-1] || "Python error";
+  const n = m ? +m[1] - userStart + 1 : 0;
+  return {res:[], error:last + (n > 0 && n <= d.userLines ? " (line " + n + " of your code)" : m ? " (line " + m[1] + " of the test program)" : "")};
+}
+function runPython(p, code, onState){
+  return new Promise(resolve=>{
+    let program;
+    try{ program = HARN().program(p, "python", code); }catch(e){ return resolve({res:[], error:"Could not build the test program: " + e.message}); }
+    let w;
+    try{ if(!PY.w){ PY.w = new Worker(URL.createObjectURL(new Blob([PY_WORKER_SRC], {type:"text/javascript"}))); PY.ready = false; } w = PY.w; }
+    catch(e){ return resolve({res:[], error:"This page cannot start a Web Worker, so Python cannot run here. Copy the test program and run it with python3."}); }
+    let timer = null, loadTimer = null, over = false;
+    const kill = () => { try{ w.terminate(); }catch(e){} if(PY.w === w){ PY.w = null; PY.ready = false; } };
+    const done = r => { if(over) return; over = true; clearTimeout(timer); clearTimeout(loadTimer); w.onmessage = null; w.onerror = null; resolve(r); };
+    if(!PY.ready){ if(onState) onState("loading"); loadTimer = setTimeout(()=>{ kill(); done({res:[], error:"Python did not load in " + Math.round(PY.loadLimit/1000) + " seconds. Check the connection to cdn.jsdelivr.net, or copy the test program and run it with python3."}); }, PY.loadLimit); }
+    w.onmessage = e => { const d = e.data || {};
+      if(d.type === "loaderror"){ kill(); return done({res:[], error:"Could not load Python from cdn.jsdelivr.net (" + d.error + "). Copy the test program and run it with python3 instead."}); }
+      if(d.type === "started"){ PY.ready = true; clearTimeout(loadTimer); if(onState) onState("running"); timer = setTimeout(()=>{ kill(); done({res:[], timeout:true, limit:PY.limit/1000}); }, PY.limit); return; }
+      if(d.type === "done") done(pyResult(Object.assign(d, {userLines:code.split("\n").length}), program.split("\n").indexOf("# ==== your code ====") + 2)); };
+    w.onerror = e => { if(e && e.preventDefault) e.preventDefault(); kill(); done({res:[], error:(e && e.message) || "Python stopped with an error."}); };
+    w.postMessage({type:"run", base:PY.base, program, user:code});
+  });
+}
+const okAt = (p, r, i) => { const d = r.res[i]; if(!d || d.error) return false; if(d.ok !== undefined) return !!d.ok;
+  return norm(d.got==="undefined"?undefined:JSON.parse(d.got), p.order_insensitive) === norm(p.tests[i].expected, p.order_insensitive); };
 function resultsHTML(p, r){
   const short = (x, n) => { const s = String(x); return s.length > (n||160) ? s.slice(0, n||160) + "…" : s; };
+  const secs = r.limit || 2;
   if(r.error && !r.res.length) return `<div class="pr-res bad"><b>Error.</b> ${esc(r.error)}</div>`;
   let pass = 0;
-  const rows = p.tests.map((t,i)=>{ const d = r.res[i];
-    let ok = false, got;
-    if(!d){ got = r.timeout ? "(stopped: over 2 seconds)" : "(not run)"; }
+  const rows = p.tests.map((t,i)=>{ const d = r.res[i], ok = okAt(p, r, i);
+    let got;
+    if(!d){ got = r.timeout ? "(stopped: over " + secs + " seconds)" : "(not run)"; }
     else if(d.error){ got = "Error: " + d.error; }
-    else { got = d.got; const val = d.got==="undefined" ? undefined : JSON.parse(d.got); ok = norm(val, p.order_insensitive) === norm(t.expected, p.order_insensitive); }
+    else got = d.got;
     if(ok) pass++;
-    return `<li class="${ok?"ok":"bad"}"><span class="pr-mark">${ok?"✓ pass":"✗ fail"}</span><span class="mono">input: ${esc(short(t.args.map(a=>JSON.stringify(a)).join(", ")))}</span><span class="mono">expected: ${esc(short(JSON.stringify(t.expected)))}${p.order_insensitive?" (any order)":""}</span><span class="mono">got: ${esc(short(got))}</span>${d&&d.logs&&d.logs.length?`<span class="mono pr-log">console: ${esc(short(d.logs.join(" | "), 240))}</span>`:""}</li>`; });
+    return `<li class="${ok?"ok":"bad"}"><span class="pr-mark">${ok?"✓ pass":"✗ fail"}</span><span class="mono">input: ${esc(short(t.args.map(a=>JSON.stringify(a)).join(", ")))}</span><span class="mono">expected: ${esc(short(JSON.stringify(t.expected)))}${p.order_insensitive?" (any order)":""}</span><span class="mono">got: ${esc(short(got))}</span>${d&&d.logs&&d.logs.length?`<span class="mono pr-log">${r.lang==="python"?"printed":"console"}: ${esc(short(d.logs.join(" | "), 240))}</span>`:""}</li>`; });
   const all = pass === p.tests.length;
-  return `<div class="pr-res ${all?"good":"bad"}"><b>${pass} of ${p.tests.length} tests pass.</b> ${all?"Well done. Now read the approach and try the follow-ups.":r.timeout?"Stopped after 2 seconds: is there an infinite loop, or a slow algorithm?":"Look at the first failing test."}${r.nolimit?" (Ran without the time limit: workers are not available here.)":""}</div><ol class="pr-tests">${rows.join("")}</ol>`;
+  return `<div class="pr-res ${all?"good":"bad"}"><b>${pass} of ${p.tests.length} tests pass.</b> ${all?"Well done. Now read the approach and try the follow-ups.":r.timeout?"Stopped after " + secs + " seconds: is there an infinite loop, or a slow algorithm?":r.error?esc(r.error):"Look at the first failing test."}${r.nolimit?" (Ran without the time limit: workers are not available here.)":""}</div><ol class="pr-tests">${rows.join("")}</ol>`;
+}
+/* the generated program for Go, C++, Rust, Scala (and Python): copied to the clipboard and shown, with the command to run it */
+async function copyProgram(p, lang, code){
+  const H = HARN(); let text;
+  try{ text = H.program(p, lang, code); }catch(e){ app().toast("Could not build the test program: " + e.message); return; }
+  const cmd = H.command(p, lang), file = H.fileName(p, lang);
+  let copied = false;
+  try{ if(navigator.clipboard && navigator.clipboard.writeText){ await navigator.clipboard.writeText(text); copied = true; } }catch(e){}
+  PR.out = `<div class="pr-res pr-prog"><b>${copied ? "Copied the test program" : "Your test program is below"}</b> (${text.split("\n").length} lines: your code and all ${p.tests.length} tests). Save it as <code>${esc(file)}</code> and run:
+    <pre class="pr-sol pr-cmdline">${esc(cmd)}</pre><span class="av-aux">It prints which tests pass; add <code>--json</code> for one machine-readable line.${lang === "scala" ? " Needs scala-cli (or Scala 3.5+ with <code>scala run</code>)." : ""}</span>
+    <details class="pr-progd"${copied ? "" : " open"}><summary>Show the program</summary><label class="sr" for="pr-prog">Test program</label><textarea id="pr-prog" class="pr-code pr-progt" readonly spellcheck="false">${esc(text)}</textarea></details></div>`;
+  const out = $("pr-out"); if(out) out.innerHTML = PR.out;
+  app().toast(copied ? "Test program copied" : "Copy the test program from the box below");
 }
 
 /* ---------------- pattern templates (content/practice/templates.json, keyed by practice pattern name) ---------------- */
 /* The language choice is shared by every code panel and kept in this browser. Lang is reusable: Lang.get(), Lang.set(id),
    Lang.list(), Lang.selectHTML(current, available) renders buttons with data-codelang; a "dts:lang" event fires on window when it changes. */
-const LANGS = [{id:"python", label:"Python", rich:"python"},{id:"javascript", label:"JavaScript", rich:"js"},{id:"go", label:"Go", rich:"go"},
-  {id:"cpp", label:"C++", rich:"c"},{id:"rust", label:"Rust", rich:"rust"},{id:"scala", label:"Scala", rich:"scala"}];
+const LANGS = [{id:"python", label:"Python", rich:"python"},{id:"go", label:"Go", rich:"go"},{id:"cpp", label:"C++", rich:"c"},
+  {id:"rust", label:"Rust", rich:"rust"},{id:"scala", label:"Scala", rich:"scala"},{id:"javascript", label:"JavaScript", rich:"js"}];
 const LKEY = "dts:lang:v1";
 const Lang = {
   get(){ let v = null; try{ v = localStorage.getItem(LKEY); }catch(e){} return LANGS.some(l=>l.id===v) ? v : "python"; },
@@ -2066,6 +2191,7 @@ function tplHTML(name, t){
     <div class="tp-code">${tplCodeHTML(t, Lang.get())}</div>
     <p class="tp-cx"><b>Complexity:</b> ${esc(t.complexity||"")}</p>
     ${(t.bugs||[]).length ? `<div class="av-h mono">Common bugs</div><ul class="tp-bugs">${t.bugs.map(x=>`<li>${esc(x)}</li>`).join("")}</ul>` : ""}
+    ${pmx("patternLink", name)}
     <div class="btnrow tp-links">${vz.map(id=>`<button type="button" class="btn" data-avizgo="${esc(id)}">Watch it step by step: ${esc(byId(id).title)}</button>`).join("")}${used ? `<button type="button" class="btn" data-apat="${esc(name)}">Practice it: ${used} problem${used===1?"":"s"}</button>` : ""}</div>
   </section>`;
 }
@@ -2153,6 +2279,9 @@ function bind(el){
     const d = b.dataset, st = app().state.algo;
     try {
       if(d.atab){ stop(); st.tab = d.atab; render(el, st); if(d.atab==="patterns") el.scrollIntoView({block:"start"}); return; }
+      if(d.codelang && b.closest(".pr-langs")){ const ta = $("pr-code"), p = problems().find(x=>x.id===st.prob);
+        if(p && ta){ clearTimeout(PR.t); saveCode(p, ta.dataset.lang, ta.value).catch(()=>{}); }
+        Lang.set(d.codelang); PR.out = ""; render(el, st); const nb = el.querySelector(`.pr-langs [data-codelang="${d.codelang}"]`); if(nb) nb.focus(); return; }
       if(d.codelang){ const box = b.closest(".tp"), same = box && box.dataset.tpl; Lang.set(d.codelang); refreshCode();
         const back = same ? Array.from(el.querySelectorAll(".tp[data-tpl]")).find(x=>x.dataset.tpl===same) : null, nb = back && back.querySelector(`[data-codelang="${d.codelang}"]`); if(nb) nb.focus(); return; }
       if(d.avizgo){ stop(); st.tab = "viz"; st.viz = d.avizgo; P.err = ""; render(el, st); el.scrollIntoView({block:"start"}); return; }
@@ -2183,14 +2312,20 @@ function bind(el){
       if(act==="reset"){ stop(); P.k = 0; return showFrame(); }
       const p = problems().find(x=>x.id===st.prob); if(!p) return;
       const ta = $("pr-code");
-      if(act==="run"){ b.disabled = true; $("pr-out").innerHTML = `<p class="av-aux">Running ${p.tests.length} tests…</p>`;
-        const code = ta.value; savePractice(p.id, {code}).catch(()=>{});
-        const r = await runTests(p, code); b.disabled = false;
+      const lang = ta ? ta.dataset.lang : "javascript";
+      if(act==="copyprog"){ clearTimeout(PR.t); saveCode(p, lang, ta.value).catch(()=>{}); return copyProgram(p, lang, ta.value); }
+      if(act==="run"){ b.disabled = true; const out = $("pr-out");
+        out.innerHTML = `<p class="av-aux">Running ${p.tests.length} tests…</p>`;
+        const code = ta.value; clearTimeout(PR.t); saveCode(p, lang, code).catch(()=>{});
+        const r = lang === "python"
+          ? await runPython(p, code, s => { const o = $("pr-out"); if(o) o.innerHTML = s === "loading" ? `<p class="av-aux pr-loading">Loading Python (~10 MB, once)…</p>` : `<p class="av-aux">Running ${p.tests.length} tests in Python…</p>`; })
+          : await runTests(p, code);
+        r.lang = lang; b.disabled = false;
         PR.out = resultsHTML(p, r); if($("pr-out")) $("pr-out").innerHTML = PR.out;
-        const all = r.res.filter((x,i)=>x && !x.error && norm(x.got==="undefined"?undefined:JSON.parse(x.got), p.order_insensitive)===norm(p.tests[i].expected, p.order_insensitive)).length === p.tests.length;
+        const all = p.tests.every((t,i)=>okAt(p, r, i));
         if(all && !solved(p.id)){ await savePractice(p.id, {solved:true}).catch(()=>{}); app().toast("All tests pass: marked as solved"); const sm = $("pr-solved"); if(sm) sm.textContent = "✓ solved"; const tb = el.querySelector('[data-aact="togglesolved"]'); if(tb) tb.textContent = "Mark as not solved"; }
         return; }
-      if(act==="starter"){ if(ta.value!==p.starter && !confirm("Replace your code with the starter code?")) return; ta.value = p.starter; await savePractice(p.id, {code:p.starter}); $("pr-saved").textContent = "saved"; return; }
+      if(act==="starter"){ const st0 = starterFor(p, lang); if(ta.value!==st0 && !confirm("Replace your " + langLabel(lang) + " code with the starter code?")) return; ta.value = st0; await saveCode(p, lang, st0); $("pr-saved").textContent = "saved"; return; }
       if(act==="togglesolved"){ const on = !solved(p.id); await savePractice(p.id, {solved:on}); app().toast(on?"Marked as solved":"Marked as not solved"); return render(el, st); }
     } catch(err){ app().toast("Something went wrong: " + err.message); }
   });
@@ -2203,14 +2338,15 @@ function bind(el){
   el.addEventListener("input", e=>{
     if(e.target.id==="pt-q"){ ptFilter(); return; }
     if(e.target.id==="av-speed"){ P.speed = +e.target.value; if(P.t) play(); return; }
-    if(e.target.id==="pr-code"){ const id = e.target.dataset.aprobId, ta = e.target; clearTimeout(PR.t); $("pr-saved").textContent = "…";
-      PR.t = setTimeout(()=>{ savePractice(id, {code:ta.value}).then(()=>{ const s = $("pr-saved"); if(s) s.textContent = "saved"; }).catch(()=>{ const s = $("pr-saved"); if(s) s.textContent = "could not save"; }); }, 600); }
+    if(e.target.id==="pr-code"){ const id = e.target.dataset.aprobId, ta = e.target, p = problems().find(x=>x.id===id); clearTimeout(PR.t); $("pr-saved").textContent = "…";
+      if(!p) return;
+      PR.t = setTimeout(()=>{ saveCode(p, ta.dataset.lang, ta.value).then(()=>{ const s = $("pr-saved"); if(s) s.textContent = "saved"; }).catch(()=>{ const s = $("pr-saved"); if(s) s.textContent = "could not save"; }); }, 600); }
   });
   el.addEventListener("keydown", e=>{
     if(e.target.id==="pr-code"){
       if(e.key==="Escape"){ PR.esc = true; return; }
-      if(e.key==="Tab" && !e.shiftKey && !PR.esc){ e.preventDefault(); const ta = e.target, a = ta.selectionStart, z = ta.selectionEnd;
-        ta.setRangeText("  ", a, z, "end"); ta.dispatchEvent(new Event("input", {bubbles:true})); return; }
+      if(e.key==="Tab" && !e.shiftKey && !PR.esc){ e.preventDefault(); const ta = e.target, a = ta.selectionStart, z = ta.selectionEnd, l = ta.dataset.lang;
+        ta.setRangeText(l === "go" ? "\t" : l === "python" || l === "cpp" || l === "rust" ? "    " : "  ", a, z, "end"); ta.dispatchEvent(new Event("input", {bubbles:true})); return; }
       PR.esc = false; return;
     }
     if(e.target.matches && e.target.matches("[data-ain]") && e.key==="Enter"){ e.preventDefault(); return rerun(readInputs()); }
@@ -2219,6 +2355,6 @@ function bind(el){
   });
 }
 
-window.DTSAlgo = { render, hash, lang:Lang, templateFor:tplFor, list:()=>V.map(v=>v.id), forConcept:id=>V.filter(v=>(v.concepts||[]).includes(id)).map(v=>({id:v.id, title:v.title})), _P:P, _V:V, _run:runViz, _init:initVals };
+window.DTSAlgo = { render, hash, practiceSaved:()=>PR.saved, lang:Lang, templateFor:tplFor, python:PY, practiceLangs:probLangs, list:()=>V.map(v=>v.id), forConcept:id=>V.filter(v=>(v.concepts||[]).includes(id)).map(v=>({id:v.id, title:v.title})), _P:P, _V:V, _run:runViz, _init:initVals };
 if(window.__dts && window.__dts.algoReady) window.__dts.algoReady();
 })();
