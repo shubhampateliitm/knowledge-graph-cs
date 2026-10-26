@@ -1,0 +1,1313 @@
+@@ rate-limiter-lld
+title: Design a rate limiter (class design)
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, ratelimit, locks, hashtables, eviction, hwclocks, memmodel, queuesbuf, fuzzing
+summary: A rate limiter library answers one question for every call: "may this caller proceed now?" Callers are named by a key such as a user id or an IP address. This is the class-design version of the problem, like Guava RateLimiter or Bucket4j: one process, many threads, no network. The interesting part is not the algorithm alone. We must put four algorithms (token bucket, fixed window, sliding window log, sliding window counter) behind one interface, keep millions of small per-key states in a map, make each check thread safe without a global lock, and remove idle keys without changing any answer. Time must come from an injected clock, so tests never sleep. It is a good test of object-oriented programming because the classes are easy to name, but the boundaries between them (rule, state, clock, store, key resolver) decide whether the design survives the follow-up questions.
+requirements: Functional requirements. A caller asks "tryAcquire(key, permits)" and gets a decision: allowed, or denied with a "retry after" time. A rule has a name, an algorithm, a limit and a period. One request can be checked against several rules (for example 10 per second per user and 1,000 per second per IP), and it is allowed only if every rule allows it. If it is denied, no rule may keep the tokens it took. The algorithm of a rule is chosen by configuration. Rules can be replaced at runtime. Idle keys must not stay in memory for ever.
+Non-functional requirements. Thread safety: two threads must never spend the same token. Latency: a check is pure in-memory work, well under a microsecond without contention. Testability: a test moves time forward by hand. Extensibility: new algorithms, key sources and decorators (metrics, logging) are new classes, not edits. Memory: about 150 bytes per active key and no growth for quiet keys.
+Assumptions. One JVM, no persistence; after a restart all counters are fresh. Keys are strings. Time comes from a monotonic clock (System.nanoTime). A few million active keys and a few hundred thousand checks per second. A denied call returns at once; a blocking acquire is an extension. A limit shared by many machines is a different problem (the distributed rate limiter).
+estimates: Scale matters only for memory and for contention. Per key we keep the key string (about 56 bytes for 10 characters), a hash map node (about 32 bytes), a table slot (4 to 8 bytes) and the limiter state. If the immutable rule is shared and only the mutable fields live in the limiter, a token bucket state is about 40 bytes. That is roughly 150 bytes per key: one million active keys use about 150 MB, ten million use 1.5 GB. So the idle sweep is not a nicety. An uncontended synchronized block costs tens of nanoseconds, so one thread can do tens of millions of checks per second. The danger is one hot key hit by many threads, where throughput can fall to a few million per second.
+api: The caller sees one interface, a decision and a rule. Everything else is behind them.
+```java
+public interface RateLimiter {
+  Decision tryAcquire(String key, int permits);
+}
+
+public record Decision(boolean allowed, long retryAfterNanos) { }
+
+public record Rule(String name, Algorithm algo, int limit,
+                   Duration period, int burst) { }
+
+public enum Algorithm { TOKEN_BUCKET, FIXED_WINDOW,
+                        SLIDING_LOG, SLIDING_COUNTER }
+```
+One Limiter holds the state of one key. It is the Strategy. A factory builds it from a rule, so the service never calls "new" on a concrete algorithm. Refund lets a multi-rule check undo a partial success.
+```java
+public interface Limiter {
+  Decision tryAcquire(int permits);
+  void refund(int permits);
+  boolean retireIfIdle();     // true if state equals a fresh limiter
+}
+
+public interface LimiterFactory {
+  Limiter create(Rule rule, LongSupplier clock);
+}
+
+public interface KeyResolver<R> {
+  List<RuleKey> resolve(R request);   // e.g. user key + IP key
+}
+```
+datamodel: A Rule is immutable and shared by all keys that use it. A Limiter is the mutable state of one (rule, subject) pair. For a token bucket it is the token count and the time of the last refill. For a fixed window it is the window start and a counter. For a sliding window log it is a deque of timestamps (see queues and ring buffers). For a sliding window counter it is two counters and the start of the current window. The Clock is a LongSupplier of nanoseconds. The store is a ConcurrentHashMap from "ruleName:ruleVersion:subject" (for example "perUser:3:u-8841") to a Limiter, a hash table in the sense of the hashing concept. The Decision is an immutable value.
+Why the rule version is in the key. When an operator changes a rule, we create a new Rule with a higher version. New requests use new keys and get fresh limiters under the new limits. The old limiters are never touched again, go idle, and the sweep removes them. This avoids a lock around "change the limit of a live limiter".
+The idle state. Every algorithm defines "idle" as "my state equals a freshly created limiter". A token bucket is idle when it is full. A fixed window is idle when its window has ended. A sliding window log is idle when all timestamps are older than the period. Dropping an idle limiter changes no future answer, so the sweep is exact. Cache eviction such as LRU is different: it may drop entries that still matter. There is no state machine here except one flag: a limiter can become retired (see the deep dive).
+design: RateLimiterService is the facade. It owns the store and a LimiterFactory. Its check method takes the limiter for a key from the map (creating it if needed) and calls tryAcquire. CompositeRateLimiter holds several (rule, service) pairs and implements the same RateLimiter interface, so a caller cannot tell whether it talks to one rule or five.
+Main flow. Step 1: the web layer passes the request to the KeyResolver, which returns for example [("perUser", "u-8841"), ("perIp", "10.1.2.3")]. Step 2: the composite calls tryAcquire(1) on the first rule. Step 3: if allowed, it goes to the next rule. Step 4: if a rule denies, the composite calls refund(1) on every limiter that had allowed, and returns the denial with the largest retry-after. Step 5: if all allow, it returns allowed. Why spend and refund? "Check all, then spend" is a race, because another thread can spend between the check and the spend. Spending first is safe because each limiter is atomic on its own.
+Token bucket. A bucket has a capacity C (the biggest burst) and a refill rate R tokens per second. We refill lazily: at each call we add the tokens earned since the last call, up to C. There is no timer thread, and idle keys cost nothing. We store tokens as a long in nano-tokens (1 token = 10^9 nano-tokens). Then elapsed nanoseconds times R is exactly the number of nano-tokens earned, so the integer arithmetic never drifts, while a double would slowly lose precision (see floating-point numbers). The wait time of a denied call is the missing nano-tokens divided by R, rounded up.
+Sliding window counter. It keeps counters for the previous and the current fixed window, and weights the previous one by the part that still overlaps the last full period:
+\[ \text{estimate} = \text{prev} \times \left(1 - \frac{t}{W}\right) + \text{curr} \]
+W is the window length and t is the time since the current window started. It needs two longs per key and removes the double burst at a window edge. The error is small when traffic inside a window is even.
+Patterns and why. Strategy: the four algorithms differ only in how they decide, so each is one class behind Limiter, and the service has no if on the algorithm. Factory: LimiterFactory maps the enum to a constructor in one place. Composite: several rules behave like one RateLimiter. Decorator: MeteredRateLimiter and LoggingRateLimiter wrap any RateLimiter and add counters or logs. Builder: Rule has optional fields (burst, version, tier), so a builder keeps call sites readable. The injected clock is not a classic pattern, but it is the most useful decision here, because time becomes a parameter. The core code follows; in a real code base each type is its own file.
+```java
+public record Rule(int capacity, int ratePerSec) {
+  static final long NANO = 1_000_000_000L;
+  public Rule {
+    if (capacity < 1 || ratePerSec < 1)
+      throw new IllegalArgumentException();
+  }
+  long capNano() { return capacity * NANO; }
+  long fullNanos() { return capNano() / ratePerSec; }  // time to refill
+}
+
+public record Decision(boolean allowed, long retryAfterNanos) {
+  static final Decision OK = new Decision(true, 0);
+  static final Decision RETIRED = new Decision(false, -1);
+}
+
+public interface Limiter {
+  Decision tryAcquire(int permits);   // RETIRED if swept away
+  boolean retireIfIdle();
+}
+
+public final class TokenBucket implements Limiter {
+  private final Rule rule;
+  private final LongSupplier clock;
+  private long nanoTokens, last;
+  private boolean retired;
+
+  public TokenBucket(Rule rule, LongSupplier clock) {
+    this.rule = rule;
+    this.clock = clock;
+    this.nanoTokens = rule.capNano();
+    this.last = clock.getAsLong();
+  }
+
+  public synchronized Decision tryAcquire(int permits) {
+    if (retired) return Decision.RETIRED;
+    if (permits < 1 || permits > rule.capacity())
+      throw new IllegalArgumentException("bad permits " + permits);
+    refill();
+    long need = permits * Rule.NANO;
+    if (nanoTokens >= need) { nanoTokens -= need; return Decision.OK; }
+    long wait = Math.ceilDiv(need - nanoTokens, rule.ratePerSec());
+    return new Decision(false, wait);
+  }
+
+  public synchronized boolean retireIfIdle() {
+    refill();
+    retired = (nanoTokens == rule.capNano());
+    return retired;
+  }
+
+  private void refill() {          // lazy: no timer thread needed
+    long now = clock.getAsLong();
+    long dt = Math.max(0, Math.min(now - last, rule.fullNanos()));
+    nanoTokens = Math.min(rule.capNano(),
+                          nanoTokens + dt * rule.ratePerSec());
+    last = now;
+  }
+}
+
+public final class RateLimiterService {
+  private final ConcurrentHashMap<String, Limiter> map =
+      new ConcurrentHashMap<>();
+  private final Supplier<Limiter> factory;
+
+  public RateLimiterService(Supplier<Limiter> factory) {
+    this.factory = factory;
+  }
+
+  public Decision check(String key, int permits) {
+    while (true) {
+      Limiter l = map.computeIfAbsent(key, k -> factory.get());
+      Decision d = l.tryAcquire(permits);
+      if (d != Decision.RETIRED) return d;
+      map.remove(key, l);          // lost a race with the sweeper
+    }
+  }
+
+  public void sweep() {            // call from a scheduled task
+    map.forEach((k, l) -> {
+      if (l.retireIfIdle()) map.remove(k, l);
+    });
+  }
+}
+```
+diagram:
+  +---------------------+      +----------------------+
+  | KeyResolver<R>      |      | RuleRegistry         |
+  | resolve(R)          |      | current(ruleName)    |
+  +----------+----------+      +-----------+----------+
+             |                             |
+             v                             v
+  +--------------------------------------------------+
+  | CompositeRateLimiter   implements RateLimiter    |
+  | tryAcquire(key, n): all rules or none (refund)   |
+  +------------------------+-------------------------+
+                           | has many
+                           v
+  +--------------------------------------------------+
+  | RateLimiterService  (facade, one per rule)       |
+  | check(key, n)    sweep()                         |
+  | map: ConcurrentHashMap<String, Limiter>          |
+  +-------------+------------------+-----------------+
+                | uses             | creates via
+                v                  v
+  +-----------------------+   +-----------------------+
+  | LimiterFactory        |   | <<interface>> Limiter |
+  | create(rule, clock)   |   | tryAcquire  refund    |
+  +-----------------------+   | retireIfIdle          |
+                              +-----------+-----------+
+                                          ^ is-a
+          +---------------+---------------+-----------+
+          |               |               |           |
+     TokenBucket    FixedWindow     SlidingLog   SlidingCounter
+
+  Decorators: MeteredRateLimiter, LoggingRateLimiter wrap RateLimiter
+  Clock = LongSupplier (System::nanoTime, or FakeClock in tests)
+deepdive: Concurrency. The map and the state inside each limiter are shared. The map is a ConcurrentHashMap, which locks one bin at a time, so unrelated keys do not block each other. A limiter reads and writes its state together (refill, compare, subtract), so these steps must be one atomic unit. We use the monitor lock of the limiter (synchronized). A lock gives mutual exclusion and a happens-before edge: after thread A leaves the block, thread B sees all of A's writes. Without it the memory model allows B to see a stale token count (see memory models and locks and atomics). We never hold two limiter locks at once, so there is no lock order and no deadlock. The composite takes its locks one after the other; the refund covers the gap between them.
+The hot key. If 32 threads hit one key, they queue on one monitor. First, measure. Then try a lock-free design: keep an immutable state object in an AtomicReference and update it with compareAndSet in a loop. It is fast at low contention and burns CPU on retries at high contention. Or split the limit of 1,000 per second into 8 sub-buckets of 125, chosen by thread id; this is cheap but unfair, because a thread with an empty sub-bucket is denied while another has spare tokens. Or let each thread lease 10 tokens at a time. For a protection limit a bounded error is fine; for a billing limit it is not.
+The sweep race. The sweeper removes idle limiters. A request thread may have just fetched the same limiter and be about to call tryAcquire. If the sweeper removed it in between, the thread spends a token on an orphan, and the next request creates a fresh full bucket: one free request. To close the window, retireIfIdle runs under the limiter lock and sets a retired flag. A retired limiter returns the RETIRED sentinel; the service then calls remove(key, value), which removes only if the map still holds that same object, and loops to create a new limiter.
+Many keys from an attacker. If a client can invent keys (spoofed IPs), the map grows. A hard cap with LRU eviction looks natural but is dangerous: junk keys push out a real busy key, which then returns with a fresh full bucket. So at the cap we do not evict busy keys; new keys go to a shared overflow limiter with a strict rule.
+Time. We use System.nanoTime, which is monotonic, and only use differences. System.currentTimeMillis is wall-clock time and jumps when NTP corrects the clock (see hardware clocks). The refill clamps elapsed time to the range from zero to the time needed to fill the bucket, which also prevents overflow after a long idle period.
+Extensibility. A new algorithm, such as GCRA, is one class implementing Limiter, one enum value and one line in the factory. A new key source is a new KeyResolver. A new cross-cutting feature is a Decorator. No old class changes (the open/closed principle).
+Testing. A FakeClock is an AtomicLong that the test advances. Unit tests: exactly capacity calls pass and the next is denied with the exact retry-after; after 1/R seconds one more passes; after a huge idle jump the bucket holds at most capacity; permits above capacity are rejected; refund never exceeds capacity; a retired limiter returns RETIRED and the service recovers. A concurrency test starts 16 threads behind a latch and asserts allowed is at most capacity plus rate times elapsed time. Property-based tests (see fuzzing) generate random (time step, permits) sequences and compare the bucket with an exact model.
+tradeoffs: Which algorithm? Choose the token bucket when you want short bursts but a steady average, which is what most APIs promise; it needs two numbers per key. Choose the sliding window log when the rule must be exact ("5 login attempts in any 60 seconds") and the limit is small, because it stores one timestamp per request. Choose the sliding window counter when memory matters and a few percent of error at the edges is fine. Choose the fixed window only for coarse quotas, because a client can send twice the limit around a boundary.
+Which locking? Choose a synchronized block per limiter when per-key contention is low, which is the normal case; it is simple to prove correct. Choose compare-and-set on an immutable state when profiling shows a hot key. Never choose one global lock: it serializes all keys for no gain.
+Inheritance or composition? Choose composition (Strategy behind an interface, plus decorators) when behaviors combine freely, as here. Choose inheritance, such as an AbstractLimiter with a template method, only when all algorithms share one skeleton and you control all subclasses. A decorator cannot be added to a class tree without one subclass per combination.
+Sweep or bound? Choose the periodic idle sweep when the number of keys is limited by real users. Choose a hard cap with a shared overflow limiter when callers can invent keys.
+failures: Invalid input. A null or empty key throws IllegalArgumentException; it must not become a shared "null" key. Permits below 1 or above the burst capacity throw, because a request for more than the capacity can never succeed, and any retry-after value would be a lie. The Rule constructor rejects a limit or a period of zero, which would divide by zero.
+Clock problems. A clock that goes backwards (a faulty fake, a paused virtual machine) gives negative elapsed time; the max(0, ...) clamp turns it into zero. A huge jump forward is clamped to the fill time, so the multiplication cannot overflow.
+Resolver and rule errors. If the KeyResolver throws or no rule matches, the library follows an explicit policy: fail open (allow and log) for normal routes or fail closed (deny) for sensitive routes such as login. The policy is a constructor argument, not a hidden catch block.
+Races. The sweeper race is closed by the retired flag; the composite race by spend-then-refund. A refund that reaches a retired limiter is a no-op. The lost refund is a token too few, which is the safe direction.
+evolution: Distributed limits. Put the store behind the Limiter interface: the same strategies run as a Redis Lua script, and the composite and decorators stay as they are. A hybrid keeps a small local bucket per node and syncs with the shared store every second.
+Blocking acquire. Add acquire(key, permits, timeout) that parks the thread for the retry-after time, or returns a CompletableFuture. Decision already carries the wait time.
+Dynamic rules and tiers. RuleRegistry watches a config service and publishes a new immutable snapshot (Observer). The rule version in the key makes the swap lock-free.
+Penalty box. After 10 denials in a minute, ban the key for 15 minutes: a small State pattern (NORMAL, BANNED) on top of the limiter. Weighted requests already work, because permits is a parameter. A smooth warm-up limiter like Guava's is one more Limiter class.
+followups: Why do you refill lazily instead of with a timer thread? || A timer needs a task per key or a scan of all keys, and it wakes up for quiet keys. With lazy refill each call computes the tokens from the elapsed time, so quiet keys cost nothing and there is no thread to manage. The only cost is a few arithmetic operations inside the lock.
+How do you make the check thread safe, and which lock do you take? || Read, refill, compare and subtract must be one atomic step, so each limiter has its own monitor lock. The map is a ConcurrentHashMap, so keys do not block each other. Locks are never nested, so there is no deadlock. For a very hot key I would measure first and then try a compare-and-set loop on an immutable state.
+How do you test it without sleeping? || Inject the clock as a LongSupplier. A test uses an AtomicLong as a fake clock and moves it by hand, so "one token per 500 ms" runs in microseconds and is exact. For concurrency, run many threads behind a latch and assert that total allowed is at most capacity plus rate times elapsed time.
+A request needs both a per-user and a per-IP rule. How do you avoid charging the user when the IP rule denies? || Spend from each limiter in turn and refund those that allowed when one denies. Check-then-spend is racy because another thread can spend between the two steps. Refund is capped at capacity, so it cannot create tokens.
+How would you add a GCRA or leaky bucket algorithm? || Write one class that implements Limiter, add an enum value and one line in the factory. The service, composite and decorators do not change. Test it with the same FakeClock and the same shared contract test that every Limiter class must pass.
+What if a client can create unlimited distinct keys? || A cap with LRU eviction lets an attacker push out a real key and reset its bucket. Cap the map and send keys beyond the cap to a shared overflow limiter with a strict rule. Also limit by a coarser key, such as the IP network, before the per-user rule.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson, Vlissides, 1994 |
+ref: book | Effective Java, 3rd edition | Joshua Bloch, 2018 |
+ref: book | Java Concurrency in Practice | Brian Goetz et al., 2006 |
+ref: docs | Strategy pattern | refactoring.guru | https://refactoring.guru/design-patterns/strategy
+
+@@ inventory
+title: Design an inventory management system
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, ccontrol, locks, acid, isolation, idempotence, ledger, hashtables, oltp
+summary: An inventory system tracks how many units of each product (SKU) a company holds, and lets orders reserve, take and give back those units. It sounds like a map from SKU to a number, but the number hides the hard part: many orders compete for the same units at the same moment, an order has several lines that must succeed together, a client may retry a request, and a customer who abandons a cart must give the units back. The class design must prevent overselling, avoid deadlock, keep an audit trail of every change, and stay easy to extend with new allocation rules and alerts. We model the stock of one place in memory, then show how the same rules carry over to a database.
+requirements: Functional requirements. Receive stock (a purchase order arrives: add units). Check availability of a SKU. Reserve units for an order: all lines or none, with a time limit (a hold). Commit a hold (the goods ship: units leave the shelf). Release a hold (the order was cancelled). Expire a hold that nobody committed in time. Adjust stock after a cycle count or damage. Transfer units between warehouses. Raise an event when the available quantity of a SKU falls under a threshold. Keep a history of every change that explains the current number.
+Non-functional requirements. Correctness first: never promise more units than exist, even under heavy concurrency. Idempotence: a client that repeats "reserve order 123" after a timeout must not reserve twice. Deadlock freedom for orders with many lines. Testability: time is injected, so expiry tests do not sleep. Extensibility: a new allocation rule or a new alert channel must not change existing classes.
+Assumptions. One process holds the state in memory for this design; the persistence section explains the database version. Quantities are whole units. Overselling is never acceptable for a normal SKU (no back-orders). A hold lives for 10 to 15 minutes. Prices, payment and shipping are outside this problem.
+estimates: Scale matters for two numbers. Objects: 1 million SKUs in 5 warehouses is 5 million stock records; at about 48 bytes each this is roughly 240 MB, fine for memory, and we only keep records that were ever touched. Contention: a flash sale can send 50,000 reserve attempts per second to one SKU. In memory, one lock per SKU handles millions of short critical sections per second, so this is easy. In a database, all those updates hit one row, each holds the row lock until commit, and one hot row does only a few thousand updates per second. So the hot SKU, not the total volume, sets the limit.
+api: The facade is InventoryService. Reserve returns a hold object, and every later step uses the hold id. The client chooses the hold id (for example the order id), which is what makes retries safe.
+```java
+public interface Inventory {
+  void receive(String sku, int qty, String ref);
+  int available(String sku);
+  Hold reserve(String holdId, List<Line> lines, Duration ttl);
+  void commit(String holdId);          // goods leave the shelf
+  void release(String holdId);         // customer cancelled
+  void adjust(String sku, int delta, String reason, String ref);
+  void transfer(String sku, String fromWh, String toWh, int qty);
+}
+
+public record Line(String sku, int qty) { }
+```
+Extension points are interfaces. A new allocation rule implements AllocationStrategy. A new listener implements StockListener.
+```java
+public interface AllocationStrategy {     // which warehouse(s)?
+  List<Pick> allocate(Line line, List<StockView> candidates);
+}
+
+public interface StockListener {
+  void onLowStock(String sku, int available);
+}
+```
+datamodel: StockLevel: key (sku, warehouse), onHand, reserved. Available is onHand minus reserved and is never stored. Hold: id, lines, expiresAt, status. Move: an append-only record of one change: sku, warehouse, delta, reason (RECEIVE, SHIP, ADJUST, TRANSFER_OUT, TRANSFER_IN), reference, timestamp. The maps are hash tables: a ConcurrentHashMap from SKU to StockLevel and from hold id to Hold, so lookups are O(1).
+Invariants. 0 <= reserved <= onHand for every record. onHand equals the sum of all Move deltas for that record. Reserved equals the sum of quantities in all holds that are still HELD. These invariants are the base of the unit tests and of a nightly check job.
+The Move list is a ledger. Each unit that enters or leaves has a reason and a reference. A transfer writes two moves, minus at the source and plus at the target, with the same reference; if the two do not cancel out, the books are wrong, which is the idea of double-entry ledgers and reconciliation. We never edit a Move. A mistake is corrected by a new adjusting Move.
+State machine of a hold: HELD goes to COMMITTED, RELEASED or EXPIRED. These three are terminal. There is no way back, and a terminal hold never touches stock again. Transitions: commit (HELD to COMMITTED, stock leaves the shelf), release (HELD to RELEASED, reserved units come back), expire (HELD to EXPIRED, same effect as release, caused by time). Only one transition can win for a given hold.
+design: Split "how many are there" from "who has claimed them". onHand is physical stock. reserved is a soft claim by holds that are not yet shipped. A reserve changes only reserved. A commit changes both: reserved goes down and onHand goes down by the same amount. A release changes only reserved. This two-number model means a cancelled order never touches the physical count, and the ledger records only real movements.
+Reserve flow, step by step. Step 1: the service looks up the hold id; if it exists, it returns the existing hold (idempotence). Step 2: it merges duplicate SKUs in the lines and sorts them by SKU. Step 3: it locks the stock records in that sorted order. Step 4: it checks that available is at least the needed quantity for every line; if any line fails, it unlocks and throws, and nothing has changed. Step 5: it adds the quantities to reserved, stores the hold, and unlocks. Check and update happen under the same locks, so two orders cannot both take the last unit.
+Commit and release flow. Step 1: find the hold. Step 2: atomically change its status from HELD to the new status with a compare-and-set. Only the caller that wins the compare-and-set continues; a repeated commit, or a commit that races with the expiry sweeper, loses and does nothing to the stock. Step 3: the winner locks the stock records in sorted order, applies the change, writes Moves for a commit, and unlocks. Commit also checks the expiry time first: a hold that is already late becomes EXPIRED and the commit fails, so late orders cannot take units that other orders may now hold.
+Expiry. A scheduled task (not shown) scans the holds every few seconds and calls the same finish step with EXPIRED. Correctness does not depend on how often it runs, because commit checks the time itself.
+Patterns and why. Facade: InventoryService hides locks, maps and ledger behind seven calls. Strategy: AllocationStrategy chooses warehouses (nearest first, or most stock first, or earliest expiry first for food); the service calls it and never branches on the rule. State: the hold lifecycle. Here an enum plus an atomic status is enough because there are only three exits and no behavior per state; use full State classes if each state gets its own rules. Observer: after a change, the service tells registered StockListener objects about low stock, outside the locks so a slow listener cannot block orders. Command: each stock change is a small object (a Move), which is both the log and the thing a replay can apply again. Repository: a StockRepository interface lets the same service run on memory or on a database.
+The core code (a single warehouse) follows.
+```java
+public final class InventoryService {
+  public enum Status { HELD, COMMITTED, RELEASED, EXPIRED }
+  public record Line(String sku, int qty) { }
+  public record Move(String sku, int delta, String why, String ref) { }
+
+  public static final class Hold {
+    final String id;
+    final long expiresAt;
+    final TreeMap<String, Integer> need = new TreeMap<>();  // sorted
+    final AtomicReference<Status> status =
+        new AtomicReference<>(Status.HELD);
+    Hold(String id, List<Line> lines, long expiresAt) {
+      this.id = id;
+      this.expiresAt = expiresAt;
+      for (Line l : lines) need.merge(l.sku(), l.qty(), Integer::sum);
+    }
+  }
+
+  private static final class Stock {
+    final ReentrantLock lock = new ReentrantLock();
+    int onHand, reserved;                 // guarded by lock
+  }
+
+  private final Map<String, Stock> stock = new ConcurrentHashMap<>();
+  private final Map<String, Hold> holds = new ConcurrentHashMap<>();
+  private final Queue<Move> ledger = new ConcurrentLinkedQueue<>();
+  private final LongSupplier clock;
+  public InventoryService(LongSupplier clock) { this.clock = clock; }
+  private Stock of(String sku) {
+    return stock.computeIfAbsent(sku, k -> new Stock());
+  }
+  public void receive(String sku, int qty, String ref) {
+    Stock s = of(sku);
+    s.lock.lock();
+    try { s.onHand += qty; ledger.add(new Move(sku, qty, "IN", ref)); }
+    finally { s.lock.unlock(); }
+  }
+
+  // Idempotent by id. All lines or none.
+  public Hold reserve(String id, List<Line> lines, long ttlNanos) {
+    return holds.computeIfAbsent(id, k -> {
+      Hold h = new Hold(id, lines, clock.getAsLong() + ttlNanos);
+      List<Stock> locked = lockAll(h);
+      try {
+        h.need.forEach((sku, q) -> {
+          Stock s = of(sku);
+          if (s.onHand - s.reserved < q)
+            throw new IllegalStateException("short: " + sku);
+        });
+        h.need.forEach((sku, q) -> of(sku).reserved += q);
+        return h;
+      } finally { locked.forEach(s -> s.lock.unlock()); }
+    });
+  }
+  public void commit(String id) {
+    Hold h = Objects.requireNonNull(holds.get(id));
+    boolean late = clock.getAsLong() >= h.expiresAt;
+    boolean won = finish(h, late ? Status.EXPIRED : Status.COMMITTED);
+    if (late || !won) throw new IllegalStateException("not committed");
+  }
+  public void release(String id) {
+    Hold h = holds.get(id);
+    if (h != null) finish(h, Status.RELEASED);
+  }
+
+  // The CAS picks one winner. Only the winner touches the stock.
+  private boolean finish(Hold h, Status to) {
+    if (!h.status.compareAndSet(Status.HELD, to)) return false;
+    List<Stock> locked = lockAll(h);
+    try {
+      h.need.forEach((sku, q) -> {
+        Stock s = of(sku);
+        s.reserved -= q;
+        if (to != Status.COMMITTED) return;
+        s.onHand -= q;
+        ledger.add(new Move(sku, -q, "OUT", h.id));
+      });
+    } finally { locked.forEach(s -> s.lock.unlock()); }
+    return true;
+  }
+  private List<Stock> lockAll(Hold h) {    // same global order always
+    List<Stock> locked = new ArrayList<>();
+    for (String sku : h.need.keySet()) {
+      Stock s = of(sku);
+      s.lock.lock();
+      locked.add(s);
+    }
+    return locked;
+  }
+}
+```
+diagram:
+  +------------------------------------------------------------+
+  | <<interface>> Inventory   (facade: InventoryService)       |
+  | receive  reserve  commit  release  adjust  transfer        |
+  +-----+------------------+------------------+----------------+
+        | has many         | has many         | notifies
+        v                  v                  v
+  +------------+    +-------------+    +-----------------------+
+  | StockLevel |    | Hold        |    | <<interface>>         |
+  | onHand     |    | id, lines   |    | StockListener         |
+  | reserved   |    | expiresAt   |    | onLowStock(sku, n)    |
+  | lock       |    | status (CAS)|    +-----------------------+
+  +------+-----+    +------+------+
+         |                 | HELD -> COMMITTED | RELEASED | EXPIRED
+         | writes          |
+         v                 |
+  +------------+           |      +-----------------------------+
+  | Move       |<----------+      | <<interface>>               |
+  | sku, delta |  (ledger)        | AllocationStrategy          |
+  | why, ref   |                  | allocate(line, candidates)  |
+  +------------+                  +--------------+--------------+
+                                      ^ is-a     |
+                    NearestWarehouse  FewestSplits  EarliestExpiry
+  Clock = LongSupplier; sweeper = scheduled task calling finish(EXPIRED)
+deepdive: Concurrency. What is shared? The stock records and the hold status. Each stock record has its own ReentrantLock, so orders for different SKUs run in parallel. The problem starts with an order of several lines. If order 1 locks A then B, and order 2 locks B then A, each holds one lock and waits for the other: deadlock. The fix is a global lock order: every code path locks SKUs in sorted order, which is why the hold keeps its lines in a TreeMap. With one rule for the order, a cycle of waiting threads cannot form. The hold map is always used before the stock locks, never while one is held, and listeners are called after unlocking.
+Why a compare-and-set on the status? Two threads may finish the same hold at once: the customer clicks "cancel" while the sweeper expires it. If both subtract the reserved units, reserved goes negative and a later order is wrongly refused. The compare-and-set from HELD lets exactly one thread win. The status change is the decision, and the stock update follows. In a database the same idea is "UPDATE hold SET status = 'EXPIRED' WHERE id = ? AND status = 'HELD'", and the code checks that one row changed.
+Idempotence. The hold id is chosen by the client. A repeated reserve with the same id returns the same hold and reserves nothing more. Doing it inside computeIfAbsent makes the check and the insert one atomic step, so two parallel retries cannot both pass. A repeated commit is also safe: the second one loses the compare-and-set and returns an error that the caller can treat as "already done".
+The database version. The same rules become SQL. The key is to make the check and the change one statement:
+```sql
+UPDATE stock
+SET reserved = reserved + :qty
+WHERE sku = :sku AND on_hand - reserved >= :qty;
+-- 1 row changed = reserved, 0 rows = not enough stock
+```
+Reading the available number first and then writing is a bug under READ COMMITTED isolation: two transactions read 1, both write, and the last unit is sold twice. The conditional update is atomic per row. For several lines, run all updates in one transaction (the ACID atomicity guarantee) and issue them in sorted SKU order, so row locks are taken in a fixed order. If any line updates 0 rows, roll back. This is pessimistic locking done by the database. The alternative, optimistic concurrency control, adds a version column and retries on conflict; it wins when conflicts are rare and loses on the hot SKU, where most attempts would retry.
+Extensibility. A new allocation rule is one class implementing AllocationStrategy, chosen by configuration. A new alert (email, chat, automatic reorder) is one StockListener. A new movement reason is one enum value. A new stock attribute such as batch or expiry date goes into the key of StockLevel and into a strategy that understands it. The hold code does not change.
+Testing. Use a FakeClock so that a hold of 10 minutes expires after one call that moves the clock. Unit tests: reserve then release returns available to the start value; reserve more than available throws and changes nothing for any line; duplicate SKUs in one order are merged; the same reserve id twice gives one hold; commit after expiry fails and frees the units; double commit is rejected. A concurrency test runs 8 threads that reserve one unit each from a stock of 100, half of them with lines in the opposite order, and asserts exactly 100 succeed and the run ends (no deadlock). After every test, check the invariants: reserved is the sum of HELD holds, and onHand equals the sum of Moves.
+tradeoffs: Pessimistic or optimistic locking? Choose a lock per SKU (or SELECT ... FOR UPDATE, or the conditional UPDATE) when many orders fight for the same items, as in flash sales, because retries would waste work. Choose optimistic versioning when most SKUs are cold and conflicts are rare, because readers never block. In both cases keep the critical section small.
+Soft reserve or immediate decrement? Choose a reserve with a time-limited hold when payment takes minutes and carts are abandoned often; the cost is a sweeper and a longer state machine. Choose an immediate decrement at order placement when checkout is one step and there is no payment delay; it is simpler, but any failure after the decrement needs a compensating add.
+One lock per SKU or one global lock? Choose per-SKU locks when orders touch few SKUs and throughput matters; they need the sorted order rule. Choose one coarse lock only for tiny systems or tests.
+Enum plus compare-and-set, or State classes? Choose the enum when states differ only in which transitions are allowed, as here. Choose State classes when each state reacts differently to the same event.
+In-memory or persisted state? Choose memory with a ledger on disk (event-sourced) for the lowest latency and easy replay. Choose the database as the source of truth when several services write stock or when a crash must never lose a reservation; that is the OLTP choice, with slower hot rows.
+failures: Invalid input. Quantity zero or negative, an unknown SKU, an empty order, or a null hold id are rejected before any lock is taken. A reserve with the same SKU twice is merged into one line.
+Insufficient stock. The reserve checks every line before it changes any, so a failure leaves no partial hold. The error names the SKU that failed, so the caller can offer a smaller quantity.
+Concurrency races. Two orders for the last unit: one gets it, one gets an error. Cancel, expire and commit on the same hold: the compare-and-set lets one win. A retry of reserve returns the first hold. A listener that throws is caught and logged outside the lock.
+Time. A commit that arrives after the deadline fails, even if the sweeper has not run. A maximum ttl stops a caller from locking stock for a day.
+Negative stock. An adjust that would make onHand smaller than reserved is rejected, or it must first cancel enough holds; otherwise the invariant reserved <= onHand breaks and committed holds could not ship.
+Crash. In memory, a crash loses holds, and stock is rebuilt from the ledger with reserved at zero. With a database, each step is one transaction, and the sweeper picks up expired holds after a restart.
+evolution: Multiple warehouses. Make StockLevel keyed by (sku, warehouse). reserve asks the AllocationStrategy for picks (a warehouse and a quantity per pick), then locks those records in sorted order of (sku, warehouse). An order can then be split among sites.
+Backorders and pre-orders. Add a policy object on the SKU: BLOCK, ALLOW_NEGATIVE up to a limit, or BACKORDER. The check in reserve calls the policy (Strategy again) instead of comparing with zero.
+Lots and expiry dates. Stock becomes a list of lots, each with quantity and expiry date. Allocation takes from the lot that expires first. The hold records which lots it took, so a release returns units to the same lots.
+Scale out. Partition the data by SKU hash so each SKU has one owner node; a multi-SKU order then needs a saga or a two-phase step across owners, with the hold ids as idempotency keys. Keep hot SKUs on a dedicated shard.
+followups: How do you prevent two customers from buying the last item? || Check and update under one lock (or in one conditional UPDATE statement), so the check and the reserve cannot be separated. The first reserve takes the last unit, the second sees available zero and fails. A read-then-write without a lock or a condition is the classic oversell bug.
+An order has 5 SKUs. How do you avoid deadlock? || Always acquire locks in one global order, for example sorted by SKU. With a fixed order, no cycle of waiting threads can form. In a database, issue the row updates in sorted order inside one transaction. Also keep the critical section short and never call outside code while holding a lock.
+The client times out and retries "reserve". What happens? || The client sends a stable hold id. The service uses computeIfAbsent on that id, so the second call returns the first hold and reserves nothing more. For commit and release, the compare-and-set on the status makes repeats harmless.
+Why keep onHand and reserved separate? || Physical stock and soft claims change for different reasons. Cancelling an order only changes reserved, so the audit trail contains only real movements. Available is derived (onHand minus reserved) so it can never drift from the two sources.
+How would you find out why the count is wrong? || Every change writes an append-only Move with reason and reference. Sum the Moves for the SKU and compare with onHand; sum the HELD holds and compare with reserved. A mismatch points to the exact missing or duplicate movement. Corrections are new adjusting Moves, never edits.
+How do you scale a single hot SKU? || In memory a lock per SKU is already fast. In a database the hot row is the limit, so split the stock into N buckets (sub-rows) and let each order try a random bucket first, accepting that availability is checked per bucket. Or queue reserves for that SKU into one single-writer worker and answer in batches.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson, Vlissides, 1994 |
+ref: book | Designing Data-Intensive Applications (chapter 7, Transactions) | Martin Kleppmann, 2017 |
+ref: book | Java Concurrency in Practice (lock ordering and deadlock) | Brian Goetz et al., 2006 |
+ref: docs | State pattern | refactoring.guru | https://refactoring.guru/design-patterns/state
+
+@@ vending-machine
+title: Design a vending machine
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, automata, formallang, floatingpoint, embedded, hoare, locks, ledger, fuzzing
+summary: A vending machine takes coins, lets the user choose a product, drops the product, and returns change. It is the classic example for the State pattern, because what the machine does with a button press depends on what has happened before: a coin means one thing when the machine is idle and another when it is out of service. It is also a small finite automaton, so the problem tests whether you can turn a story into a clean state machine with clear transitions. Below the surface there are real traps: money must never be a floating-point number, change must be made from a limited stock of coins (the greedy method can fail), hardware can jam in the middle of a sale, and a timer thread and a user can act at the same instant.
+requirements: Functional requirements. The user inserts coins; the machine shows the balance. The user selects a slot. If the slot has stock and the balance covers the price, the machine drops the product and returns the change. If the user presses cancel, or does nothing for 60 seconds, all inserted coins come back. If the machine cannot make the exact change, it refuses the sale and says so (an "exact change only" rule). An operator can restock slots and coins and set prices. If the product drop jams, the user gets all the money back and the machine goes out of service.
+Non-functional requirements. Correct money: no coin is created or lost; the sum of coins in equals product price plus change plus refund. Testability: the logic runs without real hardware, using a fake dispenser and fake coin mechanism. Thread safety: user events and the timeout timer come from different threads. Extensibility: new payment types (card, banknotes), new change rules and new products must not need a rewrite.
+Assumptions. One user at a time. Prices are whole cents. Coins are nickel (5), dime (10), quarter (25) and dollar coin (100). Coins inserted are kept in the machine and can be used for change. A refund returns the same coins that were inserted. Selling one item per transaction.
+estimates: Scale does not matter here. A machine has about 40 slots, 4 to 6 coin types, and a few hundred sales per day, so the state fits in a few kilobytes and every operation takes microseconds. The only number that needs a thought is the change search: an amount of at most 500 cents with 4 denominations has a tiny search space, so even an exhaustive search is instant. A fleet of 100,000 machines reporting sales is a different system (telemetry) and is not part of this object design.
+api: The outside world sees four user events and two hardware interfaces. The class VendingMachine implements UserPanel and MachineAdmin. Events are method calls on the machine. The hardware is behind interfaces so tests can replace it.
+```java
+public interface UserPanel {
+  void insert(Coin coin);
+  void select(String slotId);
+  void cancel();                  // also called by the idle timer
+  int balanceCents();
+}
+
+public interface Hardware {
+  void drop(String slotId) throws IOException;   // may jam
+  void payOut(List<Coin> coins);
+}
+```
+Operator calls are separate from user calls, so a customer can never reach them.
+```java
+public interface MachineAdmin {
+  void load(Slot slot);           // product, price, quantity
+  void loadCoins(Coin coin, int count);
+  void setService(boolean inService);
+  List<String> ledger();          // every sale and refund
+}
+
+public interface ChangeMaker {
+  Optional<List<Coin>> make(int cents, Map<Coin, Integer> bank);
+}
+```
+datamodel: Coin is an enum with a value in cents. Slot is an immutable record: id, price, quantity; to sell one, we replace the record with quantity minus one. The coin bank is a map from coin to count. The inserted list holds the coins of the current transaction, so a refund can return exactly those coins. The balance is an int of cents. We never use float or double for money: 0.1 + 0.2 is not 0.3 in binary floating point, and errors would add up over thousands of sales. The ledger is an append-only list of text or record entries for SALE and REFUND.
+The state machine has three states. IDLE: no money inside. HAS_MONEY: balance above zero, waiting for a choice. OUT_OF_SERVICE: a fault or an operator switch; nothing is accepted. The transitions are:
+IDLE + insert gives HAS_MONEY. IDLE + cancel stays IDLE (nothing to return).
+HAS_MONEY + insert stays HAS_MONEY and adds to the balance. HAS_MONEY + select with a valid, paid and changeable choice gives IDLE after the product and the change are out. HAS_MONEY + select with a missing slot, empty slot, low balance or no possible change stays HAS_MONEY. HAS_MONEY + cancel (or timeout) gives IDLE after the refund. HAS_MONEY + select where the drop jams gives OUT_OF_SERVICE after the refund.
+OUT_OF_SERVICE + any user event: rejected. Only the operator can leave this state.
+This is a deterministic finite automaton: a finite set of states, an alphabet of events and one next state for each pair. The set of event sequences that the machine accepts without error is a regular language, which is why a plain table or a set of state objects is enough and no stack is needed (see finite automata and formal languages). DISPENSING is not a state here, because the drop call blocks inside one synchronized method. If the hardware were asynchronous, DISPENSING would become a real state with the events DROPPED and JAMMED.
+design: The State pattern gives each state its own behavior for each event. Instead of one method with a long if-else on the current state, the machine delegates: state = state.insert(this, coin). Each state returns the next state. Illegal events fall into a default method that throws. In Java an enum with a body per constant is compact: the constants are the states, they are singletons without fields, and the compiler lists them all. If states need their own data or are numerous, use one class per state behind an interface.
+Insert flow. Step 1: the coin mechanism calls insert(coin). Step 2: the machine calls the current state. Step 3: in IDLE or HAS_MONEY the machine adds the coin to the bank and to the inserted list, adds the cents to the balance, and returns HAS_MONEY. Step 4: in OUT_OF_SERVICE the state throws, and the hardware layer returns the coin.
+Select flow. Step 1: the state HAS_MONEY calls the machine's vend with the slot id. Step 2: reject, but stay in the state, if the slot does not exist, is empty, or the balance is lower than the price. Step 3: ask the ChangeMaker for the coins that make balance minus price, using the coins in the bank. If none exist, refuse the sale and stay. Step 4: tell the hardware to drop the product. If it throws IOException, refund everything and go to OUT_OF_SERVICE. Step 5: only now change the books: reduce quantity, remove the change coins from the bank, pay out the change, write a ledger entry, clear the transaction. Return IDLE. The order matters. We plan first, do the risky physical step second, and update the books last, so a failure never leaves the books half changed.
+Cancel and timeout. cancel in HAS_MONEY pays out the inserted coins, removes them from the bank and goes to IDLE. A timer thread calls the same cancel method after 60 seconds without events. Both paths use one method, so there is one place to get right.
+Patterns and why. State: behavior depends on history, and each state has few events. Strategy: ChangeMaker is replaceable (greedy, bounded search, "never give change" for a ticket machine) and the machine does not know which. Adapter or bridge: Hardware hides the real motors and sensors behind two methods, so the logic runs in a unit test and on the device. Observer (not shown): a Display listens for balance and message changes. Command (not shown): an operator action can be a command object, written to the ledger.
+The core code below holds the state enum and the vend flow. Operator methods are left out to keep it short.
+```java
+public final class VendingMachine {
+  public enum Coin {
+    NICKEL(5), DIME(10), QUARTER(25), DOLLAR(100);
+    final int cents;
+    Coin(int cents) { this.cents = cents; }
+  }
+  public record Slot(String id, int price, int qty) { }
+  public interface Hardware {
+    void drop(String slotId) throws IOException;
+    void payOut(List<Coin> coins);
+  }
+  public interface ChangeMaker {
+    Optional<List<Coin>> make(int cents, Map<Coin, Integer> bank);
+  }
+
+  // Each constant is one state. Unlisted events are illegal.
+  enum State {
+    IDLE {
+      State insert(VendingMachine v, Coin c) {
+        v.accept(c);
+        return HAS_MONEY;
+      }
+      State cancel(VendingMachine v) { return this; }
+    },
+    HAS_MONEY {
+      State insert(VendingMachine v, Coin c) {
+        v.accept(c);
+        return this;
+      }
+      State select(VendingMachine v, String id) { return v.vend(id); }
+      State cancel(VendingMachine v) { v.refund(); return IDLE; }
+    },
+    OUT_OF_SERVICE;
+    State insert(VendingMachine v, Coin c) { throw illegal(); }
+    State select(VendingMachine v, String id) { throw illegal(); }
+    State cancel(VendingMachine v) { throw illegal(); }
+    IllegalStateException illegal() {
+      return new IllegalStateException(name());
+    }
+  }
+
+  private final Map<String, Slot> slots = new HashMap<>();
+  private final Map<Coin, Integer> bank = new EnumMap<>(Coin.class);
+  private final List<Coin> inserted = new ArrayList<>();
+  private final List<String> ledger = new ArrayList<>();
+  private final Hardware hw;
+  private final ChangeMaker changer;
+  private State state = State.IDLE;
+  private int balance;                       // cents, never a double
+  public VendingMachine(Hardware hw, ChangeMaker changer) {
+    this.hw = hw;
+    this.changer = changer;
+  }
+  public synchronized void insert(Coin c) {
+    state = state.insert(this, c);
+  }
+  public synchronized void select(String id) {
+    state = state.select(this, id);
+  }
+  public synchronized void cancel() { state = state.cancel(this); }
+
+  private void accept(Coin c) {
+    bank.merge(c, 1, Integer::sum);
+    inserted.add(c);
+    balance += c.cents;
+  }
+  private void refund() {
+    inserted.forEach(c -> bank.merge(c, -1, Integer::sum));
+    hw.payOut(new ArrayList<>(inserted));
+    ledger.add("REFUND " + balance);
+    inserted.clear();
+    balance = 0;
+  }
+  private State vend(String id) {
+    Slot s = slots.get(id);
+    if (s == null || s.qty() == 0 || balance < s.price()) return state;
+    int owed = balance - s.price();
+    Optional<List<Coin>> change = changer.make(owed, bank);
+    if (change.isEmpty()) return state;       // "exact change only"
+    try { hw.drop(id); }
+    catch (IOException e) { refund(); return State.OUT_OF_SERVICE; }
+    slots.put(id, new Slot(id, s.price(), s.qty() - 1));
+    change.get().forEach(c -> bank.merge(c, -1, Integer::sum));
+    hw.payOut(change.get());
+    ledger.add("SALE " + id + " " + s.price());
+    inserted.clear();
+    balance = 0;
+    return State.IDLE;
+  }
+}
+```
+diagram:
+  events: insert / select / cancel / timeout
+        |
+        v
+  +---------------------------------------------+
+  | VendingMachine (context)                    |
+  | state, balance, slots, bank, inserted       |
+  | insert(c) select(id) cancel()  [synchronized]|
+  +----+----------------+--------------+--------+
+       | delegates      | uses         | uses
+       v                v              v
+  +-----------+   +-------------+   +--------------+
+  | <<enum>>  |   | ChangeMaker |   | Hardware     |
+  | State     |   | make(cents, |   | drop(slot)   |
+  | IDLE      |   |      bank)  |   | payOut(coins)|
+  | HAS_MONEY |   +------+------+   +------+-------+
+  | OUT_OF_.. |          ^ is-a            ^ is-a
+  +-----------+     BoundedChange     RealHardware
+                    GreedyChange       FakeHardware (tests)
+
+  IDLE --insert--> HAS_MONEY --select ok--> IDLE
+                     |   ^                    ^
+                     |   +--insert (loop)     |
+                     +--cancel / timeout------+
+                     +--drop jams--> OUT_OF_SERVICE
+deepdive: Making change. The greedy method (take the largest coin that fits) is correct for a normal coin system with unlimited coins. It is wrong when the stock is limited. Example: the change is 30 cents and the bank has one quarter and three dimes. Greedy takes the quarter, needs 5 more, has no nickel, and gives up, although three dimes work. So the ChangeMaker searches: for each denomination from the largest, try the biggest possible count first, then fewer, and recurse on the rest. The first full answer found is returned. Because the first choices are the greedy ones, the common case is as fast as greedy, and the rare case is solved correctly. With 4 denominations and a few hundred cents the search is tiny.
+The search is about 20 lines of recursion over the four denominations. An important safety check: the machine asks for change before it takes the product out. Otherwise it could drop the product and then find that it owes 30 cents it cannot pay.
+Concurrency. Two threads touch the machine: the user's event thread and the timer. All public methods are synchronized, so they run one at a time on the same lock (see locks and atomics). The race "user presses select at the very moment the timer fires cancel" is decided by whoever gets the lock first. If cancel wins, the state is IDLE and the late select throws an illegal-state error that the hardware layer ignores. If select wins, the sale completes and the cancel finds IDLE and does nothing. Both are correct outcomes. We never call out to unknown code that could re-enter the machine while holding the lock, except the Hardware interface, which must not call back.
+Embedded concerns. On the real device the logic runs on a small controller with interrupts from coin sensors (see embedded and real-time systems). Interrupt handlers should only post events into a queue; one thread takes events from the queue and calls the machine. This removes the need for locks inside the logic and gives a total order of events. A watchdog timer resets the controller if the loop hangs. State that must survive a power loss (cash in the bank, quantities, the current balance) is saved after each transaction, so on restart the machine either refunds the pending balance or continues.
+Invariants and reasoning. Write the contract of each operation as a Hoare triple (precondition, action, postcondition). For vend: before, state is HAS_MONEY, quantity is above zero, balance is at least the price and change exists; after, quantity is one lower, balance is zero, and coins in equals price plus coins paid out. Class invariants hold between calls: balance equals the sum of inserted; every bank count is zero or more; the sum of the inserted coins is in the bank. Put them in an assertion method that tests call after every step.
+Extensibility. A new payment method (card, banknote) is a new event source that calls a method like credit(cents); the balance then becomes a number of cents and not a list of coins, and refund goes back to that source. A new change policy is a new ChangeMaker. A new state, such as MAINTENANCE or DISPENSING, is a new enum constant (or class) and a few transitions; existing states change only where they gain a new exit. Prices by time of day are a PricingPolicy strategy used in vend.
+Testing. Use fakes: FakeHardware records drops and payouts and can be told to jam; an injected clock or a manual timer triggers timeouts without sleeping. Tests: exact payment; overpayment with change; not enough money; sold-out slot; no possible change; the greedy-fails case (30 cents from one quarter and three dimes); jam gives a refund and out of service; cancel refunds the same coins; timeout equals cancel; illegal events in OUT_OF_SERVICE. A property-based test (see fuzzing) generates random sequences of events from the alphabet, runs them, and checks the invariants after every step: no negative counts, total money conserved, state always one of the three.
+tradeoffs: State classes or an enum with a switch? Choose a state per enum constant or per class when each state has its own rules for several events; adding a state touches one place. Choose a plain enum plus a transition table or a switch when the machine is tiny and has no per-state data, because it is the shortest and easiest to print as a table for review. The cost of State classes is more types; the cost of the switch is that every new state edits every method.
+Greedy or search for change? Choose greedy when the coin set is canonical and the stock is unlimited or well supplied, as in a bank. Choose the bounded search when stock is limited, as in a real machine that runs low on small coins. Choose dynamic programming when the number of denominations or amounts is large; here it would be more code with no benefit.
+Integer cents or a Money class? Choose plain int cents inside a small machine. Choose a Money value type (amount plus currency, with BigDecimal or long minor units) when several currencies or tax rules appear. Never choose double.
+One lock or an event queue? Choose a synchronized machine when callers are few and the code is small. Choose a single-threaded event loop with a queue when many sources (coin sensor, buttons, network, timers) feed the machine, because it makes order explicit and removes lock reasoning.
+failures: Invalid input. A slot id that does not exist, or an empty slot, leaves the state as it is and shows a message; it does not change any count. A negative or zero price is rejected when the operator sets it.
+No change possible. The machine refuses to sell and keeps the money; the user can add exact coins or cancel. Better: before the user inserts money, the display shows "exact change only" when the bank is low on small coins.
+Hardware faults. The drop can jam, a sensor can double count a coin, or a coin can be stuck in the path. A jam leads to a refund and OUT_OF_SERVICE; the ledger records a FAULT. If the payout of a refund fails, the ledger keeps an IOU for the operator, because the user's money is owed.
+Power loss. Persist the transaction state after each coin and after each sale. On restart, if a balance is pending, refund it. Writing the ledger entry and the stock change together, or writing the entry first and replaying it on restart, keeps the books and the shelf in step.
+evolution: Card and cash together. Introduce a PaymentSource interface (cash, card, mobile) with authorize(cents) and refund. Cash stays as it is; for card the machine authorizes the price after the choice and captures after the drop. The same State machine gets one more state, AUTHORIZING.
+Async hardware. When drop returns at once and a sensor later reports DROPPED or JAMMED, add the DISPENSING state with a timeout. The events are DROPPED, JAMMED and TIMEOUT. The sale is booked on DROPPED.
+Multiple items per transaction. Keep a cart of selected slots; HAS_MONEY becomes a loop of select events and a done button. Check total price and change at the end.
+Pricing and promotions. A PricingPolicy strategy returns the price for a slot and time. Discount rules are decorators on the policy.
+followups: Why use the State pattern here and not a big if-else? || Behavior depends on the state and the event. With if-else, every new state edits every method and it is easy to forget a case. With State, each state owns its transitions; a new state is a new constant, and an event that is not handled falls into a default that throws. It also maps one to one onto the state diagram that the product owner reviews.
+How do you handle change when the machine has a limited number of coins? || Greedy can fail, for example 30 cents with one quarter and three dimes. Search with a bounded count per denomination, trying large coins first. Check that change exists before dropping the product, and refuse the sale (exact change only) if it does not.
+Why not store money as a double? || Binary floating point cannot represent most decimal fractions, so errors appear and add up, and equality checks fail. Use integer cents (or a Money type with minor units). All arithmetic is exact and comparisons are safe.
+A user presses cancel while the timer fires a timeout. What happens? || Both call the same synchronized method, so one runs first. The first refunds and moves to IDLE; the second finds no money and does nothing. The result is one refund, never two. In an event-queue design the same holds because events are processed one at a time.
+The product drop jams after the money is accepted. What should happen? || Treat the jam as a fault: refund all inserted coins, record a FAULT in the ledger, and go to OUT_OF_SERVICE. Books change only after a successful drop, so stock and cash stay correct. If the refund cannot be paid, record an IOU for the operator.
+How would you test the whole state machine? || Fake hardware and a manual clock. Write one test per transition, plus tests for illegal events. Then add a property-based test that sends random event sequences and checks the invariants after each step: no negative count, money conserved, and a valid state.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software (State, Strategy) | Gamma, Helm, Johnson, Vlissides, 1994 |
+ref: book | Head First Design Patterns, 2nd edition (the gumball machine example) | Eric Freeman, Elisabeth Robson, 2020 |
+ref: docs | State pattern | refactoring.guru | https://refactoring.guru/design-patterns/state
+ref: book | Introduction to the Theory of Computation (finite automata) | Michael Sipser, 2012 |
+
+@@ grocery-store
+title: Design a grocery store system
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, ccontrol, hashtables, floatingpoint, locks, acid, isolation, ledger, trees
+summary: A grocery store system lets a cashier or a self-checkout scan products, builds a basket, works out the price, takes payment, prints a receipt and updates stock. The easy part is the object model: product, category, basket, receipt. The hard part is the price. Real stores run promotions such as "buy 2 get 1 free", "10 percent off apples" and "3 for 5 dollars", with tax rates that depend on the product, items sold by weight, and money that must be exact to the cent. The design question is how to keep all these rules out of the basket and checkout code so that a marketing person can add a new promotion without a code change to old classes. A second question is what to do about the shared state (stock counts, receipt numbers, payments) when ten lanes work at the same time.
+requirements: Functional requirements. Find a product by barcode (SKU) and browse a category tree. Add items to a basket by count or by weight, and remove them. Price the basket: base prices, promotions, tax. Show a receipt with line totals, each discount, tax and the final total. Take payment (cash or card) and print the receipt only once the payment is final. Decrease the stock. Managers can change prices and promotions without restarting the lanes. Refunds are a later extension.
+Non-functional requirements. Exact money, with a fixed and documented rounding rule. Determinism: the same basket and the same rules always give the same receipt, which makes receipts reproducible in a dispute. Extensibility: a new promotion type, tax rule or payment type is a new class. Thread safety for about 10 lanes. Testability: no hidden clocks or random values. Pricing must take well under 10 ms for a basket of 100 items.
+Assumptions. One store, 20,000 SKUs, one currency, prices in cents. A promotion is valid for a date range. Each unit in a basket can be used by at most one promotion. Tax is computed per line on the discounted amount and rounded half up. Stock counts on the shelf are advisory (a person can pick an item the system thinks is gone).
+estimates: Scale hardly matters. 20,000 products at about 200 bytes each is 4 MB, so the whole catalog sits in memory on every lane. Ten lanes with one basket every two minutes is five baskets per minute for the store, and pricing 100 items against 20 promotions is about 2,000 simple checks, so microseconds. A chain of 500 stores only adds a central catalog and price list that each store caches. The one place where cost grows is the search for the best promotion order (see the deep dive), and that is at most a few hundred orders.
+api: The cashier-facing facade is Checkout. It uses a catalog, a pricing engine and a payment gateway. Everything the pricing engine needs is passed in as values, so it has no hidden state.
+```java
+public interface Catalog {
+  Optional<Product> bySku(String sku);
+  List<Product> inCategory(String categoryId);   // includes children
+}
+
+public interface Checkout {
+  Basket open();
+  void scan(Basket b, String sku, int qtyOrGrams);
+  Receipt pay(Basket b, String txnId, Payment payment);
+}
+
+public interface PaymentGateway {
+  // txnId is an idempotency key: the same key never charges twice
+  boolean charge(String txnId, int cents);
+}
+```
+Pricing is a pure function from items to a receipt, driven by a list of rules. Each rule is a Strategy.
+```java
+public interface Promotion {
+  List<Discount> apply(Basket b);     // claims units, gives discounts
+}
+
+public interface StockService {
+  void sold(Map<String, Integer> qtyBySku, String receiptId);
+}
+```
+datamodel: Product: sku, name, category id, unit (EACH or PER_KG), unit price in cents, tax rate in basis points (500 is 5 percent). Category: id and parent id, which forms a tree; this tree lets a promotion say "10 percent off dairy" and match every product below dairy by walking up parents. Item: a product and a quantity (a count, or grams for weighed goods). Promotion: type, parameters, valid-from, valid-to, priority. Basket: id, items and status. Receipt: an immutable record with lines, discounts, subtotal, tax, total, transaction id and time. StockLevel: SKU and count. Journal: one entry per sale line, an append-only ledger of sales and later refunds, so stock and money can be checked against each other.
+Weighed goods. A line for 1,250 grams at 399 cents per kilogram costs 1,250 times 399 divided by 1,000 = 498.75, rounded half up to 499 cents. The calculation uses a long and integers only.
+Basket states: OPEN, PAYING, PAID, VOIDED. OPEN allows scan and remove. Pay moves OPEN to PAYING, which blocks scans while the card is charged. A successful charge gives PAID; a decline returns to OPEN; the cashier can void an OPEN basket. PAID and VOIDED are final. Lookups by SKU use a hash table, and the category tree is a plain parent-pointer tree.
+design: Classes and jobs. Catalog finds products. Basket holds items and its state, and is owned by one lane at a time. PricingEngine turns a list of items into a Receipt using a list of Promotion objects. Checkout is the facade: it ties together scan, price, payment, stock and journal. PaymentGateway hides the card terminal. StockService updates counts.
+Scan flow. Step 1: the scanner gives a SKU. Step 2: Checkout asks the Catalog; an unknown SKU shows an error and changes nothing. Step 3: Checkout adds an item to the basket. Step 4: after each scan the lane may call the engine to show the running total; the engine is pure, so this is safe and cheap.
+Pricing flow. Step 1: build a Basket view that records, for every SKU, how many units are still open (not used by any promotion). Step 2: take the promotions in priority order and let each one claim units and return discounts. A promotion for 2-plus-1 milk takes groups of 3 units. A later percent-off rule sees only the units that are still open. Step 3: for each line compute gross (quantity times unit price), the discounts for that SKU, and tax on the difference. Step 4: add up. Everything is integer cents.
+Pay flow. Step 1: price the basket again, so the receipt is exactly what the customer sees. Step 2: change the state to PAYING. Step 3: call the gateway with the transaction id. Step 4: if it succeeds, in one unit of work write the receipt, the journal lines and the stock decrement, then set PAID. Step 5: if it fails, go back to OPEN and show the reason. A repeated call with the same transaction id returns the stored receipt (idempotence) and the gateway never charges twice.
+Patterns and why. Strategy: each promotion is a class behind one interface; the engine never asks "what type are you". Factory: a PromotionFactory reads a manager's configuration and builds the objects, so marketing changes data and not code. Facade: Checkout keeps the lane code simple. Composite: the category tree, where a node can be a leaf or a group. State: the basket lifecycle. Observer: a receipt-paid event feeds loyalty points and analytics without making Checkout depend on them. Immutable value objects (Product, Item, Receipt, Discount) are Java records, which keeps them safe to share between threads.
+The core code below is the pricing engine with two promotion types.
+```java
+public final class PricingEngine {
+  public record Product(String sku, int unitCents, int taxBp) { }
+  public record Item(Product product, int qty) { }
+  public record Discount(String sku, String label, int cents) { }
+  public record Receipt(int subtotal, int discount, int tax, int total,
+                        List<Discount> discounts) { }
+
+  /** Units not yet used by a promotion: one unit, one promotion. */
+  public static final class Basket {
+    final Map<String, Item> items = new LinkedHashMap<>();
+    final Map<String, Integer> open = new HashMap<>();
+    Basket(List<Item> list) {
+      for (Item i : list) {
+        String sku = i.product().sku();
+        items.merge(sku, i,
+            (a, b) -> new Item(a.product(), a.qty() + b.qty()));
+        open.merge(sku, i.qty(), Integer::sum);
+      }
+    }
+  }
+
+  public interface Promotion { List<Discount> apply(Basket b); }
+
+  /** Buy 2 get 1 free: groups of (buy + free) units. */
+  public record BuyXGetY(String sku, int buy, int free)
+      implements Promotion {
+    public List<Discount> apply(Basket b) {
+      Item it = b.items.get(sku);
+      int groups = it == null ? 0 : b.open.get(sku) / (buy + free);
+      if (groups == 0) return List.of();
+      b.open.merge(sku, -groups * (buy + free), Integer::sum);
+      int cents = groups * free * it.product().unitCents();
+      return List.of(new Discount(sku, buy + "+" + free, cents));
+    }
+  }
+
+  /** Percent off the units that no earlier promotion used. */
+  public record PercentOff(String sku, int pct) implements Promotion {
+    public List<Discount> apply(Basket b) {
+      Item it = b.items.get(sku);
+      int n = it == null ? 0 : b.open.get(sku);
+      if (n == 0) return List.of();
+      b.open.put(sku, 0);
+      long gross = (long) n * it.product().unitCents();
+      int cents = (int) ((gross * pct + 50) / 100);   // half up
+      return List.of(new Discount(sku, pct + "% off", cents));
+    }
+  }
+
+  private final List<Promotion> promotions;          // priority order
+  public PricingEngine(List<Promotion> promotions) {
+    this.promotions = List.copyOf(promotions);
+  }
+
+  public Receipt price(List<Item> list) {            // pure: no state
+    Basket b = new Basket(list);
+    List<Discount> ds = new ArrayList<>();
+    for (Promotion p : promotions) ds.addAll(p.apply(b));
+    int sub = 0, off = 0, tax = 0;
+    for (Item it : b.items.values()) {
+      int gross = it.qty() * it.product().unitCents();
+      String sku = it.product().sku();
+      int d = ds.stream().filter(x -> x.sku().equals(sku))
+                .mapToInt(Discount::cents).sum();
+      sub += gross;
+      off += d;
+      tax += (int) (((long) (gross - d) * it.product().taxBp() + 5000)
+                    / 10000);                        // tax per line
+    }
+    return new Receipt(sub, off, tax, sub - off + tax, ds);
+  }
+}
+```
+diagram:
+  +----------------+     +-----------------+     +----------------+
+  | Catalog        |     | Checkout        |---->| PaymentGateway |
+  | bySku()        |<----| scan() pay()    |     | charge(txn,c)  |
+  | inCategory()   |     | (facade)        |     +----------------+
+  +-------+--------+     +----+------+-----+
+          |                   |      |
+          | has               | uses | writes
+          v                   v      v
+  +----------------+   +--------------+   +------------------+
+  | Category tree  |   | PricingEngine|   | StockService     |
+  | Product        |   | price(items) |   | Journal (ledger) |
+  +----------------+   +------+-------+   +------------------+
+                              | has many
+                              v
+                    +--------------------+
+                    | <<interface>>      |
+                    | Promotion          |
+                    | apply(Basket)      |
+                    +---------+----------+
+                              ^ is-a
+          BuyXGetY      PercentOff      BulkPrice      CategoryOff
+
+  Basket: OPEN -> PAYING -> PAID      (PAYING -> OPEN on decline)
+  Receipt, Item, Discount, Product: immutable records
+deepdive: Money and rounding. A double cannot hold 0.1 exactly, so sums drift and equality fails (see floating-point numbers). All amounts are int or long cents. Rounding happens at exactly three places and is written down: a percent discount is rounded half up on the whole group of units, tax is rounded half up per line, and a weighed line is rounded half up once. The sum of rounded lines can differ by a cent from the rounded sum; the store picks per-line tax because it is how receipts are audited. In some countries prices include tax; then tax is extracted from the price, not added. This is a policy class (TaxPolicy), not an if in the engine.
+Promotion conflicts. If apples have both "3 for 2" and "10 percent off", which one should win? The rule in our engine is: promotions run in priority order and each unit is used once. That is predictable but not always best for the customer. When the law or the brand requires "the best price", the engine tries every order of the applicable promotions and keeps the cheapest receipt. With at most 6 applicable promotions that is 720 orders, each costing microseconds. This works only because price() is a pure function with no side effects, so it can be called many times.
+Concurrency. What is shared? Prices and promotions (read often, changed rarely), stock counts, the receipt number, and the payment. Baskets are not shared: one lane owns one basket. Price and promotion configuration is an immutable snapshot held in an AtomicReference; a manager publishes a new snapshot, and each pricing call reads the reference once, so a call never sees half of an update. Stock counts are one AtomicInteger per SKU in a ConcurrentHashMap, updated with addAndGet; no lock is needed because each update is independent. The receipt number comes from an AtomicLong. The only multi-step action is pay, and it is made safe by the idempotency key and by the state PAYING, not by a lock.
+Strict or advisory stock. In a store the shelf is physical. A cashier scans what the customer holds, so the sale must not fail because the count says zero. We take the count down after payment, allow it to go negative, and flag the SKU for a recount. This avoids concurrency control altogether. For an online order that will be picked later, stock must be reserved up front; then we use the pattern of the inventory design: a conditional update that checks and reserves in one step (pessimistic locking per SKU, or optimistic versioning with retry).
+Transactions. When the system is backed by a database, a sale is one ACID transaction: the receipt, the journal lines and the stock changes commit together or not at all. Isolation matters for the reports: a stock report that runs in READ COMMITTED may see some sales and miss others in the same minute; for a daily close it is better to read a snapshot. The journal is a ledger: for each sale the amounts in the journal must add up to the receipt total, and a nightly reconciliation compares journal, payments and stock counts.
+Extensibility. A new promotion such as a "bundle" or "category 10 percent" is one class and one line in the factory. Category promotions use the tree: walk from the product's category to the root and check whether the promoted category is on the path. A new payment method is a new PaymentGateway. A new tax rule is a new TaxPolicy. Old classes do not change.
+Testing. The engine is pure, so tests are plain input and output: a golden file of baskets and expected receipts. Property tests: total equals subtotal minus discount plus tax; a discount never exceeds the gross of its line; the order of the items in the basket does not change the receipt; no unit is claimed twice (the open count never goes negative). Use a FakeClock for validity dates and a FakePaymentGateway that can decline, time out, or succeed after a delay. A concurrency test pays 1,000 baskets on 10 threads and checks that stock equals start minus the units sold and that receipt numbers are unique.
+tradeoffs: Fixed order or best price? Choose a fixed priority order when promotions are designed to be exclusive, results must be easy to explain, and the number of rules is large. Choose the search over all orders when the promised rule is "customer gets the lowest price" and the number of overlapping rules per basket is small (up to about 6).
+Strict or advisory stock? Choose advisory counts for items on a shelf, where physical reality wins and a failed sale is worse than a wrong count. Choose strict reservation for online orders, limited-quantity offers and anything promised in advance, and pay the cost of locks or conditional updates.
+Classes or data-driven rules? Choose one class per promotion type when the logic is complex and needs tests, and keep the rules data (parameters) in config. Choose a small rule language (conditions and actions in JSON) when marketing needs new combinations weekly; it moves flexibility into data but adds a language to test and secure.
+Tax per line or per receipt? Choose per line when receipts must show tax by line and refunds work by line. Choose per receipt when the law says to round the total tax once. The decision lives in TaxPolicy so changing it touches one class.
+failures: Invalid input. An unknown barcode, a zero or negative quantity, or a weight of zero is rejected at scan and the basket is unchanged. A weighed item needs a stable weight reading from the scale.
+Rule problems. A promotion outside its date range is skipped. A discount is clamped so that it never exceeds the line gross, so a wrong rule cannot make a negative price. A promotion that throws an exception is logged and skipped, and the receipt is flagged for review. A product without a tax rate fails to load and is not sold, because guessing tax is worse.
+Payment problems. A card decline returns the basket to OPEN. A timeout leaves the outcome unknown: the lane retries with the same transaction id, and the gateway says whether it charged. We never print a receipt before the charge is final. Double taps and retries are safe because of the idempotency key.
+Lane failure. A lane that crashes with an open basket restores it from a small local store; the PAYING state is checked with the gateway at restart before the basket is cleared.
+evolution: Online orders and pickup. Add a reservation hold on stock when the order is placed, and release it on cancel or expiry (see the inventory design). Substitutions are a new step in the order state machine.
+Returns and refunds. A refund is a new receipt of negative lines that points to the original receipt. The journal gets reversing entries; stock goes up. Promotions that gave a discount must be reversed in proportion, so the original discounts are stored on the receipt.
+Coupons and loyalty. A single-use coupon needs an atomic "redeem if unused" step, which is a concurrency-control problem (a conditional update with a unique key). Loyalty points are an Observer of the paid event.
+followups: How do you add a new promotion type without touching old code? || Promotion is an interface. A new type is one new class and one line in the PromotionFactory that builds it from configuration. The engine just loops over the promotions. Tests for the new class use the same pure engine with a golden basket.
+Two promotions apply to the same item. Which wins? || Define it. In our engine each unit is claimed by the first promotion in priority order, so the result is predictable. If the business wants the best price for the customer, try the orders of the applicable promotions and take the cheapest receipt. This is possible because pricing is a pure function.
+Why not use double for prices? || Binary floating point cannot store most decimals exactly, so sums drift and equality checks fail. Use integer cents, define one rounding rule (half up) and where it is applied, and test with values like 0.10 + 0.20.
+Ten lanes sell the same product at the same time. How do you keep the stock right? || Each SKU has an AtomicInteger, updated with addAndGet after payment, so concurrent decrements never lose an update. In a store the count is advisory, so it may go negative and trigger a recount. For online orders use a conditional update or lock per SKU to reserve.
+The card terminal times out after the customer tapped. What now? || Use an idempotency key (the transaction id) for the charge. After a timeout, retry with the same key or ask the gateway for the status. If it was charged, finish the sale and print the receipt; if not, retry or cancel. Never charge twice and never print before success.
+How do you make sure a receipt can be reproduced later? || Pricing is a pure function of the items, the promotion snapshot and the tax policy. Store the receipt with the lines, discounts and the snapshot version. A dispute is then settled by showing the stored receipt, and a test can recompute it.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson, Vlissides, 1994 |
+ref: book | Head First Design Patterns, 2nd edition | Eric Freeman, Elisabeth Robson, 2020 |
+ref: book | Patterns of Enterprise Application Architecture (Money pattern) | Martin Fowler, 2002 |
+ref: docs | Strategy pattern | refactoring.guru | https://refactoring.guru/design-patterns/strategy
+
+@@ tic-tac-toe
+title: Design tic-tac-toe
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, automata, binary, heuristicsearch, mcts, hoare, fuzzing, prng, locks
+summary: Two players take turns to put X and O on a 3 by 3 board; the first to get three in a row wins, and a full board without a winner is a draw. The rules fit in one sentence, which is why interviewers use the game: the answer shows how you split a small problem into classes. A weak answer puts the board, the rules, the input and the printing in one class with a 40-line main loop. A strong answer separates the game model (board, turn, status), the rules (win detection), the players (human, random, smart), and the view, so that the same model can be played on a console, in a web page, by two humans, or by a human against a bot. It also gets the follow-ups right: an n by n board with k in a row, undo, a computer opponent, and two players moving at the same time over a network.
+requirements: Functional requirements. Start a game on a board of size n (default 3) with a winning line length k (default 3). Two players, X and O, alternate, and X moves first. A move names a cell; it is rejected if the cell is outside the board or taken, if it is not that player's turn, or if the game is over. After each move the game reports one of: in progress, won by X, won by O, or draw. Undo the last move. A player can be a person or a computer opponent, and the game does not need to know which. Views are told when the game changes.
+Non-functional requirements. Separation: the model has no input or output code. Extensibility: new board sizes, win lengths, player types and views need no change to the model. Correctness: illegal moves never change the state. Thread safety: if two clients play over a network, only one move is applied at a time and a wrong-turn move is refused. Testability: bots take their random numbers from a seeded generator, so a test can replay a game.
+Assumptions. Two players only. Win lines are horizontal, vertical or diagonal. One game object per match. The board is small, so memory is not a concern. Network transport, accounts and scores are outside the design.
+estimates: For the classic game the numbers are tiny and exact. There are 5,478 reachable positions and 255,168 different games; a full search of the game tree visits 549,946 nodes, which takes a few milliseconds. For an n by n board there are at most 3 to the power n squared positions (each cell is empty, X or O). For n = 15 (the size of gomoku) this is 3 to the power 225, so searching all positions is impossible and a bot must use a heuristic or sampling. A win check from the last move takes at most 4 lines times 2 directions times k steps, which is constant for a fixed k.
+api: A game exposes moves and queries. Players and views are interfaces.
+```java
+public interface Player {
+  Game.Move chooseMove(Game game);        // called only on its turn
+}
+
+public interface GameView {               // observer of the model
+  void onChange(Game game);
+}
+
+public interface Match {                  // the controller loop
+  Game.Status playToEnd();                // asks players, calls play()
+}
+```
+The model has these public methods, as in the core listing: play(mark, move), undo(), status(), turn(), winner(), at(row, col), addListener(listener). A factory creates players from a name:
+```java
+public interface PlayerFactory {
+  Player create(String kind, Game.Mark mark, long seed);
+}
+```
+datamodel: Mark is an enum with X and O and a method other(). Move is an immutable record with row and column. The board is a two-dimensional array of Mark, where null means empty. Game holds the board, the size, the win length, the current turn, the status, the winner and a stack of the moves played (the history). The history is what makes undo possible: pop a move, clear its cell and give the turn back to the player who made it.
+State machine of the game. The control states are IN_PROGRESS, WON and DRAW, with the turn as extra data. IN_PROGRESS moves to WON when a move completes a line, to DRAW when the board is full without a line, and stays IN_PROGRESS otherwise, flipping the turn. WON and DRAW are final, except that undo returns the game to IN_PROGRESS. Seen as a finite automaton, the real states are the board positions (5,478 of them in the 3 by 3 game), and a move is a transition. The legal games are the paths through this automaton from the empty board to a final state (see finite automata).
+Invariants. The number of X marks equals the number of O marks, or is one more. The history length equals the number of non-empty cells. At most one player has a winning line. If the status is IN_PROGRESS, no line is complete and the board is not full. These are the facts that tests assert after every move.
+design: Classes and jobs. Game is the model: it owns the board and applies the rules. Mark and Move are values. Player is the strategy for choosing a move. Match is the controller: it asks the player whose turn it is for a move and passes it to the game. GameView is the observer: a console printer, a GUI, or a network broadcaster. PlayerFactory builds players.
+Play flow. Step 1: the controller asks game.turn() who moves. Step 2: it asks that Player to choose a move; a human player waits for input, a bot computes. Step 3: it calls game.play(mark, move). Step 4: the game checks four things in order (game not over, right turn, cell inside the board, cell empty) and throws on the first that fails, changing nothing. Step 5: it writes the mark, pushes the move on the history, and checks for a win. Step 6: it sets the new status and turn and tells the listeners. Step 7: the loop repeats until the status is not IN_PROGRESS.
+Win detection. The simple method scans the whole board after every move, which is O(n squared). A faster method looks only at the cell just played: count equal marks going one way and the other way along each of 4 directions (horizontal, vertical, two diagonals), add 1 for the new cell, and compare with k. This costs O(k), works for any n and k, and is what the listing does. For strict n in a row there is an O(1) trick: keep one counter per row, column and diagonal, add 1 for X and subtract 1 for O, and declare a win at n or minus n. It fails when k is smaller than n, so we choose the scan.
+Patterns and why. Strategy: Player is the one thing that changes between a human, a random bot and a minimax bot, so the match loop does not know which it has. Observer: the model sends change events and knows nothing about screens, so a console view and a web view can both listen. Command: a Move is a small value that can be stored, undone, replayed from a log, or sent over the network. State: the status is a three-valued enum because the states have no behavior of their own; use State classes only if each state gets its own rules (such as a "paused" state). Factory: PlayerFactory builds players from names in a config or a command line. Together this is the Model-View-Controller split: Game, GameView, Match.
+The core code below is the model with win detection, undo and listeners.
+```java
+public final class Game {
+  public enum Mark { X, O; Mark other() { return this == X ? O : X; } }
+  public enum Status { IN_PROGRESS, WON, DRAW }
+  public record Move(int row, int col) { }
+
+  private final int size, winLen;
+  private final Mark[][] cells;
+  private final Deque<Move> history = new ArrayDeque<>();
+  private final List<Consumer<Game>> listeners =
+      new CopyOnWriteArrayList<>();
+  private Mark turn = Mark.X, winner;
+  private Status status = Status.IN_PROGRESS;
+
+  public Game(int size, int winLen) {
+    if (size < 1 || winLen < 1 || winLen > size)
+      throw new IllegalArgumentException("bad size or win length");
+    this.size = size;
+    this.winLen = winLen;
+    this.cells = new Mark[size][size];
+  }
+
+  public void addListener(Consumer<Game> l) { listeners.add(l); }
+
+  public void play(Mark who, Move m) {
+    synchronized (this) {                  // one move at a time
+      if (status != Status.IN_PROGRESS)
+        throw new IllegalStateException("game over");
+      if (who != turn) throw new IllegalStateException("not your turn");
+      if (!inside(m.row(), m.col()) || cells[m.row()][m.col()] != null)
+        throw new IllegalArgumentException("bad cell " + m);
+      cells[m.row()][m.col()] = who;
+      history.push(m);
+      if (wins(m, who)) { status = Status.WON; winner = who; }
+      else if (history.size() == size * size) status = Status.DRAW;
+      else turn = who.other();
+    }
+    listeners.forEach(l -> l.accept(this));    // outside the lock
+  }
+
+  public synchronized void undo() {
+    if (history.isEmpty()) throw new IllegalStateException("no moves");
+    Move m = history.pop();
+    turn = cells[m.row()][m.col()];       // that player moves again
+    cells[m.row()][m.col()] = null;
+    status = Status.IN_PROGRESS;
+    winner = null;
+  }
+
+  private boolean wins(Move m, Mark who) {
+    int[][] dirs = {{0, 1}, {1, 0}, {1, 1}, {1, -1}};
+    for (int[] d : dirs) {           // count both ways on each line
+      int run = 1 + count(m, d[0], d[1], who)
+                  + count(m, -d[0], -d[1], who);
+      if (run >= winLen) return true;
+    }
+    return false;
+  }
+
+  private int count(Move m, int dr, int dc, Mark who) {
+    int n = 0, r = m.row() + dr, c = m.col() + dc;
+    while (inside(r, c) && cells[r][c] == who) {
+      n++;
+      r += dr;
+      c += dc;
+    }
+    return n;
+  }
+
+  private boolean inside(int r, int c) {
+    return r >= 0 && c >= 0 && r < size && c < size;
+  }
+
+  public synchronized Status status() { return status; }
+  public synchronized Mark turn() { return turn; }
+  public synchronized Mark winner() { return winner; }
+  public synchronized Mark at(int r, int c) { return cells[r][c]; }
+}
+```
+diagram:
+  +-------------------------+        +---------------------------+
+  | Match (controller)      |------->| <<interface>> Player      |
+  | playToEnd()             | asks   | chooseMove(Game)          |
+  +-----------+-------------+        +-------------+-------------+
+              | calls play()                       ^ is-a
+              v                  HumanPlayer  RandomBot  MinimaxBot
+  +-------------------------+                      MctsBot
+  | Game (model)            |
+  | cells[][], turn, status |        +---------------------------+
+  | history (Deque<Move>)   |------->| <<interface>> GameView    |
+  | play() undo() at()      | notify | onChange(Game)            |
+  +------+------------------+        +-------------+-------------+
+         | has                                      ^ is-a
+         v                                ConsoleView  WebView
+  +--------------+  +-------------+
+  | Mark X | O   |  | Move r, c   |
+  +--------------+  +-------------+
+
+  Status: IN_PROGRESS --line--> WON       IN_PROGRESS --full--> DRAW
+          undo() returns WON or DRAW to IN_PROGRESS
+deepdive: Computer players. A random bot picks uniformly among empty cells. Give it its own seeded generator, not a global one, so that a failing game can be replayed (see pseudorandom generators). A perfect bot for the 3 by 3 game uses minimax. The value of a position for the player to move is +1 for a win, 0 for a draw and -1 for a loss, and a player picks the move that leaves the opponent the worst result. The negamax form is short when the board is two bitmasks of 9 bits (see binary representations), one for each player, and a win is tested by comparing with 8 line masks.
+```java
+static final int[] LINES = {0b111, 0b111000, 0b111000000, 0b1001001,
+    0b10010010, 0b100100100, 0b100010001, 0b1010100};
+
+static boolean won(int m) {
+  for (int l : LINES) if ((m & l) == l) return true;
+  return false;
+}
+
+/** +1 if the side to move wins, 0 draw, -1 loses (best play). */
+static int negamax(int me, int opp) {
+  if (won(opp)) return -1;
+  int all = me | opp;
+  if (all == 0x1FF) return 0;
+  int best = -1;
+  for (int i = 0; i < 9; i++)
+    if ((all & (1 << i)) == 0)
+      best = Math.max(best, -negamax(opp, me | (1 << i)));
+  return best;
+}
+```
+From the empty board this returns 0: with best play the game is a draw. It visits 549,946 nodes. Alpha-beta pruning gives the same answer after about 17,000 nodes in our test run, and a table of results by position (a memo with 3 to the power 9 = 19,683 entries at most) makes it instant. For larger boards, minimax with a depth limit and an evaluation function (for example "open threes minus the opponent's") is heuristic search; for very large boards such as 15 by 15, Monte Carlo tree search plays many random games from each candidate move and picks the move with the best win rate, trading exactness for speed (see Monte Carlo tree search).
+Concurrency. For a network game, two clients may send moves at the same instant. The shared state is the Game. The check "is it my turn, is the cell free" and the change "write the mark, flip the turn" must be one atomic step, otherwise both clients could pass the check and write to the same cell. We make play synchronized on the game object (see locks and atomics); the second request then runs after the first and sees a changed turn, so it is refused. Listeners are called after the lock is released, so a slow or buggy view cannot block the game or cause a deadlock by calling back into the model. A listener should treat the game it receives as a snapshot to read, not as a lock holder.
+Undo and redo. History is a stack of moves; undo pops one. The status is not stored in the history: undo sets it back to IN_PROGRESS, because a finished game can only have ended with its last move. Redo needs a second stack that any new move clears. The Memento pattern (a copy of the whole state before each move) is an alternative.
+Extensibility. Larger boards and other win lengths are constructor arguments. A third player needs Mark to grow and the turn rule to become "next in a list"; line checking works as before. A different rule set (the misere game, where making a line loses) is a WinRule strategy passed to the game. A new view is a new GameView. A new bot is a new Player and one line in the factory.
+Testing. Unit tests: a row, a column and both diagonals win; a full board with no line is a draw; a move out of turn, on a taken cell or after the end throws and leaves the board unchanged; undo restores the board and the turn, also after a win. Check the invariants after every move. A fuzz test (see fuzzing and property-based testing) plays 100,000 random games with fixed seeds on sizes 3 to 7 and asserts the invariants at every step. On the 3 by 3 board random play ends with X winning about 58 percent, O about 29 percent and a draw about 13 percent, a good smoke test of the whole rule set. The minimax bot must never lose to the random bot. Bots get a seeded generator and a human is a scripted fake, so no test needs a screen.
+tradeoffs: Scan from the last move or keep counters? Choose the scan from the last move when the win length can be smaller than the board size (gomoku-like rules) and you want one simple code path. Choose per-line counters when it is strictly n in a row and you need O(1), for example in a very large number of simulated games for a bot.
+Enum status or State classes? Choose an enum with the turn as data when states have no own behavior, as here. Choose State classes when each state has its own rules for the same event, such as lobby, playing, paused and finished in an online game.
+Undo with a move stack or with snapshots? Choose a move stack (Command) when undo is just the reverse of a move and memory matters. Choose snapshots (Memento) when moves have side effects that are hard to reverse, or when you want cheap branching in a search tree.
+Exact search or sampling? Choose minimax with alpha-beta for the 3 by 3 game and similar small games: it is exact, and the whole tree is searchable. Choose Monte Carlo tree search or a heuristic with a depth limit when the board is large and the tree explodes; you accept a move that is good but not proven best.
+failures: Invalid moves. A cell outside the board, a taken cell, a move out of turn, and a move after the game ended each throw an exception with a clear message, and the board, turn and history stay unchanged. The checks run before any write.
+Invalid configuration. A board of size zero, a win length of zero, or a win length bigger than the size is refused in the constructor, because such a game could never be won (or would be won at once).
+Undo problems. Undo on an empty history is refused. Undo while a bot is thinking can race with its answer: the controller must ignore a bot move that was computed for an older position, for example by comparing the history size when the move was requested and when it arrived.
+Bot problems. A bot that returns an illegal move, or takes too long, is a fault of the bot: the controller either asks again a limited number of times or applies a fallback (a random legal move), and logs it. Never let a bot bypass the checks in play.
+Network. A move that arrives twice (a retry) is rejected the second time because the turn has changed; a move number in the request lets the server tell a retry from a new move. Listener failures are caught per listener, so one broken view does not stop the others.
+evolution: Bigger and different games. The same model with a size of 15 and a win length of 5 is gomoku; Connect Four adds gravity, so a move names only a column and the row is computed, which fits as a MoveRule strategy. Ultimate tic-tac-toe is a game inside a game, where each cell of the outer board holds an inner Game and the last move decides which inner board is playable.
+Online play. The server holds a map from game id to Game, authenticates each move, and broadcasts changes through GameView implementations that write to sockets. The synchronized play method already gives one move at a time.
+Persistence and replay. Store the list of moves with the seed of each bot. A game is then fully reproducible, and a replay viewer just feeds the moves to a fresh model.
+followups: How do you split the problem into classes? || Model: Game (board, turn, status), Mark and Move values. Rules live inside the model. Players choose moves behind a Player interface. A controller runs the loop. Views observe the model. This is Model-View-Controller with Strategy for players and Observer for views.
+How do you check for a win efficiently? || Look only at the cell just played: count equal marks both ways on each of the 4 lines through it and compare with the win length. That is O(k). For strict n in a row, keep one counter per row, column and the two diagonals and test for n in O(1). The counter trick fails when k is smaller than n.
+How do you add a perfect computer opponent? || Implement Player with minimax or negamax: score +1, 0, -1 for win, draw, loss and pick the move with the best score for the player to move. For 3 by 3 the full tree has 549,946 nodes, and alpha-beta plus memoization makes it instant. The result is a draw with best play.
+How do you handle two clients moving at the same time? || The game state is shared, and "check turn and cell, then write and flip turn" must be atomic, so play is synchronized (or the game runs on a single-threaded executor). The second request sees the new turn and is rejected. Add a move number so a retry is not mistaken for a new move.
+How do you implement undo? || Keep a stack of moves (Command). Undo pops a move, clears the cell, resets status to IN_PROGRESS and gives the turn back to the player who made the move. Redo needs a second stack cleared by any new move. Snapshots (Memento) are an alternative.
+How do you test a bot that uses randomness? || Give it its own seeded random generator, so a game can be replayed from the seed. Test properties over many games: it never plays an illegal move, and the minimax bot never loses. Use a fuzz test with the invariants checked after every move.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson, Vlissides, 1994 |
+ref: book | Head First Design Patterns, 2nd edition | Eric Freeman, Elisabeth Robson, 2020 |
+ref: book | Artificial Intelligence: A Modern Approach (adversarial search) | Stuart Russell, Peter Norvig, 2020 |
+ref: docs | Observer pattern | refactoring.guru | https://refactoring.guru/design-patterns/observer
+
+@@ blackjack
+title: Design a blackjack game
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, randalgo, prng, probability, montecarlo, automata, dst, ledger, fuzzing
+summary: Blackjack is a card game between players and a dealer. Each side tries to get a hand total closer to 21 than the dealer without going over. The model is small (cards, shoe, hand, player, dealer), but it carries several classic object-oriented design questions. How do you count a hand when an ace can be 1 or 11? How do you shuffle fairly, and test code that depends on randomness? How do you model a round with phases and per-hand actions such as hit, stand, double down and split, so that illegal actions are impossible? How do you keep the rules (dealer hits on soft 17, payout 3 to 2 or 6 to 5) out of the engine so that tables can differ? And how do you account for chips so that none are created or lost? We design a table with several seats that plays rounds against one dealer.
+requirements: Functional requirements. A table has a shoe of several decks and up to 7 seats. A round has these steps: each player places a bet; the dealer deals two cards to each player and two to itself (one face up); players act in turn; the dealer plays by a fixed rule; each hand is settled. Player actions are hit, stand, double down (double the bet, take exactly one card) and split (two cards of the same rank become two hands with the same bet each). A natural blackjack (an ace and a ten-value card as the first two cards) pays 3 to 2 unless the table says 6 to 5. A hand over 21 is bust. The shoe is reshuffled when a cut card is reached. Insurance and surrender are optional extras.
+Non-functional requirements. Fairness: the shuffle is uniform. Rules are configuration: dealer stands or hits on soft 17, payout ratio, number of decks, penetration, split limits. Accounting: chips are whole numbers, and a round never creates or destroys chips. Testability: a test supplies a fixed card order or a seeded random generator and gets the same round every time. Extensibility: new player types (human, basic-strategy bot, card counter) and new side bets must not change the engine. Thread safety: players on different tables never block each other.
+Assumptions. Chips are integers. The dealer peeks for a natural when the face-up card is an ace or ten-value. A split hand that reaches 21 is not a natural. Split aces receive one card each. At most 4 hands per player. Money, accounts and the network layer are outside this design.
+estimates: Scale does not decide the design. A 6-deck shoe holds 312 cards; because cards are immutable and only 52 different ones exist, the shoe can hold references to 52 shared objects (the Flyweight idea), about 2.5 KB per table. A server with 10,000 tables then uses roughly 25 MB for shoes. A round takes 30 to 60 seconds when people act, so event rates are low. For a simulation by a bot the speed matters: a round is a few hundred nanoseconds of work, so one core can play many millions of rounds per second. That makes Monte Carlo testing cheap.
+api: The engine is a Table. It receives player actions and publishes events. Players are strategies; views are observers.
+```java
+public interface Table {
+  void sit(String playerId, int seat);
+  void bet(String playerId, long chips);
+  void act(String playerId, Action action);   // on your turn only
+  Phase phase();
+}
+
+public enum Action { HIT, STAND, DOUBLE, SPLIT }
+public enum Phase { BETTING, DEALING, PLAYERS, DEALER, SETTLING }
+```
+A bot or a human interface makes the decision; an event listener sees everything that happens.
+```java
+public interface PlayerStrategy {
+  Action decide(Hand hand, Card dealerUpcard, Set<Action> allowed);
+}
+
+public interface TableListener {
+  void onEvent(TableEvent event);   // dealt, acted, settled, shuffled
+}
+
+public interface Wallet {
+  void debit(String playerId, long chips, String ref);
+  void credit(String playerId, long chips, String ref);
+}
+```
+datamodel: Rank and Suit are enums. A Rank holds its points, with the ace as 1. Card is an immutable record of rank and suit, and only 52 instances exist. Hand holds a list of cards, the bet, a flag for "from split" and a status. Shoe holds the list of cards in dealing order, the number of decks and the cut position. A Seat holds a player and one or more hands (more than one after a split). Rules is an immutable configuration object: dealer rule, payout ratio, decks, penetration, split limit.
+Hand value. The hard total counts every ace as 1. If the hand has an ace and hard plus 10 is at most 21, the total is hard plus 10 and the hand is soft. Only one ace can count as 11, because two would give 22. Ace and king is 21 (soft); ace, ace, nine is 21 (soft); ace, six, king is 17 (hard).
+State machine of a round. The phases are BETTING, DEALING, PLAYERS, DEALER and SETTLING, then back to BETTING. In BETTING only bets are accepted. DEALING gives two cards each; if the dealer has a natural, the round skips to SETTLING. In PLAYERS the turn pointer moves from seat to seat and from hand to hand. In DEALER the dealer draws by its rule. Each hand has its own small state: ACTIVE, STOOD, BUST, BLACKJACK, DOUBLED. A hand leaves ACTIVE by standing, going bust, doubling (it gets one card and is done) or being a natural. The round moves to DEALER when no hand is ACTIVE. The set of allowed actions is a function of the phase and the hand: double and split are allowed only with exactly two cards, split only for a pair, and only while the split limit and the player's chips allow it. These are the transitions of a finite automaton (see finite automata), and any other input is rejected.
+Chip accounting. The wallet is a ledger: each change carries a reference such as "round 812, seat 3, bet". A bet is debited when placed, a double or split debits again, and at settlement the player gets the stake back plus the net win. After each round the sum of all wallet changes plus the house balance is zero (see double-entry ledgers).
+design: Classes and jobs. Card, Rank, Suit are values. Shoe deals cards and shuffles. Hand knows its totals. Rules holds the table's choices. Table is the engine and state machine. Seat and Player represent who plays. PlayerStrategy chooses actions for bots. TableListener sees events. Wallet moves chips.
+Round flow. Step 1: in BETTING, each seat calls bet; the table debits the wallet and stores the bet. Step 2: DEALING; the shoe gives one card to each hand, one to the dealer, a second to each hand and a second (hidden) one to the dealer. If the face-up card is an ace or ten-value, the dealer peeks for a natural. Step 3: PLAYERS; for the active hand the table computes the allowed actions and waits for act(). HIT draws a card, and the hand is bust if the hard total is over 21. STAND ends the hand. DOUBLE debits the bet again, draws one card and ends the hand. SPLIT makes two hands with one card each and a new bet, and draws a second card for each. Step 4: DEALER; if every player hand is bust, the dealer does not draw; otherwise it draws while rules.dealerHits(hand) is true. Step 5: SETTLING; rules.settle gives the net chips for each hand and the wallet is credited. Step 6: if the cut card was reached, the shoe is reshuffled before the next round, never in the middle of one.
+Why a state machine. Without it the game is a pile of flags and every action checks ten conditions. With a phase and a per-hand status, one function allowed(hand, phase) returns the set of legal actions. The engine checks against it, and the bot receives the same set, so a bot can never propose an illegal move.
+Shuffling. Fisher-Yates walks from the last position to the first and swaps each card with a uniformly chosen card at or before it. Every one of the n factorial orders is equally likely (see randomized algorithms). The tempting wrong version swaps each position with a random position anywhere in the array: it has n to the power n equally likely paths, which cannot be divided evenly over n factorial orders. We measured it on 3 cards, 600,000 times: Fisher-Yates gave each of the 6 orders about 100,000 times; the naive version gave three orders about 88,700 times and three about 111,300 times. Real money needs a secure random source: a 48-bit seed, as in java.util.Random, reaches only 2 to the power 48 orders, while a deck has about 8 times 10 to the power 67 (see pseudorandom generators). So the Shoe takes a RandomGenerator: production passes SecureRandom, tests pass a seeded one.
+Patterns and why. State: the round phases and the hand status. Strategy: PlayerStrategy (human, basic-strategy bot, counter) and the rule objects (dealer rule, payout) are interchangeable parts. Observer: TableListener sends events to UI, logs and statistics without the engine knowing them. Command: an Action with a player id is a small request that can be logged and replayed. Flyweight: the 52 shared cards. Rules is built by name, for example Rules.S17_3_2.
+The core code below holds the card model, hand values, the shuffling shoe and the rule object with settlement.
+```java
+public enum Suit { CLUBS, DIAMONDS, HEARTS, SPADES }
+
+public enum Rank {
+  ACE(1), TWO(2), THREE(3), FOUR(4), FIVE(5), SIX(6), SEVEN(7),
+  EIGHT(8), NINE(9), TEN(10), JACK(10), QUEEN(10), KING(10);
+  final int points;                       // ace counts 1 here
+  Rank(int points) { this.points = points; }
+}
+
+public record Card(Rank rank, Suit suit) { }
+
+public final class Hand {
+  private final List<Card> cards = new ArrayList<>();
+  private final boolean fromSplit;        // 21 after a split is not BJ
+  public Hand(boolean fromSplit) { this.fromSplit = fromSplit; }
+
+  public void add(Card c) { cards.add(c); }
+  public int hard() {
+    return cards.stream().mapToInt(c -> c.rank().points).sum();
+  }
+  public int total() {                    // one ace may count 11
+    boolean ace = cards.stream().anyMatch(c -> c.rank() == Rank.ACE);
+    return ace && hard() + 10 <= 21 ? hard() + 10 : hard();
+  }
+  public boolean isSoft() { return total() != hard(); }
+  public boolean isBust() { return hard() > 21; }
+  public boolean isBlackjack() {
+    return !fromSplit && cards.size() == 2 && total() == 21;
+  }
+}
+
+public final class Shoe {
+  private static final List<Card> DECK = Arrays.stream(Suit.values())
+      .flatMap(s -> Arrays.stream(Rank.values())
+          .map(r -> new Card(r, s)))
+      .toList();                          // 52 shared, immutable cards
+  private final List<Card> cards = new ArrayList<>();   // top = end
+  private final int decks, cutAt;
+  private final RandomGenerator rng;      // seeded in tests
+
+  public Shoe(int decks, double penetration, RandomGenerator rng) {
+    this.decks = decks;
+    this.rng = rng;
+    this.cutAt = (int) (52 * decks * (1 - penetration));
+    shuffle();
+  }
+  public void shuffle() {                 // fresh decks + Fisher-Yates
+    cards.clear();
+    for (int d = 0; d < decks; d++) cards.addAll(DECK);
+    for (int i = cards.size() - 1; i > 0; i--)
+      Collections.swap(cards, i, rng.nextInt(i + 1));
+  }
+  public Card draw() { return cards.remove(cards.size() - 1); }
+  public boolean needsShuffle() { return cards.size() <= cutAt; }
+}
+
+public record Rules(Predicate<Hand> dealerHits, int bjNum, int bjDen) {
+  public static final Rules S17_3_2 =
+      new Rules(h -> h.total() < 17, 3, 2);
+  public static final Rules H17_6_5 = new Rules(
+      h -> h.total() < 17 || (h.total() == 17 && h.isSoft()), 6, 5);
+
+  /** Net chips for the player: + won, - lost, 0 push. */
+  public long settle(Hand p, Hand d, long bet) {
+    if (p.isBust()) return -bet;
+    if (p.isBlackjack() && !d.isBlackjack()) return bet * bjNum / bjDen;
+    if (d.isBlackjack()) return p.isBlackjack() ? 0 : -bet;
+    if (d.isBust() || p.total() > d.total()) return bet;
+    return p.total() == d.total() ? 0 : -bet;
+  }
+}
+```
+diagram:
+  +----------------------------------------------------------+
+  | Table (engine, state machine)       phase, turn pointer  |
+  | sit() bet() act()        BETTING>DEALING>PLAYERS>DEALER  |
+  +--+----------+-----------+-----------+----------+---------+
+     | has      | has       | uses      | uses     | notifies
+     v          v           v           v          v
+  +--------+ +--------+ +--------+ +---------+ +---------------+
+  | Shoe   | | Seat   | | Rules  | | Wallet  | | TableListener |
+  | draw() | | player | | dealer | | debit() | | onEvent()     |
+  | shuffle| | hands  | | payout | | credit()| +---------------+
+  +---+----+ +---+----+ | settle | +---------+
+      |          |      +--------+
+      v          v
+  +--------+ +--------+     +---------------------------+
+  | Card * | | Hand   |     | <<interface>>             |
+  | rank   | | cards  |     | PlayerStrategy            |
+  | suit   | | total()|     | decide(hand, upcard, set) |
+  +--------+ | soft?  |     +------------+--------------+
+             +--------+          ^ is-a   |
+                          Human  BasicStrategyBot  CounterBot
+deepdive: Randomness and testing. All randomness enters through one RandomGenerator given to the Shoe. In tests, a seeded generator gives the same shoe every run, so a failing round can be replayed exactly from the seed and the list of actions. For rules tests, use an even simpler tool: a Shoe built from a fixed list of cards ("ace, king, ten, six, five...") so that the test says exactly which cards come out. This idea, that all non-determinism comes from injected sources so that a run can be replayed, is the basis of deterministic simulation testing. Log the seed and the actions of every round; a dispute is then settled by replay.
+Monte Carlo checks. Because a round costs under a microsecond, we can test the whole engine by simulation (see Monte Carlo methods and probability). In our run of 1,000,000 dealer hands with 6 decks and the dealer standing on all 17, the dealer went bust in about 28 percent of the hands. A player who copies the dealer (hit below 17, never double or split) lost about 5.6 percent of the money bet, while a basic-strategy player loses only about half a percent under common rules. A result far from the known values means a bug in the rules or the shuffle.
+Concurrency. A table's state (shoe, hands, phase, turn pointer) is shared by the players' threads, but only the player whose turn it is may act, and a timer can force a stand. We guard the table with one lock (synchronized, see locks and atomics) or run each table on a single-threaded executor, which gives a total order of events with no locks in the logic. Different tables share nothing, so they never wait for each other. A wallet is the only cross-table object. Debit and credit are atomic on one balance (an atomic long, or a database row with a conditional update "balance >= amount"), and no operation changes two wallets at once, so there is no lock-ordering problem. Each wallet call carries a reference such as round id and seat, so a retry after a timeout does not debit twice.
+Timeouts and turns. A player who does not act in 30 seconds is stood automatically. The timer sends an event into the same queue as the actions, so a late action and the timeout cannot both apply: the first changes the hand status, and the second finds the hand no longer ACTIVE and is rejected.
+Extensibility. New rules are Rules values and need no subclass. A new payout (6 to 5, a bonus for three sevens) is a payout rule object. Side bets (pairs, 21+3) are objects that look at the first cards and settle on their own. A new bot is a PlayerStrategy; a card counter also listens to the TableListener events and keeps a running count. The engine does not change.
+Testing. Unit tests for Hand: ace and king, ace ace nine, ace six king, a bust, a split 21 that is not a natural. Settlement tests: every pairing of player result (bust, 20, natural) with dealer result (bust, 20, natural), with a bet of 10. Engine tests with a fixed card list: natural against natural pays nothing, split aces get one card, double ends the hand, the dealer does not draw when all players are bust, reshuffle happens only between rounds, an action out of turn is rejected. A fuzz test (see fuzzing and property-based testing) plays thousands of rounds with random legal actions and checks after each round that the chips balance.
+tradeoffs: Enum phase or State classes? Choose an enum phase plus a per-hand status when each state mostly decides which actions are allowed, as here; it fits on one page and is easy to test. Choose State classes when each phase has long logic of its own, such as a casino that adds insurance, side bets and a jackpot phase.
+Rules as subclasses or as values? Choose a Rules value object (dealer rule, payout, decks, penetration) when tables differ in parameters, which is the normal case. Choose subclasses of the engine only when a variant changes the flow, such as Spanish 21 or a game with a different phase order.
+Reshuffle at a cut card or after every round? Choose a cut card at about 75 percent penetration for a realistic game. Choose a reshuffle every round, which acts like a continuous shuffling machine, for online play where card counting must be impossible; it costs a shuffle of 312 cards per round, still microseconds.
+Seeded or secure randomness? Choose a seeded generator for tests, simulations and replays. Choose a secure generator for real money and log each shoe so that the order can be audited. Never use the time of day as the seed for real play.
+failures: Invalid actions. An action out of turn, in the wrong phase, double with three cards, split of two different ranks, or any action when the player lacks chips is rejected with an error and changes nothing. The allowed set is computed once and used for both the check and the bot.
+Invalid bets. A bet of zero, below the table minimum, above the maximum, or more than the wallet holds is rejected. With a 3 to 2 payout, odd bets would need half chips, so the table requires multiples of 2.
+Shoe problems. If the shoe runs out in the middle of a round (many splits at the end), the table reshuffles the used cards and continues. The cut card makes this rare, but the code handles it.
+Wallet failures. If a debit fails, the bet is not accepted. If a credit fails after settlement, the round is stored as "settled, unpaid" and a retry with the same reference completes it without a double credit.
+evolution: Insurance and surrender. Insurance is a side bet of half the stake, offered when the dealer shows an ace, paying 2 to 1; it adds one optional phase (INSURANCE) and one settlement rule. Surrender is one more Action that ends the hand and returns half the bet.
+Multiplayer and online. Each table runs as an actor with its own queue; a lobby service creates tables; the wallet becomes a service with idempotent debits. Players join and leave between rounds. Events go to clients through the TableListener, with hidden cards removed before sending.
+followups: How do you compute a hand value with aces? || Count every ace as 1 to get the hard total. If there is at least one ace and hard plus 10 is at most 21, the total is hard plus 10 and the hand is soft. Only one ace can be an 11. A bust is judged on the hard total.
+How do you shuffle fairly, and what is the common mistake? || Use Fisher-Yates: for i from the last index down to 1, swap position i with a uniform random position from 0 to i. The mistake is swapping with a random position in the whole array, which gives n to the power n paths and a biased result. Use a secure generator for money, because a small seed cannot reach all 52 factorial orders.
+How do you test code that depends on random cards? || Inject the randomness. For rule tests build a Shoe with a fixed list of cards. For statistics use a seeded generator and a large number of rounds, then compare with known values such as the dealer bust rate of about 28 percent. Log seeds so that any failing round can be replayed.
+How do you stop illegal actions like doubling after a hit? || Compute the set of allowed actions from the phase and the hand (card count, pair, chips, split limit) in one place. The engine checks the action against the set, and a bot receives the same set. A state machine per round and per hand keeps this logic small.
+How do you keep the chips correct? || Treat the wallet as a ledger. Debit on bet, double and split, credit at settlement, always with a reference such as round and seat. Debit and credit are atomic and idempotent by reference. After every round the sum of changes plus the house balance is zero, and a test asserts it.
+Two players act at the same time on one table. What happens? || A table processes events one at a time, with a lock or a single-threaded executor. Only the player at the turn pointer may act; the other action is rejected. Tables are independent, so they run in parallel. Timeouts go through the same queue.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson, Vlissides, 1994 |
+ref: book | The Art of Computer Programming, Volume 2 (random numbers, shuffling) | Donald Knuth, 1997 |
+ref: book | Head First Design Patterns, 2nd edition | Eric Freeman, Elisabeth Robson, 2020 |
+ref: docs | State pattern | refactoring.guru | https://refactoring.guru/design-patterns/state
+
+@@ atm
+title: Design an ATM system
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, automata, ledger, locks, acid, idempotence, outbox, pwhash, authn, wal, circuitbreaker
+summary: An ATM lets a customer insert a card, prove who they are with a PIN, and then check a balance, withdraw cash or deposit money. As an object-oriented problem it has two layers. The first is the machine: a session state machine, hardware devices (card reader, keypad, cash dispenser, printer) behind interfaces, and transaction types that can grow. The second is the contract with the bank, where the real difficulty hides. Between "the bank debited the account" and "the notes are in the customer's hand" there is a network call, a mechanical device and a possible power cut. The design must make sure that cash never leaves without a debit, a debit never stays without cash, and a retry never repeats either. We also look at PIN security, concurrent access to one account from two places, and how to plan which notes to pay.
+requirements: Functional requirements. Insert a card; enter a PIN with at most 3 attempts, after which the card is kept. Then choose: balance inquiry, cash withdrawal, cash deposit, and optionally a transfer. A withdrawal is in multiples of the smallest note, within a per-transaction limit and a daily limit. The machine pays the notes, prints a receipt on request and returns the card. If the customer does nothing for 30 seconds, the card is returned. An operator can load cash and collect deposits. Every step is written to an audit journal.
+Non-functional requirements. Money safety comes first: no cash without a debit, no debit without cash or a reversal. Idempotence: a repeated message to the bank never changes the account twice. Security: the PIN is never visible in clear text in software, logs or storage. Testability: hardware and bank are interfaces with fakes, including fakes that fail. Extensibility: a new transaction type, note set or device is a new class. Availability: if the bank is unreachable the machine says so and does not guess.
+Assumptions. The ATM and the bank talk over an authenticated, encrypted channel. The keypad is a secure device that encrypts the PIN inside the hardware, so the software holds only an encrypted PIN block. Amounts are whole minor units. One customer at a time. The bank enforces balance and limits; the ATM checks them only to help the user.
+estimates: The machine is tiny: a session lasts one or two minutes, and four cassettes hold about 2,000 notes each. The numbers that matter are on the bank side. A network of 10,000 ATMs with 300 transactions each per day is 3 million a day, about 35 per second on average and a few hundred per second at peak (salary day, evenings). That is easy for a database, so correctness, not speed, is the hard part. Each ATM sends only a few messages per session, so the journal and the retry queue stay small.
+api: The ATM receives events from the keypad, the card reader and a timer, and calls three outside interfaces: the bank, the hardware and a durable journal. Events and states are plain immutable values.
+```java
+public interface Bank {                      // remote, may time out
+  boolean verifyPin(String card, String encryptedPin);
+  boolean debit(String txn, String card, long cents)
+      throws TimeoutException;               // idempotent by txn id
+  void reverse(String txn);                  // idempotent too
+}
+
+public interface Hardware {
+  void dispense(Map<Integer, Integer> notes) throws IOException;
+  void eject(boolean keepCard);
+}
+```
+Transactions are commands, so a new kind is a new class and no old class changes. A planner decides which notes to pay.
+```java
+public interface Transaction {
+  Result execute(Session session);          // validate, bank, hardware
+}
+
+public interface Planner {
+  Optional<Map<Integer, Integer>> plan(long cents,
+                                       Map<Integer, Integer> stock);
+}
+```
+datamodel: ATM side: State is one of Idle, AwaitPin (with the card and the number of tries), Menu (with the card) and OutOfService (with a reason). Cassette stock is a map from note value to count. The journal is an append-only file of (transaction id, step) lines, written to disk before the step it announces. Steps are DEBIT_SENT, DISPENSING, REVERSE_DUE and DONE. The card number is kept only in the session and is masked in logs.
+Bank side: Account (id, balance, daily limit, used today) and LedgerEntry (transaction id, account, signed amount, kind, time). A cash withdrawal writes two entries with the same transaction id: minus on the customer's account, plus on the bank's "cash in ATMs" account. Together they sum to zero, which is the rule of a double-entry ledger. A reversal writes the opposite two entries and a mark on the transaction id, so a debit message that arrives late is refused. A unique key on (transaction id, kind) is what makes repeated messages harmless.
+State machine of a session. IDLE: a card is inserted, go to AWAIT_PIN with tries 0. AWAIT_PIN: a correct PIN goes to MENU; a wrong PIN with fewer than 3 tries stays with tries plus 1; the third wrong PIN keeps the card and goes to IDLE; cancel or timeout ejects the card and goes to IDLE. MENU: a withdrawal runs and returns to MENU; cancel or timeout ejects the card and goes to IDLE; a dispenser jam goes to OUT_OF_SERVICE. OUT_OF_SERVICE: all customer events are ignored until a technician resets the machine. This is a finite automaton (see finite automata) whose states carry data, which is why we model states as immutable records.
+design: Classes and jobs. Atm is the context and owns the current state. State records hold the data of a state. Event records are inputs. Bank is a client for the bank host. Hardware wraps the devices. Journal is the durable log. Planner chooses notes. Transaction types (Withdrawal, Deposit, BalanceInquiry) are commands that run in the MENU state.
+Withdrawal flow, step by step. Step 1: the customer types an amount. Step 2: the planner checks that the cassettes can pay it with the notes in stock; if not, the machine says so and nothing else happens. Step 3: the ATM writes DEBIT_SENT to the journal, then asks the bank to debit, using a fresh transaction id. Step 4: if the bank declines (no funds, limit), the ATM records DONE and shows the reason. Step 5: if the bank accepts, the ATM writes DISPENSING and tells the hardware to dispense. Step 6: if the notes are presented, the ATM reduces its stock, writes DONE and prints the receipt. Step 7: if the dispenser fails, or if the bank call timed out, the ATM writes REVERSE_DUE. A recovery task, at boot and on a timer, sends reverse for each transaction in DEBIT_SENT or REVERSE_DUE state and writes DONE when the bank confirms. The order is the point: the journal entry comes before the action it describes, so after a crash we always know what might have happened (this is the write-ahead log idea).
+Why the debit comes before the cash. The reverse order (dispense first, then debit) fails badly: if the debit then fails, the bank has lost cash. With debit first, the worst case is a customer debited and not paid, and that is fixed by a reversal that we can always retry until it succeeds.
+Patterns and why. State: the session behavior depends on where we are; sealed interfaces and pattern matching make the compiler check that every state is handled. Command: each transaction type is an object with an execute method, so it can be logged, tested alone and added without touching the machine. Strategy: the Planner decides which notes to pay (greedy, balanced, minimum notes). Adapter: each hardware vendor gets an adapter behind Hardware. Proxy: a BankClient wrapper adds retries and a circuit breaker without changing the Bank interface. Observer: screen and audit log listen to events. Template Method: every Transaction follows the same skeleton (validate, authorize, perform, record).
+The core code shows the session state machine, the withdrawal with its journal and the recovery task.
+```java
+public final class Atm {
+  sealed interface State { }
+  record Idle() implements State { }
+  record AwaitPin(String card, int tries) implements State { }
+  record Menu(String card) implements State { }
+  record OutOfService(String why) implements State { }
+  sealed interface Event { }
+  record Insert(String card) implements Event { }
+  record EnterPin(String encryptedPin) implements Event { }
+  record Withdraw(long cents) implements Event { }
+  record Cancel() implements Event { }
+  public interface Bank {                   // all calls are remote
+    boolean verifyPin(String card, String encryptedPin);
+    boolean debit(String txn, String card, long cents)
+        throws TimeoutException;            // idempotent by txn id
+    void reverse(String txn);               // idempotent too
+  }
+  public interface Hardware {
+    void dispense(Map<Integer, Integer> notes) throws IOException;
+    void eject(boolean keepCard);
+  }
+  public interface Journal {                // durable, write-ahead
+    void append(String txn, String step);
+    List<String> toReverse();               // DEBIT_SENT, REVERSE_DUE
+  }
+  public interface Planner {                // which notes to pay
+    Optional<Map<Integer, Integer>> plan(long cents,
+                                         Map<Integer, Integer> stock);
+  }
+  private final Bank bank;  private final Hardware hw;
+  private final Journal journal;  private final Planner planner;
+  private final Map<Integer, Integer> notes;  // denomination -> count
+  private State state = new Idle();
+
+  public Atm(Bank b, Hardware h, Journal j, Planner p,
+             Map<Integer, Integer> notes) {
+    bank = b; hw = h; journal = j; planner = p; this.notes = notes;
+  }
+
+  public synchronized void handle(Event e) {
+    state = switch (state) {
+      case Idle i -> e instanceof Insert n
+          ? new AwaitPin(n.card(), 0) : i;
+      case AwaitPin a -> e instanceof EnterPin p
+          ? pin(a, p.encryptedPin())
+          : e instanceof Cancel ? eject(false) : a;
+      case Menu m -> e instanceof Withdraw w ? withdraw(m, w.cents())
+          : e instanceof Cancel ? eject(false) : m;
+      case OutOfService o -> o;             // only a technician leaves
+    };
+  }
+
+  private State eject(boolean keep) {
+    hw.eject(keep);
+    return new Idle();
+  }
+
+  private State pin(AwaitPin a, String enc) {
+    if (bank.verifyPin(a.card(), enc)) return new Menu(a.card());
+    return a.tries() < 2 ? new AwaitPin(a.card(), a.tries() + 1)
+                         : eject(true);     // 3rd wrong PIN: keep card
+  }
+
+  private State withdraw(Menu m, long cents) {
+    var plan = planner.plan(cents, notes);
+    if (plan.isEmpty()) return m;           // cannot pay this amount
+    String txn = UUID.randomUUID().toString();
+    journal.append(txn, "DEBIT_SENT");      // before the network call
+    try {
+      if (!bank.debit(txn, m.card(), cents)) {
+        journal.append(txn, "DONE");        // declined: nothing to undo
+        return m;
+      }
+      journal.append(txn, "DISPENSING");    // crash here: manual check
+      hw.dispense(plan.get());
+    } catch (TimeoutException | IOException ex) {
+      journal.append(txn, "REVERSE_DUE");   // outcome unknown: undo it
+      return ex instanceof IOException ? new OutOfService("jam") : m;
+    }
+    plan.get().forEach((d, n) -> notes.merge(d, -n, Integer::sum));
+    journal.append(txn, "DONE");
+    return m;
+  }
+  public synchronized void recover() {      // at boot and from a timer
+    for (String txn : journal.toReverse()) {
+      bank.reverse(txn);
+      journal.append(txn, "DONE");
+    }
+  }
+}
+```
+diagram:
+  keypad / card reader / timer  --events-->
+        |
+        v
+  +-------------------------------------------------------+
+  | Atm (context)  state: Idle|AwaitPin|Menu|OutOfService  |
+  | handle(event) [synchronized]      recover()           |
+  +----+----------+-----------+-----------+---------------+
+       | uses     | uses      | uses      | uses
+       v          v           v           v
+  +--------+ +----------+ +---------+ +----------------+
+  | Bank   | | Hardware | | Journal | | Planner        |
+  | verify | | dispense | | append  | | plan(cents,    |
+  | debit  | | eject    | | toRever.| |      stock)    |
+  | reverse| +----+-----+ +----+----+ +-------+--------+
+  +---+----+      ^ is-a       |              ^ is-a
+      | via       VendorA..    v         Greedy  Balanced
+      v           (adapters)  disk file  (Strategy)
+  +---------------+
+  | BankClient    |  retries + circuit breaker (Proxy)
+  +-------+-------+
+          |  network
+          v
+  Bank host: Account, Ledger (debit + credit entries, one transaction)
+
+  Idle -insert-> AwaitPin -pin ok-> Menu -withdraw-> Menu
+  AwaitPin -3 wrong-> Idle (card kept)      Menu -jam-> OutOfService
+deepdive: Exactly once on an unreliable network. The ATM cannot get "exactly once" from the network, so it builds it from two parts: at-least-once delivery and idempotent handlers (see idempotence). Every message that changes money carries a transaction id made by the ATM. The bank stores the id with the result; a repeated debit with the same id returns the stored result and changes nothing. A reverse for an id that was never seen is recorded as a tombstone, so if the original debit arrives later (a delayed packet), it is refused. When the ATM cannot send a reversal now, it keeps it in the journal and retries until the bank confirms; this durable "to do" list is the outbox pattern. The only moment with no safe automatic answer is a crash after DISPENSING and before DONE: the notes may or may not have been presented. The dispenser keeps its own count, and the next service visit reconciles cassette counts against the journal; such cases are rare and go to a human.
+Concurrency on the ATM. One session, but three event sources: the keypad, the card reader and an idle timer. All go through handle, which is synchronized on the machine (see locks and atomics), so the state changes one event at a time. If the timer and a withdrawal arrive together, the lock decides: a timer that wins ejects the card, and the withdrawal then finds IDLE and is ignored. The bank call is made inside the lock, because the session can do nothing else while it waits; it has a timeout so the lock is never held for long.
+Concurrency on the account. The same account can be debited from two ATMs and from online banking at once. Reading the balance and then writing it is a lost-update bug. The debit must be one atomic check-and-change: UPDATE account SET balance = balance - :x, used_today = used_today + :x WHERE id = :id AND balance >= :x AND used_today + :x <= :limit, and the code checks that one row changed. Both ledger entries go in the same database transaction, so either both exist or neither (the atomicity and durability of ACID). For a transfer, lock the two rows in order of account id so that opposite transfers cannot deadlock.
+PIN security. The keypad encrypts the PIN inside a tamper-resistant module, so the ATM software, logs and journal never see it in clear. The bank verifies it in a hardware security module. PINs are not stored as plain hashes, because a 4-digit PIN has only 10,000 values and a leaked hash list would fall in a fraction of a second, even with a slow hash such as bcrypt (see password hashing). Safety comes from limiting online attempts (3 tries, then block) and from keys that never leave hardware. Card plus PIN is two factors, something you have and something you know (see authentication).
+Planning the notes. Greedy (largest note first) is right when stock is unlimited, but with limited stock it can fail where an answer exists, for example when the 500s run out. A bounded search over denominations, largest count first, finds an answer if one exists. A balanced planner prefers the cassette with more notes, and a cap of about 40 notes per withdrawal keeps the dispenser fast. The classic Chain of Responsibility (one handler per note) is just greedy and cannot back up. The plan is made before the debit, so the customer is never debited for an amount the machine cannot pay.
+Host failures. After several timeouts in a row, the BankClient opens a circuit breaker (see timeouts and circuit breakers): for a minute, new withdrawals are refused at once with a clear message instead of making each customer wait 30 seconds. It then lets one probe through and closes the breaker if it works.
+Extensibility. A new transaction (bill payment, mini statement) is a new Transaction class and a menu entry. A new note set is Planner configuration. A new device vendor is a new Hardware adapter. A one-time code from a phone for cardless withdrawal is a new state before MENU. None of these edit existing states.
+Testing. Fakes for Bank and Hardware fail on demand: timeout before the bank commits, timeout after it commits (the dangerous one), decline, jam, power loss. Unit tests: three wrong PINs keep the card; cancel ejects; a decline leaves stock and journal clean; a jam leaves REVERSE_DUE that recovery clears; recovery run twice sends the same reverse twice and the bank changes nothing the second time. Crash test: stop the machine after each journal step, restart, run recovery, and check that the customer debit equals the cash presented. Bank side: two threads withdraw from an account that holds enough for one, and exactly one succeeds; all ledger entries sum to zero.
+tradeoffs: Reverse on timeout or ask first? Choose to reverse at once (safe for any outcome, because reverse is idempotent) when the host has no way to look up a transaction. Choose "inquire, then reverse only if debited" when the host offers a status call and reversals are costly or visible to the customer.
+Sealed states with pattern matching, or an enum with methods? Choose sealed records when states carry data (the card, the number of tries) and you want the compiler to enforce that every state is handled. Choose an enum with a method per event, as in the vending machine design, when states carry no data.
+Bank-side limits or ATM-side limits? Choose the bank as the authority, because ATM software can be out of date and an attacker may control a machine. Keep ATM-side checks only to give fast feedback.
+Stand-in processing when the host is down? Choose to refuse withdrawals when the cost of a mistake is high or rules do not allow offline approval. Choose small offline withdrawals with strict limits and later settlement only when availability matters more than a little fraud risk; it needs a risk model and reconciliation.
+failures: Invalid input. A withdrawal of zero, a negative amount, an amount that is not a multiple of the smallest note, or one above the limit is refused before any bank call. Unknown events in a state are ignored, not errors.
+Network. Timeout before the bank processed the debit: reverse finds no debit and records a tombstone. Timeout after it processed: reverse undoes the debit. Both are covered by the same retry-until-confirmed reverse. A duplicate message is harmless because of the transaction id.
+Hardware. A jam or sensor error during dispensing moves to OUT_OF_SERVICE and schedules a reversal. Notes not taken by the customer are pulled back by the machine, and the journal records a reversal for them.
+Power loss. After reboot, the recovery task reads the journal and acts on the last step of each transaction. Steps that are unknown go to a human check.
+evolution: Deposits. A cash deposit is credited as "pending" until the notes are counted and verified, then confirmed or reversed. This is a second ledger state, and the Transaction class for deposits writes pending entries.
+Cardless withdrawal. The customer starts on a phone and gets a one-time code or QR. The ATM gets a new first state, AwaitCode, which leads to MENU with a limited set of operations. The rest of the machine is the same.
+Interbank network. When the card belongs to another bank, Bank becomes a switch that routes the message by card number range, over a financial message format such as ISO 8583. The ATM code and its idempotency rules do not change.
+followups: Why debit the account before dispensing cash? || If you dispense first and the debit then fails, the bank has lost money and cannot recover it. If you debit first and the dispenser fails, the customer is debited without cash, but that can be fixed by a reversal, which can be retried until it succeeds. So the safe order is debit, dispense, and reverse on failure.
+The bank call times out. How do you know whether the account was debited? || You do not, so you send a reversal with the same transaction id. The bank handles three cases: it debited (so it undoes the debit), it never saw the debit (so it records a tombstone and refuses a late debit), or it already reversed (so it does nothing). The reversal is idempotent and the ATM retries it from a durable journal until confirmed.
+What happens if the ATM loses power after the bank debited? || The journal has DEBIT_SENT, written before the network call. After reboot the recovery task reverses every transaction in that state. If the last step is DISPENSING, notes may have been presented, so the case goes to manual reconciliation using the dispenser counters and the cassette counts.
+Two ATMs withdraw from the same account at once. How do you prevent overdraft? || Make the check and the change one atomic statement at the bank: update the balance only where balance is at least the amount and the daily limit holds, then check that one row changed. Write both ledger entries in the same transaction. Do not read the balance first and write later.
+How would you store and check the PIN? || The ATM never sees the PIN in clear: the keypad encrypts it in hardware. The bank verifies it in a hardware security module and limits attempts to 3. Hashing a 4-digit PIN gives no safety because there are only 10,000 values, so protection comes from rate limits and keys that never leave hardware.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson, Vlissides, 1994 |
+ref: book | Designing Data-Intensive Applications (transactions, exactly-once) | Martin Kleppmann, 2017 |
+ref: book | Release It!, 2nd edition (circuit breaker, timeouts) | Michael Nygard, 2018 |
+ref: docs | Command pattern | refactoring.guru | https://refactoring.guru/design-patterns/command

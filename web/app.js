@@ -69,7 +69,7 @@ let SCENE_ALL = STANDALONE ? (DATA.scenes||[]) : null;
 const DESIGNS = (DATA.designs||[]).map(d=>{ if(d.rd && d.summary===undefined) d.summary=(d.rd.summary||[""])[0]; return d; });
 const DES = {}, DES_FULL = {}; DESIGNS.forEach(d=>{ DES[d.id]=d; if(d.rd) DES_FULL[d.id]=d; });
 const USES = {}; DESIGNS.forEach(d=>d.concepts.forEach(id=>{ if(N[id]) (USES[id]=USES[id]||[]).push(d.id); }));
-const DES_CATS = ["Web & product","Data & analytics","Infrastructure","Ads & media","AI & ML"];
+const DES_CATS = ["Web & product","Data & analytics","Infrastructure","Ads & media","AI & ML","Mobile","Object-oriented design"];
 const isDes = id => typeof id==="string" && id.startsWith("design/");
 const isJourney = t => /^what happens when/i.test(t.title);
 

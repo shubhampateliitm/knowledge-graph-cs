@@ -1,0 +1,744 @@
+@@ image-captioning
+title: Design image captioning
+category: AI & ML
+level: Senior / Staff
+concepts: multimodal, contrastive, attention, cv, decoding, evals, embeddings, llm
+summary: Image captioning turns a picture into a short sentence such as "Two children flying a red kite on a beach". We build it for a photo-sharing platform. The captions have two jobs: alt text for blind and low-vision users who use screen readers, and searchable text for the photo library. This is a multimodal problem: a vision model must understand pixels, and a language model must write fluent text that is true. What makes it hard is not speed, because a caption costs a few milliseconds of GPU time. The hard parts are truthfulness (the model must not invent objects), usefulness (a generic caption like "a person standing" helps nobody), safe wording for people, and measuring quality when many different captions are all correct. We design the full path: data, model, training, serving, evaluation and monitoring.
+requirements: Functional requirements. For each uploaded image the system produces a short caption of at most 20 words and, on request, a detailed caption of 2 to 3 sentences. Captions are written in the language of the user's account (start with 10 languages). Captions are stored with the image, shown as alt text in the apps, and indexed for search. A user can edit a caption, and a human-written caption always wins over a model caption. Old images are captioned once in a backfill. When we ship a better model, we can re-caption selected images.
+Quality requirements. Offline: CIDEr and SPICE on a standard benchmark (COCO test split, nocaps) to track research progress, and an object hallucination rate (the share of captions that name an object that is not in the image) on 2,000 images sampled from our own platform and labeled by people. Targets: hallucinated objects in under 3 percent of captions, and at least 85 percent of captions rated "accurate and useful" by trained raters. Online: the rate at which blind users edit or flag a caption, the share of images with a caption, and the click-through of caption-based search.
+Non-functional requirements. A new upload must have a caption within 5 seconds at p99, but the upload itself never waits for the caption (the work is asynchronous). Availability: if the captioner is down, uploads still work and the caption appears later. Cost: under 0.1 cent per image. Safety: the caption must not guess sensitive traits such as race, religion or health from a face. It must not repeat abusive text found in the image. Privacy: images are processed inside our own cloud and are not sent to a third party.
+Assumptions. 200 million new images per day. A backlog of 2 billion old images. About 20 percent of uploads are exact copies of images we already know (re-shares and re-uploads). Every image already has a 640 pixel rendition made by the upload pipeline.
+estimates: Average load. 200 million images per day divided by 86,400 seconds is about 2,300 images per second. Peak is about 3 times the average, so 7,000 per second. After the exact-copy cache removes 20 percent, the model sees about 5,600 per second at peak.
+Compute per image. The vision encoder is a ViT-L/14 at 224 pixels: 16 x 16 = 256 patches plus one class token, so 257 tokens, and about 80 GFLOPs per image. A connector turns these into 32 visual tokens. The language decoder has 1 billion parameters. Reading 32 visual tokens and a short prompt (about 40 tokens) costs 2 x 1e9 x 40 = 80 GFLOPs. Writing 20 tokens one by one costs 2 x 1e9 x 20 = 40 GFLOPs. A GPU with about 100 TFLOPs of real throughput (a fraction of its peak) encodes in 80e9 / 100e12 = 0.8 ms and reads the prompt in 0.8 ms. Writing is limited by memory, not by math: each step must read all 2 GB of weights (1 billion parameters in 16 bits). At 2 TB/s of memory bandwidth that is 1 ms per step. A batch of 64 images shares the same weight read, so 20 steps take about 25 ms for 64 images, which is 0.4 ms per image. Total per image: 0.8 + 0.8 + 0.4 = 2 ms of GPU time, so one GPU does about 500 images per second.
+GPU count. 5,600 per second at peak divided by 500 is about 11 GPUs. We want 50 percent headroom, zone redundancy and room for the long caption mode, so we run 32 GPUs. Backfill: 2 billion images at 500 per second per GPU is 4 million GPU-seconds, about 1,100 GPU-hours. At roughly 2.5 dollars per GPU-hour this is under 3,000 dollars. Captioning is cheap. Steady state cost: 32 GPUs x 24 hours x 2.5 dollars is about 1,900 dollars per day for 200 million images, which is 0.001 cent per image, 100 times below the budget.
+The real bottleneck is the CPU. Decoding a 12-megapixel JPEG takes about 60 ms of one core. At 5,600 per second that is 336 cores for decoding alone. Decoding the 640 pixel rendition instead takes about 4 ms, so 5,600 x 4 ms is 22 cores. We read the rendition, not the original. This one choice saves more money than any model tuning.
+Training compute. Stage 1 trains only the connector on 100 million image-text pairs. Per sample: encoder forward 80 GFLOPs, plus decoder forward and backward on about 52 tokens, which is 3 x 2 x 1e9 x 52 = 312 GFLOPs. Total about 400 GFLOPs. For 100 million samples this is 4e19 FLOPs. On 64 GPUs at 100 TFLOPs each (6.4e15 per second) it takes 6,250 seconds, under 2 hours.
+api: POST /v1/captions with {asset_id, content_hash, lang, kind: "short" or "long"}. Called by the upload pipeline, not by apps. Returns 202 Accepted with a job id. The caption is delivered by an event, not by this response.
+GET /v1/assets/{asset_id}/caption?lang=en&kind=short returns {text, source: "model" or "human", model_version, confidence, updated_at}. The apps call this when they render an image without cached alt text. Responses carry an ETag and Cache-Control: max-age=3600, so the CDN serves most reads.
+PUT /v1/assets/{asset_id}/caption with {lang, text} stores a human edit. It sets source to "human" and blocks later model overwrites for that language.
+POST /v1/captions/feedback with {asset_id, lang, verdict: "good", "wrong", "offensive", "too_generic"}. This feeds the label queue for retraining.
+Internal call, captioner service (gRPC): Caption(images[], lang, kind, decode_params) returns captions[] with the token log-probabilities and a CLIP-style image-text score. The batch API lets the scheduler fill the GPU.
+datamodel: Captions are keyed by content, not by asset, so re-shared copies share work. Two tables in a sharded key-value or SQL store:
+```sql
+CREATE TABLE caption (
+  content_hash  BYTES(32),     -- SHA-256 of the image bytes
+  lang          TEXT,          -- 'en', 'hi', ...
+  kind          TEXT,          -- 'short' | 'long'
+  model_version TEXT,          -- e.g. 'cap-v7'
+  text          TEXT,
+  score         REAL,          -- image-text agreement, 0..1
+  flags         INT,           -- bit set: unsafe_text, low_score, ...
+  created_at    TIMESTAMP,
+  PRIMARY KEY (content_hash, lang, kind)
+);
+CREATE TABLE asset_caption_override (
+  asset_id BIGINT, lang TEXT, text TEXT, editor_id BIGINT,
+  PRIMARY KEY (asset_id, lang)
+);
+```
+The read path looks up the override first, then the model caption through the asset's content_hash. Partition key: content_hash (uniform, no hot spots). A secondary job table keeps the state of backfill batches. Image embeddings go to a vector index (approximate nearest neighbor search) with the asset id as payload. Search uses the caption text in an inverted index and the embedding for "find similar" queries.
+design: The path of a new image. The app uploads the file to object storage. The upload service verifies it, makes renditions (640 pixel and others) and publishes an "image created" event to a queue. A captioning worker consumes the event, computes the SHA-256 of the image, and checks the caption cache for (content_hash, lang, kind). A hit ends the job. A miss goes to the captioner. The captioner returns the text and a score. A post-filter checks the text. The result is written to the caption table and a "caption ready" event updates the search index and the asset metadata. The app shows the caption the next time it loads the image.
+The model has four parts. First, an image encoder, a Vision Transformer pretrained with contrastive learning (the CLIP recipe) on hundreds of millions of image-text pairs. Contrastive pretraining is the reason it works: the encoder was trained so that an image and its true caption land close together in one embedding space, so its features already carry the meaning that words describe. Second, a connector that compresses the 257 patch features into 32 visual tokens. We use a small Transformer with 32 learned query vectors that look at the patches through cross-attention, in the style of the Q-Former from BLIP-2. Third, the language decoder, a 1 billion parameter Transformer language model. The 32 visual tokens are placed in front of the text prompt as if they were words. Fourth, a decoding step that picks the words one by one.
+Why this design and not one big model trained from zero? The encoder and the decoder are each expensive to train and each already good. We freeze the encoder and train the connector on pair data (stage 1), then fine-tune the decoder with LoRA on a smaller set of high-quality captions (stage 2). A small adapter on a frozen pair of models needs hours of training, not months, and a new language or style is one more fine-tune.
+Batching and scheduling. A captioner replica gets requests from a queue. A dynamic batcher waits up to 10 ms or until 64 images are ready, whichever comes first, then runs one batch. The decoder uses a key-value cache so each new token costs one step. Short and long captions go to different pools, because a long caption of 80 tokens would hold a batch of short ones back (head-of-line blocking).
+Post-filtering. After decoding we compute the image-text score: the cosine similarity between the image embedding and the caption embedding, both from the contrastive model. If it is below a threshold, we publish a shorter, safer caption ("A photo of a beach") or none. A text classifier blocks unsafe words, and a word list enforces the wording rules for people.
+diagram:
+  app --upload--> [upload svc] --> object store (original + 640px)
+                       |
+                  "image created"
+                       v
+                  [queue / Kafka]
+                       |
+                       v
+  +-------------- caption worker ----------------+
+  | sha256 -> cache hit? --yes--> done           |
+  |     no                                       |
+  |     v                                        |
+  |  fetch 640px  (CPU decode, 4 ms)             |
+  +----------------------+-----------------------+
+                         | batch of 64
+                         v
+  +---------------- GPU captioner ---------------+
+  | ViT-L/14 -> connector (32 tokens) -> 1B LM   |
+  |                          beam search + KV    |
+  +----------------------+-----------------------+
+                         v
+        post-filter (score, safety) --> caption table
+                         |
+          "caption ready" event
+             |                     |
+             v                     v
+       search index          app / CDN (alt text)
+animation:
+== A user uploads a photo of a dog catching a frisbee in a park.
+  upload --> [object store]     640px rendition ready
+  queue: image created id=9917
+  worker : idle                 GPU : idle
+  cache  : (hash a41f) not found
+== The worker hashes the bytes. No cache entry, so it fetches the image.
+  upload --> [object store]
+  queue: -
+  worker : sha256=a41f, fetch    GPU : idle
+  cache  : miss -> need model
+== The worker sends the image to the batcher with 63 others.
+  upload --> [object store]
+  queue: -
+  worker : decode 640px (4 ms)   GPU : batch 64 filling
+  cache  : miss
+== The encoder makes 257 patch features; the connector keeps 32.
+  worker : -                     GPU : ViT-L/14 -> 32 visual tokens
+  tokens : [v1 v2 ... v32] + prompt "Describe the image briefly:"
+== The decoder writes the caption word by word, keeping 3 beams.
+  GPU : "A dog"  "A brown dog"  "A brown dog jumps"
+  step 3 of 12, key-value cache grows by 1 token per step
+== The best beam is "A brown dog jumps to catch a frisbee in a park".
+  GPU : done, 64 captions returned
+  score(image, caption) = 0.31 (above threshold 0.22)
+== The filter passes it. It is stored and the search index is updated.
+  caption table : (a41f, en, short) -> "A brown dog jumps ..."
+  event: caption ready -> search index, asset metadata, CDN
+deepdive: What the encoder gives, and the contrastive loss. A CLIP-style model has an image encoder and a text encoder. In a batch of N pairs, it computes all N x N cosine similarities and trains each image to pick its own caption among N candidates, and each caption to pick its own image. With temperature \( \tau \), the image-to-text loss is
+\[ \mathcal{L}_{i \to t} = -\frac{1}{N} \sum_{i=1}^{N} \log \frac{\exp(s_{ii}/\tau)}{\sum_{j=1}^{N} \exp(s_{ij}/\tau)} \]
+where \( s_{ij} \) is the cosine similarity between image i and text j. With batch size 32,768 the model sees 32,767 wrong captions for every right one, so it learns fine details (a "red kite" versus a "red balloon"). The embeddings it produces are the same ones we use at serving time to score the final caption, so the encoder pays for itself twice.
+The connector and attention. The patch features are many (257) and each is a 1,024-dimension vector. Feeding all of them to the decoder would make every caption cost 257 extra tokens of attention. The connector uses 32 learned queries. In each layer, the queries run self-attention among themselves and cross-attention to the patch features: query q asks "what in the image matters for the caption?" and takes a weighted sum of patch features. The cost of cross-attention is 32 x 257 = 8,224 scores per head, tiny compared to the encoder. The result is a fixed-size summary that the language model reads like a short prompt. A simpler design maps each patch with a linear layer (as in LLaVA), which keeps more detail but costs more tokens. For short captions 32 tokens are enough; for long, detailed captions and for reading small text in the image, we raise the image resolution and the token count.
+Decoding and the blandness problem. The decoder picks the next word from a probability list. Greedy decoding takes the top word each time and often gets stuck in repeats. Beam search keeps the best k partial captions (we use k = 3) and tends to produce safe, generic sentences, because short common phrases have a high total probability. "A man standing in a room" scores well and says almost nothing. Three fixes work together. A length penalty stops captions from being too short. Fine-tuning on human-written detailed captions moves the probability toward specific words. A reward-based stage (self-critical sequence training, which uses the CIDEr score as the reward, or preference tuning on pairs of good and bad captions) pushes toward informative captions. For the long mode we use nucleus sampling with p = 0.9 and temperature 0.7, then rerank 4 samples with the image-text score. The score of each sample is its agreement with the image, not its likelihood alone.
+Hallucination. The decoder is a language model. It likes plausible text, and a plausible sentence often contains objects that are not in the image ("a dog on a couch with a remote control"). Hallucination gets worse for rare scenes and for long captions. Our defenses are layered. At training time, we filter noisy web captions with an image-text matching model, and add synthetic captions that pass the same filter (the CapFilt idea from BLIP). At decoding time, we rerank by image-text score. After decoding, we run an open-vocabulary object detector (the cv model) on the image and check that each noun in the caption that names a physical object is supported by a detection or a high CLIP similarity for the crop. Unsupported nouns are removed or the caption is rejected. We measure all of this with an object hallucination metric on our own data. Public benchmarks are not enough because web photos differ from phone photos.
+Evaluation is hard because captions are open-ended. BLEU and METEOR count overlap with reference captions and correlate weakly with human judgment. CIDEr weights n-grams by how rare they are in the corpus (tf-idf) and compares against 5 human references; it rewards specific words but still needs references. SPICE compares scene graphs (objects, attributes, relations) and is closer to meaning. CLIPScore needs no reference: \( \text{CLIP-S}(c, v) = w \cdot \max(\cos(E_c, E_v), 0) \) with \( w = 2.5 \). It is good at spotting wrong objects but is blind to word order and to fluency. We report all four, but our launch decision uses human ratings on 2,000 platform images, scored for accuracy (is every claim true?), coverage (are the main things named?) and tone (does it follow the safe wording rules?). We rerun these ratings for every candidate model with the same images and the same raters.
+Safe wording for people. Alt text is read aloud, so a wrong guess is hurtful. The rules: say "a person" or "two people" unless the user has set a name; do not state gender, age beyond broad terms (child, adult), race, religion, disability or emotion as fact. Hard rules are enforced in training data (we rewrite captions that break them) and again in a post-filter with a word list and a classifier. For context-heavy images the model may describe visible actions ("a person in a wheelchair crosses a street") only if it is visibly true and relevant.
+tradeoffs: Frozen encoder with a connector versus end-to-end training. Choose a frozen encoder with a trained connector when you have fewer than about 100 million high-quality pairs, a small team and a need to change the language model often. Training takes hours and the encoder keeps its general knowledge. Choose end-to-end fine-tuning when your images are far from web photos (medical, satellite, screenshots) and the frozen features miss what matters. You pay with 10 to 50 times more compute and a risk of forgetting.
+Small specialized captioner versus a large general vision-language model. Choose a 1 billion parameter captioner when the task is narrow (one short sentence), the volume is hundreds of millions of images per day and cost per image must be a thousandth of a cent. Choose a large model (tens of billions of parameters, or a hosted API) when you need long, detailed, question-answering style descriptions, rare world knowledge, or reading dense text. The large model costs 20 to 100 times more per image; you can limit it to the images where the small model's score is low or where a user asks for details.
+Beam search versus sampling. Choose beam search with k = 3 to 5 for short captions, where accuracy matters and there is one good answer. It is deterministic, which also helps caching and debugging. Choose sampling with reranking for long or creative descriptions, where beams collapse into the same bland text. You give up some determinism and pay for several samples.
+failures: GPU pool overload. A viral event doubles uploads. The queue grows and captions are late. Uploads are not affected. Autoscaling adds replicas based on queue age, not CPU. If the queue age passes 60 seconds, the system switches to greedy decoding and the short caption only, which is 2 times faster, and pauses the backfill.
+A bad model version. A new model passes offline checks but writes captions that mention a "man" in most pictures of women in a certain context, which the test set does not cover. We release in three steps: shadow mode (run both models, compare), 1 percent of new images, then ramp up. The monitor tracks the hallucination proxy (low-score rate), the rate of person words by type, the user edit rate and the flag rate. Rolling back means pointing the version flag to the old model; the stored captions carry model_version, so we can re-caption only the affected images.
+Drift. Photo styles change over time: a new phone camera mode, a new meme format, a seasonal event. The captioner's quality slowly drops. We sample 500 new images per week for human rating, track the image-text score distribution (a shift in the mean or in the 5th percentile is an early alarm) and track the mix of image types by clustering the embeddings. When the alarm rings we add labeled examples of the new type and fine-tune.
+evolution: At 1 million images per day (one GPU), call a hosted vision-language API or run one open model, store captions next to the image row, and skip caching. At 100 million per day, move to the design above: the queue, the dynamic batcher, a distilled 1B captioner, the content-hash cache and the post-filter. At 1 billion per day, the CPU decode and network become the cost: move decoding to GPU (hardware JPEG decoders) or use thumbnails made at upload, keep image embeddings computed once and reused for captions, search and ranking, and quantize the models to 8-bit weights to double the decode batch. The model side also changes: one multilingual model replaces many language-specific ones, and captions become structured (objects, text found, scene) so that different apps can compose them. Human feedback from blind users, who are the real experts on what alt text should say, becomes the main training signal.
+followups: Why not caption images synchronously during upload? || Upload latency would depend on a GPU queue and a model that can fail. Alt text is not needed to display the image, so we make it asynchronous with retries and batching. The only synchronous case is an explicit "describe" action, and that uses a small dedicated pool.
+How do you stop the model from inventing objects? || Use several layers: filter noisy training pairs with an image-text matching model, tune on faithful human captions, rerank candidates by image-text score, and check nouns against an object detector. Measure an object hallucination rate on platform images. Prefer to publish a short true caption over a rich doubtful one.
+Why does beam search produce bland captions and what do you do? || Short common phrases have a high total probability, so beams converge to them. Use a length penalty, fine-tune on detailed captions, optimize a reward such as CIDEr or a preference signal, or sample several captions and rerank by image-text score.
+How would you evaluate a new captioner before launch? || Run fixed offline benchmarks (CIDEr, SPICE) only to catch regressions. Then rate 2,000 platform images with trained raters for accuracy, coverage and tone, check hallucination and person-word rates by slice, run in shadow mode, and ramp to 1 percent while watching edit and flag rates. Never decide on one metric.
+Where is the real cost of this system? || Not in the model. A 1B captioner uses about 2 ms of GPU time per image. Decoding the full-size JPEG on CPU costs 60 ms, so reading the 640 pixel rendition is the biggest saving. Network and storage of embeddings come next.
+ref: paper | Show and Tell: A Neural Image Caption Generator | Vinyals et al., 2015 |
+ref: paper | Learning Transferable Visual Models From Natural Language Supervision (CLIP) | Radford et al., OpenAI, 2021 |
+ref: paper | BLIP-2: Bootstrapping Language-Image Pre-training with Frozen Image Encoders and Large Language Models | Li et al., Salesforce, 2023 |
+ref: paper | BLIP: Bootstrapping Language-Image Pre-training for Unified Vision-Language Understanding and Generation | Li et al., 2022 |
+ref: paper | CLIPScore: A Reference-free Evaluation Metric for Image Captioning | Hessel et al., 2021 |
+ref: paper | CIDEr: Consensus-based Image Description Evaluation | Vedantam, Zitnick and Parikh, 2015 |
+
+@@ face-generation
+title: Design realistic face generation
+category: AI & ML
+level: Senior / Staff
+concepts: gans, diffusion, vae, evals, adversarial, gpucomp, mixedprec, conv
+summary: We build a service that creates photo-realistic faces of people who do not exist. Customers use them for avatars, game characters, design mock-ups, and privacy-safe test data for face detectors. The core is a generative model that turns random numbers into a 1024 x 1024 face. The model is the easy part to name and the hard part to get right. The difficult questions are around it: how to train a generator that does not collapse to a few faces, how to measure realism and variety with numbers, how to guarantee that no generated face is a copy of a real person from the training photos, how to cover all kinds of people fairly, and how to mark every image as synthetic so it cannot be sold as a real photo. We design the full system from data to serving.
+requirements: Functional requirements. A customer asks for N faces and gets 1024 x 1024 JPEG images plus a 256 x 256 thumbnail. Optional controls: an age range, smile, head angle, glasses, hair style and hair color. A seed makes a result repeatable. Large customers can ask for a balanced set (for example, equal numbers per age band and a wide range of skin tones). A generated face is never sold twice by default; a customer can pay for exclusivity. We do not accept a real photo as input in the first release, because "make a face that looks like this person" is the main route to misuse.
+Quality requirements. Realism: in a test where raters see one real and one generated face, the rate of correct picks is close to 50 percent for the best 90 percent of our images. Variety: no collapse to a small set of faces, measured by precision and recall of the image distribution and by the number of distinct identities in 10,000 samples. Artifact rate (broken teeth, mismatched earrings, melted glasses): under 2 percent in the delivered images. Identity safety: no delivered face may match a training photo or a listed public figure above a set similarity.
+Non-functional requirements. On-demand generation: p99 under 1.5 seconds including filters. Pool delivery: p99 under 200 ms. Availability 99.9 percent. Every image carries an invisible watermark and signed Content Credentials metadata (C2PA) that say "AI generated". Training photos are used under written consent and can be withdrawn.
+Assumptions. 20 million faces per day are delivered, 80 percent from a pre-made pool and 20 percent made on demand with custom controls. The training set is 300,000 consented photos at 1024 x 1024 (the public FFHQ set has 70,000 photos, so we assume more).
+estimates: Average load. 20 million faces per day divided by 86,400 is about 230 faces per second. Peak is 4 times the average, so about 930 per second. On-demand part: 20 percent of 930 is about 190 per second at peak.
+Generation cost. A StyleGAN-style generator makes an image in one forward pass. Assume one A100-class GPU makes 80 images per second at 1024 x 1024 in 16-bit precision (measure this on your hardware; the number depends on the model version). The 190 on-demand images per second need 190 / 80 = 2.4 GPUs. Generation is cheap. The filters cost more: the face-recognition network used to check identity (a ResNet-100 on a 112 x 112 crop, about 24 GFLOPs) plus quality and safety networks take roughly the same GPU time as the generator. We count 2 times the generator cost, so 5 GPUs, and with 2 times headroom and two zones we deploy 12.
+Pool production. We want a pool of 40 million accepted faces. At a 20 percent reject rate we need 50 million candidates. With 80 images per second per GPU for generation and 40 per second for filters, one GPU makes 1 / (1/80 + 1/40) = 27 candidates per second. 50 million / 27 = 1.85 million GPU-seconds, about 515 GPU-hours, roughly 1,300 dollars at 2.5 dollars per GPU-hour. On 32 GPUs this takes 16 hours.
+Storage. A 1024 x 1024 JPEG at quality 90 is about 250 KB, and a 256 x 256 thumbnail is about 15 KB. 40 million x 265 KB is about 10.6 TB. The identity embeddings are 512 numbers in 16 bits, 1 KB each: 40 GB for the pool. That fits in the memory of a small search cluster. Delivery bandwidth: 930 per second x 250 KB = 232 MB per second at peak, about 1.9 Gbit per second, which the CDN serves.
+Training. StyleGAN-class training runs until the discriminator has seen about 25 million real images (25,000 "kimg"). Assume 8 GPUs process 1,000 images in 10 seconds (reported speeds on older V100 hardware were slower; benchmark first). Then 25,000 x 10 seconds = 250,000 seconds, about 2.9 days. Ten experiments for tuning and ablations cost about 30 days of 8 GPUs, which is 5,800 GPU-hours, roughly 14,500 dollars. This is why many teams start from a released checkpoint and fine-tune.
+api: POST /v1/faces/batches with {count, attributes: {age_min, age_max, smile, yaw_range, glasses, hair_color}, balance: "none" or "age_and_tone", seed?, exclusive?}. Returns 202 with batch_id. Small batches (up to 50) can be asked with ?wait=true and return in the same call.
+GET /v1/faces/batches/{batch_id} returns {status, faces: [{face_id, image_url, thumb_url, attributes, generator_version}]}. URLs are signed and expire in 1 hour.
+GET /v1/faces/{face_id}/credentials returns the signed C2PA manifest for the image. Public verification works from the file itself, because the manifest is embedded.
+POST /v1/faces/{face_id}/takedown marks a face as withdrawn (for example, a person who sees a face that looks like them). It is removed from the pool and the customers get a notice.
+Internal: Generate(seeds[], truncation, attribute_directions[]) on the GPU service returns images. Filter(images[]) returns scores: quality, artifact, nearest training identity and its similarity, nearest public-figure similarity, safety flags.
+datamodel: The pool is a catalog with the image in object storage and the metadata in a table.
+```sql
+CREATE TABLE face (
+  face_id       BIGINT PRIMARY KEY,
+  generator_ver TEXT,        -- 'g12'
+  seed          BIGINT,      -- reproduces the latent z
+  truncation    REAL,        -- psi used, e.g. 0.8
+  age_bucket    SMALLINT,    -- from a classifier, 0..9
+  attrs         JSONB,       -- smile, yaw, glasses, hair ...
+  tone_bucket   SMALLINT,    -- for balance auditing, not for sale
+  image_key     TEXT,        -- object storage path
+  thumb_key     TEXT,
+  id_embedding  BLOB,        -- 512 x fp16, also in the vector index
+  filter_status TEXT,        -- 'accepted' | 'rejected' | 'withdrawn'
+  min_train_sim REAL,        -- closest training identity
+  served_count  INT,
+  exclusive_to  BIGINT       -- customer id or NULL
+);
+```
+Index: (filter_status, age_bucket) for balanced sampling, and an inverted index on selected attrs. A separate approximate nearest neighbor index holds all accepted id_embeddings; every new candidate must be far from all of them, so we do not publish near-twins. The training-set embeddings are kept in a restricted store, never in the pool table. Batches have their own table with the customer, the filters used and the face ids, for billing and takedown.
+design: Two paths share one generator. The pool path runs offline. A job samples random latent vectors \( z \) from a Gaussian, the generator turns each into an image, and the filters decide. Accepted faces are uploaded to object storage, their embeddings go to the vector index, and the catalog row is written. The delivery path is simple: the API picks faces from the catalog that match the filters and are not yet served to this customer, signs URLs and returns them. The on-demand path serves custom attributes: the API sends seeds and attribute directions to the GPU service, which generates, filters and returns within the latency budget.
+The generator is a StyleGAN2-class model. A mapping network turns \( z \) into an intermediate vector \( w \). A synthesis network starts from a learned 4 x 4 constant and upsamples step by step to 1024 x 1024. At every layer, \( w \) controls the style through modulated convolution, so coarse layers set pose and face shape and fine layers set skin texture and hair detail. Attribute control is done in \( w \) space: we find a direction for each attribute (smile, age) by fitting a linear classifier on labeled samples, and move \( w \) along that direction. The truncation trick pulls \( w \) toward the average, which raises quality and lowers variety. We use a factor near 0.8 for delivered images and 1.0 for the pool, and mark the setting in the row.
+Identity safety is a pipeline stage, not an afterthought. The face-recognition network maps each candidate to a 512-number embedding. The training embeddings (300,000 vectors, 300,000 x 512 x 2 bytes = 307 MB) fit in GPU memory, so a brute-force matrix product finds the nearest training face in under 1 ms. If the cosine similarity is above the threshold, the candidate is rejected. The threshold is chosen on validation pairs so that two photos of the same person pass the match test 99 percent of the time; we use the same threshold for the public-figure list.
+Provenance. Before upload, a watermark encoder adds an invisible signal to the pixels, which survives resizing and JPEG compression to a useful degree. The file also carries a signed C2PA manifest with the generator version and the date. Neither is perfect: metadata is removed by screenshots, and a watermark can be attacked. They are layers, and a detector that we train and publish is the third one.
+The training side is a separate pipeline: consented photos are aligned and cropped (5-point landmark alignment), written to shards, and used by a distributed training job with data parallelism. A checkpoint is promoted only if it beats the current one on the evaluation suite.
+diagram:
+   TRAINING                          POOL (offline)
+   consented photos                  random z ~ N(0,I)
+        |                                 |
+   align + crop                      +----------+
+        |                            | mapping  | z -> w
+   +---------+  real   +-----+      +----------+
+   | trainer |-------->|  D  |           |
+   | (8 GPU) |<-fake---|     |      +----------+
+   +---------+  G(z)   +-----+      | synthesis| w -> 1024x1024
+        | checkpoint                +----------+
+        +---------------------------->   |
+                                     +----------+  reject
+                                     | filters  |--------> bin
+                                     | id, art, |
+                                     | safety   |
+                                     +----------+
+                                          | accept
+              +---------------------------+---------+
+              v                           v         v
+        object store               vector index   catalog
+        (jpeg + thumb)             (id embeddings) (rows)
+                    \                    |         /
+                     +------- API / CDN -----------+
+                                  |
+                              customers
+animation:
+== A customer asks for 3 faces: age 25-35, smiling, balanced tones.
+  client --POST /v1/faces/batches--> [API]          GPU: idle
+  catalog: 2 matches in pool, need 1 on demand
+  pool: face 77 ok, face 91 ok
+== The API takes two faces from the pool and sends one seed to the GPU.
+  client                    [API] --seed 5512, smile+0.8--> [GPU]
+  pool: 77 ok, 91 ok
+  GPU : mapping(z) -> w
+== The generator moves w along the smile direction and renders 1024 px.
+  client                    [API]                          [GPU]
+  pool: 77 ok, 91 ok
+  GPU : w + 0.8*d_smile -> synthesis -> image (80 ms/batch)
+== The filters embed the face and compare it with training faces.
+  client                    [API]                          [GPU]
+  pool: 77 ok, 91 ok
+  GPU : id embed -> nearest train sim 0.31 (limit 0.50) pass
+== The face passes. A watermark and a C2PA manifest are added.
+  client                    [API]                          [GPU]
+  pool: 77 ok, 91 ok
+  new : face 5512 -> watermark + manifest -> object store
+== The API signs URLs for all three and returns them.
+  client <--200 [77, 91, 5512] with signed URLs-- [API]
+  served_count updated; tone mix: 1 light, 1 medium, 1 dark
+deepdive: The adversarial game. A GAN trains two networks against each other. The generator G makes images from noise. The discriminator D sees real and fake images and tries to tell them apart. The original objective is
+\[ \min_G \max_D \; \mathbb{E}_{x \sim p_{data}}[\log D(x)] + \mathbb{E}_{z \sim p_z}[\log(1 - D(G(z)))] \]
+In practice the generator uses the non-saturating form, which maximizes \( \log D(G(z)) \), because the original form gives almost no gradient early in training when D wins easily. Why one pass is enough at serving time: G never needs D after training. This is the big speed advantage over diffusion, which needs many network calls per image. The price is the training game. It has no single loss that falls while quality rises, so the team watches FID and sample grids, and it can diverge.
+Stabilizing training. Three habits keep StyleGAN training alive. R1 regularization penalizes the gradient norm of D on real images, \( \frac{\gamma}{2}\,\mathbb{E}\,\lVert \nabla D(x) \rVert^2 \), which keeps D smooth so it cannot become a perfect, gradient-less judge. Lazy regularization applies the penalty every 16 steps to save time. Adaptive discriminator augmentation (ADA) applies random flips, rotations and color changes to the images that D sees, with a strength that rises when D starts to overfit; this matters when the training set has tens of thousands of images, and 300,000 is on the border. Mode collapse (many z give the same face) is caught by the recall metric and by counting distinct identities.
+Convolution and why the generator looks like this. The synthesis network is a stack of convolutions. In StyleGAN2, each convolution is modulated: the style vector scales the input channels of the kernel, \( w'_{ijk} = s_i \cdot w_{ijk} \), and then the kernel is demodulated, \( w''_{ijk} = w'_{ijk} / \sqrt{\sum_{i,k} w'^2_{ijk} + \epsilon} \), so each output channel keeps a unit scale. This replaced adaptive instance normalization, which caused droplet-like artifacts in StyleGAN1. At 1024 x 1024 the last two resolution levels hold most of the compute, because the cost of a convolution grows with the number of pixels: going from 512 to 1024 pixels per side makes 4 times more pixels.
+Mixed precision and the GPU. Most of the time goes to the high-resolution layers, so we run these layers in 16-bit floating point and keep the rest in 32-bit. 16-bit numbers overflow at 65,504, and a few activations grow large, so we clamp activations to a fixed range (for example plus or minus 256) and keep a loss scale. Result: about 1.5 to 2 times faster training and half the memory for activations, with the same FID within noise. Memory also decides the per-GPU batch size (for example 8 images at 1024 x 1024), and we use gradient accumulation if the global batch must be larger. At serving time we compile the network with a graph compiler (kernel fusion) and use batch 16 to keep the GPU busy.
+Measuring realism and variety. FID (Frechet Inception Distance) fits a Gaussian to the Inception features of 50,000 real and 50,000 generated images and measures the distance between the two. A lower value is better; StyleGAN2 reported 2.84 on FFHQ. FID mixes quality and variety into one number and is biased by sample size and by the Inception network (which was trained on objects, not faces). So we add precision and recall (precision: how many generated images fall inside the real data manifold; recall: how much of the real manifold is covered by generated images), perceptual path length for smoothness of the latent space, a face-specific distance based on the recognition embedding, and human tests. Human raters see pairs and judge "which one is real"; we recruit raters who are not our staff, and we repeat the test with each new generator.
+Fairness and coverage. A generator learns the mix of its data. If the training set has few older people or few dark-skinned faces, the model makes poorer faces for them, with more artifacts and less variety. We audit with a classifier for age and skin tone (with known errors, so we also sample by hand) and compare the artifact rate and recall per group. The fix is on the data side first: collect more consented photos for weak groups. We also oversample in the pool so a "balanced" request can be satisfied without lowering quality for any group.
+Robustness and abuse. Our own filters are neural networks, and neural networks can be fooled by small changes, so we treat them as targets. An attacker who sees that a face gets rejected can add tiny noise until it passes (an adversarial example). We hide scores from customers, use an ensemble of two different recognition networks, test the filters with attacks (gradient-based perturbations and common edits like crops and blur) and retrain with the hard cases. The reverse problem is detecting our own output: a detector network is trained on our faces and other generators, evaluated on unseen generators and after compression, because detectors trained on one generator often fail on a new one.
+tradeoffs: GAN versus diffusion versus VAE. Choose a GAN when you need one-pass generation (tens of milliseconds), a smooth latent space for attribute control, and the domain is narrow, like aligned faces. It trains in days on 8 GPUs. Choose a diffusion model when you need text prompts, many kinds of scenes, better coverage of the data and stable training; it costs 20 to 50 network calls per image (or 1 to 4 after distillation), so 10 to 50 times more GPU time at serving. Choose a VAE when you need an encoder and stable training more than sharp images, as in the autoencoder inside latent diffusion; plain VAE faces are blurry because the loss averages over possible outputs. Our choice, a GAN, is right for aligned faces at 20 million images per day; a diffusion model would be right for "a face in a scene".
+Pool versus on-demand. Choose a pre-made pool when most requests are plain and the filters are the expensive step: you filter once, deliver in under 200 ms, and you can inspect samples by hand. Choose on-demand when the customer needs custom controls or a fresh image that nobody has seen. The pool costs storage (10.6 TB, about 250 dollars a month) and the risk of stale style when the generator improves, so we regenerate part of it each quarter.
+Strict identity threshold versus yield. Choose a low similarity threshold (strict) when legal risk is high, as in our case; it rejects more candidates and lowers variety near common face types. Choose a looser threshold for internal use only. Each 5 points of threshold changes the reject rate by a few percent, so we fix the threshold by a measured false-match target and revisit it with legal counsel.
+Train from scratch versus fine-tune a public checkpoint. Choose fine-tuning when your data is under a few hundred thousand images and a public checkpoint is licensed for your use: it needs 10 times less compute. Choose training from scratch when the license or the data origin must be clean, as in our case where we promise all training data is consented. You pay in time and tuning effort.
+failures: Mode collapse or divergence during training. FID jumps up or all samples look alike. The trainer keeps a checkpoint every 200 kimg, an alert fires on recall and on identity count in a 5,000-sample test, and we roll back to the last good checkpoint and lower the learning rate or raise the R1 weight.
+A bad generator release. A new version has a hidden artifact (a faint grid pattern, or earrings that are always different). The release goes through a canary: 1 percent of on-demand traffic and a manual review of 2,000 samples before the pool is refilled. The pool rows carry generator_ver, so we can withdraw a whole version with one update.
+A generated face that looks like a real person. This will happen by chance, because faces of 8 billion people overlap in the embedding space. The filter lowers the risk against the people we know about, but cannot remove it. The takedown API removes the face within minutes, the customers are notified, and the embedding goes onto a blocklist so near-copies cannot be published again.
+Training-data withdrawal. A person withdraws consent. Their photos are deleted from the dataset and the embedding store. We do not retrain for every request. We retrain at each scheduled release and, in the meantime, check that no pool face is closer to the withdrawn identity than the threshold.
+Filter dependency fails. If the identity filter is unavailable, we fail closed: on-demand images are not delivered. The pool is unaffected because it was filtered before publishing. This is the opposite of a rate limiter's fail-open choice, because the cost of one bad face is higher than the cost of a short outage.
+evolution: At 1,000 faces per day, run a public checkpoint on one GPU, add only a basic filter and no pool. At a million per day, add the identity check, the pool, the watermark and the catalog. At 100 million per day, the cost shifts to filters and storage; we distill the filter networks, use smaller thumbnails for most use cases and generate at 512 pixels with a learned upsampler for the default tier. At a billion per day, we would add a diffusion path for scenes and full-body images, with distilled few-step models, and keep the GAN for the aligned-face fast lane. We would also move from a fixed pool to a continuous stream: generate, filter and publish constantly, and age out old faces, so that each customer sees fresh images.
+followups: Why is GAN inference so much cheaper than diffusion, and what do you give up? || A GAN makes the image in one forward pass; diffusion needs 20 to 50 passes, or 1 to 4 after distillation. We give up training stability, since the adversarial game has no simple loss to follow, and some coverage of the data distribution, since GANs drop rare modes more often.
+How do you know your generator did not memorize training faces? || Embed generated images with a face-recognition network and search the nearest training embeddings. Reject anything above a similarity threshold chosen on real pairs. Also check by looking at the closest pairs by eye, and use a held-out set of real faces as a control for the expected distance.
+What does FID miss? || It collapses quality and variety into one number, depends on sample size, and uses features from a network trained on objects. Add precision and recall, face-specific embedding metrics, human tests and slice metrics by age and skin tone.
+What is mode collapse and how do you detect it? || The generator covers only part of the data, for example a few faces. Detect it with low recall, a low count of distinct identities among 10,000 samples, and nearest-neighbor clustering of samples. Fix with regularization, augmentation, a larger batch and a lower learning rate.
+How would you make faces with a specific smile or age? || Use the latent space. Label samples with classifiers, fit a linear direction in w space for each attribute and move along it. Control strength by distance, and check that other attributes (identity, background) change little. Entangled attributes need conditional training or a diffusion model with text control.
+ref: paper | A Style-Based Generator Architecture for Generative Adversarial Networks | Karras, Laine and Aila, 2019 |
+ref: paper | Analyzing and Improving the Image Quality of StyleGAN | Karras et al., 2020 |
+ref: paper | Training Generative Adversarial Networks with Limited Data | Karras et al., 2020 |
+ref: paper | Generative Adversarial Nets | Goodfellow et al., 2014 |
+ref: paper | GANs Trained by a Two Time-Scale Update Rule Converge to a Local Nash Equilibrium (FID) | Heusel et al., 2017 |
+ref: paper | Improved Precision and Recall Metric for Assessing Generative Models | Kynkaanniemi et al., 2019 |
+ref: spec | C2PA Technical Specification (Content Credentials) | Coalition for Content Provenance and Authenticity |
+
+@@ hires-image-synthesis
+title: Design high-resolution image synthesis
+category: AI & ML
+level: Senior / Staff
+concepts: diffusion, vae, denoising, attention, conv, mixedprec, quant, gpucomp, evals
+summary: We build a text-to-image service that makes sharp images at 1024 x 1024 and above, from a text prompt, in seconds. A diffusion model starts from random noise and removes the noise step by step, guided by the text. The hard part is resolution. A 1024 x 1024 image has over 3 million numbers, and the cost of the attention layers grows with the square of the number of image tokens, so a 4096 x 4096 image costs hundreds of times more than a 1024 x 1024 image if done naively. We design the system around this fact: work in a compressed latent space made by a variational autoencoder, use a transformer denoiser, train in stages from low to high resolution, serve with reduced precision and fewer steps, and generate very large images with tiles. We also design how to measure quality, because the standard FID metric cannot even see high-resolution detail.
+requirements: Functional requirements. A user sends a prompt and optional settings (size, seed, style, negative prompt) and gets back images. Sizes: 512 up to 2048 per side directly, and 4096 per side through a separate upscale call. Two quality tiers: "fast" (about 0.5 s) and "quality" (about 5 s). The same seed and settings give the same image on the same model version. The user can ask for variations of an image and for an upscale of a result.
+Quality requirements. Prompt following: objects, counts, colors and positions in the prompt appear in the image. Image quality: sharp texture, no repeated objects at large sizes, good hands and faces, readable short text. Offline metrics: a prompt-following benchmark such as GenEval, CLIP score, and a learned preference score; human side-by-side tests are the deciding metric. Online: the rate at which users keep or download an image, the share of regenerations (a high rate means the first result missed), and complaint rates.
+Non-functional requirements. Latency: fast tier p95 under 1.5 s including queueing; quality tier p95 under 12 s. Throughput: a few million images per day with a peak of 3 times the average. Cost: under 0.5 cent per image on average. Safety: block disallowed prompts and disallowed outputs, add an invisible watermark and provenance metadata. Reproducibility and versioning: every image stores the model version and settings.
+Assumptions. 3 million images per day. 80 percent use the fast tier, 20 percent use the quality tier. Most images are 1024 x 1024; 5 percent are 2048 x 2048. H100-class GPUs with 80 GB memory.
+estimates: Average load. 3 million images per day divided by 86,400 is about 35 images per second. Peak is 3 times that: about 105 per second.
+Why latent space. A 1024 x 1024 RGB image has 1024 x 1024 x 3 = 3.1 million values. A VAE that shrinks each side by 8 and keeps 16 channels gives 128 x 128 x 16 = 262,144 values, 12 times fewer (a 4-channel VAE gives 65,536, 48 times fewer). The denoiser works on this smaller tensor. The decoder returns to pixels once at the end.
+Token count. The transformer cuts the latent into 2 x 2 patches. At 1024 x 1024 the latent is 128 x 128, so there are (128 / 2)^2 = 4,096 tokens. At 2048 x 2048: 16,384 tokens. At 4096 x 4096: 65,536 tokens.
+Cost of one denoiser pass. Take a 3 billion parameter transformer with 28 layers and width 3,072. Linear layers cost about 2 x parameters per token: 2 x 3e9 = 6 GFLOPs per token. Attention costs about 4 x N^2 x width per layer, with N the number of tokens. At N = 4,096: linear 4,096 x 6e9 = 24.6 TFLOPs; attention 4 x 4,096^2 x 3,072 x 28 = 5.8 TFLOPs; total about 30 TFLOPs. At N = 16,384: linear 98 TFLOPs, attention 92 TFLOPs, total 190 TFLOPs, 6 times more for 4 times the pixels. At N = 65,536: linear 393 TFLOPs, attention 1,470 TFLOPs, total 1.9 PFLOPs per pass, 62 times more than at 1024. This is the square law, and it is the reason for tiles at 4096.
+Time per image. Quality tier: 30 steps with classifier-free guidance, which needs 2 passes per step (with and without the prompt), so 60 passes x 30 TFLOPs = 1.8 PFLOPs. An H100 gives about 990 TFLOPs peak in 16-bit dense math; real transformers reach about 40 percent, so use 400 TFLOPs. Time: 1.8e15 / 4e14 = 4.5 s. Fast tier: a distilled model with 4 steps and no guidance pass: 4 x 30 = 120 TFLOPs, 0.3 s. Add text encoding (about 20 ms, cached for repeated prompts), VAE decode (about 50 ms) and safety checks (about 30 ms): fast about 0.4 s, quality about 4.6 s.
+GPU count. Average GPU-seconds per image: 0.8 x 0.4 + 0.2 x 4.6 = 0.32 + 0.92 = 1.24. At peak, 105 x 1.24 = 130 GPUs busy. Target 60 percent utilization at peak so the queue stays short: 130 / 0.6 = 217. Round to 240 GPUs. Cost: 240 x 24 x 2.5 dollars = 14,400 dollars per day, 0.48 cent per image. With 8-bit weights the quality tier gets about 1.4 times faster, which saves around 40 GPUs. Autoscaling to the daily curve lowers the average cost further.
+Training. The cost of training is about 6 x parameters x tokens seen. Per sample that is 6 x 3e9 = 18 GFLOPs per token. Stage A at 256 pixels (256 tokens), 5 billion samples: 5e9 x 256 x 18e9 = 2.3e22 FLOPs. Stage B at 512 pixels (1,024 tokens), 1.5 billion samples: 2.8e22. Stage C at 1024 pixels (4,096 tokens), 0.5 billion samples: 3.7e22. Total about 8.8e22, plus about 15 percent for attention: 1e23 FLOPs. A cluster of 512 GPUs at 350 TFLOPs gets 1.8e17 per second, so 1e23 / 1.8e17 = 5.6e5 s, about 6.5 days, 80,000 GPU-hours, roughly 200,000 dollars. Low resolution first is cheap: stage A costs 16 times fewer FLOPs per sample than stage C. We use mixed precision: matrix products in bfloat16 (same exponent range as 32-bit floats, so no loss scaling) with 32-bit master weights and two Adam buffers, 3e9 x 12 bytes = 36 GB, sharded across GPUs. Normalization, softmax and the loss stay in 32-bit.
+api: POST /v1/images with {prompt, negative_prompt?, width, height, tier: "fast" or "quality", seed?, guidance?, n: 1 to 4}. Returns 202 with {job_id}. For the fast tier, ?wait=true holds the call open up to 3 seconds.
+GET /v1/images/jobs/{job_id} returns {status, images: [{image_id, url, seed, model_version, width, height}]}. Status: queued, running, done, blocked, failed. Blocked jobs return a reason code, not the filter details.
+POST /v1/images/{image_id}/upscale with {scale: 2 or 4, creativity: 0 to 1}. Returns a job. Higher creativity lets the model add new detail; low creativity stays faithful.
+POST /v1/images/{image_id}/variations with {strength: 0 to 1, seed?}. It adds noise to the existing latent and denoises again; strength sets how far the result may move.
+Internal: Sample(latent_shape, text_embeddings, steps, guidance, seed) on the GPU service returns a latent. Decode(latent) returns pixels. They are separate so a different pool can run each.
+datamodel: A job row and an image row, plus caches.
+```sql
+CREATE TABLE image_job (
+  job_id      UUID PRIMARY KEY,
+  user_id     BIGINT,
+  prompt_hash BYTES(16),   -- hash of normalized prompt, for caches
+  params      JSONB,       -- size, tier, steps, guidance, seed
+  model_ver   TEXT,        -- 'dit3b-r12'
+  status      TEXT,
+  gpu_ms      INT,         -- for cost per user
+  created_at  TIMESTAMP
+);
+CREATE TABLE image (
+  image_id    UUID PRIMARY KEY,
+  job_id      UUID,
+  object_key  TEXT,        -- path in object storage
+  width       INT, height INT,
+  nsfw_score  REAL,
+  watermark   BOOLEAN
+);
+```
+Queues are per tier and per resolution, so the scheduler can batch jobs with the same shape. A prompt-embedding cache keyed by prompt_hash stores the text-encoder output (77 to 256 tokens x 4,096 numbers, about 2 MB in 16 bits) for popular prompts. Because the same prompt is often asked twice with different seeds, the hit rate is useful. Images are stored in object storage with a CDN in front.
+design: The path of a request. The API checks the prompt with a fast text classifier and rejects disallowed prompts. It puts the job into a queue for its tier and size. A scheduler assigns the job to a GPU worker that already has the right model loaded (loading 6 GB of weights from local NVMe takes a few seconds, so we avoid moving models). The worker runs the text encoders, builds a random latent from the seed, and runs the sampling loop: at each step the denoiser predicts the direction toward clean data, and the sampler updates the latent. After the last step, the VAE decoder makes pixels. A safety classifier looks at the image. The invisible watermark is added, the file is written to object storage, and the job becomes done.
+The model. We use a transformer denoiser (a diffusion transformer, DiT) in the latent space of a VAE. Text enters through two paths: a pooled vector that modulates the layers, and the full sequence of text tokens that the image tokens attend to. Each layer runs self-attention over image and text tokens together, so words and image regions can look at each other. Convolution still has a role: the VAE encoder and decoder are convolutional networks that work well on local texture, and a small convolutional stem and head can be used around the transformer. Putting convolutions at the ends and attention in the middle uses each where it is strongest: convolutions for local detail at high resolution (cost grows linearly in pixels) and attention for global layout on the small latent (cost grows with the square of tokens).
+The sampler. Training teaches the model to predict the noise, or the direction to data, at a random noise level. At serving time, 30 steps with a good solver (for example a second-order solver) are enough for the quality tier. For the fast tier we use a model distilled to 4 steps, trained to match the output of the 30-step teacher in fewer steps. Guidance: the quality tier uses classifier-free guidance, combining the prompt-conditioned and unconditioned outputs; a scale of 4 to 8 trades variety for prompt following. The distilled fast model has the guidance baked in, so it needs a single pass per step.
+Large images. Up to 2048 x 2048 we sample directly (16,384 tokens, 190 TFLOPs per pass, about 6 times a 1024 image), which costs about 28 seconds in the quality tier. Beyond that, we make a 1024 image first, upsample it, and refine it in overlapping tiles: for 4096 x 4096 we use 1024 x 1024 tiles with 128 pixels of overlap, which is a 5 x 5 grid, 25 tiles. Each tile runs a short refinement (about 12 passes with partial noise, so the global layout of the base image is kept). The overlaps are blended with a smooth weight. Cost: 25 x 12 x 30 TFLOPs = 9 PFLOPs, about 23 seconds on one GPU, far below the 1.9 PFLOPs x 60 passes = 114 PFLOPs of one direct 4096 image.
+diagram:
+  client --POST /v1/images--> [API]--prompt check--> reject / continue
+                                |
+                          [queue: tier x size]
+                                |
+                         [scheduler] (model-aware)
+                                |
+   +----------------------- GPU worker -----------------------+
+   |  text enc (T5+CLIP)   cache by prompt_hash                |
+   |         |                                                 |
+   |   noise z ~ N(0,I)  128x128x16                            |
+   |         v                                                 |
+   |   +---------------- loop: 4 or 30 steps -----------+      |
+   |   | DiT (fp8/bf16): self+cross attention, 4096 tok |      |
+   |   | guidance mix -> sampler update -> z            |      |
+   |   +------------------------------------------------+      |
+   |         v                                                 |
+   |   VAE decoder (conv) -> 1024x1024 pixels                  |
+   +---------+-------------------------------------------------+
+             v
+     [image safety] -> [watermark] -> object store -> CDN
+             |
+        (optional) tile upscaler: 5x5 tiles, 128 px overlap -> 4096
+animation:
+== The prompt "a red fox in snow" is checked and queued as a fast job.
+  prompt --> [check ok] --> [queue]       z : -
+  GPU: model loaded            step 0 / 4
+== The text encoders turn the prompt into token vectors (cache miss).
+  prompt --> [check ok] --> [queue]       z : -
+  GPU: text enc -> 256 x 4096            step 0 / 4
+== A seed makes pure noise z with shape 128 x 128 x 16.
+  GPU: z = noise (seed 41)               step 0 / 4
+  image view: static, no shape at all
+== Step 1 of 4: the denoiser predicts, z gets rough shapes.
+  GPU: DiT pass 1 (4096 tokens, 30 TFLOPs)   step 1 / 4
+  image view: a blurry light blob on dark
+== Step 2 and 3: layout and colors settle, fox and snow appear.
+  GPU: DiT passes 2, 3                   step 3 / 4
+  image view: fox shape, orange on white
+== Step 4: fine detail (fur, shadows). The VAE decodes z to pixels.
+  GPU: DiT pass 4 -> VAE decode 1024 x 1024   step 4 / 4
+  image view: sharp fox, fur and shadows
+== Safety check passes, watermark added, image stored, job done.
+  GPU: free                              total 0.4 s
+  job: done -> object store -> CDN
+deepdive: The denoising objective. In training, a clean latent x is mixed with noise: \( x_t = \sqrt{\bar\alpha_t}\,x + \sqrt{1-\bar\alpha_t}\,\epsilon \), where t sets how noisy it is. The network learns to predict the noise,
+\[ \mathcal{L} = \mathbb{E}_{x,\,\epsilon,\,t}\,\lVert \epsilon - \epsilon_\theta(x_t, t, c) \rVert^2 \]
+with c the text condition. Newer models use a straight-line path (rectified flow): \( x_t = (1-t)\,x + t\,\epsilon \), and the network predicts the velocity \( \epsilon - x \). A straight path is easier to follow with few steps, which is why these models distill well. At sampling time we start at pure noise and take steps along the learned direction until t = 0.
+Resolution changes the noise schedule. This is a point that interviewers like. Take a flat region of an image, such as a clear sky. At high resolution, many neighboring pixels hold nearly the same value, so independent noise added to each pixel can be averaged away; the same noise level destroys less information than it does at low resolution. If we reuse a schedule made for 256 pixels at 1024, the early steps are too easy and the model spends its steps in the wrong place. The fix is to shift the schedule toward higher noise as resolution grows (the shift in Stable Diffusion 3 and in the "simple diffusion" work), so the model has enough high-noise steps to decide global layout. Without it, large images show repeated objects and broken composition.
+Attention at scale. The attention matrix is N x N. At 4,096 tokens the cost is small next to the linear layers; at 16,384 it equals them; at 65,536 it is 4 times larger. Three tools help. Fused attention kernels (FlashAttention) compute attention in blocks inside fast on-chip memory and never write the N x N matrix to HBM, which cuts memory from quadratic to linear and speeds up the math by 2 to 4 times because the job is memory bound. Position encodings that extrapolate (rotary encodings in 2D) let a model trained to 1024 run at other sizes and ratios. For very large images, local or windowed attention in some layers keeps the global layers few. Even so, the safest route to 4096 is the tiled upscale.
+The VAE and what it limits. The autoencoder decides how much detail the denoiser can ever produce. A VAE with 4 channels loses fine text and small faces; 16 channels keep more but make the denoiser's job harder. The decoder is convolutional and has its own memory problem: at 4096 x 4096 the activations are large, so we decode in overlapping tiles (with blending) to bound memory. We train the VAE with a pixel loss, a perceptual loss (LPIPS), a small adversarial loss for sharpness and a small KL term. The KL term is deliberately weak, so the latent stays rich; the denoiser handles the shape of the distribution.
+Quantization for serving. After training, we store the weights of the large linear layers in 8-bit floating point (FP8) or 8-bit integers, with a scale per output channel, and we run the matrix products in 8 bits. On H100 GPUs the 8-bit tensor cores have twice the peak rate of 16-bit, and the weights take half the memory traffic, giving about 1.3 to 1.5 times faster passes in practice. Not everything is quantized: the first and last layers, the normalization and the time embeddings stay in 16-bit, because diffusion models are sensitive to small errors that repeat across 30 steps. We calibrate with a few hundred prompts and then check the result with the same evaluation set: FID, CLIP score, and a blind human test on 500 prompts. 4-bit methods exist and show large savings, especially on consumer GPUs, but they need more care and extra low-rank correction to keep text rendering and fine detail.
+Evaluation. FID compares feature statistics of 30,000 generated images with real ones, but the Inception network resizes every image to 299 x 299 pixels first, so it cannot see the sharpness, texture or text of a 1024 image. It also does not measure whether the prompt was followed. We therefore use several tools. CLIP score measures text-image match but is blind to counts and spatial words. GenEval and similar benchmarks test objects, counts, colors and positions with detectors. A learned preference model (trained on human votes) gives a cheap ranking. The final decision uses blind pairwise human tests on 1,000 prompts, giving a win rate with a confidence interval; a rise of 2 points in win rate with 1,000 votes is within noise, since the standard error is about 1.6 points. We also plot FID against CLIP score for guidance scales 1 to 10: the curve shows the trade-off between variety and prompt following, and each model version should move the curve up and to the left.
+tradeoffs: Pixel space versus latent space. Choose a latent diffusion model for anything above 256 pixels: it is 12 to 48 times cheaper per pass. Choose pixel-space diffusion only when the autoencoder's loss of detail is unacceptable (very fine text, scientific images) and you can pay for cascades of models, one per resolution. You give up the last bit of sharpness in the first case and a lot of compute in the second.
+Many steps versus few steps. Choose 25 to 50 steps with guidance when quality and variety matter and the user waits several seconds (professional use). Choose a distilled 1 to 4 step model when latency is under a second and cost per image must be tiny (previews, mass use). Distilled models lose some variety and fine detail, and they are fixed to one guidance strength. A common product pairs both: the fast tier proposes, the quality tier finishes.
+Native high resolution versus tiled upscale. Choose native generation up to 2048 per side where global layout needs to be right. Choose tiled upscaling above that: cost grows linearly with the number of tiles, not with the square of tokens, but seams, repeated textures and a lack of global awareness can appear. A base image at lower resolution anchors the layout, and overlap blending hides seams.
+failures: Queue growth at peak. A popular event pushes arrivals above capacity. Queue wait is the alarm (not GPU load). Policies: the quality tier gets lower priority than the fast tier, large sizes are limited per user, and a "degrade" switch moves quality requests to 20 steps. A bounded queue returns 429 with a retry hint instead of growing without limit.
+GPU out of memory or a stuck kernel. Large sizes, long prompts or many images in one batch can exceed memory. The scheduler knows the memory footprint per shape and does not batch above it. A watchdog kills jobs that run 3 times longer than the estimate, returns the GPU to the pool after a reset and retries the job once on another node.
+A bad model or quantization release. The images look fine on average, but hands or text got worse. We run a regression suite of 2,000 fixed prompts with fixed seeds for every release, compare scores per category (people, text, animals, scenes), run a blind human test, and canary on 2 percent of traffic. The model version is stored with every image so we can find and regenerate.
+evolution: At 1,000 images per day, run one open model on one GPU with a simple job queue and 30 steps. At 100,000 per day, add a model-aware scheduler, a prompt-embedding cache, a safety layer and 16-bit serving. At 3 million per day (this design), add distillation for the fast tier, 8-bit serving, tiled upscaling and per-shape batching. At a billion per day, serving dominates cost: step distillation to 1 to 2 steps, adaptive compute (easy prompts get fewer steps), caching of partial results for popular prompts, specialized inference chips, and an autoscaler on spot capacity. Training also changes: you train on synthetic recaptioned data (a vision-language model rewrites every training caption to be longer and more exact), which improves prompt following more than adding parameters.
+followups: Why does the cost of high-resolution generation grow faster than the number of pixels? || A transformer's attention cost grows with the square of the number of tokens, and tokens grow with the number of pixels. From 1024 to 4096 pixels per side, pixels grow 16 times, tokens 16 times, and attention work about 256 times. Linear layers grow 16 times. That is why we use tiles and fused attention.
+What does classifier-free guidance do and what does it cost? || It mixes the output with the prompt and the output without it: output = uncond + w x (cond - uncond). A larger w follows the prompt more but lowers variety and can oversaturate. It costs two passes per step, which can be batched or removed by distilling guidance into the model.
+Why does the noise schedule need to change at higher resolution? || Neighboring pixels are strongly correlated, so independent noise is easier to average out at high resolution; the same noise level hides less. We shift the schedule to higher noise so enough steps decide the global layout. Without the shift, large images show repeated objects.
+How do you know quantization did not hurt quality? || Compare against the 16-bit model with the same prompts and seeds: pixel-level difference, FID and CLIP score, then a blind human test. Keep sensitive layers in 16-bit. Watch categories like text and hands, where small errors are visible.
+How do you generate a 4096 x 4096 image on a fixed GPU memory budget? || Make a 1024 base, upsample, and refine in overlapping tiles with partial noise; decode the VAE in tiles. Memory depends on tile size, not on the full image. Blend overlaps. Keep the base as the anchor for global structure.
+ref: paper | High-Resolution Image Synthesis with Latent Diffusion Models | Rombach et al., 2022 |
+ref: paper | Denoising Diffusion Probabilistic Models | Ho, Jain and Abbeel, 2020 |
+ref: paper | Scalable Diffusion Models with Transformers (DiT) | Peebles and Xie, 2023 |
+ref: paper | Scaling Rectified Flow Transformers for High-Resolution Image Synthesis (Stable Diffusion 3) | Esser et al., 2024 |
+ref: paper | Classifier-Free Diffusion Guidance | Ho and Salimans, 2022 |
+ref: paper | FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness | Dao et al., 2022 |
+
+@@ personalized-headshots
+title: Design personalized headshot generation
+category: AI & ML
+level: Senior / Staff
+concepts: lora, diffusion, embeddings, contrastive, evals, gpucomp, objectstore, mlops
+summary: A customer uploads 10 to 20 selfies and, within an hour, receives 40 professional-looking headshots of themselves in different outfits and backgrounds. Under the hood we teach a diffusion model what this one person looks like by training a small LoRA adapter on their photos, then we generate many candidate images and keep only the ones that look like the person and look good. This is a batch pipeline, not a chat: every order is a job with about 20 minutes of GPU time, so the engineering is about workflow, GPU scheduling and cost. The hard questions are quality (the output must be recognizably the customer, not "someone similar"), consistency across thousands of orders, privacy of face data, and abuse (nobody should be able to make headshots of another person). We design the pipeline, the evaluation gates and the operations around it.
+requirements: Functional requirements. The customer pays, uploads 10 to 20 photos, picks style packs (for example "office", "outdoor", "studio grey"), and gets 40 final images within 60 minutes. Photos are checked on upload: one face per photo, enough resolution, sharp, varied angles and light. The customer can re-roll a style pack, download in full resolution, and delete everything with one action. We also offer a free preview of 4 images that arrives in 5 minutes.
+Quality requirements. Identity: the face must be recognizably the customer. We measure this with a face-recognition embedding and with human rating. Realism: no extra fingers, warped teeth, mismatched earrings, or plastic skin. Prompt and style fit: clothes and background match the pack. Variety: 40 images must not be 40 copies of the same pose. Targets: at least 85 percent of customers rate 10 or more images as "looks like me", the refund rate stays under 5 percent, and at least 35 of the 40 delivered images pass the automated checks.
+Non-functional requirements. Turnaround p95 under 60 minutes. Cost per order under 1.5 dollars of compute. Privacy: face images are biometric data in many places (GDPR treats biometric data used to identify a person as a special category; Illinois has BIPA). We need explicit consent, a retention limit (selfies deleted after 7 days, trained adapters after 30 days) and real deletion on request. Abuse: only adults, only the person themselves, no sexual content, no celebrity or public-figure likeness.
+Assumptions. 5,000 orders per day on average, with an evening peak 3 times the average. Base model: a latent diffusion transformer of about 3 billion parameters. Each order uses 15 selfies of about 3 MB.
+estimates: Orders. 5,000 per day is 0.06 orders per second on average, about 210 per hour. At the peak hours, 3 times that: 630 per hour. Each order is a long job, so the right unit is GPU-minutes, not requests per second.
+Training time. A LoRA step on a frozen base model needs the forward pass and the backward pass through activations, but no gradients for the base weights, so it costs about 2 forward passes. At 1024 x 1024, one forward pass of the 3B model is about 30 TFLOPs (4,096 tokens x 6 GFLOPs + attention), so one image costs about 60 TFLOPs and a batch of 2 costs 120 TFLOPs. At 400 TFLOPs per second, that is 0.3 s. Real jobs with small batches reach about half of this, so we plan 0.6 s per step. A typical recipe has 1,200 steps: 1,200 x 0.6 = 720 s, 12 minutes. Image latents and text embeddings of the 15 selfies (with 4 flips and crops each) are computed once before training, which is cheap.
+Generation time. A quality image uses 24 steps with guidance, so 48 passes. With the adapter active, each pass costs about 10 percent more: 48 x 30 TFLOPs x 1.1 = 1.6 PFLOPs, 4 s. We over-generate: 120 candidates for 40 final images, because about one in three passes the quality gate. 120 x 4 s = 480 s = 8 minutes.
+Other steps. Photo checks and preprocessing: about 1 minute of CPU and a small GPU slice. Scoring 120 images with the face-recognition, quality and prompt-match models: about 30 s. Total GPU time per order: 12 + 8 + 1 = 21 minutes, about 0.36 GPU-hours.
+GPU count. 5,000 orders x 0.36 = 1,800 GPU-hours per day, or 75 GPUs busy on average. The 60-minute deadline lets us smooth the peak by queueing: we plan for 150 GPUs at the evening peak (a queue wait of 10 to 20 minutes still fits). Cost: 1,800 x 2.5 dollars = 4,500 dollars per day, 0.90 dollars per order. Using preemptible (spot) GPUs at about 60 percent of the price for the training stage brings this to roughly 0.70 dollars, as long as we checkpoint.
+Storage. A LoRA of rank 16 on the attention and MLP matrices of 28 layers has 24.8 million parameters, 50 MB in 16-bit, against 6 GB for a full copy of the model. Per day: adapters 5,000 x 50 MB = 250 GB (kept 30 days: 7.5 TB), selfies 5,000 x 45 MB = 225 GB (kept 7 days: 1.6 TB), results 5,000 x 16 MB = 80 GB (kept 90 days: 7.2 TB). All in object storage with lifecycle rules.
+api: POST /v1/orders with {style_packs: ["office", "studio_grey"], consent: {version, accepted_at}, locale}. Returns {order_id, upload_urls[]}: signed URLs for direct upload to object storage, so photos never pass through the API servers.
+POST /v1/orders/{order_id}/start tells the system that uploads are complete. The system validates the photos and returns {status: "validating"} or a list of problems per photo (no face, two faces, too blurry, too small).
+GET /v1/orders/{order_id} returns {status, step, progress, preview_urls[], result_urls[]}. Statuses: uploading, validating, queued, training, generating, ranking, ready, failed, deleted. Webhook: order.ready.
+POST /v1/orders/{order_id}/rerun with {style_pack}. Uses the stored adapter, so a re-roll costs only generation time (about 8 minutes) and no training.
+DELETE /v1/orders/{order_id}/data deletes photos, adapter, embeddings and results, and returns a deletion receipt. Internal: TrainAdapter(order_id, recipe_version) and Generate(order_id, pack, n) are workflow activities that run on GPU workers.
+datamodel: Order state is in a relational database; large objects are in object storage under a prefix per order.
+```sql
+CREATE TABLE orders (
+  order_id    UUID PRIMARY KEY,
+  user_id     BIGINT,
+  status      TEXT,
+  recipe_ver  TEXT,         -- training recipe, e.g. 'r7'
+  base_ver    TEXT,         -- base model, e.g. 'dit3b-v4'
+  consent_ver TEXT,
+  created_at  TIMESTAMP, ready_at TIMESTAMP,
+  purge_at    TIMESTAMP     -- deadline for deleting inputs
+);
+CREATE TABLE photos (
+  photo_id UUID PRIMARY KEY, order_id UUID, object_key TEXT,
+  face_box JSONB, quality REAL, id_embedding BLOB, accepted BOOLEAN
+);
+CREATE TABLE results (
+  image_id UUID PRIMARY KEY, order_id UUID, pack TEXT,
+  object_key TEXT, id_sim REAL, aesthetic REAL, clip_sim REAL,
+  artifact_score REAL, rank INT, delivered BOOLEAN
+);
+```
+Object layout: s3-style keys such as orders/{order_id}/in/{photo_id}.jpg, orders/{order_id}/lora/adapter.safetensors, orders/{order_id}/out/{image_id}.jpg. A lifecycle rule per prefix class enforces retention. The workflow engine keeps its own history (one row per step attempt) so we can resume after a failure. The id_embedding of each selfie (512 numbers) lives in the row and is deleted with the order.
+design: The pipeline has six stages. (1) Ingest and validate. The API creates the order and hands out signed upload URLs. After upload, a CPU worker runs a face detector on each photo, crops and aligns the face, computes a face-recognition embedding, a sharpness score and a pose estimate. It clusters the embeddings: all faces must belong to one person (cosine similarity to the cluster mean above a threshold). If a photo shows another person, the order asks for a replacement. This is both a quality check and the first abuse control. We also compare the faces to a list of public figures and refuse a match.
+(2) Prepare. Photos are cropped to several framings (head, head and shoulders, half body), resized to the training resolution and captioned with a short template ("a photo of sks person, wearing a grey t-shirt"). The identity word is a rare token, and the optional first step of the recipe learns a new embedding for it (textual inversion) before the adapter starts, which makes the adapter learn faster and drift less. Latents and text embeddings are cached.
+(3) Train. A GPU worker loads the base model (kept warm in memory), attaches LoRA layers of rank 16 and trains 1,200 steps with a small learning rate and a mix of the customer's images and generic "person" images (so the model does not forget what people in general look like). It saves a checkpoint every 200 steps to object storage. If a spot instance is reclaimed, the workflow restarts on another worker from the last checkpoint.
+(4) Generate. For each style pack, a prompt library holds 30 to 60 prompts (pose, outfit, light, background). The worker samples 120 images across the packs with random seeds, using the adapter. A face-detail pass (inpainting the face area at higher resolution) fixes small faces in full-body shots.
+(5) Rank and filter. Each candidate is scored by four models: identity similarity (cosine between its face embedding and the mean embedding of the customer's selfies), an artifact detector (hands, teeth, eyes), an aesthetic scorer and a prompt-match score from a text-image model. Candidates below hard thresholds are dropped. The rest are ranked by a weighted sum, and a diversity step removes near-duplicates (two images whose embeddings or poses are too close). We take the top 40.
+(6) Deliver. The results are watermarked in metadata (not visible), put in the customer's gallery, and the webhook fires. A timer deletes the inputs after 7 days and the adapter after 30. Everything is run by a workflow engine (for example Temporal or Argo Workflows), where each stage is a step with a timeout, retries and a stored result, so a worker crash never loses an order.
+diagram:
+  customer --selfies--> signed URL --> [object store: in/]
+        |                                   |
+   POST /start                          validate (CPU)
+        |                       detect, align, embed, cluster
+        v                                   |
+  +------------------+   fail: ask for other photos
+  | workflow engine  |<---------------+
+  | (order state,    |                |
+  |  retries, timers)|          prepare: crops, captions,
+  +------------------+          cache latents
+     |       |       \                      |
+     |       |        \-----> GPU pool (spot + on-demand)
+     |       |                  |  train LoRA r=16, 1200 steps
+     |       |                  |  ckpt every 200 -> [store: lora/]
+     |       |                  |  generate 120 candidates
+     |       |                  v
+     |       |             score: id sim, artifacts,
+     |       |             aesthetic, prompt match
+     |       |                  |  top 40 + diversity
+     |       v                  v
+     |   [model registry:   [object store: out/]
+     |    base, recipe]         |
+     v                          v
+  status API / webhook  <---  gallery + CDN
+  (timers: purge in/ after 7 days, lora/ after 30 days)
+animation:
+== The customer uploads 15 selfies straight to object storage.
+  customer --15 jpegs--> [store in/]       queue: 0   GPU: idle
+  order 4411: uploading
+== Validation finds one face per photo and checks it is one person.
+  [store in/] --> CPU validate: 15 faces, 1 cluster (sim 0.78)
+  order 4411: validating     queue: 0     GPU: idle
+== The order waits for a free GPU worker with the base model loaded.
+  workflow --> queue (wait 6 min)          GPU: busy (other order)
+  order 4411: queued
+== LoRA training runs 1,200 steps and saves checkpoints.
+  GPU worker 17: step 600 / 1200   loss 0.11   ckpt 3 saved
+  order 4411: training       adapter 50 MB when done
+== The worker generates 120 candidates with the adapter.
+  GPU worker 17: image 70 / 120    4 s each
+  order 4411: generating
+== Scoring keeps 41 images; the top 40 are chosen with variety.
+  scorers: id sim >= 0.45, artifacts low, aesthetic high
+  order 4411: ranking        41 pass -> 40 deliver
+== The gallery is ready and the webhook fires. Timers start.
+  order 4411: ready (53 min)   purge in/ at day 7, lora/ at day 30
+deepdive: Why LoRA, and why it is small. Fine-tuning all 3 billion weights for one customer would need about 36 GB of optimizer state and produce a 6 GB file per order. LoRA keeps the base weights frozen and learns a low-rank change to each selected matrix:
+\[ W' = W + \frac{\alpha}{r}\, B A, \quad A \in \mathbb{R}^{r \times d_{in}},\; B \in \mathbb{R}^{d_{out} \times r} \]
+With r = 16, we train 24.8 million numbers instead of 3 billion (0.8 percent). The idea is that a change needed to learn one new person lies in a small subspace of the weight space. B starts at zero, so training begins exactly at the base model. Because the change is small, many orders can share one loaded base model on a GPU: the worker swaps a 50 MB adapter in a fraction of a second. We can also merge the adapter into the weights (W' computed once) for faster generation.
+Overfitting with 15 photos. The model can memorize the exact photos: it reproduces the same backgrounds, clothes and poses, and ignores the prompt. We fight this in five ways: a small rank and few steps; a generic-person set mixed in (prior preservation) so "person" keeps its meaning; crops and flips as augmentation; captions that describe clothes and background in the selfies, so the model does not tie them to the identity token; and early stopping at the checkpoint that has the best score on a validation prompt set. We pick the checkpoint with a small automatic search: generate 8 images from 3 checkpoints (steps 800, 1,000, 1,200) with fixed seeds and keep the one with the best balance of identity similarity and prompt match. Overfit shows as high identity similarity but low prompt match.
+Identity measurement with embeddings. A face-recognition network maps a face to a vector of 512 numbers so that two photos of the same person are close (small angle) and photos of different people are far apart. It is trained with a metric loss on millions of identities, in the same family as contrastive learning: pull matching pairs together, push other pairs apart. We use the embedding in three places: validation (are all selfies the same person?), ranking (how close is each output to the customer?), and abuse control (does the face match a public figure?). The threshold is not guessed. We take pairs of different people and pairs of the same person from a labeled set, and choose the similarity where the false match rate is 1 in 1,000. As a baseline, we also compute leave-one-out similarity of the customer's own selfies: a generated image with a similarity above that average is better than a new real photo, and below the 10th percentile it is rejected.
+Evaluation and the release gate. Every change (new base model, new recipe, new prompt pack, new threshold) is evaluated on a fixed benchmark of 200 anonymized volunteer identities with consent: 15 selfies for training and 5 held-out photos per person. Metrics: identity similarity of outputs to held-out photos (median and 10th percentile), prompt match, artifact rate, diversity (mean pairwise distance), pass rate of the gate, and a human test in which 5 raters compare the old and new pipelines on the same identity ("which looks more like the person?"). A change must win on identity without losing on artifacts. Online we track the rate of orders with 10 or more favorites, downloads per order, re-roll rate and refund rate, and we run an A/B test by order, since each customer sees only one pipeline.
+Operations as MLOps. The recipe, the base model version, the prompt packs and the thresholds are all versioned and recorded in the order row. A model registry stores each base model with its evaluation report; a release moves from shadow runs (new pipeline on volunteers) to 5 percent of orders to all. Drift is watched through pass rate (a drop means the base model or the inputs changed), identity similarity per order, and GPU minutes per order. A cost dashboard shows GPU-hours per order by stage. When a bug is found in a version, we can list the affected orders and re-run generation from the stored adapters, as long as they are inside the retention window.
+tradeoffs: Per-customer LoRA versus zero-shot identity adapters. Choose a trained LoRA when identity fidelity is the product and the customer pays for it: it needs 12 minutes of training but gives the best likeness across angles and lights. Choose a zero-shot adapter when you need results in seconds, in a free preview, or at very large volume; it has lower likeness and less consistency and no training cost.
+LoRA versus full fine-tuning (DreamBooth style) versus textual inversion. Choose LoRA for the balance: 50 MB, 12 minutes, good fidelity. Choose full fine-tuning only if you have a few customers who pay a lot and need maximum fidelity (36 GB of optimizer state, 6 GB per customer, 3 to 5 times more time). Choose textual inversion alone when you must be extremely cheap: it learns one vector (a few KB) but the likeness is weak because the model cannot change its weights. Our recipe uses textual inversion as a warm start and LoRA for the real work.
+Over-generate and filter versus generate exactly. Choose over-generation (120 candidates for 40) when GPU time is cheaper than a bad image and the pass rate is about one in three: you pay 3 times the generation cost (about 5 more minutes) and get the quality the customer sees. Choose exact generation only for the free preview, where 4 images are enough and quality matters less.
+Spot versus on-demand GPUs. Choose spot for training and re-rolls that have checkpoints and a loose deadline; it saves about 40 percent but jobs may be interrupted two or three times a day per hundred jobs. Choose on-demand for the last stages when an order is near its deadline, and for the preview. The scheduler promotes a job to on-demand when it has less than 15 minutes of slack.
+failures: Bad input photos. Sunglasses, heavy filters, photos of a different person, or only front-facing selfies. The validator catches most cases and tells the customer what to fix. If too few usable photos remain (less than 8), the order stops before any GPU is used. Without this check, the pipeline would waste 20 minutes of GPU time and then produce poor results.
+Spot interruptions and worker crashes. The workflow engine notices a missed heartbeat after 60 seconds and restarts the step on another worker from the last checkpoint. A step is idempotent: its output path includes the attempt id and is committed on success. A job can be retried 3 times, then it goes to a manual queue and the customer gets an apology and a delay notice.
+A regression in a new version. Identity similarity drops 5 percent but nobody notices for a day. The release gate and the per-order score dashboard, with an alert when the median falls under a bound for 100 consecutive orders, find this within an hour. A rollback is a switch of the recipe version in the registry.
+Privacy incident. A bug exposes a gallery. Defenses: per-order prefixes and signed URLs that expire in 1 hour, encryption at rest with per-order keys, no face data in logs, a deletion workflow that is tested weekly, and a data map for audits. The deletion receipt lists every store that was purged: object store, database rows, caches, vector entries and backups with their expiry date.
+evolution: At 50 orders per day, run one GPU with a script, a simple queue and manual spot checks of results. At 5,000 per day, add the workflow engine, the model registry, the scoring models and the release gate. At 100,000 per day, GPU cost is the main line item: move to a faster base model with fewer generation steps, train adapters in 4 minutes with a better recipe (a hypernetwork or an encoder that predicts the adapter from the photos), merge generation and scoring on the same GPU, and use multi-order batching for the same base model. At that point the zero-shot method becomes competitive, and the product may use it for most orders and keep LoRA for the premium tier. Another path is to keep a small adapter per returning customer, with consent, so new style packs cost only generation.
+followups: Why train a LoRA per customer instead of one model for everyone? || One model cannot know a new person's face without a learned input. A per-customer adapter is a small update (50 MB, 25 million parameters) that stores the likeness. Training takes 12 minutes. Zero-shot adapters avoid training and are good for previews, but their likeness is lower.
+How do you measure that the output looks like the customer? || Use face-recognition embeddings: cosine similarity between each output and the mean embedding of the selfies, with a threshold fixed at a false match rate of 1 in 1,000 on labeled pairs. Compare it with the leave-one-out similarity of real selfies. Add human tests on held-out photos of volunteers. Track the refund rate online.
+The model reproduces the customer's selfie backgrounds. What happened and what do you do? || It overfit to the 15 photos. Use fewer steps and lower rank, mix generic person images (prior preservation), caption the clothes and backgrounds, add augmentation, and select the checkpoint by the balance of identity similarity and prompt match. Overfit shows as high identity but low prompt match.
+What happens when a spot GPU is reclaimed during training? || The workflow engine sees a missed heartbeat, and the step restarts on another worker from the last checkpoint (saved every 200 steps, so at most about 2 minutes are lost). Steps are idempotent and write results with an attempt id. After 3 failures, the order goes to a manual queue.
+How do you prevent someone from making headshots of another person? || Check that all uploads belong to one identity, compare with a public-figure list, require a liveness selfie for new accounts, limit accounts and payment methods, filter prompts and outputs, keep an audit trail and respond fast to takedowns. No control is perfect, so layers and monitoring are needed.
+ref: paper | LoRA: Low-Rank Adaptation of Large Language Models | Hu et al., 2021 |
+ref: paper | DreamBooth: Fine Tuning Text-to-Image Diffusion Models for Subject-Driven Generation | Ruiz et al., 2022 |
+ref: paper | An Image is Worth One Word: Personalizing Text-to-Image Generation using Textual Inversion | Gal et al., 2022 |
+ref: paper | ArcFace: Additive Angular Margin Loss for Deep Face Recognition | Deng et al., 2019 |
+ref: paper | IP-Adapter: Text Compatible Image Prompt Adapter for Text-to-Image Diffusion Models | Ye et al., 2023 |
+ref: paper | InstantID: Zero-shot Identity-Preserving Generation in Seconds | Wang et al., 2024 |
+
+@@ text-to-video
+title: Design text-to-video generation
+category: AI & ML
+level: Senior / Staff
+concepts: diffusion, attention, vae, parallelism, motioncomp, multimodal, gpucomp, codecs, evals
+summary: We build a service that turns a text prompt (and optionally a first image) into a short video, for example a 5 second clip at 720p and 24 frames per second. A latent diffusion transformer does the work: a video autoencoder compresses the clip to a small block of latent numbers, the transformer removes noise from that block step by step, and the decoder turns the result back into frames. Video is the hardest case of image generation because time adds a dimension: one 5 second 720p clip is 120 images that must agree with each other. Attention over all of them is very expensive, a single job needs a group of 8 GPUs for several minutes, and the output must be compressed with a normal video codec before delivery. We design the model path, the multi-GPU serving, the job system, the quality measurement and the safety controls.
+requirements: Functional requirements. A user sends a prompt and gets a video. Inputs: text; optionally one image used as the first frame (image-to-video) or as a style reference. Options: duration (4 or 5 seconds in the first release), resolution (480p draft, 720p final), aspect ratio (16:9, 9:16, 1:1) and a seed. The user can extend a clip, and can upscale a draft to a final. Output is an MP4 (H.264) and a short preview. Jobs take minutes, so everything is asynchronous with a progress report and a notification.
+Quality requirements. Prompt following: the subjects, actions and camera moves in the text appear. Motion: movement is smooth and plausible, objects keep their shape and identity across frames, no flicker. Visual quality: sharp frames, natural color. Offline metrics: Frechet Video Distance (FVD), the VBench suite of measures (subject consistency, motion smoothness, dynamics, aesthetics, text alignment) and CLIP-based text alignment. Online and decisive: blind side-by-side human tests and the rate at which users download or regenerate a clip.
+Non-functional requirements. Draft (480p, 4 s): p95 under 90 seconds including queueing. Final (720p, 5 s): p95 under 12 minutes. Success rate of jobs above 99 percent (jobs that fail are retried, not charged). Cost: under 70 cents per video on average. Safety: block disallowed prompts and outputs, no real-person likeness without consent, watermark and provenance metadata on every file.
+Assumptions. 100,000 videos per day. 80 percent are drafts, 20 percent are finals. The model has 14 billion parameters (40 layers, width 5,120). Each job runs on one node with 8 H100-class GPUs connected by a fast GPU-to-GPU link (NVLink).
+estimates: Average load. 100,000 videos per day is 1.2 videos per second. Peak is about 2 times the average, 2.4 per second. Jobs are long, so the number of jobs running at the same time matters more than the rate.
+Size of the data. A 5 s clip at 24 fps has 121 frames. Raw RGB at 1280 x 720 is 121 x 720 x 1,280 x 3 = 334 million values. The video autoencoder shrinks time by 4 and each side by 8 and keeps 16 channels: (121 - 1)/4 + 1 = 31 latent frames of 90 x 160 positions x 16 channels = 31 x 90 x 160 x 16 = 7.1 million values. That is 47 times fewer. In 16-bit this is 14 MB.
+Token count. The transformer cuts each latent frame into 2 x 2 patches: 45 x 80 = 3,600 tokens per frame. Total for 720p: 31 x 3,600 = 111,600 tokens. For the 480p draft (4 s, 97 frames, 832 x 480): 25 latent frames x (30 x 52 = 1,560) = 39,000 tokens.
+Cost of one pass at 720p. Linear layers: 2 x 14e9 x 111,600 = 3.1 PFLOPs. Full attention over all tokens: 4 x N^2 x width x layers = 4 x (1.116e5)^2 x 5,120 x 40 = 10.2 PFLOPs. Total 13.3 PFLOPs, and attention is 77 percent of it. A 50 step run with classifier-free guidance makes 100 passes: 1.33 exaFLOPs. One node of 8 GPUs, each at 400 TFLOPs real throughput, gives 3.2 PFLOPs per second, so the final takes 1.33e18 / 3.2e15 = 416 s, about 7 minutes. That is 8 x 416 = 3,330 GPU-seconds.
+Draft. One pass at 39,000 tokens: linear 1.1 PFLOPs, attention 4 x (3.9e4)^2 x 5,120 x 40 = 1.25 PFLOPs, total 2.3 PFLOPs. A 25 step run with guidance has 50 passes: 117 PFLOPs, 37 s on the node, 293 GPU-seconds.
+Fleet size. Average GPU-seconds per video: 0.8 x 293 + 0.2 x 3,330 = 234 + 666 = 900. Per day: 100,000 x 900 = 90 million GPU-seconds, so 90e6 / 86,400 = 1,040 GPUs busy on average. With peak 2 times: 2,100 GPUs, about 260 nodes. Cost: 1,040 x 24 x 2.5 dollars = 62,400 dollars per day, 62 cents per video. Fleet utilization below 100 percent raises this; autoscaling and a queue that fills the nodes keeps it near this value.
+Few-step models. A distilled model with 8 steps and no guidance pass makes 8 passes instead of 100: 12.5 times fewer. A final then costs 3,330 / 12.5 = 266 GPU-seconds, and a draft 23. If half of all finals use the fast model, the average cost falls by about 40 percent.
+Communication. With the tokens split across 8 GPUs (sequence parallelism), each GPU holds 111,600 / 8 = 14,000 tokens. One activation tensor per GPU is 14,000 x 5,120 x 2 bytes = 143 MB. Attention needs 4 all-to-all exchanges per layer (queries, keys, values, output). At about 450 GB per second per GPU on NVLink, each takes 0.3 ms, so 4 x 0.3 ms x 40 layers = 50 ms per pass against 4.2 s of math: about 1 percent.
+Output file. H.264 at about 5 Mbit per second for 720p: 5 s x 5 Mbit = 25 Mbit = 3 MB. 100,000 videos per day x 3 MB = 300 GB per day. The latent (14 MB) is larger than the MP4, because it is made for generation, not for storage.
+api: POST /v1/videos with {prompt, image_url?, duration_s: 4 or 5, resolution: "480p" or "720p", aspect: "16:9", seed?, mode: "standard" or "fast", rewrite_prompt: true}. Returns 202 with {video_id, eta_s}.
+GET /v1/videos/{video_id} returns {status, progress: 0 to 1, preview_url?, video_url?, prompt_used, seed, model_version}. Status: queued, running, decoding, encoding, done, blocked, failed. A webhook video.done carries the same body.
+POST /v1/videos/{video_id}/finalize turns a draft into a 720p final. It reuses the prompt and seed, and starts from the draft's low-resolution video: the draft is upscaled and a short refinement (about 40 percent of the steps, starting from partial noise) adds detail. This costs less than a new final and keeps the content of the draft.
+POST /v1/videos/{video_id}/extend with {prompt, extra_s: 4}. Uses the last frames as conditioning for a new segment.
+Internal: RunJob(job_spec) on a node controller; the controller starts the 8 worker processes, loads the weights (28 GB in 16-bit per GPU, or a shard), and reports step progress and latent checkpoints.
+datamodel: Jobs and assets are rows; heavy data is in object storage.
+```sql
+CREATE TABLE video_job (
+  video_id    UUID PRIMARY KEY,
+  user_id     BIGINT,
+  spec        JSONB,       -- prompt, rewrite, size, steps, seed
+  mode        TEXT,        -- 'draft' | 'final' | 'fast'
+  parent_id   UUID,        -- draft this final came from
+  status      TEXT,
+  step        INT,         -- last completed denoising step
+  node_id     TEXT,
+  model_ver   TEXT,
+  gpu_s       INT,         -- billing and cost tracking
+  created_at  TIMESTAMP, done_at TIMESTAMP
+);
+CREATE TABLE video_asset (
+  video_id UUID, kind TEXT,   -- 'latent' | 'mp4' | 'preview' | 'thumb'
+  object_key TEXT, bytes BIGINT, PRIMARY KEY (video_id, kind)
+);
+```
+The job queue is keyed by mode, resolution and priority. Every 10 denoising steps the node writes the current latent (14 MB) to fast local storage and the step number to the row, so a failed node costs at most 10 steps of work. Final MP4 files, previews and thumbnails are in object storage behind a CDN. Prompt text and the rewritten prompt are stored for audit, with a retention rule.
+design: The path of a job. The API checks the prompt with a fast text classifier. An LLM then rewrites the prompt: the model was trained on long, detailed captions made by a captioning model, so a short prompt like "a dog on a beach" is expanded to describe the subject, action, camera, light and style. This matches the training distribution and is one of the cheapest quality gains. The job enters the queue. A scheduler waits until a node with 8 free GPUs in one NVLink domain is available and sends the job there (gang scheduling: all 8 or none).
+On the node, the text encoder turns the prompt into a sequence of vectors (with image conditioning for image-to-video: the first-frame latent is concatenated to the input and image features are added as extra tokens). This is the multimodal part: text, image and video tokens all enter one transformer. The node draws a random latent block for the seed, split along the token axis into 8 slices, one per GPU. The sampling loop runs: each step is a pass through the 40 transformer layers, where every layer does self-attention over all video tokens plus cross-attention to the text tokens, then an MLP. Between GPUs, an all-to-all exchange moves tokens so that each GPU computes attention for a subset of heads over all tokens (sequence parallelism, also called Ulysses style). After the last step, the VAE decoder turns the latent into frames. The decoder works in time chunks and spatial tiles to limit memory.
+After decoding, a post-process stage can interpolate frames if the model generated at 12 or 16 fps, using a motion-aware interpolation network. A safety classifier samples one frame in 8 (15 frames) and checks them. The encoder (H.264, High profile, yuv420p, 5 Mbit per second, faststart so playback begins at once) writes the MP4 on CPU or with a hardware encoder (GPU video engine). A watermark and a C2PA manifest are added. The file goes to object storage, a preview (360p, 1 Mbit per second) is made, and the job is done.
+Draft to final. The draft costs about 9 percent of a final. Users iterate on drafts (4 seconds at 480p, under 90 seconds) and promote only the best ones. If a user makes 3 drafts for each final, the cost is 3 x 293 + 3,330 = 4,210 GPU-seconds, against 4 x 3,330 = 13,320 if every try were a final: 3.2 times less.
+diagram:
+  client --POST /v1/videos--> [API] -- prompt check --> reject/continue
+                                |
+                          [prompt rewriter (LLM)]
+                                |
+                        [queue: mode x res x prio]
+                                |
+                    [gang scheduler: 8 GPUs, one NVLink domain]
+                                |
+  +---------------------- GPU node (8 x H100) ------------------+
+  | text enc (+ image latent for i2v)                           |
+  | noise latent 31 x 90 x 160 x 16, split in 8 token slices    |
+  |   +-- step loop (25 or 50 steps, guidance x2) ----------+   |
+  |   | GPU0 GPU1 ... GPU7  per layer: attention + MLP      |   |
+  |   |  <== all-to-all over NVLink (heads <-> tokens) ==>  |   |
+  |   +-----------------------------------------------------+   |
+  |   latent ckpt every 10 steps -> local NVMe                  |
+  | VAE decode (time chunks, tiles) -> 121 frames               |
+  +------------------------------+------------------------------+
+                                 v
+      safety (15 frames) -> interpolate? -> H.264 encode
+                                 v
+      watermark + C2PA -> object store -> CDN -> client
+animation:
+== A prompt arrives, is checked and rewritten into a detailed caption.
+  "a dog on a beach" --> check ok --> rewrite (1.5 s)
+  node: none yet          queue: 14 jobs
+== The job waits for a free node with 8 GPUs.
+  job 7731 --> queue (wait 25 s) --> node 42 (8 free)
+  node 42: loading weights (28 GB per GPU, from local NVMe)
+== The node makes a noise latent (31 frames) and splits it over 8 GPUs.
+  node 42: z = noise   31 x 90 x 160 x 16   GPU0..7 hold 14k tokens each
+  step 0 / 50
+== Each step: attention across all frames, using all-to-all exchange.
+  node 42: step 12 / 50   pass = 4.2 s   (guidance: cond + uncond)
+  latent view: blobs with a rough camera layout
+== Checkpoint at step 20; a GPU fails; the job resumes from step 20.
+  node 42: step 24 -> GPU5 error   node drained
+  node 57: resume from latent ckpt at step 20
+== Steps finish: the sand, the dog and the motion are clear.
+  node 57: step 50 / 50
+  latent view: dog runs left to right, waves move
+== The VAE decodes to 121 frames; the encoder makes the MP4.
+  VAE decode 25 s -> frames -> H.264 (3 MB) -> object store
+  safety: 15 frames pass    watermark + C2PA added
+== The client is notified and plays the preview first.
+  webhook video.done   total 7.9 min   gpu_s 3,560
+deepdive: Why attention is the problem. A video is a stack of frames, and objects move between them. To keep a dog consistent from frame 1 to frame 120, the model must let tokens in different frames look at each other. Full 3D attention lets every one of the 111,600 tokens attend to every other, which costs N^2 and is 77 percent of the compute. A cheaper layout factorizes attention: spatial attention inside each frame (31 frames x 3,600^2) followed by temporal attention across frames at the same position (3,600 positions x 31^2). For one layer at width 5,120 the full form costs 4 x N^2 x 5,120 = 255 TFLOPs, the factorized form about 8.3 TFLOPs, 31 times less. But factorized models have a harder time with large motion and camera moves, because information from a moving object must pass through several layers to reach its new position. Recent open models mostly choose full 3D attention and accept the cost, and use sequence parallelism and efficient kernels.
+The video VAE. The VAE is a 3D causal convolutional network: the encoder compresses each block of 4 frames in time and 8 x 8 pixels in space into one latent position of 16 channels; "causal" means a frame never sees later frames, so the first frame can be encoded alone, which makes image-to-video and training on single images natural (frames = 1). It does the job a codec's motion compensation does, in a learned form: both exploit the fact that frame t+1 is mostly frame t, moved. A codec predicts blocks from earlier frames with motion vectors and codes the residual; the VAE learns a representation where static content is stored once and change is stored as small differences. They differ in aim: a codec removes redundancy to cut bits (3 MB for our clip), a VAE keeps an easy-to-model grid (14 MB) with 16 channels of detail. The VAE limits quality: fine text, fast motion blur and small faces are lost in the 8 x 8 x 4 compression, which no later step can recover. Decoding is expensive and memory-hungry (tens of GB without chunking), so the decoder runs on time chunks with overlap and on spatial tiles, with a small blend at the seams.
+Parallelism in serving. Four ways to split a job across GPUs. Data parallelism runs different requests on different nodes; it adds throughput but not speed for one job. Tensor parallelism splits each matrix and needs an all-reduce twice per layer; it works but moves a lot of data for 5,120-wide activations with 111,600 tokens. Pipeline parallelism puts layers on different GPUs; one request has only a few micro-batches, so most GPUs idle (pipeline bubbles), a poor fit for latency. Sequence parallelism splits the tokens: each GPU holds 1/8 of the tokens and, after an all-to-all, 1/8 of the heads with all tokens, so attention is exact. Ring attention does it by passing key and value blocks around a ring and overlaps communication with math. We use 8-way sequence parallelism, which gives a speedup of nearly 8 for one job because the communication is about 1 percent. An option is 4-way sequence parallelism plus guidance parallelism (the conditioned and unconditioned passes run at the same time on two groups of 4 GPUs), which keeps all-to-all groups smaller.
+Training data and captions. The training set is video clips with captions, and clip quality dominates model quality. Pipeline: detect scene cuts and split videos into single-shot clips of 2 to 10 seconds; remove clips with little motion (compute motion energy from optical flow), burned-in text and logos, low aesthetic score, and duplicates; caption each clip with a vision-language model in two lengths, short and long, and include camera motion terms ("slow zoom in", "tracking shot"). We mix images and videos in training (images are one-frame videos), which keeps image quality high, and we train in stages at rising resolution and length: 256 pixel images, then short low-resolution clips, then 480p, then 720p with fine-tuning on the best 1 percent of data.
+Evaluation. FVD compares the distribution of features (from a video classification network, I3D) of generated and real clips. It needs thousands of clips, is dominated by frame content more than by motion, and often fails to rank models by temporal quality. VBench splits quality into 16 dimensions (subject consistency, background consistency, motion smoothness, dynamic degree, aesthetic quality, imaging quality, and several text-alignment measures). It is cheap and helps find regressions, but a model can be tuned to the metric. Human preference tests are the final judge: raters see two clips from the same prompt and choose, with separate questions for motion, prompt following and visual quality, so we can see that a gain in sharpness did not cost motion. We keep a private set of 1,000 prompts that cover animals, people, crowds, camera moves, text, physics (liquid, fire, cloth) and counting, and track a win rate per category. Failures like morphing, limbs that appear or vanish and impossible physics are counted by raters as a defect rate.
+tradeoffs: Full 3D attention versus factorized space-time attention. Choose full 3D attention when motion quality and camera movement matter and you have the GPUs: attention costs 31 times more than the factorized form and a job needs 8 GPUs. Choose factorized attention for a cheaper model, short low-resolution clips and large volume (30 times cheaper attention); you pay with weaker motion and identity drift in long shots.
+Cascade versus single stage at high resolution. Choose a cascade (draft at 480p, then refine or upscale to 720p) when most users iterate: the draft costs 9 percent of a final. Choose single-stage 720p when the first result must be final, such as an API for developers. The cascade can change fine details between draft and final, so keep the same seed and refine from partial noise.
+Many steps with guidance versus a distilled few-step model. Choose 50 steps with guidance for the final tier where users pay for quality; choose an 8 step distilled model for drafts and for the free tier, 12 times cheaper with less variety and some loss of motion. Distillation is a team-quarter of research, so plan for it once volume justifies it.
+failures: A GPU or node fails during a run. Heartbeats stop; the controller marks the node bad. The job restarts on a new node from the last latent checkpoint (every 10 steps, so at most 10 steps or about 80 seconds are lost). Nodes with repeated errors are drained and tested with a burn-in program before they return.
+Queue explosion. A viral prompt style or a bot sends 10 times the traffic. Per-user concurrency limits, credits for each job (cost known at submit time from the spec), a cap on drafts per hour, an admission limit that returns 429 with a wait estimate, and a switch to the fast model for the free tier. Final jobs have a separate pool so that drafts do not starve them.
+Safety miss. A disallowed prompt is rephrased to bypass the text classifier. The output check on sampled frames is the second layer, and a rolling review of a random sample by people is the third. Prompts and outputs are logged under a retention rule. Real-person likeness requires verified consent, and image-to-video with a face input is limited to the account holder's verified photos or is blocked.
+evolution: At 1,000 videos per day, run one open model on a few nodes with a plain queue, one tier and 480p. At 100,000 per day (this design), add the draft-to-final flow, gang scheduling, sequence parallelism, latent checkpoints, the prompt rewriter and the safety stack. At 5 million per day, serving is the main cost: distill to few steps, quantize to 8-bit, use sparse or windowed attention in some layers, cache the text encoding and the draft for repeated prompts, and move the VAE decode and the H.264 encode to cheaper hardware. Cost per video must fall by 10 times to make a free tier work. Model direction: longer clips with better physics, native audio generated jointly with the picture (a second token stream in the same transformer), and editing (video to video, with masks), where the input video enters as extra conditioning.
+followups: Why is video generation so much more expensive than image generation? || Tokens multiply by the number of latent frames (31 here, 111,600 tokens against 4,096 for an image), and full attention grows with the square of tokens. One 720p pass is 13 PFLOPs against 30 TFLOPs for a 1024 image. Add 25 to 50 steps and guidance, and one clip needs a node of 8 GPUs for minutes.
+How do you split one job across 8 GPUs? || Sequence parallelism: split the tokens over GPUs, then use an all-to-all so each GPU computes some attention heads over all tokens. Add parallelism over the two guidance passes. The communication is about 1 percent of the time on NVLink. Tensor parallelism moves more data and pipeline parallelism leaves GPUs idle for a single request.
+Why a video VAE, and how is it like a video codec? || It compresses 4 frames and 8 x 8 pixels into one latent position, 47 times fewer values, so the transformer can run. Both it and a codec exploit that frame t+1 resembles frame t. A codec uses motion vectors and residuals for small files; the VAE learns a grid for modeling. The VAE caps the detail of the result.
+How do you make a job survive a node failure? || Checkpoint the latent (14 MB) and the step number every 10 steps, make steps idempotent, detect failures with heartbeats and collective timeouts, and restart on another node from the checkpoint. Drain bad nodes and burn them in before reuse.
+How would you evaluate a new model version? || Run VBench and FVD for regressions, run motion-specific checks, then blind pairwise human tests on a private prompt set with separate questions for motion, prompt following and quality. Compare per category, then canary at 2 percent while watching the defect rate and user flags.
+ref: paper | Video Diffusion Models | Ho et al., 2022 |
+ref: paper | Scaling Rectified Flow Transformers for High-Resolution Image Synthesis | Esser et al., 2024 |
+ref: paper | CogVideoX: Text-to-Video Diffusion Models with An Expert Transformer | Yang et al., 2024 |
+ref: paper | Wan: Open and Advanced Large-Scale Video Generative Models | Wan team, Alibaba, 2025 |
+ref: paper | VBench: Comprehensive Benchmark Suite for Video Generative Models | Huang et al., 2024 |
+ref: paper | DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models | Jacobs et al., 2023 |
+
+@@ mobile-news-feed
+title: Design a news feed mobile app
+category: Mobile
+level: Senior / Staff
+concepts: mobilearch, apidesign, cachelayer, eviction, httpcaching, websocket, retries, cdn
+summary: We design the iOS and Android app of a news product, together with the API it talks to. The app shows a ranked, endlessly scrolling list of articles with a headline, a summary and a thumbnail. It must open instantly, scroll at 60 frames per second, work on a weak network or none at all, use little battery and data, and tell the user about breaking news. The difficulty is not the list. It is the phone: a small memory, a radio that costs battery every time it wakes up, a network that changes from Wi-Fi to cellular to a tunnel, an operating system that kills the app in the background, and old app versions that stay in use for years. We design the client layers, the local database and caches, the paging contract, the sync and retry rules, image loading, push and live updates, and the backend and CDN behind them.
+requirements: Functional requirements. A personalized feed of articles, newest and most relevant first, with infinite scroll. Pull-to-refresh and a "new stories" pill. An article screen with the body text and images. Bookmarks that are readable offline. Breaking-news push notifications. Read and unread state, and reading signals (impressions, opens, time spent) sent back to improve ranking. Sign-in on several devices with bookmarks synchronized.
+Non-functional requirements. Speed: cold start shows content from the local database in under 1 second; with network, fresh content within 1.5 seconds on 4G at p75. Smoothness: scrolling stays at 60 frames per second (16.7 ms per frame; 8.3 ms on 120 Hz screens) with under 1 percent slow frames. Data use: the first screen costs under 300 KB on cellular. Battery: background work under 2 percent of battery per day. Offline: the last 200 feed items and all bookmarked articles are readable without a network. Reliability: crash-free sessions at least 99.9 percent. Freshness: breaking news reaches 90 percent of devices in 10 seconds. Compatibility: the API serves app versions up to 3 years old.
+Assumptions. 10 million daily active users. 8 sessions per user per day. Each session loads the first page and 3 more pages. A page has 20 items. Phones range from 2 GB to 12 GB of RAM. The backend ranks per user and stores a ranked candidate list for each active user.
+estimates: Request rate. 10 million users x 8 sessions = 80 million sessions per day. Each session makes 4 feed page requests, so 320 million page requests per day. Divided by 86,400 seconds: 3,700 per second on average. Mornings are about 5 times the average: 18,500 per second at peak. A page of 20 items is about 24 KB of JSON, 6 KB with Brotli.
+Images. A user sees about 10 images per page. 320 million pages x 10 = 3.2 billion image loads per day if nothing were cached on the phone. A 640 pixel wide thumbnail in WebP is about 40 KB: 3.2 billion x 40 KB = 128 TB per day. That is 128e12 x 8 / 86,400 = 11.9 Gbit per second on average and about 59 Gbit per second at peak. Images are the cost, not JSON. With the on-device cache removing repeat loads (say 30 percent) and a CDN hit rate of 97 percent, the origin sees 59 x 0.7 x 0.03 = 1.2 Gbit per second at peak.
+First screen on cellular. One page of JSON (6 KB) plus 6 visible thumbnails of 30 KB is 186 KB, below the 300 KB budget.
+Backend servers. A feed request reads one list of ranked ids from a key-value store and fetches 20 article cards from a card cache with one multi-get. Say 20 ms of server time and 2 ms of CPU, so one server handles about 1,500 requests per second. 18,500 / 1,500 = 12; with 3 times headroom and zone redundancy we run 40 app servers.
+Device storage and memory. The database holds 300 feed items x 1.5 KB = 450 KB and 100 article bodies x 20 KB = 2 MB: about 2.5 MB. The image disk cache is capped at 200 MB. The image memory cache is limited to 1/8 of the app memory budget: on a phone with a 256 MB heap limit that is 32 MB. A decoded 640 x 360 thumbnail in 8-bit RGBA takes 640 x 360 x 4 = 0.92 MB, so 32 MB holds about 35 decoded images. A decoded bitmap is 23 times larger than its 40 KB file, which is why a memory cache must count decoded bytes and why images are decoded at the size of the view, not their original size.
+Live connections. At peak about 4 percent of daily users have the app in the foreground: 400,000 connections. A tuned gateway holds about 50,000 idle connections per node, so 8 nodes; with headroom and zones, 16.
+Breaking news. A push to 5 million devices. Sending in batches of 500 tokens (the multicast limit of the Firebase service) means 10,000 batches. 20 sender workers, each sending 500 batches, finish in about a minute. If 15 percent of recipients open the app within 2 minutes, that is 750,000 opens in 120 seconds, 6,250 article requests per second. The article is the same for all users, so the CDN serves it.
+api: GET /v1/feed?limit=20&cursor=<opaque>. Returns {feed_id, items: [{id, title, summary, source, published_at, updated_at, thumb: {url, w, h, blurhash}}], next_cursor, version}. The first page (no cursor) creates a feed snapshot on the server. The cursor identifies the snapshot and the position, so the next pages continue the same list even if the ranking changes in the meantime. The response has ETag and Cache-Control: private, no-cache. A client that sends If-None-Match gets 304 Not Modified with no body.
+GET /v1/feed/updates?since=<version> returns {new_count, top_ids[]}, a tiny response used to show the "N new stories" pill without fetching a whole page.
+GET /v1/articles/{id} returns the body as a list of blocks (paragraph, image, quote, embed) in JSON, with ETag and Cache-Control: public, max-age=300, stale-while-revalidate=60. It is the same for all users, so the CDN caches it. The images use URLs with a content hash and Cache-Control: public, max-age=31536000, immutable. A width parameter chooses 320, 640 or 960 pixel variants.
+POST /v1/events with {batch_id, events: [{type: "impression" or "open" or "dwell", article_id, ts, dwell_ms}]}. A batch_id makes the call idempotent: if the phone repeats it after a timeout, the server ignores the second copy. Returns 202.
+PUT /v1/devices/{device_id} with {push_token, platform, app_version, locale, tz}. POST /v1/bookmarks/{article_id} and DELETE /v1/bookmarks/{article_id}; GET /v1/bookmarks?since=<token> for sync. Live channel: WebSocket at wss://live.example.com/v1/stream sends {type: "new_stories", version} and {type: "breaking", article_id, headline}.
+datamodel: The phone has a local SQLite database (Room on Android, GRDB or Core Data on iOS). It is the single source of truth for the screen: the UI observes the database, and the network only writes into it.
+```sql
+CREATE TABLE article (
+  id TEXT PRIMARY KEY, title TEXT, summary TEXT, source TEXT,
+  published_at INTEGER, updated_at INTEGER, thumb_url TEXT,
+  thumb_blurhash TEXT, body_json TEXT, etag TEXT,
+  fetched_at INTEGER, bookmarked INTEGER DEFAULT 0,
+  read INTEGER DEFAULT 0
+);
+CREATE TABLE feed_item (
+  feed_id TEXT, position INTEGER, article_id TEXT,
+  PRIMARY KEY (feed_id, position)
+);
+CREATE TABLE feed_state (
+  feed_id TEXT PRIMARY KEY, next_cursor TEXT, etag TEXT,
+  version INTEGER, fetched_at INTEGER
+);
+CREATE TABLE outbox (
+  batch_id TEXT PRIMARY KEY, payload BLOB, attempts INTEGER,
+  next_try_at INTEGER
+);
+```
+feed_item holds only the order and points to article, so one article shared by two feeds is stored once. outbox holds events and bookmark changes until the server confirms them. On the server, the feed store is a key-value store (key: user id; value: a list of 200 ranked article ids plus a version), the article card cache is keyed by article id, and snapshots live for 30 minutes under key (user, feed_id). Events go to a log (Kafka) for ranking and analytics.
+design: Client layers. The UI layer is a virtualized list (UICollectionView with a diffable data source on iOS, LazyColumn in Compose on Android). Only the rows on screen exist, and rows are reused. A view model holds the screen state and exposes one immutable state object (unidirectional flow), which makes scroll restoration and tests simple. A repository combines a local data source and a remote data source. The domain layer holds rules such as "which items count as new". Below are the database, the HTTP client, the image loader and a background scheduler. Layering keeps the screen free from network code, so offline behavior comes from the architecture and not from special cases.
+Opening the app. The view model reads the latest feed from the database and the UI paints at once (stale-while-revalidate): the user sees yesterday's feed in about 200 ms, never a spinner. In parallel the repository sends GET /v1/feed with If-None-Match. A 304 costs about 300 bytes and 100 ms. A 200 brings a new snapshot. The repository writes the new items into the database in one transaction, and the UI sees the change through the observer. It does not move the list under the user's finger. If the user has scrolled, new items are placed above and a "N new stories" pill appears; a tap scrolls to the top. The scroll position is anchored to an item id, not to a pixel offset.
+Paging. When the user is within 5 items of the end, the app fetches the next page using next_cursor, writes it to feed_item and continues. On Android, the Paging library with a RemoteMediator does this pattern; on iOS we write the same logic by hand. Cursor paging is used, not offset paging, because with a ranking that changes over time an offset skips or repeats items. The snapshot makes pages consistent with each other. Duplicates are removed on write by (feed_id, article_id).
+Caching layers. There are four caches with clear roles. (1) The image memory cache keeps decoded bitmaps for fast scrolling; it is an LRU cache with a byte limit. (2) The image disk cache keeps encoded files for 7 days or until 200 MB. (3) The HTTP cache of the network stack keeps responses by their Cache-Control and ETag headers. (4) The database keeps structured data for offline use. Server side, a CDN holds images and article bodies close to users, and a card cache holds article cards in front of the content database.
+Image loading. A library (Coil or Glide on Android; Nuke or Kingfisher on iOS) does the work, and we set the rules. It requests the variant that matches the view width in physical pixels (a 360 point wide view on a 3x screen asks for the 960 variant, a 2x screen the 640 variant). It decodes on a background thread, downsamples to view size, and cancels the request when the row is reused (the user scrolls fast). While loading, it shows a blurhash placeholder (a 20 byte string in the JSON that decodes to a blurred preview), which stops the layout from jumping. Prefetch: while scrolling, it starts loading the thumbnails for the next 6 rows.
+Live updates and push. In the foreground, the app opens one WebSocket and gets "new stories" and "breaking" events, so the pill and a banner appear without polling. When the app goes to the background, the socket is closed, because a mobile OS freezes background connections and a keepalive ping every 30 to 60 seconds would wake the radio and drain the battery. Background delivery uses push through Apple (APNs) and Google (FCM). A push has a headline and the article id (the payload limit is 4 KB), a collapse key so that a newer breaking item replaces an older one, and a time-to-live of 1 hour. A push is best effort, so it is never the only way to learn something: the next foreground open always syncs.
+diagram:
+  PHONE
+  +-----------------------------------------------------------+
+  | UI: virtualized list <-- state --  ViewModel               |
+  |                                      |                     |
+  |                                 Repository                 |
+  |                     +----------------+---------------+     |
+  |                     v                                v     |
+  |        SQLite (source of truth)               Remote source|
+  |   article | feed_item | feed_state | outbox        |       |
+  |                     ^                                |     |
+  |   Image loader: mem LRU 32 MB -> disk LRU 200 MB     |     |
+  |   Scheduler: WorkManager / BGTask   Push receiver    |     |
+  +--------------------------------------------------|---------+
+             HTTP/2 or HTTP/3, Brotli, ETag          |  WebSocket
+                                                      v  (foreground)
+  +------------------- CDN / edge ------------------------------+
+  | images (immutable), article JSON (max-age 300 + SWR)        |
+  +-----------------------------+-------------------------------+
+                                | miss / private feed
+                        +-------v--------+     +---------------+
+                        | API gateway    |---->| live gateway  |
+                        | auth, limits   |     | (sockets)     |
+                        +---+--------+---+     +-------^-------+
+                            |        |                 | events
+                  +---------v--+  +--v-----------+  +--+------------+
+                  | feed svc   |  | article svc  |  | push sender   |
+                  | KV: ids    |  | card cache   |  | APNs / FCM    |
+                  +------------+  +--------------+  +---------------+
+                            events log (Kafka) -> ranker, analytics
+animation:
+== The user opens the app. The database already has yesterday's feed.
+  UI  : shows 20 cached items (200 ms)       network: idle
+  DB  : feed f41, etag "a9"                  outbox : 3 events
+== In parallel the app sends a conditional request for the feed.
+  UI  : cached items on screen               network: GET /feed
+  request carries If-None-Match "a9"          outbox : 3 events
+== The server answers 200 with a new snapshot f42 and 20 new items.
+  UI  : cached items on screen               network: 200, 6 KB
+  DB  : writes f42 in one transaction        outbox : 3 events
+== The database changes, so the UI updates without moving the list.
+  UI  : pill "7 new stories" above the list  network: idle
+  DB  : f42 saved, etag "c3"                 outbox : 3 events
+== Thumbnails load: memory hit, disk hit, or the CDN.
+  UI  : row 1 mem hit, row 2 disk hit        network: GET img x3
+  placeholders use blurhash until bytes arrive
+== The user scrolls near the end. The app fetches page 2 by cursor.
+  UI  : rows 15 to 20 visible                network: GET /feed?cursor
+  DB  : writes items 21 to 40                outbox : 5 events
+== The app flushes the outbox in one batch. A timeout means a retry.
+  network: POST /events batch b77  -> timeout
+  retry in 2.3 s (backoff + jitter), same batch_id, server ignores dupes
+deepdive: Pagination and a moving ranking. If the server ranks anew on every request, page 2 may contain an item that was on page 1 (because it moved down) and skip another. A pure offset cursor makes this worse. Our snapshot fixes it: the first request stores the ranked list of up to 200 ids for 30 minutes and gives it an id. The cursor names the snapshot and the next position. A page is then a slice of a fixed list. Cost: 200 ids x 16 bytes = 3.2 KB of memory per active user for 30 minutes; with 1 million active users that is 3.2 GB in the key-value store, cheap. If the snapshot has expired (the phone slept for an hour), the server answers with a cursor-expired code and the client starts a fresh page one, keeping the old items until the new ones arrive. For pages beyond 200 items the server builds a second snapshot with the items not yet shown.
+HTTP caching on a personalized feed. The feed is private, so the CDN must not store it. We use Cache-Control: private, no-cache with an ETag, which lets the phone store the response and revalidate it on each use. The server computes the ETag from the version number of the user's ranked list, so a 304 costs one key-value read and no card hydration. Articles and images are the same for everyone and carry long lifetimes. Articles use max-age=300 with stale-while-revalidate=60: the CDN and phone can serve a copy up to 5 minutes old without asking, and for another minute while refreshing in the background. When an editor corrects an article, the updated_at in the feed item changes, and the client refetches the body by comparing it with the stored value, so freshness does not depend on the CDN time-to-live. Images use content-hashed URLs; a changed image has a new URL, so they can be immutable and never need a purge.
+Eviction and the cost of a bad policy. LRU by bytes suits images, because re-use follows recency. For feed rows and article bodies we use a mix: keep the newest 300 feed items, the article bodies of the last 7 days that the user opened, and every bookmark. A pure LRU would evict a bookmark that the user has not opened for a month, which breaks the promise of offline reading. The memory cache must also react to system pressure: on a low-memory signal (onTrimMemory on Android, a memory warning on iOS) we drop the memory cache to a quarter of its size. The OS can kill a background app without notice, so state that matters is in the database, never only in memory.
+Retries, backoff and jitter. On a failed request, the client does not retry at once. It waits base x 2^attempt, with base 1 second and a cap of 5 minutes, and picks a random time up to that bound (full jitter), so a million phones that failed together do not return together. Only idempotent calls are retried automatically; for POST /events the batch_id makes a retry safe. The client obeys Retry-After. Failures are classified: a timeout or a 5xx is retried; a 429 waits for Retry-After; a 401 refreshes the token once, with one refresh shared by all waiting requests (single flight); a 4xx such as 400 or 404 is not retried. A circuit breaker stops requests to the host after 5 failures in a row for 30 seconds and shows the cached feed with an "offline" bar. A user action (pull to refresh) bypasses the delay but not the breaker.
+Battery. The cellular radio moves to a high-power state for each transfer and stays there for several seconds afterwards (the "tail", often 5 to 15 seconds, set by the carrier). Ten small requests spread over 10 minutes cost much more energy than one batch of ten. Rules: batch the events, send them on the next foreground request or at most every few minutes; prefetch only on Wi-Fi; use the OS scheduler (WorkManager on Android, minimum period 15 minutes; background tasks on iOS), which groups our work with other apps and honors constraints such as network available and battery not low; do not poll.
+tradeoffs: Database as source of truth versus memory plus network. Choose the database as the single source of truth when offline use, fast start and surviving process death matter, as they do for news: the UI always shows something and the network just updates it. You pay for schema work, migrations and about 20 percent more code. Choose in-memory state with direct network calls only for small, short-lived screens or prototypes.
+Cursor snapshot versus plain offset or timestamp paging. Choose snapshot cursors for a personalized ranked feed, where the order changes between requests: pages stay consistent, and memory cost is small. Choose timestamp (keyset) paging for a pure reverse-chronological list, where it needs no server state and is trivial to cache. Choose offset paging only for stable, small lists. You give up statelessness with snapshots and some freshness with keyset.
+WebSocket versus SSE versus push versus polling. Choose WebSocket (or SSE) for the foreground, when a banner within 2 seconds adds value and you can afford 400,000 connections (16 nodes). SSE is simpler if the traffic only goes from server to phone; WebSocket is better if the phone also sends acknowledgements. Choose APNs/FCM push for the background; it is the only way to reach a closed app. Choose polling with ETag (every 60 seconds, a 304 costing 300 bytes) when the product can live with a minute of delay: it needs no connection state, but costs battery. We use push plus a foreground socket, and the ETag check on open as the safety net.
+failures: No network or a captive portal. The phone says it is connected, but requests hang or return an HTML login page. A request timeout of 10 seconds, a content-type check (JSON expected) and the circuit breaker avoid endless spinners. The UI shows cached content with an "offline" bar and retries in the background.
+The server is slow or down. The client times out at 10 seconds for the first page, retries with backoff and jitter, and keeps showing the cache. On the server, the gateway returns cached older feeds ("serve stale on error") for up to 10 minutes when the feed service is unhealthy, and load is shed by priority: events and prefetch requests first, article pages next, the first page last.
+Thundering herd after a breaking news push or an outage. All phones open or retry together. Defense: sends are spread over 60 seconds, the article is served by the CDN, the feed refresh after a push is jittered by a random 0 to 5 seconds on the client, and the gateway has per-user and global rate limits. The CDN request coalescing sends one request to the origin for the same article.
+evolution: At 10,000 users, one backend, plain JSON and a database cache on the phone are enough. At 1 million, add the CDN for images and articles, ETag revalidation, snapshot cursors, the outbox and push. At 10 million (this design), add the card cache, the live gateway, tuned image variants, client performance monitoring and remote flags. At 100 million, regionalize: feed stores and live gateways in several regions with user affinity, connection counts in the millions (tens of gateway nodes), edge compute for ETag checks, and a push pipeline sharded by region.
+followups: How do you make the app open instantly? || Paint from the local database first (stale-while-revalidate), then revalidate with a conditional request. Keep the first screen small (about 190 KB), use blurhash placeholders and a prefetch of the next rows. Avoid work on the main thread at launch, and preconnect to the API host.
+What should be cached, where, and for how long? || Images: immutable URLs, CDN and phone disk and memory caches, evicted by LRU. Article bodies: public with max-age=300 and stale-while-revalidate. The feed: private with ETag revalidation, never in the CDN. Bookmarks and the last 300 items: in the database without expiry for bookmarks.
+How do you design retries so that you do not make an outage worse? || Exponential backoff with full jitter, a cap, only for idempotent calls (batch_id for events), obey Retry-After, a client circuit breaker, and server load shedding by priority. User-initiated actions can retry sooner but not without limit.
+Would you use WebSocket for everything? || No. Use it in the foreground only. In the background the OS freezes sockets and keepalives drain the battery, so use APNs/FCM. Keep the ETag sync as the fallback, because push is best effort and can be dropped or delayed.
+How do you keep battery use low? || Batch events, never poll, prefetch only on Wi-Fi and charging, use the OS scheduler, close the socket in the background, and measure radio wakeups in production.
+ref: docs | Guide to app architecture (Android Developers) | Google |
+ref: docs | Paging library overview and RemoteMediator (Android Developers) | Google |
+ref: spec | RFC 9111: HTTP Caching | Fielding, Nottingham and Reschke, 2022 | https://www.rfc-editor.org/rfc/rfc9111
+ref: spec | RFC 5861: HTTP Cache-Control Extensions for Stale Content | Nottingham, 2010 | https://www.rfc-editor.org/rfc/rfc5861
+ref: spec | RFC 6455: The WebSocket Protocol | Fette and Melnikov, 2011 | https://www.rfc-editor.org/rfc/rfc6455
+ref: blog | Exponential Backoff And Jitter | Marc Brooker, AWS Architecture Blog, 2015 |
+

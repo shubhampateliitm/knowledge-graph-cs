@@ -1,0 +1,1150 @@
+# LLD v9 batch 3: restaurant, snake-ladder, splitwise, hotel-management, kv-store-lld, chess (object-oriented design)
+
+@@ restaurant
+title: Design a restaurant management system (object-oriented design)
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, semaphores, queuesbuf, automata, locks, hashtables, idempotence, threadpool, backpressure
+summary: Design the core classes of a software system that runs one restaurant: guests are seated at tables, waiters take orders, the kitchen cooks dishes at different stations, and the cashier prints a bill and takes payment. This is a classic object-oriented design (OOD) problem because it is not about data volume. It is about modelling many small things that each have rules. A table is free, reserved or occupied. An order item moves from placed to preparing to ready to served, and it can be cancelled only early. A grill has two burners and a limited ticket queue, so cooks must wait. Several waiters act at the same time and must never seat two parties at one table. The interviewer wants clean classes (see object-oriented programming), the right patterns (see design patterns and SOLID), a state machine for the order item (see finite automata), and safe sharing of scarce resources with a semaphore and a bounded queue (see semaphores and bounded buffers).
+requirements: Functional requirements. The menu has dishes; each has a price, a category and a kitchen station (grill, fry, cold, bar). Guests can reserve a table for a time and a party size, or arrive without a reservation. The host seats a party at the smallest free table that fits; if none fits, the party joins a waitlist and is seated when a fitting table is freed. A waiter opens an order for a table, adds items, and can cancel an item only while it still waits in the kitchen queue. Each station cooks items in arrival order. When an item is ready, the waiter is told. The cashier produces one bill per table: items, tax, an optional discount and a tip. Payment is cash or card. After payment the table becomes free.
+Non-functional requirements. Thread safety: waiters, cooks and the host work in parallel, so seating and kitchen queues must be safe. Extensibility: adding a new discount rule, a new payment method or a new station must not change existing classes. Testability: no class reads the system clock or starts threads by itself, so unit tests are fast and repeatable. Observability: every state change can be logged.
+Assumptions I choose: one restaurant, one process, state in memory (a database can be added behind a repository interface); about 40 tables and 15 staff; money is stored as an integer count of the smallest unit (cents or paise) to avoid floating point errors; users, authentication and inventory of ingredients are out of scope.
+estimates: Scale does not decide this design. A busy restaurant seats perhaps 300 parties per evening, which is about 2,000 order items and well under one request per second in the kitchen. A single process holds all of it in a few megabytes. What matters is concurrency: about 10 waiter threads, 8 cook threads and 1 host thread touch the same tables and queues. The risks are a race (two parties on one table), a lost wakeup (a cook sleeps while tickets wait) and an unbounded queue that hides a slow kitchen. So the effort goes into correct state transitions and small critical sections, not into caches or partitioning.
+api: The public interface has a facade, a few services, and small interfaces for the parts that vary. The facade hides the internal classes from callers such as a UI or an HTTP controller.
+```java
+public interface Restaurant {
+    SeatResult seat(PartyRequest party);        // table or waitlist
+    ReservationId reserve(PartyRequest party, Instant at);
+    void cancelReservation(ReservationId id);
+    OrderId openOrder(TableId table, WaiterId waiter);
+    ItemId addItem(OrderId order, DishId dish, int qty, String note);
+    boolean cancelItem(ItemId item);            // false if cooking
+    Bill closeAndBill(OrderId order, List<DiscountRule> rules);
+    PaymentResult pay(BillId bill, PaymentMethod method, Money tip,
+                      String requestId);               // idempotent
+}
+```
+The kitchen side and the extension points are separate interfaces.
+```java
+public interface Station {
+    boolean submit(OrderItem item);     // false when the queue is full
+    void cookNext(long cookMillis) throws InterruptedException;
+}
+public interface DiscountRule {
+    Money discountFor(Order order, Money subtotal);
+}
+public interface PaymentMethod {
+    PaymentResult charge(Money amount, String requestId);
+}
+public interface ItemListener { void onChange(OrderItem item); }
+public interface Clock { Instant now(); }
+```
+Each call returns a clear result instead of throwing for normal business cases. For example, seat returns a table id or a waitlist position, and cancelItem returns false when the item is already cooking. Exceptions are kept for programmer errors such as an unknown order id.
+datamodel: Entities. Dish(id, name, price, category, stationId). Table(id, seats, status). Reservation(id, partySize, startTime, tableId). Order(id, tableId, waiterId, items, status). OrderItem(id, dish, quantity, note, status). Bill(id, orderId, lines, tax, discount, tip, total, status). Payment(id, billId, method, amount, requestId). Waitlist is a queue of PartyRequest.
+Relations. A Table has at most one open Order. An Order has many OrderItems, and each OrderItem is routed to one Station through its dish. A Bill belongs to one Order and a Payment to one Bill. Hash maps from id to object (see hashing and hash tables) give constant time lookups by table, order and item id.
+State machine for a table. FREE goes to RESERVED when a reservation is made for the near future, and to OCCUPIED when a party is seated. RESERVED goes to OCCUPIED on arrival, or back to FREE on cancellation or after a 15 minute no-show. OCCUPIED goes to FREE only after the bill is paid.
+State machine for an order item. PLACED goes to PREPARING when a cook starts it, or to CANCELLED if the guest cancels first. PREPARING goes to READY, and READY to SERVED. SERVED and CANCELLED are final. CANCELLED is not allowed from PREPARING: food is already on the fire, so the bill still charges it. The code makes this policy visible in one place.
+design: The classes fall into four groups.
+Seating. TableManager owns the list of tables and the waitlist. Its method seat(party) takes one lock, scans the free tables, picks the one with the fewest seats that is still big enough (best fit), marks it occupied and returns it. The scan is linear in the number of tables, which is about 40, so a simple scan is enough. If nothing fits, the party is added to a FIFO waitlist (a plain queue, see queues and ring buffers). When a table is released, the manager walks the waitlist from the front and seats the first party that fits. A party that is too large for the free table does not block smaller parties behind it, but it keeps its position for the next free table.
+Ordering. Order is the aggregate root: all changes to its items go through it. OrderItem has a status and uses the State idea in its simplest form: an enum with a method canMoveTo that lists the legal next states. With five states and no state-specific behaviour, an enum is better than five State classes. A listener list (Observer pattern) tells the waiter app or a logger whenever the status changes. Observer fits because the item does not need to know who cares.
+Kitchen. Each Station has a bounded queue of tickets (an ArrayBlockingQueue) and a Semaphore with one permit per burner or fryer. Waiters are producers: they call submit, which uses offer and returns false when the queue is full. That is backpressure (see backpressure): the waiter app tells the guest the kitchen is busy instead of growing a queue without limit. Cooks are consumers: a cook thread calls cookNext in a loop. It takes a ticket, acquires a burner permit, marks the item PREPARING, cooks, marks it READY and releases the permit. Cook threads come from a fixed thread pool (see thread pools and executors); the pool size per station equals the number of cooks, and the semaphore limits how many can use equipment at once.
+Billing. Price rules are Strategy objects: a list of DiscountRule implementations (happy hour, loyalty, coupon) is applied one after another, and a TaxPolicy computes tax from the net amount. PaymentMethod is also a Strategy, with CashPayment and CardPayment. The Restaurant class is a Facade that wires everything together. A small Factory builds Dish objects from the menu so that adding an item does not need to know which station handles it.
+Main flow. Step 1: the host calls seat for a party of 4; the manager marks the best-fit table occupied. Step 2: a waiter calls openOrder, then addItem twice; each item is created as PLACED and submitted to the station of its dish. Step 3: a cook takes the ticket, waits for a burner, and the item moves to PREPARING and then READY; the listener fires. Step 4: the waiter delivers it and it becomes SERVED. Step 5: closeAndBill totals the lines, applies rules and tax, and creates an OPEN bill. Step 6: pay charges the method, marks the bill PAID and releases the table, which seats the next party from the waitlist.
+Core code. This listing is the heart of the kitchen and seating logic: the item state machine, the station with a bounded queue and a semaphore, and the table manager.
+```java
+enum ItemStatus {
+    PLACED, PREPARING, READY, SERVED, CANCELLED;
+
+    boolean canMoveTo(ItemStatus next) {
+        switch (this) {
+            case PLACED:
+                return next == PREPARING || next == CANCELLED;
+            case PREPARING: return next == READY;
+            case READY:     return next == SERVED;
+            default:        return false;
+        }
+    }
+}
+
+class OrderItem {
+    final String id, dish;
+    final int stationId;
+    private ItemStatus status = ItemStatus.PLACED;
+    private final List<Consumer<OrderItem>> listeners =
+        new CopyOnWriteArrayList<>();
+
+    OrderItem(String id, String dish, int stationId) {
+        this.id = id; this.dish = dish; this.stationId = stationId;
+    }
+    void onChange(Consumer<OrderItem> l) { listeners.add(l); }
+    synchronized ItemStatus status() { return status; }
+
+    boolean moveTo(ItemStatus next) {
+        synchronized (this) {
+            if (!status.canMoveTo(next)) return false;
+            status = next;
+        }
+        listeners.forEach(l -> l.accept(this));
+        return true;
+    }
+}
+
+class Station {
+    private final BlockingQueue<OrderItem> tickets;
+    private final Semaphore burners;
+
+    Station(int queueCapacity, int burnerCount) {
+        tickets = new ArrayBlockingQueue<>(queueCapacity);
+        burners = new Semaphore(burnerCount);
+    }
+    boolean submit(OrderItem item) { return tickets.offer(item); }
+
+    void cookNext(long cookMillis) throws InterruptedException {
+        OrderItem item = tickets.take();
+        burners.acquire();
+        try {
+            if (!item.moveTo(ItemStatus.PREPARING)) return;
+            Thread.sleep(cookMillis);
+            item.moveTo(ItemStatus.READY);
+        } finally { burners.release(); }
+    }
+}
+
+class TableManager {
+    static class Table {
+        final int id, seats; boolean free = true;
+        Table(int id, int seats) { this.id = id; this.seats = seats; }
+    }
+    private final List<Table> tables = new ArrayList<>();
+    TableManager(int... seatCounts) {
+        for (int i = 0; i < seatCounts.length; i++)
+            tables.add(new Table(i + 1, seatCounts[i]));
+    }
+    synchronized Optional<Table> seat(int party) {
+        Table best = null;
+        for (Table t : tables)
+            if (t.free && t.seats >= party
+                && (best == null || t.seats < best.seats)) best = t;
+        if (best != null) best.free = false;
+        return Optional.ofNullable(best);
+    }
+    synchronized void release(Table t) { t.free = true; }
+}
+```
+The listing keeps a boolean for the table status to stay short. Real code uses an enum with FREE, RESERVED and OCCUPIED, as in the data model. Read the station carefully. The burner permit is taken before the item moves to PREPARING. This way an item that waits for a burner can still be cancelled, because it is still PLACED. If moveTo returns false (the guest cancelled it while it waited), the cook returns and the finally block still releases the permit.
+diagram:
+  +----------------+        +------------------+
+  | Restaurant     |------->| TableManager     |
+  | (facade)       |        | seat(), release()|
+  | seat() pay()   |        | waitlist: Queue  |
+  | addItem()      |        +------------------+
+  +-------+--------+
+          |
+          |            +--------------------+
+          +----------->| Order              |
+          |            | items: OrderItem[] |
+          |            +---------+----------+
+          |                      | 1..*
+          |            +---------v----------+   notifies
+          |            | OrderItem          |------------> ItemListener
+          |            | status: ItemStatus |   (Observer)
+          |            | moveTo(next)       |
+          |            +---------+----------+
+          |                      | routed by dish
+          |            +---------v----------+
+          +----------->| Station            |
+          |            | BlockingQueue      |
+          |            | Semaphore burners  |
+          |            | submit(), cookNext |
+          |            +--------------------+
+          |
+          |            +--------------------+   +-----------------+
+          +----------->| BillCalculator     |-->| DiscountRule    |
+                       | TaxPolicy          |   | (Strategy list) |
+                       +---------+----------+   +-----------------+
+                                 |
+                       +---------v----------+
+                       | PaymentMethod      |  Cash / Card (Strategy)
+                       +--------------------+
+deepdive: Concurrency, what is shared. Three things are shared between threads: the table list, each station queue, and each order item's status. The table list is protected by one intrinsic lock inside TableManager (see locks and atomics). The critical section scans 40 tables, so contention is tiny. Do not use a lock per table: finding a best fit needs a consistent view of all tables, and many small locks would force an acquisition order to avoid deadlock (see deadlock) for no gain.
+The station queue is a bounded blocking queue, which is already thread-safe. The semaphore counts free burners. A semaphore fits because the resource has a count, not an owner: any cook may release a permit. A plain lock would allow one cook at a time. This is the classic producer and consumer problem with a limited buffer plus a limited resource, described in the Little Book of Semaphores. The two limits differ on purpose: the queue limit protects the waiters from an endless backlog, and the burner limit models the physical kitchen.
+Item status changes use a short synchronized block on the item that checks canMoveTo and updates the field. Listeners run after the block, outside the lock, so a slow listener never blocks a cook and a listener that calls back into the item cannot deadlock. This rule, decide inside the lock and notify outside, is the most common concurrency rule in OOD answers.
+Race between cancel and cook. A guest cancels at the moment a cook picks up the ticket. Both call moveTo on the same item, and only one wins because the check and the update happen under the item lock. If the cook wins, cancelItem returns false. If the cancel wins, the cook sees false and drops the ticket. The state machine is the arbiter, so no special code is needed.
+Lock order. Each operation takes at most one lock at a time, and the facade never holds the table lock while it calls a station. With no nested locks there is no lock-order problem. If a later feature needs two table locks (moving an order), take them in ascending table id.
+Idempotent payment. A card terminal may time out after the charge went through, and the waiter taps pay again. The pay method takes a requestId; a hash map from requestId to PaymentResult returns the stored result on a repeat instead of charging twice (see idempotence).
+Extensibility. A new discount is one class that implements DiscountRule. A new station such as pastry is one more Station instance and a dish mapping. A new payment method implements PaymentMethod. The Restaurant class does not change. This is the open and closed principle from SOLID: closed for editing, open for extension.
+Testing. Inject a Clock so reservation timeouts need no sleeping. Test the item state machine with all 25 pairs: only four return true. Test TableManager with parties of 1 to 7 and check best fit and waitlist order. Give a station a queue of 2 and one burner, submit 3 items and assert the third submit returns false. For concurrency, start 50 threads that all seat a party of 2 with 10 two-seat tables, and assert exactly 10 succeed and no table is given twice. Use fake PaymentMethod objects that fail on demand to test retries.
+tradeoffs: Enum with a transition method or the State pattern with one class per state. Choose the enum when states differ only in their legal moves, like the order item. Choose State classes when each state has its own behaviour or data, for example a Table whose occupied state tracks the order and whose free state tracks the next reservation. State classes cost more files and indirection.
+One global lock or fine-grained locks. Choose one lock in TableManager while there are tens of tables and each operation takes microseconds; it is correct by construction. Choose a lock per table or a concurrent structure only when profiling shows contention, for example a food court with thousands of seats. You give up simplicity and take on deadlock risk.
+Bounded or unbounded kitchen queue. Choose a bounded queue so overload is visible at once and the waiter can tell the guest. Choose an unbounded queue only for work that must never be refused, such as logging, and then monitor its length. A bounded queue forces you to design the "queue full" path, which is extra work but honest.
+Observer callbacks or polling. Choose Observer when several parts must react at once and latency matters, such as the waiter seeing "ready" within a second. Choose polling when consumers are remote or slow and can tolerate delay, such as a nightly report. Observers can leak memory if nobody unsubscribes.
+failures: Edge cases. A party of 9 when the largest table has 8 seats is rejected with a clear reason or marked as needing combined tables; it must not wait forever. A party size of 0 or less is rejected before any lock is taken. A reservation in the past, or two overlapping reservations for one table, is rejected when created. A no-show is removed after a grace period and the waitlist is checked.
+Invalid operations. Adding an item to a closed order, cancelling a served item, or paying a bill twice returns an error or false and never changes state. Every change goes through moveTo or an equivalent guard, so no path can skip a state.
+Resource failures. A cook thread that throws must still release the burner: that is why the release is in a finally block. If the thread dies, the item stays PREPARING; a supervisor can move items stuck there too long back to PLACED, which needs one extra legal transition, added on purpose and tested.
+Payment failures. If a card charge fails, the bill stays OPEN and the table stays OCCUPIED. If the result is unknown (timeout), the retry uses the same requestId. Money is never added with floating point, and a test asserts that the total equals the sum of lines, tax and tip.
+evolution: Online orders and delivery: add an OrderSource and an Order without a table; the kitchen is unchanged because it only sees OrderItems. Large parties: make Table a Composite (a TableGroup that holds tables and reports total seats), so TableManager treats both the same. VIP or rush orders: replace the FIFO queue with a priority queue ordered by rank and arrival number, keeping the bound. Kitchen display: add one more ItemListener. Many branches: put a branch id in every entity; state moves to a database, and seat becomes a conditional update on the table status instead of an in-memory lock. Undo for waiters: make add item and cancel item Command objects with an undo method. Inventory: a Dish gets ingredients, and the station reserves stock before it accepts a ticket.
+followups: Why is a semaphore used for burners and not a lock? || A lock has one owner and allows one holder. Burners are a counted resource, so N cooks can hold a permit at once and any thread may release. Semaphore(N) models that exactly.
+What if two waiters seat two parties at the last free table? || The seat method holds the manager lock for the scan and the update, so only one sees the table as free. The other gets another table or the waitlist. A 50 thread test proves it.
+How do you stop the kitchen from being flooded? || Use a bounded queue per station. submit returns false when full and the app shows "kitchen busy". This is backpressure at the producer; the limit comes from the measured cook rate times an acceptable wait.
+How do you add a discount without changing billing code? || Implement DiscountRule and register it. The calculator applies all rules in order. Decide clearly whether rules stack or the best one wins, and put that in a small CombinePolicy.
+How do you make payment safe against double charging? || Pass a client generated requestId and store the result by that id. A retry with the same id returns the stored result. This is idempotence, and it matters more than any lock here.
+How does this change on several servers? || Move state to a database. Seating becomes a conditional update on the table row (set occupied where status is free). Kitchen queues become a message queue with consumer groups. Item transitions use a version column for optimistic concurrency.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson, Vlissides, 1994 |
+ref: book | Head First Design Patterns, 2nd edition | Freeman and Robson, 2020 |
+ref: book | Effective Java, 3rd edition | Joshua Bloch, 2018 |
+ref: book | The Little Book of Semaphores | Allen B. Downey, 2016 | https://greenteapress.com/wp/semaphores/
+ref: docs | State pattern | refactoring.guru | https://refactoring.guru/design-patterns/state
+
+@@ snake-ladder
+title: Design Snake and Ladder (object-oriented design)
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, randalgo, automata, queuesbuf, hashtables, locks, dst
+summary: Design a software version of the board game Snake and Ladder. Two or more players take turns to roll a die and move their token forward on a numbered board, usually 1 to 100. If a token lands on the foot of a ladder it climbs up; if it lands on the head of a snake it slides down. The first player to reach the last square wins. The rules fit in one paragraph, so the problem looks easy, and that is why interviewers like it: it shows whether you can turn a small rule set into clean classes (see object-oriented programming) without over-building. The interesting parts are the design choices. Snakes and ladders are the same thing, a jump. The die is a source of randomness (see randomized algorithms) that must be replaceable in tests. The turn order is a circular queue (see queues and ring buffers). The game moves through a few states (see finite automata). And the rules around the end of the board differ between families, so they must be pluggable (see design patterns and SOLID).
+requirements: Functional requirements. A game is created with a board size, a list of snakes and ladders, and two or more players. Players take turns in a fixed order. On a turn the current player rolls the die, moves forward by the rolled number, and if the new square is the start of a jump the token moves to the end of that jump. A player who reaches the last square wins and the game ends. A player whose roll would go past the last square stays where they are (the "exact finish" rule). The system reports each move to anyone who listens (a console, a UI or a log), and can tell the current positions, the current player and the winner.
+Non-functional requirements. Testability: a test must be able to play a whole game with fixed dice values and get the same result every time. Extensibility: new rules (roll a six and move again, bounce back from the end, two dice, no jump on the first square) must not need edits in existing classes. Validity: a bad board, such as a snake that loops, must be refused when the board is created, not discovered in the middle of a game. Thread safety: one game object is played by one thread at a time, but a server may run many games in parallel.
+Assumptions I choose: board of 100 squares by default, one six sided die, 2 to 8 players, a jump may not start on square 1 or on the last square, a jump may not end on the start of another jump (no chains), and a token is a position number only (no drawing of the board).
+estimates: Scale does not matter here. A game has at most a few hundred objects: one board with about 20 jumps, a handful of players, and a history of moves. With no jumps, a single player needs on average 33.3 turns to finish 100 squares under the exact finish rule (a small Markov chain calculation); ladders reduce this and snakes increase it. So a game has well under a few hundred turns, each costing microseconds. A server with 10,000 parallel games holds a few million small objects. The only thing worth designing for is correctness and the ability to replay a game exactly, which means controlling the source of randomness.
+api: A small set of types is enough. The game is built from a board, a die and the players, so each part can be replaced.
+```java
+public interface Dice {
+    int roll();                          // 1..6 for a normal die
+}
+public interface RuleSet {
+    int nextPosition(int current, int roll, int boardSize);
+    boolean extraTurn(int roll);         // e.g. six: roll again
+}
+public interface GameListener {
+    void onMove(Player p, int roll, int from, int to);
+    void onWin(Player p);
+}
+```
+The main classes and their public methods:
+```java
+public final class Board {
+    public Board(int size, Map<Integer, Integer> jumps);
+    public int size();
+    public int resolve(int square);      // follows a snake or ladder
+}
+public final class Game {
+    public Game(Board b, Dice d, RuleSet r, List<Player> players);
+    public void addListener(GameListener l);
+    public void playTurn();              // one roll, current player
+    public GameState state();            // see the state machine
+    public Player currentPlayer();
+    public Player winner();              // null until FINISHED
+}
+```
+The constructor of Board throws IllegalArgumentException for an invalid board. playTurn throws IllegalStateException if the game is already over. Both are programmer errors, so exceptions are right here.
+datamodel: Entities. Board(size, jumps). Jump is a pair (from, to): if to is larger than from it is a ladder, if smaller it is a snake. Player(name, position). Game(board, dice, rules, turn queue, state, winner). A Move event holds (player, roll, from, to).
+Relations. A Game has one Board, one Dice, one RuleSet and a queue of Players. The board stores the jumps in a hash map from start square to end square (see hashing and hash tables), so resolving a square is one constant time lookup. There is no class called Snake and no class called Ladder: both are entries in the same map. Two classes that differ only in the sign of a number would add code and no behaviour.
+State machine for a game. NOT_STARTED goes to IN_PROGRESS on the first call to playTurn. IN_PROGRESS stays IN_PROGRESS after a normal move, and goes to FINISHED when a token reaches the last square. FINISHED is final: every further playTurn is refused. This tiny machine (see finite automata) is the whole life cycle, and the enum is enough because the states have no behaviour of their own.
+Turn order. The queue is a double ended queue. A turn removes the player from the front and puts them at the back after the move. A rule that gives an extra turn puts the player back at the front instead. Both are constant time.
+design: The central idea is to give each source of change its own object.
+Board. Board knows its size and its jumps and nothing else. It checks the jumps when it is built: a jump may not start on square 1 or on the last square, both ends must be on the board, it must move the token (from is not equal to to), and no jump may end on the start of another jump. The last check removes chains and therefore also cycles: a chain such as 99 to 12 and 12 to 99 could loop forever. If your rules do allow chains, validate with a walk from every start and a visited set instead. Failing early, in the constructor, keeps invalid boards out of a running game.
+Dice. Dice is an interface (the Strategy pattern). RandomDice wraps a pseudo random generator with a seed. A test uses a FixedDice that returns a scripted list. Because the game receives the dice as an argument, nothing inside Game calls a global random function. This is the same idea as injecting a clock, and it is the single most important testability decision in the problem (see deterministic simulation testing).
+RuleSet. The rules at the end of the board are a second Strategy. The default rule is exact finish: if current plus roll is larger than the board size, the token stays. Another rule set bounces back: the token moves to the end and back by the extra steps. A third gives an extra turn on a six. Putting these in an interface means that adding "three sixes in a row lose the turn" is a new class, not an edit of Game.
+Game. Game is the coordinator. It owns the turn queue, the state, the winner and a list of listeners. Its method playTurn does these steps. Step 1: take the next player from the queue. Step 2: roll the die. Step 3: ask the rules for the next position. Step 4: ask the board to resolve any jump. Step 5: update the player and tell the listeners (the Observer pattern; the console printer, a UI and a test recorder are all listeners). Step 6: if the player is on the last square, set FINISHED and the winner. Step 7: put the player back in the queue.
+Randomness. A good die gives each face the same chance. The method nextInt(6) + 1 does this without bias because nextInt(bound) rejects the few raw values that would favour small faces. Do not write abs(nextInt()) % 6, which is wrong for the minimum integer value and slightly uneven.
+Core code. This listing is a complete working game, using the exact finish rule directly to keep it short. In the full design the line with target would be a call to RuleSet.
+```java
+interface Dice { int roll(); }
+
+class RandomDice implements Dice {
+    private final Random rnd;
+    RandomDice(long seed) { rnd = new Random(seed); }
+    public int roll() { return rnd.nextInt(6) + 1; }
+}
+
+class Board {
+    final int size;
+    private final Map<Integer, Integer> jumps = new HashMap<>();
+
+    Board(int size, Map<Integer, Integer> jumpList) {
+        this.size = size;
+        for (Map.Entry<Integer, Integer> e : jumpList.entrySet()) {
+            int from = e.getKey(), to = e.getValue();
+            if (from <= 1 || from >= size || to < 1 || to > size
+                    || from == to)
+                throw new IllegalArgumentException("bad jump " + from);
+            jumps.put(from, to);
+        }
+        for (int start : jumps.keySet()) {       // no chains, no cycles
+            if (jumps.containsKey(jumps.get(start)))
+                throw new IllegalArgumentException("chain at " + start);
+        }
+    }
+    int resolve(int square) {
+        return jumps.getOrDefault(square, square);
+    }
+}
+
+enum GameState { NOT_STARTED, IN_PROGRESS, FINISHED }
+
+class Player {
+    final String name; int position = 0;
+    Player(String name) { this.name = name; }
+}
+
+class Game {
+    private final Board board;
+    private final Dice dice;
+    private final Deque<Player> turns = new ArrayDeque<>();
+    private final List<Consumer<String>> listeners = new ArrayList<>();
+    private GameState state = GameState.NOT_STARTED;
+    private Player winner;
+
+    Game(Board board, Dice dice, List<Player> players) {
+        if (players.size() < 2) throw new IllegalArgumentException();
+        this.board = board; this.dice = dice; turns.addAll(players);
+    }
+    void listen(Consumer<String> l) { listeners.add(l); }
+    GameState state() { return state; }
+    Player winner() { return winner; }
+
+    void playTurn() {
+        if (state == GameState.FINISHED)
+            throw new IllegalStateException("game over");
+        state = GameState.IN_PROGRESS;
+        Player p = turns.pollFirst();
+        int roll = dice.roll();
+        int target = p.position + roll;
+        if (target <= board.size) {            // exact finish rule
+            p.position = board.resolve(target);
+            emit(p.name + " rolled " + roll + " -> " + p.position);
+        }
+        if (p.position == board.size) {
+            state = GameState.FINISHED; winner = p;
+            emit(p.name + " wins");
+        }
+        turns.addLast(p);
+    }
+    private void emit(String m) { listeners.forEach(l -> l.accept(m)); }
+}
+```
+diagram:
+  +--------------------+          +--------------------+
+  | Game               |--------->| Board              |
+  | playTurn()         |   has    | size               |
+  | state(): GameState |          | jumps: Map<int,int>|
+  | winner()           |          | resolve(square)    |
+  +--+----+----+----+--+          +--------------------+
+     |    |    |    |
+     |    |    |    |  has      +-----------------------+
+     |    |    |    +---------->| Dice <<interface>>    |
+     |    |    |                | roll()                |
+     |    |    |                +-----------------------+
+     |    |    |                  RandomDice, FixedDice
+     |    |    |  has           +-----------------------+
+     |    |    +--------------->| RuleSet <<interface>> |
+     |    |                     | nextPosition()        |
+     |    |                     | extraTurn()           |
+     |    |  notifies           +-----------------------+
+     |    |                     +-----------------------+
+     |    +-------------------->| GameListener          |
+     |                          | (Observer)            |
+     |  has                     | onMove(), onWin()     |
+     v                          +-----------------------+
+  +----------------+
+  | Deque<Player>  |   1..*   +----------------+
+  | turn queue     |--------->| Player         |
+  +----------------+          | name, position |
+                              +----------------+
+deepdive: Concurrency. One game is a sequence of turns, so it needs no parallelism inside. The risk is two threads calling playTurn on the same game, for example two network handlers for the same match. The simplest safe design is to make playTurn synchronized (a lock on the game, see locks and atomics) or to give each game a single thread executor, so turns are processed in the order they arrive. Games do not share state, so many games run in parallel with no lock between them. This "one owner per game" rule is easier to reason about than a global lock and scales with the number of games. If listeners do slow work (a network call), call them after the state change and outside the lock, or hand the events to a queue.
+Randomness and fairness. For a server game with money or prizes use a cryptographic random generator, since the java.util.Random sequence can be predicted from a few outputs. For a family game the normal generator is enough. The seed is part of the game record: store it and the game can be replayed exactly (see randomized algorithms).
+Generating a board. Random boards are useful. Pick a distinct set of squares with a shuffle: the Fisher and Yates shuffle puts all squares in random order in linear time, and you take the first 2k squares and pair them up as k jumps. Then orient each pair: the first is the start, the second the end. If the start is lower it is a ladder, if higher a snake. The shuffle guarantees that no square is used twice, so chains cannot appear, which keeps the Board check simple.
+Extensibility. Rules are added by implementing RuleSet. A bigger board is only a number. Several dice sit behind one Dice that returns the sum. A new event is a new method on GameListener with an empty default body, so old listeners still compile. Special squares such as "lose a turn" can be added by turning the jump map into a map of square to Effect objects (a Command pattern): an Effect receives the game and the player and may move the token or skip a turn. A jump becomes one Effect among many, and Board.resolve is replaced by apply.
+Testing. Use a FixedDice for exact tests. An overshooting roll leaves the position unchanged. A ladder 3 to 22 moves the token on a roll of 3, and a snake 14 to 4 moves it down. A board with a chain throws. playTurn after the win throws. The turn order is A, B, A, B. Use a recording listener to compare the event list with an expected list. Finally, run a property test: play 10,000 games with seeded random dice and assert that every game ends, that no position is ever outside 0 to the board size, and that the winner is on the last square.
+tradeoffs: Separate Snake and Ladder classes or one Jump. Choose one Jump (or just map entries) when snakes and ladders behave the same, as in the classic game. Choose a class per kind only when they gain different behaviour, such as snakes that bite only some players or ladders that cost a coin. The extra classes buy nothing before that point.
+Enum states or the State pattern for the game. Choose an enum with a guard when states have no behaviour of their own and transitions are three. Choose State classes when each state changes what the same method does, for example a paused state, a tournament lobby and a replay mode. Each new class adds a file, so wait for real behaviour differences.
+Strategy for rules or flags in Game. Choose a RuleSet when you expect several rule families, because each new family is a new class and Game stays closed to edits. Choose a few boolean flags (exactFinish, extraTurnOnSix) when there are two or three fixed options in a one-off program. Flags are shorter but spread an if over the code, and they combine badly.
+Pseudo random or cryptographic dice. Choose a seeded pseudo random generator for testing, replay and casual play. Choose a secure generator when real value is at stake and an attacker could learn the next roll. You give up replay by seed, unless you log every roll.
+Synchronized game or single thread executor. Choose synchronized when callers are a few threads and each turn is fast. Choose one executor thread per game, or an actor style queue, when handlers are many or slow, since it removes lock contention and keeps the turn order fair. It costs a thread or a queue per game.
+failures: Invalid boards. A jump with an end outside the board, from equal to to, a jump on square 1 or on the last square, or a jump that lands on the start of another jump is rejected with a message that names the bad square. Two jumps with the same start cannot exist because the map has one value per key. Fewer than two players or duplicate player names are rejected when the game is created.
+Runtime errors. A roll outside 1 to 6 from a faulty Dice is rejected with an exception before it is used. A listener that throws must not stop the game, so the game catches its exceptions and logs them. Calling playTurn after FINISHED raises IllegalStateException instead of moving a token past the end.
+Overshoot. The exact finish rule can make a player wait several turns near the end. That is legal. A game with a turn limit that ends it as a draw guards against a faulty die that never rolls the needed number.
+evolution: Common follow-up requirements. Add a second die: a Dice that rolls two numbers and sums them, or a DiceGroup. Add a rule "a six gives another turn, three sixes lose the turn": the RuleSet tracks consecutive sixes per player. Add undo: record each Move as a Command with an undo method that restores the previous position and queue. Add a web version: the Game state becomes a persisted record (board, positions, seed, roll count), and each request replays or updates it with a version check. Add a replay or a spectator mode: the log of Move events is enough, and a seed makes the random part reproducible.
+followups: Why do snakes and ladders share one class? || Both only change a position from one square to another. The sign of the change is data. One map from start to end is simpler, and a validation step covers both.
+How would you test a game that depends on randomness? || Inject the die as an interface. Tests use a FixedDice with a script, so the result is exact. For many random games, use seeded generators so that a failure can be replayed.
+How do you add the rule "a six gives another turn"? || Add a method extraTurn to a RuleSet strategy, or write a RuleSet that wraps another one (Decorator). Game asks the rule set after each move and puts the player at the front of the queue instead of the back.
+How do you stop a snake chain that loops forever? || Validate when building the board. Either forbid a jump ending on another jump's start, or walk from each start with a visited set and reject a repeat.
+How can two threads play the same game safely? || Give each game one owner: make playTurn synchronized or run each game on a single thread executor. Games share no state, so they scale across threads without a global lock.
+How would you support special squares like "skip a turn"? || Replace the jump map by a map from square to Effect, a Command-like object that receives game and player. A jump is one effect; others skip turns or give bonus rolls.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson, Vlissides, 1994 |
+ref: book | Head First Design Patterns, 2nd edition | Freeman and Robson, 2020 |
+ref: docs | Strategy pattern | refactoring.guru | https://refactoring.guru/design-patterns/strategy
+ref: docs | Observer pattern | refactoring.guru | https://refactoring.guru/design-patterns/observer
+
+@@ splitwise
+title: Design Splitwise, an expense sharing system (object-oriented design)
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, ledger, graphsalgo, idempotence, trees, hashtables, locks, occ
+summary: Design the core of an app like Splitwise. Friends, flatmates or travellers put expenses into a group: "A paid 1,000 for dinner, split equally among four people". The system records who paid and who owes what, shows each person a balance ("you owe B 250"), and lets people settle up. It is a good object-oriented design (OOD) problem (see object-oriented programming) because the code is small but the traps are real. A split can be equal, by exact amounts, by percentage or by shares, so the split rule is a Strategy (see design patterns and SOLID). Money must be exact: 100 divided among 3 people cannot be 33.33 three times. Balances follow the rules of a double-entry ledger (see double-entry ledgers). And the app can reduce the number of payments needed to clear all debts, which is a graph problem (see graph algorithms).
+requirements: Functional requirements. Users can create groups and add members. A member adds an expense with a description, a total, the payer, the participants and a split type: EQUAL, EXACT (a fixed amount for each person), PERCENT (percentages that add to 100) or SHARES (for example 2 shares for a couple and 1 for a single person). The system shows the balance of a user inside a group and across groups, and who owes whom. A user can record a settlement: "B paid A 250 in cash". An optional feature, simplify debts, replaces the many small debts in a group by few payments.
+Non-functional requirements. Exactness: no money is created or lost; the sum of all balances in a group is always zero. Extensibility: a new split type must not change existing code. Thread safety: two members can add expenses at once. Idempotence: a retry of the same request must not add the expense twice. Testability: no clock or random call inside the core.
+Assumptions I choose: one currency per group; amounts are stored as a whole number of the smallest unit (cents or paise) in a long; one payer per expense (several payers are a follow-up); groups have up to 50 members; state is in memory behind repository interfaces.
+estimates: Scale does not shape the object design. A group has at most 50 members and some thousands of expenses over its life. Adding an expense touches one balance entry per participant, so it costs \( O(n) \) for n participants. Simplifying debts costs \( O(n \log n) \) with two heaps. A busy service with a million groups holds the data in a database, and each request touches only one group. So the unit of locking and of storage is the group. What matters is exactness of arithmetic and the right split of responsibilities between classes.
+api: The facade is a service with a few use cases. Every amount is a long in minor units.
+```java
+public interface ExpenseService {
+    ExpenseId addExpense(GroupId g, UserId payer, long total,
+                         SplitType type, List<UserId> participants,
+                         Map<UserId, Long> input, String requestId);
+    void settle(GroupId g, UserId from, UserId to, long amount,
+                String requestId);
+    Map<UserId, Long> netBalances(GroupId g);   // + is owed, - owes
+    List<Debt> whoOwesWhom(GroupId g);          // pairwise view
+    List<Debt> simplify(GroupId g);             // fewest-ish payments
+}
+```
+The extension points are small interfaces:
+```java
+public interface SplitStrategy {
+    Map<UserId, Long> split(long total, List<UserId> who,
+                            Map<UserId, Long> input);
+}
+public interface ExpenseListener {
+    void onExpense(Group g, Expense e);          // notify members
+}
+```
+A Debt is a small value object: (from, to, amount). The input map means different things per strategy: exact amounts for EXACT, basis points (hundredths of one percent) for PERCENT, share counts for SHARES, and it is ignored for EQUAL. Each strategy validates its own input and throws IllegalArgumentException with a clear message.
+datamodel: Entities. User(id, name). Group(id, name, members, currency). Expense(id, groupId, payer, total, splitType, owes, createdAt, requestId), where owes maps each participant to the amount they owe. Settlement(id, groupId, from, to, amount, requestId). Each expense and each settlement is immutable after creation.
+Ledger view. Every expense produces entries that add up to zero. The payer gets +total (the group owes them the money they put in). Each participant gets minus their share. If the payer is also a participant their two entries combine. A settlement from B to A of 250 gives B +250 (B owes less) and A minus 250 (A is owed less). The sum of all entries in a group is zero at all times, and this invariant is the best test of the whole model (see double-entry ledgers). The balance of a user is the sum of their entries.
+Derived data. The net balance per user is kept incrementally in a hash map (see hashing and hash tables). The pairwise view "who owes whom" is another projection: for every expense, each participant owes the payer their share, and debts between the same two people are netted, so if A owes B 100 and B owes A 30, only "A owes B 70" is shown. Both views can be rebuilt from the list of expenses and settlements, so they are caches, not the source of truth.
+Editing and deleting. Records are immutable, so an edit is a reversal of the old expense plus a new one. This keeps an audit trail and keeps the invariant simple.
+design: Split rules. SplitStrategy is the Strategy pattern. EqualSplit, ExactSplit, PercentSplit and SharesSplit each turn a total and an input into a map from user to owed amount. The strategies share one rule: the amounts must add up to the total, to the last cent. A small Factory maps the SplitType enum to a strategy instance, so the service never uses if chains or switch on the type. Strategy fits because the rule changes at runtime from request to request, and the service only needs the result.
+Exact money. EqualSplit computes the base share with integer division and gives one extra unit to the first r participants, where r is the remainder. For 100 among 3 people: base 33, remainder 1, so the amounts are 34, 33 and 33. They add up to 100. PercentSplit works in basis points: the share is total times points divided by 10,000, and the rounding rest goes to the last participant, so the sum is exact. Never use double for money: 0.1 plus 0.2 is not exactly 0.3 in binary floating point, and the errors add up. To be fair over many expenses, the person who gets the extra cent can be rotated, for example by the expense id modulo n, instead of always the first.
+Recording. BalanceBook is the class that keeps the net balance of each user. Its method record(payer, total, owes) checks that the shares add up to the total, adds the total to the payer and subtracts each share from the participants. It never sees split types, so it is easy to test. The ExpenseService creates the expense, calls the strategy, then calls record, all inside one lock for the group, then tells the listeners (Observer pattern) outside the lock. Observer is used because email, push and an activity feed must all learn about an expense, and the service should not know them.
+Simplifying debts. Take the net balances. Users with a positive balance are creditors, users with a negative balance are debtors. The debts form a directed graph (see graph algorithms) in which many paths and cycles can be cancelled. The greedy method puts creditors and debtors in two max-heaps (see trees, heaps and tries). It repeatedly takes the largest debtor and the largest creditor, makes a payment of the smaller of the two amounts, and puts the remainder back. Each step settles at least one person fully, so for n people with non-zero balances there are at most n minus 1 payments. Finding the true minimum is NP-hard, because it asks for the largest number of groups of people whose balances sum to zero, which is related to the subset sum problem. The greedy answer is good enough for a product and is fast.
+Main flow. Step 1: addExpense checks the arguments and the requestId. Step 2: it takes the strategy from the factory and computes the owed amounts. Step 3: under the group lock it records the expense and updates the balances. Step 4: it releases the lock and notifies the listeners.
+Core code. The listing shows two split strategies and the balance book with debt simplification.
+```java
+interface SplitStrategy {
+    /** What each participant owes; the amounts add up to total. */
+    Map<String, Long> split(long total, List<String> who,
+                            Map<String, Long> input);
+}
+
+class EqualSplit implements SplitStrategy {
+    public Map<String, Long> split(long total, List<String> who,
+                                   Map<String, Long> unused) {
+        int n = who.size();
+        long base = total / n;
+        int extra = (int) (total % n);      // leftover cents, one each
+        Map<String, Long> owes = new LinkedHashMap<>();
+        for (int i = 0; i < n; i++)
+            owes.put(who.get(i), base + (i < extra ? 1 : 0));
+        return owes;
+    }
+}
+
+class PercentSplit implements SplitStrategy {
+    public Map<String, Long> split(long total, List<String> who,
+                                   Map<String, Long> basisPoints) {
+        long sum = 0;
+        for (long bp : basisPoints.values()) sum += bp;
+        if (sum != 10_000)
+            throw new IllegalArgumentException("not 100%");
+        Map<String, Long> owes = new LinkedHashMap<>();
+        long given = 0;
+        for (String u : who) {
+            long part = total * basisPoints.get(u) / 10_000;
+            owes.put(u, part);
+            given += part;
+        }
+        String last = who.get(who.size() - 1);
+        owes.merge(last, total - given, Long::sum);   // rounding rest
+        return owes;
+    }
+}
+
+class BalanceBook {
+    record Share(String user, long amount) {}
+    private final Map<String, Long> net = new HashMap<>();
+
+    /** The payer paid total; every user in owes carries a share. */
+    synchronized void record(String payer, long total,
+                             Map<String, Long> owes) {
+        long sum = owes.values().stream().mapToLong(x -> x).sum();
+        if (sum != total) throw new IllegalArgumentException("sum");
+        net.merge(payer, total, Long::sum);           // is owed total
+        owes.forEach((u, a) -> net.merge(u, -a, Long::sum));
+    }
+
+    /** Match the biggest debtor with the biggest creditor, repeat. */
+    synchronized List<String> simplify() {
+        Comparator<Share> big = Comparator.comparingLong(Share::amount)
+                                          .reversed();
+        PriorityQueue<Share> cr = new PriorityQueue<>(big);
+        PriorityQueue<Share> db = new PriorityQueue<>(big);
+        net.forEach((u, v) -> {
+            if (v > 0) cr.add(new Share(u, v));
+            if (v < 0) db.add(new Share(u, -v));
+        });
+        List<String> out = new ArrayList<>();
+        while (!cr.isEmpty() && !db.isEmpty()) {
+            Share c = cr.poll(), d = db.poll();
+            long pay = Math.min(c.amount(), d.amount());
+            out.add(d.user() + " pays " + c.user() + " " + pay);
+            if (c.amount() > pay)
+                cr.add(new Share(c.user(), c.amount() - pay));
+            if (d.amount() > pay)
+                db.add(new Share(d.user(), d.amount() - pay));
+        }
+        return out;
+    }
+}
+```
+Example: A pays 1,000, B pays 500 and C pays 90, each split equally among A, B, C and D. The net balances are A +602, B +102, C -307 and D -397. Simplify returns three payments: D pays A 397, C pays A 205, C pays B 102.
+diagram:
+  +---------------------+      +----------------------+
+  | ExpenseService      |----->| SplitStrategyFactory |
+  | addExpense()        |      | create(SplitType)    |
+  | settle()            |      +----------+-----------+
+  | simplify()          |                 | returns
+  +---+------+-------+--+                 v
+      |      |       |        +-------------------------+
+      |      |       |        | SplitStrategy <<iface>> |
+      |      |       |        | split(total, who, in)   |
+      |      |       |        +-----^-----^-----^-------+
+      |      |       |         Equal| Exact| Pct/Shares
+      |      |       v
+      |      |   +-----------------+   notifies
+      |      |   | ExpenseListener |<------------ (Observer)
+      |      |   +-----------------+
+      |      v
+      |  +------------------------+
+      |  | BalanceBook (per group)|
+      |  | net: Map<User,long>    |
+      |  | record(), simplify()   |
+      |  +------------------------+
+      v
+  +---------------------+  1..*  +-----------------------+
+  | Group               |------->| Expense / Settlement  |
+  | members, currency   |        | immutable records     |
+  +---------------------+        +-----------------------+
+deepdive: Concurrency. The shared state is the balance book of a group and its list of expenses. All operations on one group touch only that group, so the lock is per group: a synchronized method, a ReentrantLock held in the Group object, or one executor thread per group (see locks and atomics). Different groups never block each other. The critical section has three small steps: validate shares, update the map, append the expense. Notifications run after the lock is released so a slow email never blocks other members. There is no operation that needs two groups, so lock ordering and deadlock cannot happen. If you later add a transfer between groups, lock the two groups in order of their ids.
+Reads. A balance read must never see half an expense, so read under the same lock or copy the map while holding it.
+Idempotence. A mobile client times out and sends addExpense again. The service keeps a hash map from requestId to expense id for each group. If the id is already there, it returns the earlier result and changes nothing (see idempotence). Without it, one dinner would be billed twice. The map is kept as long as clients may retry, for example 24 hours, and it lives inside the same lock as the balances so the check and the write are atomic.
+Persisted version. With a database, the group row holds a version number. A write reads the version, computes the new balances, and updates with "where version equals the old one". If zero rows change, someone else wrote first, so retry. This is optimistic concurrency (see optimistic concurrency): fine for groups where conflicts are rare, because two people rarely add expenses in the same millisecond.
+Extensibility. A new split type, for example "by days stayed", is one class that implements SplitStrategy plus one line in the factory. BalanceBook and the service do not change. A new notification channel is one more ExpenseListener. A multi-currency group means each amount carries a currency and the balance map is keyed by user and currency; conversion happens only when showing a total, with a rate fixed at the time of the expense.
+Testing. Write property tests rather than only examples. For random totals and random participants, each strategy must return amounts that add up to the total and are never negative. After any sequence of expenses and settlements, the sum of net balances is zero. After applying the payments from simplify, every net balance becomes zero, and there are at most n minus 1 payments. Use fixed seeds for the random generators so that a failing case can be replayed. Test a retry with the same requestId and check there is one expense. Run 50 threads adding expenses to one group and assert that the final sum is zero and the count of expenses is right. Test the examples: 100 among 3 gives 34, 33, 33.
+tradeoffs: Pairwise debts or net balances. Choose pairwise balances (who owes whom) when users want to see and settle with a specific person, as most users do. Choose net balances per user when the aim is the fewest payments for a group, as in a trip. Keep both: the net map is the base and the pairwise view is derived. You give up some memory for two views.
+Greedy or exact simplification. Choose the greedy two-heap method for groups of any realistic size: it is fast, simple, and gives at most n minus 1 payments. Choose an exact search over subsets only for very small groups (about 15 people or fewer) when the minimum number of payments matters, since it is exponential. Greedy may use one more payment than the best answer in rare cases.
+Event log or stored balances. Choose to store only immutable expenses and compute balances on demand when groups are small and audit matters. Choose to keep running balances next to the log when reads are frequent; then add a repair job that recomputes them from the log.
+Long minor units or BigDecimal. Choose a long in minor units for speed and simple exact addition with one currency. Choose BigDecimal when currencies have different decimal places or when you convert rates, and set the rounding mode on purpose. A long overflows only above 9 quintillion units, which is far beyond any bill.
+failures: Invalid input. A total of zero or less, an empty participant list, a participant who is not a group member, or a payer who is not a member is rejected before anything is stored. EXACT amounts that do not add up to the total, PERCENT that do not add up to 100 percent, and SHARES with a zero or negative count are rejected by the strategy with a message that says by how much the sum is off.
+Rounding. Every strategy ends with an assertion that the amounts add up to the total. If the check fails it is a bug, so it throws and nothing is recorded.
+Duplicates and retries. A repeated requestId returns the first result. A settlement larger than the current debt is allowed (it just flips the direction), but the UI may warn. Settling with oneself is rejected.
+Removing a member. A member with a non-zero balance cannot leave until they settle; otherwise their balance would vanish and break the zero-sum invariant.
+Concurrency failures. If a listener throws, the expense stays saved and the notification is retried later. If the process stops between saving the expense and updating the cached balances, a repair job rebuilds them from the log.
+evolution: Common follow-ups. Several payers: the expense gets a map of payer to paid amount, and the payer entries are +paid for each, with the shares unchanged. Recurring expenses: a scheduler creates them from a template with requestId = template id plus date. Multiple currencies: keep per-currency balances and convert only for display. Undo: delete is a reversing expense. Item-wise bills: an expense has line items, each with its own participants, and the totals per person are added. Privacy and permissions: a group admin role can edit or delete expenses. Large scale: partition by group id, one lock or one actor per group, and balances in a table with a version column.
+followups: Why store money as a long and not a double? || Binary floating point cannot represent most decimal fractions exactly, and errors accumulate. A long in minor units adds exactly, and the invariant "sum is zero" can be tested with equality.
+How do you split 100 equally among 3 people? || Base share is 33, remainder is 1. The first person pays 34 and the others 33, so the amounts add up to 100. Rotate who pays the extra unit, for example by expense id, so it is fair over time.
+How does simplify debts work and is it optimal? || Compute net balances, put creditors and debtors in two max-heaps, and repeatedly match the largest of each. It gives at most n minus 1 payments and runs in n log n. The exact minimum is NP-hard, so greedy is the practical answer.
+What happens if two people add expenses at the same moment? || The lock is per group, so the two updates run one after the other and the sum stays zero. In a database use a version column and retry on conflict.
+How do you avoid double adding when the app retries? || The client sends a requestId. The service stores it with the result in the same atomic step as the expense. A repeat returns the old result.
+How would you handle an expense paid by two people? || Store a map of payer to amount paid. Each payer gets plus their payment, the participants get minus their shares. The totals must still match, and the same recording code works.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson, Vlissides, 1994 |
+ref: book | Effective Java, 3rd edition (items on BigDecimal and immutability) | Joshua Bloch, 2018 |
+ref: docs | Strategy pattern | refactoring.guru | https://refactoring.guru/design-patterns/strategy
+ref: docs | Factory method pattern | refactoring.guru | https://refactoring.guru/design-patterns/factory-method
+
+@@ hotel-management
+title: Design a hotel management system (object-oriented design)
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, ccontrol, locks, occ, automata, trees, deadlock, idempotence, ledger, hashtables
+summary: Design the classes of a hotel booking and front-desk system. Guests search for a room type for some dates, book it, check in, use paid services such as breakfast, and check out with a bill. The staff can cancel bookings, mark no-shows and see which rooms are free. The main trap is the rule that one room can never be booked twice for the same night, even when two guests press "book" at the same moment for the last room. This makes it a good test of concurrency control (see concurrency control) and of date interval handling. The other parts are classic object-oriented design (see object-oriented programming): room types, a booking life cycle that is a state machine (see finite automata), pricing rules that combine (Strategy and Decorator, see design patterns and SOLID), and a guest bill that behaves like a small ledger (see double-entry ledgers).
+requirements: Functional requirements. The hotel has rooms; each has a number, a type (SINGLE, DOUBLE, SUITE), a floor and amenities. A guest searches by room type and by check-in and check-out dates and sees the available rooms and the total price. A guest books a room for a date range and gets a booking id. A booking can be cancelled; a cancellation fee depends on how close the stay is. At check-in the front desk marks the booking CHECKED_IN, and at check-out CHECKED_OUT. A guest who never arrives is marked NO_SHOW and the room is freed. During the stay, charges such as room service are added to the guest bill (the folio), and payments reduce it. The bill must be paid in full before check-out. When a guest leaves, housekeeping is told that the room needs cleaning.
+Non-functional requirements. Correctness: no two active bookings of one room overlap. Thread safety: many guests and staff members use the system at once. Extensibility: new room types, price rules and cancellation policies must be added without editing old classes. Idempotence: a retry of a booking request must not create two bookings. Testability: the clock is injected.
+Assumptions I choose: one hotel with 200 to 500 rooms (a chain is many hotels, each with its own object graph); a stay is a half open interval of dates [checkIn, checkOut), so a guest who leaves on the 5th and another who arrives on the 5th do not conflict; booking is for one room; times of day, taxes by country and loyalty programs are out of scope; state is in memory behind repositories.
+estimates: Scale is small. A 500 room hotel at 80 percent occupancy and a 2 night average stay has about 73,000 bookings a year, or 200 a day. Searching one room type scans at most a few hundred rooms, and each room checks overlap in \( O(\log b) \) for b bookings. Contention is the only interesting number: on a busy weekend maybe 50 guests look at the same last room within a minute. The real pressure is correctness at the moment of the booking, so the design spends its effort on the locking unit (one room), not on caches or sharding.
+api: The facade has one method per use case. Dates are LocalDate values.
+```java
+public interface HotelService {
+    List<Room> search(String roomType, LocalDate in, LocalDate out);
+    Quote quote(String roomType, LocalDate in, LocalDate out);
+    Booking book(String guestId, String roomType,
+                 LocalDate in, LocalDate out, String requestId);
+    CancelResult cancel(String bookingId);       // policy fee
+    void checkIn(String bookingId);
+    void addCharge(String bookingId, String description, long amount);
+    void pay(String bookingId, long amount, String requestId);
+    Invoice checkOut(String bookingId);          // if paid
+    void markNoShow(String bookingId);
+}
+```
+Extension points:
+```java
+public interface PricingRule {
+    long nightPrice(Room room, LocalDate night, long basePrice);
+}
+public interface CancellationPolicy {
+    long fee(Booking b, LocalDate today);
+}
+public interface HotelListener {
+    void onBookingChanged(Booking b, BookingStatus from,
+                          BookingStatus to);
+}
+```
+book returns the booking or throws NoRoomAvailableException. Searching is read-only and may be stale a moment later: only book decides.
+datamodel: Entities. Guest(id, name, contact). Room(number, type, floor, amenities, basePrice, status). Booking(id, guestId, room, checkIn, checkOut, status, requestId, createdAt). Folio(bookingId, lines), where each line is (description, amount, kind): a charge has a positive amount and a payment a negative one. RoomType is an enum or a small class with the base price and capacity. Housekeeping tasks are separate small objects (roomNumber, state).
+Relations. A Hotel has many Rooms. A Room has many Bookings over time, none of which overlap while active. A Booking has one Folio. Rooms are grouped by type in a hash map (see hashing and hash tables) so a search looks only at one type. Inside a Room, active bookings are kept in a TreeMap ordered by check-in date (a balanced search tree, see trees, heaps and tries). It answers "does anything overlap [in, out)?" with two lookups.
+State machine for a booking. CONFIRMED goes to CHECKED_IN when the guest arrives, to CANCELLED when cancelled, or to NO_SHOW when the guest does not come. CHECKED_IN goes to CHECKED_OUT. The other three states are final. A booking in CANCELLED or NO_SHOW no longer blocks its dates, so it is removed from the room's tree. This is a state machine (see finite automata) and the enum carries the table of legal moves.
+Bill as a ledger. The folio balance is the sum of its lines: charges minus payments. Lines are never edited; a mistake is fixed with a correcting line. The checkout rule is simply "balance is zero". This is the idea of an append-only ledger on a very small scale.
+design: Room and interval check. The core invariant is no overlap. Because stays are half open, two stays [a, b) and [c, d) overlap exactly when a is before d and c is before b. A room keeps its active bookings in a TreeMap from check-in date to booking. To test a new stay [in, out) it looks at two neighbours only: the booking with the greatest check-in not after "in" (does it run past "in"?), and the booking with the smallest check-in not before "in" (does it start before "out"?). Because existing bookings never overlap each other, those two neighbours are enough.
+Booking flow. Step 1: book validates the dates and checks the requestId. Step 2: it takes the rooms of the requested type. Step 3: for each room in order it calls tryReserve. Inside a lock on that room, tryReserve checks the overlap and inserts the booking, in one atomic step. Step 4: the first room that accepts wins and the booking is stored. Step 5: if no room accepts, the guest gets NoRoomAvailableException. Check and insert are never separated, so two threads cannot both pass the check for the same room.
+Pricing. A night price is the base price of the room type, adjusted by rules. PricingRule is a Strategy, and rules wrap each other like a Decorator: a WeekendSurcharge wraps the base price, a SeasonalMultiplier wraps that, and a LoyaltyDiscount wraps that. The total is the sum over every night in [in, out). A new rule is a new class and the order is set in configuration. Quote and book use the same chain, so the guest pays what they saw.
+Cancellation. CancellationPolicy is another Strategy. FlexiblePolicy charges nothing up to 48 hours before check-in; StrictPolicy charges the first night. The policy is chosen per rate plan and stored with the booking, so a later change of hotel policy does not change old bookings.
+Events. When a booking changes state, the service calls the listeners (the Observer pattern). The housekeeping module listens for CHECKED_OUT and creates a cleaning task; the billing module listens for CHECKED_IN to open the folio. Observer fits because front desk, housekeeping, billing and the guest app all want to know and none should be called by name from the booking code.
+Core code. The listing has the status machine, the room with its interval tree and lock, and the booking flow.
+```java
+import java.time.LocalDate;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
+
+enum BookingStatus {
+    CONFIRMED, CHECKED_IN, CHECKED_OUT, CANCELLED, NO_SHOW;
+
+    boolean canMoveTo(BookingStatus n) {
+        switch (this) {
+            case CONFIRMED:
+                return n == CHECKED_IN || n == CANCELLED
+                    || n == NO_SHOW;
+            case CHECKED_IN: return n == CHECKED_OUT;
+            default:         return false;
+        }
+    }
+}
+
+class Booking {
+    final String id; final Room room;
+    final LocalDate checkIn, checkOut;           // [checkIn, checkOut)
+    BookingStatus status = BookingStatus.CONFIRMED;
+    Booking(String id, Room r, LocalDate in, LocalDate out) {
+        this.id = id; room = r; checkIn = in; checkOut = out;
+    }
+}
+
+class Room {
+    final int number; final String type;
+    private final ReentrantLock lock = new ReentrantLock();
+    private final TreeMap<LocalDate, Booking> byCheckIn =
+        new TreeMap<>();
+
+    Room(int number, String type) {
+        this.number = number; this.type = type;
+    }
+
+    /** Adds the booking if the dates are free, else returns null. */
+    Booking tryReserve(String id, LocalDate in, LocalDate out) {
+        lock.lock();
+        try {
+            if (overlaps(in, out)) return null;
+            Booking b = new Booking(id, this, in, out);
+            byCheckIn.put(in, b);
+            return b;
+        } finally { lock.unlock(); }
+    }
+
+    void release(Booking b) {
+        lock.lock();
+        try { byCheckIn.remove(b.checkIn); }
+        finally { lock.unlock(); }
+    }
+
+    private boolean overlaps(LocalDate in, LocalDate out) {
+        var before = byCheckIn.floorEntry(in);
+        if (before != null && before.getValue().checkOut.isAfter(in))
+            return true;                    // an earlier stay runs on
+        var after = byCheckIn.ceilingEntry(in);
+        return after != null && after.getKey().isBefore(out);
+    }
+}
+
+class Hotel {
+    private final Map<String, List<Room>> roomsByType = new HashMap<>();
+    private final Map<String, Booking> bookings =
+        new ConcurrentHashMap<>();
+    private final AtomicInteger nextId = new AtomicInteger(1);
+
+    void addRoom(Room r) {                 // call only before opening
+        roomsByType.computeIfAbsent(r.type, t -> new ArrayList<>())
+                   .add(r);
+    }
+    Optional<Booking> book(String type, LocalDate in, LocalDate out) {
+        if (!out.isAfter(in))
+            throw new IllegalArgumentException("bad dates");
+        String id = "B" + nextId.getAndIncrement();
+        for (Room r : roomsByType.getOrDefault(type, List.of())) {
+            Booking b = r.tryReserve(id, in, out);
+            if (b != null) {
+                bookings.put(id, b);
+                return Optional.of(b);
+            }
+        }
+        return Optional.empty();
+    }
+}
+```
+Look at tryReserve. The overlap check and the put are in one lock, and the lock covers only one room. Other rooms and other guests are not blocked. The id is generated before the loop with an atomic counter, so two threads can never receive the same booking id.
+diagram:
+  +-------------------+       +--------------------+
+  | HotelService      |------>| PricingRule chain  |
+  | search() book()   |       | Base -> Weekend -> |
+  | cancel() checkIn()|       | Season -> Loyalty  |
+  | checkOut()        |       +--------------------+
+  +----+---------+----+       +--------------------+
+       |         |----------->| CancellationPolicy |
+       |         |            +--------------------+
+       |         | notifies   +--------------------+
+       |         +----------->| HotelListener      |
+       |                      | housekeeping, bill |
+       v                      +--------------------+
+  +---------------------+ 1..*  +----------------------+
+  | Room                |------>| Booking              |
+  | number, type, price |       | status: BookingStatus|
+  | lock                |       | checkIn, checkOut    |
+  | TreeMap<date,Book>  |       | requestId            |
+  | tryReserve()        |       +----------+-----------+
+  +---------------------+                  | 1
+                                           v
+                                  +----------------------+
+                                  | Folio (ledger lines) |
+                                  | charge +, payment -  |
+                                  | balance()            |
+                                  +----------------------+
+deepdive: Concurrency: what is the unit of locking? The invariant is about one room, so the lock is per room (see locks and atomics). Two guests who want different rooms never wait for each other. Two guests who want the same room are serialized, and the second sees the first booking and moves to the next room. A single global lock would be correct but would make every booking wait for every other one. Search reads a snapshot. Its answer is only a hint, because the room can be booked a moment later, so the booking step always checks again.
+Pessimistic or optimistic. The listing is pessimistic: it takes the lock first and then checks. That is simple and right when the lock is cheap and in memory. With a database, the same idea becomes either a row lock (SELECT ... FOR UPDATE on the room row) or an optimistic version check (see optimistic concurrency and concurrency control): read the room's version, check overlap, write the booking with "where version is the old one", retry if no row changed. PostgreSQL can also enforce the rule directly with an exclusion constraint on a date range column, which rejects an overlapping row in the database itself. Whichever you choose, the check and the write must be one atomic step.
+Booking several rooms at once. A family wants 3 rooms. If the code reserves room by room it can end up with 2 of 3. Two choices: reserve one by one and release the earlier ones if a later one fails (a compensating action, using release), or lock all candidate rooms first. If you lock several rooms, always take the locks in ascending room number. Two threads that need rooms 101 and 102 then both take 101 first, so neither holds 102 while it waits for 101, and a deadlock cannot happen (see deadlock).
+Holds and expiry. Real systems hold a room for 10 minutes while the guest pays. Add a HELD status that blocks the dates and has an expiry time. A background task using an injected Clock removes expired holds from the tree.
+Idempotence. A mobile app that loses the response will send the same book request again. The service keeps a map from requestId to booking id; if the id exists, it returns that booking and does nothing else (see idempotence). The map write must happen under the same atomic step as the reservation, or two parallel retries could both book.
+Extensibility. A new price rule, cancellation policy or listener is one class. A new room type such as PENTHOUSE is a new entry in the type table. A new booking state such as HELD adds one enum value and rows in the transition table. Room and Hotel know nothing about prices or policies.
+Testing. Inject the Clock and use a fixed LocalDate in all tests. Test the interval logic as a table: same dates, a stay that ends the day another starts (allowed), a stay that starts the day before another ends (rejected), a stay that contains another, a stay inside another. Test all 25 pairs of the status machine. Test cancellation fee at 47 and 49 hours. For concurrency, start 100 threads that book the same type and dates in a hotel with 3 rooms, and assert exactly 3 succeed with different rooms. A fake listener that records events checks that checkout creates one cleaning task.
+tradeoffs: Assign a specific room at booking or only a room type. Choose to assign a room at booking when the room matters (a view, a floor) and the code must be simple: the room's interval tree is the single source of truth. Choose booking by type, with a specific room at check-in, when the hotel wants to move guests to fill gaps and avoid empty nights. That needs counting logic per type and per night, and it allows controlled overbooking, but it is harder to prove that no night is overfilled.
+Lock per room or lock per hotel. Choose a lock per room for a large hotel or a busy site: contention is only on the same room. Choose one lock per hotel for a small system, or when an operation touches many rooms (for example a group booking of 20 rooms), because it is simpler and cannot deadlock. You trade throughput for simplicity.
+Pessimistic or optimistic locking. Choose pessimistic locking (a lock or a row lock) when two guests often fight for the same room, such as a peak weekend, since retries waste work. Choose optimistic locking when conflicts are rare and requests span a network, since holding a lock across a user think time is harmful. You give up retry code on one side and waiting on the other.
+Enum states or State classes. Choose an enum plus a transition table when the states differ in rules only, like here. Choose State classes when each state has its own operations, for instance a CHECKED_IN booking that accepts charges and a CONFIRMED one that does not.
+failures: Bad input. A check-out date not after the check-in date, a date in the past, an unknown room type, or a stay longer than the limit is rejected before any lock is taken. A null guest or requestId is rejected.
+Conflicts. No free room: NoRoomAvailableException with the dates, and the UI may suggest nearby dates. A second request with the same requestId returns the first booking. Cancel on a booking that is already CHECKED_IN or CANCELLED returns a clear error and keeps state. Double cancel is safe: it is a no-op on a final state.
+Money. Check-out with a positive balance is refused; the invoice lists the lines. A payment larger than the balance creates a credit line or is refused, by policy. Amounts are integers in minor units, never doubles.
+Partial failure. If a group booking fails halfway, the compensation step releases the earlier rooms. If the process stops between the reservation and the map write, the room's tree is the source of truth and a repair step rebuilds the map.
+Operations. A room put out of service (a leak) gets an extra room status; search skips it and the front desk is told to move future bookings. Late check-out is a policy and does not change the interval logic.
+evolution: Common follow-ups. Booking by type with later room assignment (see tradeoffs) and overbooking limits. A waiting list: a queue per type and date that is offered a room when a cancellation arrives. Dynamic prices from occupancy: one more PricingRule that reads the occupancy of the hotel. Multiple hotels in a chain: a Chain object holds Hotels, and search takes a hotel id or a city; each hotel is the unit of locking. Housekeeping workflow: a task state machine (DIRTY, CLEANING, CLEAN, INSPECTED) with its own listener. Packages and group blocks: a Block object reserves several rooms for dates and releases the unsold ones by a cut-off day. Persistence and many servers: the room's tree becomes a table of bookings with a range constraint, and idempotence keys become a unique index.
+followups: How do you prevent double booking of the last room? || Make the overlap check and the insert one atomic step per room: a lock on the room in memory, or a row lock or exclusion constraint in a database. Check-then-act without atomicity is the bug interviewers look for.
+How do you check overlap quickly? || With half open intervals, two stays overlap if a is before d and c is before b. Keep each room's active stays sorted by check-in in a TreeMap and look at the two neighbours of the new check-in date, which is logarithmic.
+Why lock per room and not per hotel? || The rule is per room, so different rooms can be booked in parallel. A hotel lock is correct but serializes everyone. Use a hotel lock only for operations that touch many rooms.
+How do you book three rooms atomically? || Either reserve one by one and release on failure, or lock all candidates in ascending room number and then check and insert. A fixed lock order prevents deadlock between two group bookings.
+How would you hold a room for 10 minutes during payment? || Add a HELD status with an expiry time that blocks the dates. A scheduled task using an injected clock expires old holds and frees the room. Payment success moves HELD to CONFIRMED.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson, Vlissides, 1994 |
+ref: book | Java Concurrency in Practice | Goetz et al., 2006 |
+ref: docs | PostgreSQL: Range types and exclusion constraints | PostgreSQL documentation | https://www.postgresql.org/docs/current/rangetypes.html
+ref: docs | Decorator pattern | refactoring.guru | https://refactoring.guru/design-patterns/decorator
+
+@@ kv-store-lld
+title: Design an in-memory key-value store with TTL (object-oriented design)
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, hashtables, eviction, locks, trees, dst, threadpool, lockfree
+summary: Design the classes of a small in-memory key-value store, like a tiny Redis or a Guava or Caffeine cache that lives inside one process. Callers can put a value under a key, optionally with a time to live (TTL), get it back, and delete it. After the TTL passes, the key disappears. When the store is full, it removes some other key to make room. This looks like "a hash map with extra steps", and that is the point of this object-oriented design (see object-oriented programming): the problem tests whether you can combine a hash table (see hashing and hash tables), a time ordered structure for expiry (see trees, heaps and tries), a replaceable eviction rule (see cache eviction), and correct locking (see locks and atomics), all behind a small interface. The design patterns that appear naturally are Strategy for eviction, Observer for removal callbacks, and Decorator for metrics. The interviewers also look at one habit: time must come from an injected clock, never from the system call, so tests do not need to sleep (see deterministic simulation testing).
+requirements: Functional requirements. put(key, value) stores a value forever. put(key, value, ttl) stores it for ttl milliseconds. get(key) returns the value or nothing, and never returns an expired value. delete(key) removes a key. The store has a maximum number of entries; when a put would exceed it, an entry is evicted by a policy (least recently used by default). Expired entries are removed in the background, so a key that is never read does not stay in memory forever. A listener can be told when an entry leaves the store and why: expired, evicted, deleted or replaced.
+Non-functional requirements. Thread safety: many threads read and write at the same time, and no operation returns a torn or half-updated state. Performance: get and put are expected constant time, expiry work is logarithmic per key. Extensibility: a new eviction policy such as LFU, or a new kind of listener, must not change the store. Testability: the clock is injected, and the background sweep can be called by hand.
+Assumptions I choose: keys and values are generic objects, values are treated as immutable by callers, one process, no persistence, no network protocol, a TTL has millisecond resolution, and a capacity from 1 up to a few million entries.
+estimates: Scale matters only for memory and for lock contention. Each entry in Java costs roughly 150 bytes of overhead on top of the data: a hash map node (about 32 bytes), an Entry record (about 24 bytes), an Expiry record in the heap (about 24 bytes), and a node in the eviction order (about 40 bytes). One million entries therefore add about 150 MB of overhead. Time cost: get and put are constant time; each key with a TTL costs one heap insertion, which is logarithmic, about 20 comparisons for a million timers. Contention: with one lock, throughput is limited to what one core can do, which is several million simple operations per second. That is often enough. If it is not, split the store into shards (see the deep dive).
+api: The public interface is small and generic.
+```java
+public interface KeyValueStore<K, V> {
+    void put(K key, V value);                       // no expiry
+    void put(K key, V value, long ttlMillis);
+    Optional<V> get(K key);
+    boolean delete(K key);
+    int size();
+    void addListener(RemovalListener<K, V> listener);
+}
+public interface RemovalListener<K, V> {
+    void onRemoval(K key, V value, RemovalCause cause);
+}
+public enum RemovalCause { EXPIRED, EVICTED, DELETED, REPLACED }
+```
+The two extension points that the store receives in its constructor:
+```java
+public interface Clock { long nowMillis(); }
+
+public interface EvictionPolicy<K> {
+    void touched(K key);     // inserted or read
+    void removed(K key);     // left the store
+    K victim();              // who to evict when full
+}
+```
+get returns Optional so that "missing" and "expired" look the same to the caller, as they should. An invalid argument, such as a negative capacity or a null key, throws IllegalArgumentException when the call is made.
+datamodel: Entities. Entry(value, expiresAt) holds a value and an absolute expiry time in milliseconds, or the largest long value if it never expires. Expiry(key, at) is a record in a priority queue. The store owns four structures that are kept in step: a hash map from key to Entry, a min-heap of Expiry ordered by time (see trees, heaps and tries), the eviction policy's order of keys, and a lock that guards all three.
+Why an absolute time. A relative TTL would need a ticking counter in each entry. An absolute expiry time is a single comparison with the clock, and it is the same fact whenever you look.
+Lazy deletion in the heap. When a key is overwritten, its old Expiry is still in the heap, and removing it from the middle of a binary heap costs a search. Instead, the heap keeps the stale record. When it reaches the top, the sweep compares the record's time with the live Entry's expiresAt; if they differ, the record is stale and is thrown away. Memory for stale records is bounded by the TTL window: they all leave the heap when their time comes.
+State of a key. A key is absent, live, or expired but not yet removed. The third state is invisible to callers because get checks the time first. This is what lets the store delay the physical removal without ever returning wrong data.
+design: Two ways to expire. Lazy expiry: get looks at expiresAt and, if the time has passed, removes the entry and reports nothing. It is free, but a key that nobody reads stays in memory. Active expiry: a background task calls sweep every second. sweep pops heap records whose time has passed and removes the matching entries. Together they give correctness (lazy) and bounded memory (active). Redis uses the same pair, with random sampling in the active part instead of a heap.
+The store. TtlStore does the work. put computes the expiry time, replaces the entry, tells the eviction policy the key was touched, adds an Expiry if the TTL is finite, removes any expired entries, and finally evicts while the size is over capacity. get reads the entry, checks the time, tells the policy and returns the value. delete removes the key from all structures. Every public method takes the one lock for its whole body, so the three structures change together.
+Eviction as Strategy. EvictionPolicy hides how a victim is chosen. LruPolicy keeps keys in access order (a LinkedHashSet: the first element is the least recently used). A FifoPolicy ignores reads. An LfuPolicy keeps a count per key and picks the lowest. The store only calls touched, removed and victim, so a new policy is a new class. Strategy fits because the rule changes between deployments but the call sequence is fixed. Before evicting a live key, the store first removes expired keys, because they are free victims.
+Listeners. RemovalListener is the Observer pattern. The store collects removal events while holding the lock and delivers them after releasing it, so a slow listener cannot block other threads, and a listener that calls the store again cannot deadlock itself. The cause tells a cache why the entry went.
+Decorator for extras. MetricsStore wraps any KeyValueStore, counts hits and misses and delegates every call. A LoggingStore or a NamespacedStore (adds a key prefix) works the same way. Decorator fits because these extras should be added or removed without touching the store.
+Clock. The real Clock should read a monotonic timer, such as System.nanoTime converted to milliseconds, because wall clock time can jump backwards when an administrator or NTP changes it. A FakeClock holds a number that a test advances.
+Core code. The listing is the store, the eviction policy and the clock.
+```java
+import java.util.*;
+import java.util.concurrent.locks.ReentrantLock;
+interface Clock { long nowMillis(); }
+
+interface EvictionPolicy<K> {
+    void touched(K key);        // key was inserted or read
+    void removed(K key);        // key left the store
+    K victim();                 // key to evict when full
+}
+
+class LruPolicy<K> implements EvictionPolicy<K> {
+    private final LinkedHashSet<K> order = new LinkedHashSet<>();
+    public void touched(K key) { order.remove(key); order.add(key); }
+    public void removed(K key) { order.remove(key); }
+    public K victim() { return order.iterator().next(); }
+}
+
+class TtlStore<K, V> {
+    private record Entry<V>(V value, long expiresAt) {}
+    private record Expiry<K>(K key, long at) {}
+
+    private final Map<K, Entry<V>> map = new HashMap<>();
+    private final PriorityQueue<Expiry<K>> expiries =
+        new PriorityQueue<>(Comparator.comparingLong(Expiry::at));
+    private final EvictionPolicy<K> policy;
+    private final Clock clock;
+    private final int capacity;
+    private final ReentrantLock lock = new ReentrantLock();
+
+    TtlStore(int capacity, EvictionPolicy<K> policy, Clock clock) {
+        if (capacity < 1)
+            throw new IllegalArgumentException("capacity");
+        this.capacity = capacity;
+        this.policy = policy;
+        this.clock = clock;
+    }
+
+    /** ttlMillis <= 0 means the key never expires. */
+    void put(K key, V value, long ttlMillis) {
+        lock.lock();
+        try {
+            long now = clock.nowMillis();
+            long at = ttlMillis > 0 ? now + ttlMillis : Long.MAX_VALUE;
+            map.put(key, new Entry<>(value, at));
+            policy.touched(key);
+            if (at != Long.MAX_VALUE)
+                expiries.add(new Expiry<>(key, at));
+            sweepLocked(now);
+            while (map.size() > capacity) remove(policy.victim());
+        } finally { lock.unlock(); }
+    }
+
+    Optional<V> get(K key) {
+        lock.lock();
+        try {
+            Entry<V> e = map.get(key);
+            if (e == null) return Optional.empty();
+            if (e.expiresAt() <= clock.nowMillis()) {   // lazy expiry
+                remove(key);
+                return Optional.empty();
+            }
+            policy.touched(key);
+            return Optional.of(e.value());
+        } finally { lock.unlock(); }
+    }
+
+    boolean delete(K key) {
+        lock.lock();
+        try { return remove(key); } finally { lock.unlock(); }
+    }
+    /** A background thread calls this every second or so. */
+    void sweep() {
+        lock.lock();
+        try { sweepLocked(clock.nowMillis()); }
+        finally { lock.unlock(); }
+    }
+
+    private void sweepLocked(long now) {
+        while (!expiries.isEmpty() && expiries.peek().at() <= now) {
+            Expiry<K> x = expiries.poll();
+            Entry<V> e = map.get(x.key());
+            if (e != null && e.expiresAt() == x.at()) remove(x.key());
+        }
+    }
+
+    private boolean remove(K key) {
+        policy.removed(key);
+        return map.remove(key) != null;
+    }
+}
+```
+To stay short, the listing leaves out listeners, size and the sweep batch limit. Notice that sweepLocked is called from put too, so a busy store cleans itself, and from the background thread. The comparison of the entry's expiresAt with the heap record's time is what makes stale records harmless.
+diagram:
+  +--------------------------+
+  | KeyValueStore <<iface>>  |<-------------------------+
+  | put() get() delete()     |                          |
+  +------------+-------------+              +-----------+----------+
+               ^                            | MetricsStore         |
+               |                            | (Decorator)          |
+  +------------+--------------------+       | hits, misses         |
+  | TtlStore<K,V>                   |       +----------------------+
+  | lock                            |
+  | map: HashMap<K,Entry>           |    +------------------------+
+  | expiries: PriorityQueue<Expiry> |--->| Clock <<interface>>    |
+  | capacity                        |    | SystemClock, FakeClock |
+  | put() get() delete() sweep()    |    +------------------------+
+  +-----+--------------------+------+
+        |                    |            +------------------------+
+        v                    +----------->| RemovalListener        |
+  +-------------------------+  notifies   | (Observer)             |
+  | EvictionPolicy <<iface>>|             +------------------------+
+  | touched() removed()     |
+  | victim()                |      +-----------------------------+
+  +----------^--------------+      | Sweeper (ScheduledExecutor) |
+             |                     | calls sweep() each second   |
+        Lru / Fifo / Lfu           +-----------------------------+
+deepdive: Concurrency: one lock. All state is shared and changes together, so one ReentrantLock around each public method is the simplest correct design (see locks and atomics). Even get needs the lock, because a read changes the LRU order, so it is a write to the policy. The critical sections are short: a few hash and heap operations, microseconds. Do not use a read-write lock for an LRU: reads would still need the write side. Do not use a ConcurrentHashMap alone and then update the heap and the policy separately: the three structures could disagree for a moment, for example a key in the map but not in the policy, and the policy would never evict it.
+Sharding. If one lock becomes the limit, create N independent TtlStore objects and route each key by hash(key) modulo N (see hashing and hash tables). Each shard has capacity divided by N and its own lock, so threads on different shards run in parallel. The price: LRU becomes approximate, because the least recently used key is chosen per shard and not globally, and a hot shard can evict while others have space. Choose N as a small multiple of the number of cores, for example 16 or 64.
+The background sweeper. A ScheduledExecutorService with one thread (see thread pools and executors) calls sweep every second. It takes the same lock, but sweepLocked stops at the first heap record in the future, so most runs cost one comparison. To avoid a long pause when millions of keys expire in the same second, limit one sweep to a batch of, say, 1,000 records and run again at once if more remain. The sweeper is created outside the store and passed in or started by a factory, so tests can call sweep by hand and the store itself starts no threads.
+Compound operations. putIfAbsent, compute and increment must be atomic: they run entirely under the lock. Do not offer a get followed by a put as the way to do this, because another thread can run in between.
+Lock-free reads. Libraries like Caffeine avoid the lock on reads: a read is recorded in a small buffer and the policy order is updated later in a batch (see lock-free data structures). It trades exact recency for speed. For an interview answer, say it exists, explain why (reads mutate the order), and keep the simple lock unless the interviewer asks for more.
+Extensibility. A new eviction policy is one class. A new removal listener is one class. A new storage layout, say off-heap, can sit behind the same KeyValueStore interface. Sliding expiration (a read extends the TTL) is a different policy of what get does, so make it an option object, not a boolean spread through the code.
+Testing. Use FakeClock for everything. Put with a TTL of 100, advance 99, assert the key is there; advance 1 more, assert it is gone. Overwrite a key with a longer TTL and check the old heap record does not delete the new entry. Fill a store of capacity 3 and check that LRU evicts the right key after a get changes the order. Check that expired keys are evicted before live ones. For concurrency, run 16 threads doing random put, get and delete for a few seconds against a store of capacity 100, with a checker that asserts size is never above capacity and the structures agree (map size equals policy size).
+tradeoffs: Heap of expiry times or a timing wheel. Choose the heap (or a DelayQueue) for up to a few million timers and exact expiry: it is simple and logarithmic. Choose a timing wheel for very many timers where an error of one tick (say 1 second) is fine, since insertion and removal are constant time. The wheel is more code and rounds up expiry times.
+Lazy expiry only or lazy plus active. Choose lazy only for a small cache where every key is read often, so nothing lingers. Choose lazy plus a background sweep when keys may never be read again and memory matters. The sweep needs a thread and costs a little CPU, but it bounds memory.
+One lock, striped locks or concurrent map. Choose one lock for up to a few hundred thousand operations per second and for simplicity. Choose shards when profiling shows lock contention, and accept approximate LRU. Choose a concurrent map with a read buffer, as in Caffeine, only when you need top throughput and can accept the complexity; it is better to use the library than to write it.
+Eviction policy: LRU or LFU. Choose LRU when recent use predicts future use, which is common for sessions and web pages. Choose LFU when a few keys are always hot and a one-time scan should not push them out. LFU needs frequency counters and aging, so it is more complex and slower to adapt.
+Inheritance or composition for features. Choose composition (policy objects, listeners, Decorator wrappers) so features combine freely. Choose a subclass such as LruStore only for a throwaway; every new feature then multiplies the number of classes.
+failures: Invalid input. A null key is rejected. A null value is rejected too, because get returns Optional and a null would mean two things; a caller who needs it stores a marker object. A capacity below 1 is rejected in the constructor. A TTL of 0 or less means no expiry in the listing. This must be documented, because many systems treat 0 as "expire at once"; a stricter API rejects it.
+Time problems. now plus a very large TTL can overflow a long; the code should saturate to the largest value. A wall clock that steps backwards could resurrect an expired key, so use a monotonic clock. A paused process (a long garbage collection) may find thousands of expired keys at once, which the batch limit in sweep absorbs.
+Resource problems. If the sweeper thread dies from an exception, memory grows, so the task catches all exceptions and logs them. Stale heap records can pile up if a client rewrites one key millions of times; rebuild the heap when stale records outnumber live keys by a factor of 4.
+Object problems. If callers change a mutable value after put, readers see the change without any lock. Document that values must be immutable, or copy on put and on get.
+Listener problems. A listener that throws must not break the store, so each call is wrapped in try and catch. Slow callbacks go to an executor.
+evolution: Common follow-ups. Add LFU: write LfuPolicy with count buckets (a map from count to a linked set of keys) so victim is constant time. Add persistence: append every put and delete to a write-ahead log, write snapshots, and replay on start. Add a loader: get(key, loader) calls the loader once per missing key even if 100 threads ask at once (single flight). Add weights: capacity in bytes with a weigher function. Distribute: partition keys by consistent hashing over several nodes, each running this store.
+followups: How do you make get never return an expired value? || Check expiresAt against the clock inside get, under the lock, before returning. Background cleanup is only for memory, never for correctness.
+Why does the store use a heap and not a scan? || A scan visits every key to find the expired ones, which is linear. A min-heap keyed by expiry time gives the next expiring key in constant time and costs a logarithm per insert, so the sweep only touches keys that are really due.
+What happens when a key is overwritten with a new TTL? || The old heap record stays. When it reaches the top, the sweep compares its time with the live entry and ignores it if they differ. This lazy deletion avoids an expensive remove from the middle of the heap.
+How do you make LRU thread safe, and is a read-write lock enough? || No: a read updates the order, so it is a write. Use one lock, or shard by key hash with a lock per shard, or buffer reads as Caffeine does. Sharding makes LRU approximate.
+How do you test TTL logic without sleeping? || Inject a Clock. The fake clock is a number the test advances. Also call sweep by hand instead of starting the background thread.
+How would you add LFU without changing the store? || Implement EvictionPolicy with frequency counts, for example buckets of keys per count, and pass it to the constructor. The store only calls touched, removed and victim.
+How would you stop a thundering herd when a hot key expires? || Add a get with a loader that uses a per-key future: the first caller loads, the others wait for the same result. Optionally refresh early, before the expiry, with some random jitter.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson, Vlissides, 1994 |
+ref: book | Java Concurrency in Practice | Goetz et al., 2006 |
+ref: docs | Redis key expiration | Redis documentation | https://redis.io/docs/latest/commands/expire/
+ref: docs | Caffeine: a high performance caching library for Java | Ben Manes | https://github.com/ben-manes/caffeine
+
+@@ chess
+title: Design a chess game (object-oriented design)
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, automata, hashtables, randalgo, locks, dst, trees
+summary: Design the classes of a two-player chess game: a board with 64 squares, 32 pieces with six kinds of movement, turns, check, checkmate, stalemate, and the special moves castling, en passant and promotion. Chess is the standard "rules heavy" object-oriented design problem. The code must put each rule in a place where it belongs, so that the game does not turn into one huge method with 300 if statements. Pieces differ in how they move, so they form a class hierarchy with polymorphic move generation (see object-oriented programming). A move is a command that can be applied and undone (see design patterns and SOLID). The game status is a small state machine (see finite automata). Draw by repetition needs a hash of the position (see hashing and hash tables). The goal is a correct rules engine, not a strong player: no search, no AI.
+requirements: Functional requirements. Two players, white and black, move in turn, white first. The game rejects any illegal move. The king moves one square; the queen, rook and bishop slide until blocked; the knight jumps; the pawn goes forward, captures diagonally, can move two squares from its start row, can capture en passant, and promotes on the last row. Castling needs an unmoved king and rook, empty squares between, and a king that is not in check, does not cross an attacked square and does not end in check. A move that leaves your own king in check is illegal. The game ends in checkmate, stalemate, or a draw (agreement, fifty move rule, threefold repetition, insufficient material), or when a player resigns. The game can list the legal moves for a square and can undo moves.
+Non-functional requirements. Correctness first: the engine must be testable against known move counts. Extensibility: a variant such as Chess960 or a new piece must not need edits in old classes. Thread safety: a server may receive moves from two clients, so a move is validated and applied atomically. Testability: no input or output, clock or randomness in the core, except a seeded generator for position hashes.
+Assumptions I choose: standard 8 by 8 board, one game per object, no time controls, no AI, promotion chosen by the player.
+estimates: Scale is tiny, but one number shapes the design: the cost of finding legal moves. A typical middle game position has about 30 to 40 legal moves, and the largest known number in any reachable position is 218. The approach below generates about 40 pseudo-legal moves and, for each one, scans the 64 squares once to test for check. That is a few thousand simple operations, a few microseconds in Java, which is far more than fast enough for two people. A chess engine that searches millions of positions per second needs bitboards (a 64 bit integer per piece type) instead, and that would change the data model but not the class design here.
+api: The facade is a Game object. A Square is a small value class with a file (a to h) and a rank (1 to 8), so callers never pass raw numbers.
+```java
+public interface ChessGame {
+    Color sideToMove();
+    MoveResult move(Square from, Square to, PieceType promotion);
+    List<Move> legalMovesFrom(Square from);
+    GameStatus status();               // ACTIVE, CHECK, CHECKMATE, ...
+    boolean undo();                    // false if no move to undo
+    void resign(Color who);
+    boolean offerDraw(Color who);      // true if the draw is accepted
+    Optional<Piece> pieceAt(Square s);
+    void addListener(GameListener l);
+}
+public enum GameStatus {
+    ACTIVE, CHECK, CHECKMATE, STALEMATE, DRAW, RESIGNED
+}
+public interface GameListener {
+    void onMove(Move m, GameStatus statusAfter);
+}
+```
+move returns a result object, not an exception, for normal mistakes: ILLEGAL_MOVE, NOT_YOUR_TURN, GAME_OVER, PROMOTION_REQUIRED, or OK. Exceptions are only for programming errors such as a null square. The promotion argument is ignored unless the move is a pawn reaching the last row.
+datamodel: Entities. Square(file, rank). Piece(color, type). Board: 64 slots, each empty or a Piece. Move(from, to, moved piece, captured piece and its square, kind, promotion piece), where kind is NORMAL, DOUBLE_PUSH, CASTLE, EN_PASSANT or PROMOTION. GameState: the board, the side to move, four castling rights, the en passant target square, the half move clock for the fifty move rule, the full move number, and the history of moves.
+Why the captured square is stored. In en passant the captured pawn is not on the target square of the move, it is next to it. Undo must put it back in the right place.
+Castling rights. Four bits: white and black, king side and queen side. A right is lost when the king moves, when that rook moves, or when that rook is captured. Rights are part of the position: the same pieces with different rights are a different position for the repetition rule.
+State machine for the game. ACTIVE goes to CHECK when the side to move is attacked and has a legal move; CHECK goes back to ACTIVE after the answer. From either, the game can reach CHECKMATE (attacked, no legal move), STALEMATE (not attacked, no legal move), DRAW or RESIGNED, which are final. The status is computed after each move from three facts: does the side to move have a legal move, is its king attacked, and do the draw counters say stop.
+Position history. A hash map from position hash to a count answers the threefold rule in constant time. Undo decreases the count.
+design: Piece hierarchy. Piece is an abstract class with two methods. attacks(board, square) lists the squares a piece controls. moves(board, square) lists the pseudo-legal moves, which may still leave the own king attacked. For most pieces moves is just attacks minus squares with a friendly piece, so the base class implements it once (a Template Method). Pawn is the exception: it attacks diagonally but moves straight, so it overrides moves. Two small classes cover the rest by data: Stepper takes a list of offsets (king and knight), and Slider takes a list of directions and walks along each until it hits a piece (rook, bishop, queen). A Factory class, Pieces, builds each piece and the starting position. Polymorphism replaces the big switch on piece type: the game code never asks what kind of piece it holds.
+Move as a Command. A Move records everything needed to apply and to reverse it. The board has make(move) and unmake(move). This is the Command pattern with undo, and one piece of code serves three jobs: executing a move, trying a move to test legality, and undoing a move for the player. The history stack of Moves is the undo list.
+Legality by simulation. For each pseudo-legal move, make it, ask whether the own king is attacked, and unmake it. This one rule handles pins, moving the king into check, and answering a check by capture or block. No case is coded one by one.
+Special rules as plug-ins. Castling needs rights and attacked squares, and en passant needs the previous move, so they are not inside the piece classes. A SpecialMoveRule interface has one method, addMoves(state, list); CastlingRule and EnPassantRule implement it. The generator calls the piece methods, then each rule. Chess960 swaps CastlingRule for another class. This is a Strategy per rule and follows the open and closed principle.
+Status and Observer. GameStatus is computed after each move. The states have no behaviour except refusing moves, so an enum is enough. The game calls each GameListener after a move; a GUI, a move list and a network sender can all listen, and the game knows none of them.
+Core code. The listing is the heart of the piece model. It is the piece hierarchy, the Move command data, and the board is an array of 64 slots (index is row times 8 plus column). It supports promotion to a queen only; castling, en passant and under-promotion are added by the rules above.
+```java
+import java.util.*;
+
+enum Color {
+    WHITE, BLACK;
+    Color other() { return this == WHITE ? BLACK : WHITE; }
+}
+
+record Move(int from, int to, Piece moved, Piece captured,
+            boolean promote) {}
+
+abstract class Piece {
+    final Color color;
+    Piece(Color c) { color = c; }
+
+    /** Squares this piece attacks (a square 0..63 is row*8+col). */
+    abstract List<Integer> attacks(Piece[] b, int from);
+
+    /** Pseudo-legal moves: may still leave the own king in check. */
+    List<Move> moves(Piece[] b, int from) {
+        List<Move> out = new ArrayList<>();
+        for (int to : attacks(b, from))
+            if (b[to] == null || b[to].color != color)
+                out.add(new Move(from, to, this, b[to], false));
+        return out;
+    }
+    boolean isKing() { return false; }
+    static boolean on(int r, int c) {
+        return r >= 0 && r < 8 && c >= 0 && c < 8;
+    }
+}
+
+class Stepper extends Piece {                 // king and knight
+    private final int[][] steps;
+    Stepper(Color c, int[][] steps) { super(c); this.steps = steps; }
+    List<Integer> attacks(Piece[] b, int from) {
+        List<Integer> out = new ArrayList<>();
+        for (int[] s : steps) {
+            int r = from / 8 + s[0], c = from % 8 + s[1];
+            if (on(r, c)) out.add(r * 8 + c);
+        }
+        return out;
+    }
+}
+
+class Slider extends Piece {                  // rook, bishop, queen
+    private final int[][] dirs;
+    Slider(Color c, int[][] dirs) { super(c); this.dirs = dirs; }
+    List<Integer> attacks(Piece[] b, int from) {
+        List<Integer> out = new ArrayList<>();
+        for (int[] d : dirs) {
+            int r = from / 8 + d[0], c = from % 8 + d[1];
+            while (on(r, c)) {
+                out.add(r * 8 + c);
+                if (b[r * 8 + c] != null) break;     // blocked
+                r += d[0]; c += d[1];
+            }
+        }
+        return out;
+    }
+}
+
+class Pawn extends Piece {
+    Pawn(Color c) { super(c); }
+    private int dir() { return color == Color.WHITE ? 1 : -1; }
+    List<Integer> attacks(Piece[] b, int from) {
+        List<Integer> out = new ArrayList<>();
+        int r = from / 8 + dir();
+        for (int dc = -1; dc <= 1; dc += 2)
+            if (on(r, from % 8 + dc)) out.add(r * 8 + from % 8 + dc);
+        return out;
+    }
+    @Override List<Move> moves(Piece[] b, int from) {
+        List<Move> out = new ArrayList<>();
+        int row = from / 8, one = from + 8 * dir();
+        boolean last = row + dir() == 0 || row + dir() == 7;
+        if (b[one] == null) {
+            out.add(new Move(from, one, this, null, last));
+            boolean home = row == (color == Color.WHITE ? 1 : 6);
+            if (home && b[one + 8 * dir()] == null)
+                out.add(new Move(from, one + 8 * dir(), this, null,
+                                 false));
+        }
+        for (int to : attacks(b, from))
+            if (b[to] != null && b[to].color != color)
+                out.add(new Move(from, to, this, b[to], last));
+        return out;
+    }
+}
+```
+Look at the Pawn. Its pushes (straight, to empty squares only) and its attacks (diagonal) are different sets, so it overrides moves and uses attacks for captures and for check detection. One method serves both purposes.
+diagram:
+  +----------------+       +------------------------+
+  | ChessGame      |------>| GameState              |
+  | move() undo()  |       | board, sideToMove      |
+  | status()       |       | castling rights        |
+  | legalMoves...()|       | enPassant, clocks      |
+  +---+--------+---+       | history: Deque<Move>   |
+      |        |           | seen: Map<hash,count>  |
+      |        |           +-----------+------------+
+      |        | notifies              | has 64
+      |        v                       v
+      |  +--------------+   +------------------------+
+      |  | GameListener |   | Piece (abstract)       |
+      |  | (Observer)   |   | attacks()  moves()     |
+      |  +--------------+   +--^-------^-------^-----+
+      |                        |       |       |
+      v                   Stepper   Slider    Pawn
+  +----------------------+  (K, N)  (R, B, Q)
+  | MoveGenerator        |
+  | piece.moves()        |    +------------------------+
+  | + SpecialMoveRule[]  |--->| SpecialMoveRule        |
+  | + legality filter    |    | Castling, EnPassant    |
+  +----------+-----------+    +------------------------+
+             |
+             v
+  +----------------------+
+  | Move (Command)       |
+  | from, to, moved,     |
+  | captured, kind       |
+  | board.make/unmake    |
+  +----------------------+
+deepdive: The legality filter. This is the most important method in the engine. It is short because make and unmake are exact inverses.
+```java
+List<Move> legalMoves(Color c) {
+    List<Move> out = new ArrayList<>();
+    for (int i = 0; i < 64; i++) {
+        if (sq[i] == null || sq[i].color != c) continue;
+        for (Move m : sq[i].moves(sq, i)) {
+            make(m);                         // try it on the board
+            if (!inCheck(c)) out.add(m);     // own king must be safe
+            unmake(m);                       // take it back
+        }
+    }
+    return out;
+}
+```
+inCheck(c) finds the king of color c and asks every enemy piece whether the king square is in its attacks. Checkmate is "inCheck and no legal move"; stalemate is "not inCheck and no legal move". One source of truth answers both.
+Castling. CastlingRule checks the right is set, the squares between are empty, the king is not in check, and the square it crosses is not attacked; the legality filter checks the final square. The move is one Move of kind CASTLE that make and unmake handle by moving two pieces. This is why Move needs a kind.
+En passant. After a double push the state stores the skipped square for exactly one move. Undo must restore the old target, so each Move saves what it overwrites (rights, target, clocks), a small Memento.
+Repetition and Zobrist hashing. Give every pair (piece kind and color, square) a random 64 bit number from a fixed seed (see randomized algorithms). The hash of a position is the XOR of the numbers of all pieces, plus numbers for the side to move, the castling rights and the en passant file. Zobrist described this in 1970. XOR is its own inverse, so make and unmake update the hash in constant time. A hash map from hash to count gives the threefold rule. Two positions can share a hash with probability about \( 2^{-64} \) per pair, which is negligible for a game; engines that must be exact compare the full position on a match.
+Insufficient material. Draw when neither side can force mate: king against king, king and one bishop or knight against king, or only bishops on the same color. The rule is a small function over piece counts.
+Concurrency. One game is a sequence of moves, so one lock guards the whole state (see locks and atomics): move() takes the lock, checks the turn, validates and applies the move, updates the status, and releases the lock. Listeners run after the release. Two clients that send a move in the same turn are serialized, and the second gets NOT_YOUR_TURN. Separate games share nothing.
+Testing. The best test for a rules engine is perft: count all leaf positions at depth n and compare with known numbers. From the start position the counts are 20, 400, 8,902, 197,281 and 4,865,609 for depths 1 to 5. The test position called Kiwipete, rich in castling, pins and en passant, gives 48, 2,039 and 97,862 for depths 1 to 3. If the counts match, move generation, check detection, make and unmake are very likely right; if not, the depth of the first difference points to the bug. Then add targeted tests: fool's mate ends in CHECKMATE; a known stalemate; a pinned piece cannot move; castling through an attacked square is refused; en passant works only on the next move; undo of every move returns the exact starting position and hash (see deterministic simulation testing for the seeded hash numbers).
+tradeoffs: Class per piece or one Piece class with data. Choose a class hierarchy (or at least a few classes like Stepper and Slider) when piece rules differ in behaviour, like the pawn. Choose one class with a table of directions from an enum when only the data differs, which is shorter and faster to read for a simple program. Chess has one real exception, the pawn, so a mixed design (data driven for most pieces, a class for the pawn) is fair.
+Make and unmake or copy the board. Choose make and unmake for speed and no allocation. Choose copying the board (an immutable Position) when you value simple code and safe sharing, such as a UI that keeps all previous positions. Copying 64 references is cheap; it hurts only in engines that search millions of positions per second.
+Simulate to test legality or code the pin rules. Choose simulation: it is short and covers every case. Choose precomputed pin and attack maps only in an engine, where one extra attack scan per move is too slow.
+Special rules inside pieces or as rule objects. Choose rule objects when a rule needs game state beyond the board and when variants exist. Choose code inside the piece class when a rule depends only on the board and the piece. Putting castling in the King class makes King depend on game history, which is the wrong direction.
+Result values or exceptions. Choose result values for illegal moves, because they are normal and the UI needs the reason. Choose exceptions for contract violations such as a null square.
+failures: Invalid moves. No piece on the from square, a piece of the other color, a target outside the board, a move that does not follow the piece's pattern, a move that leaves the king attacked, a move after the game is over, or a move out of turn all return a specific result and leave the state unchanged. Check and apply happen in one locked step, so a refused move never changes the board.
+Promotion. A pawn reaching the last row without a chosen piece returns PROMOTION_REQUIRED. Promotion to a king or a pawn is refused.
+Castling and en passant. Castling out of, through or into check is refused. A right lost by moving the rook is never restored by moving it back. An en passant capture one move late is refused. Undo must restore rights and the target square, or the next move list would be wrong.
+Draw bookkeeping. The fifty move clock counts half moves since the last capture or pawn move, and undo restores it. Undo must also reduce repetition counts, or a position seen twice could be called a draw.
+Setup errors. If you load a position from text (FEN), reject positions without exactly one king per side, pawns on the first or last row, or with the side not to move in check.
+evolution: Common follow-ups. Computer player: minimax search over the game tree (see trees, heaps and tries) with alpha-beta pruning uses the same legalMoves, make and unmake plus a material score, and speed then pushes you to bitboards. Clocks: a ChessClock with an injected time source and a TIMEOUT status. Notation: algebraic notation such as Nf3 produced from a Move and parsed back, FEN for positions, PGN for games. Server: the game is authoritative, clients send move requests with a version number to refuse stale ones, and each accepted move is broadcast as an event. Variants: replace the start position factory and the CastlingRule.
+followups: How do you check that a move does not leave the king in check? || Make the move on the board, test whether any enemy piece attacks the own king square, then unmake the move. This single rule covers pins and moves into check, so no special case is needed.
+How do you find checkmate and stalemate? || Compute the legal moves of the side to move. If there are none, it is checkmate when the king is attacked and stalemate when it is not. Both come from the same two functions.
+Where do castling and en passant belong, and why not in the King and Pawn classes? || They depend on game state beyond the board (rights, last move), so they live in rule objects that read the state. This keeps the pieces simple and lets variants swap the rule.
+How do you detect threefold repetition efficiently? || Keep a hash for each position, computed incrementally with Zobrist hashing, and a hash map from hash to count. Include side to move, castling rights and the en passant file in the hash. Undo decreases the count.
+How would you test the move generator? || Perft: count the leaf nodes at depths 1 to 5 from known positions and compare with published numbers (20, 400, 8,902, 197,281, 4,865,609 from the start). A difference at depth n shows where to look.
+How does the design change for a chess engine? || Keep the interface but switch to bitboards with precomputed attack tables, pack a move into an int to avoid allocation, and add search. The class design stays as the correctness reference.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson, Vlissides, 1994 |
+ref: book | Head First Design Patterns, 2nd edition | Freeman and Robson, 2020 |
+ref: docs | Perft results | Chess Programming Wiki | https://www.chessprogramming.org/Perft_Results
+ref: docs | Zobrist hashing | Chess Programming Wiki | https://www.chessprogramming.org/Zobrist_Hashing
+ref: docs | Command pattern | refactoring.guru | https://refactoring.guru/design-patterns/command
+

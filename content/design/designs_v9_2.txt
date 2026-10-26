@@ -1,0 +1,745 @@
+@@ online-judge
+title: Design an online judge like LeetCode
+category: Infrastructure
+level: Senior / Staff
+concepts: containers, nscgroups, permissions, virtualization, mqueue, autoscaling, cachelayer, realtime, websocket, loadshed, sqs
+summary: An online judge takes source code from a stranger, compiles it, runs it against hidden tests under strict time and memory limits, and returns a verdict such as Accepted, Wrong Answer or Time Limit Exceeded. It is hard for three reasons. First, the code is hostile by default: people try fork bombs, file reads, network calls and kernel exploits, so the sandbox is a security boundary. Second, the verdict must be fair: the same program must get the same verdict on a busy machine and on an idle one. Third, the load is bursty: a weekly contest sends 30,000 people to the same four problems in the same ten minutes. We design a judge with a queue, a fleet of disposable worker machines, a sandbox built from Linux namespaces and cgroups, and a push channel that shows the verdict within seconds.
+requirements: Functional requirements. A user opens a problem, writes code in one of about 15 languages (C++, Java, Python, Go, Rust, JavaScript and others), and presses Run or Submit. Run executes the code on the sample inputs or on a custom input and returns the output within about 3 seconds. Submit runs the code on all hidden tests (say 30 to 100 cases) and returns one verdict plus the time and memory used. Verdicts are Accepted, Wrong Answer, Time Limit Exceeded, Memory Limit Exceeded, Runtime Error, Compile Error and Output Limit Exceeded. Contests have a scoreboard that updates live. Problem authors can upload test data and a custom checker.
+Non-functional requirements. Safety: no submission may read other users' code, the hidden tests, the network or the host. Fairness: a correct solution that uses 40 percent of the time limit must never fail because of a noisy neighbour. Latency: p95 from Submit to verdict is under 10 seconds in normal hours and under 30 seconds at a contest start. Availability: the website works when the judge is overloaded; submissions wait in a queue and none is lost. Cost: judge machines are the main cost, so we scale them with demand.
+Assumptions. 2 million submissions per day normally; a contest has 30,000 participants with about 6 submissions each in 90 minutes. An average submission needs 6 CPU-seconds: 1.5 s to compile and 4.5 s for 50 tests of about 90 ms each. Test data averages 5 MB per problem, with a few at 100 MB.
+estimates: Normal load. 2,000,000 submissions per day divided by 86,400 seconds is about 23 per second. Evening peak is about 5 times the average, so 115 submissions per second.
+Contest load. 30,000 people times 6 submissions is 180,000 submissions in 90 minutes (5,400 s), or 33 per second on average. Most of them come in the first 20 minutes and in the last 10, so the peak is about 10 times the average: 330 per second. The first-accepted race also makes people resubmit fast.
+Compute. At 6 CPU-seconds per submission, normal peak needs 115 times 6 = 690 busy cores. The contest peak needs 330 times 6 = 1,980 busy cores. We do not run judge processes on hyper-threads that share a core with another judge process, because timing noise grows. So we count physical cores. A 32-core worker keeps 4 cores for the operating system, the agent and the cache, and runs 28 sandboxes at once. We want 70 percent utilization to keep queue waits short. Normal peak: 690 / 0.7 = 986 cores, divided by 28 gives 36 workers. Contest peak: 1,980 / 0.7 = 2,830 cores, divided by 28 gives about 101 workers. So the fleet changes by a factor of about 3 within a known time window, and we can schedule the scale-out before the contest.
+Storage. Code is about 2 KB, so 2 million per day is 4 GB per day, about 1.5 TB per year. A verdict record is about 1.5 KB (30 bytes per test), 3 GB per day. Test data: 3,000 problems times 5 MB is 15 GB, maybe 100 GB with outliers. It fits on the NVMe disk of every worker, so tests are read locally.
+Fan-out. A verdict message is about 300 bytes, so 330 per second is small. The scoreboard costs more, with 30,000 viewers, so we push a diff once per second.
+api: The API is small. The main work is behind the queue.
+POST /v1/problems/{problem_id}/submit with body {language, source, contest_id?} returns 202 Accepted and {submission_id, status: "QUEUED"}. The call writes the submission and puts a message in the queue. It does not wait for judging. A client-generated header Idempotency-Key makes a retry after a network failure return the same submission_id.
+POST /v1/problems/{problem_id}/run with body {language, source, input?} returns 202 and {run_id}. It uses the same pipeline with a smaller job: only sample tests or the custom input, and a higher priority.
+GET /v1/submissions/{submission_id} returns {status, verdict, time_ms, memory_kb, failed_test?, compile_log?}. This is the fallback when the push channel is not available. Clients poll it with a delay of 1 s that grows to 3 s.
+GET /v1/submissions/{submission_id}/events upgrades to a WebSocket (or Server-Sent Events) and pushes status changes: QUEUED, COMPILING, RUNNING 17/50, DONE. A contest page opens GET /v1/contests/{contest_id}/scoreboard/stream for scoreboard deltas.
+Internal worker API (workers call the control plane, never the reverse): POST /internal/jobs/{id}/result with {attempt, verdict, per_test[]}. The call carries a short-lived token valid for one job only.
+datamodel: Use a relational database (PostgreSQL) for the control data, because it is small and needs transactions, and an object store for test data and large logs.
+```sql
+CREATE TABLE submissions (
+  id           BIGINT PRIMARY KEY,        -- time-ordered id
+  user_id      BIGINT NOT NULL,
+  problem_id   INT NOT NULL,
+  contest_id   INT,
+  language     TEXT NOT NULL,
+  source_sha   BYTEA NOT NULL,            -- sha256 of source
+  source       TEXT NOT NULL,             -- up to 64 KB
+  status       TEXT NOT NULL,             -- QUEUED|RUNNING|DONE|FAILED
+  attempt      INT NOT NULL DEFAULT 0,    -- bumped on each dispatch
+  verdict      TEXT,
+  time_ms      INT,
+  memory_kb    INT,
+  failed_test  INT,
+  created_at   TIMESTAMPTZ NOT NULL,
+  judged_at    TIMESTAMPTZ
+);
+CREATE INDEX ON submissions (user_id, created_at DESC);
+CREATE INDEX ON submissions (contest_id, created_at);
+```
+Problems are versioned: (problem_id, version, time_limit_ms, memory_limit_kb, checker, tests_manifest_sha). Test files sit in the object store under a content hash, "tests/{sha256}", so a file is never copied twice and a worker can verify its copy. A changed test set gets a new version; old submissions keep the version they were judged on.
+Queues. Each queue holds only a pointer: {submission_id, problem_version, attempt, priority}, a few hundred bytes. We keep four queues: run-jobs (highest priority), contest, practice, rejudge (lowest). Source code is read from the database by the worker, so a queue message never carries user data.
+Scoreboard. A Redis sorted set per contest, with score = solved count times a large number minus penalty minutes. The database is the source of truth; the set can be rebuilt in seconds.
+design: The request path. The user presses Submit. The API server checks the user, the per-user limit (for example 1 pending submission per problem and 10 per minute), and the source size. It writes a row with status QUEUED and sends a message to the contest or practice queue (Amazon SQS or any similar durable queue). It returns 202 in about 20 ms. The browser opens a WebSocket on the submission and shows "In queue".
+Pull, not push. Judge workers pull jobs from the queues. A worker that has a free sandbox slot asks for the next message, taking from the highest-priority queue that has one. Pull has three good effects: a slow or dead worker takes no more work than it can do, the queue length is a direct measure of overload, and a new worker joins just by starting to pull. The queue gives at-least-once delivery. A message that is received becomes invisible for a visibility timeout (30 s by default in SQS, up to 12 hours). The worker extends it while it works. If the worker dies, the message becomes visible again after the timeout and another worker takes it.
+Judging steps. The worker loads the source and looks in its cache for a compile result with the same hash, language and flags. If none exists, it compiles inside a sandbox with its own limits (10 s CPU, 512 MB, a small cap on the output file). Then for each test it creates a fresh sandbox, mounts the compiled program and only that test's input, runs it with the problem's limits, collects stdout, CPU time and peak memory, and compares the output with the expected answer or runs the checker. It stops at the first failing test, as most judges do. Every few tests it sends progress, so the page can show "Running 17/50".
+The sandbox. It is built from the same Linux parts that containers use: namespaces give the process its own view of processes, files and network, cgroups limit memory, CPU and process count, and a seccomp filter lists the system calls it may make. The worker itself is a virtual machine with no secrets, so even a sandbox escape lands in a disposable box.
+Result path. The worker posts the result with its attempt number. The control plane updates the row only if the attempt matches the latest dispatch, then publishes an event for this submission. The WebSocket gateway that holds the user's connection forwards it. In a contest, the scoreboard service also updates the sorted set and sends a diff once per second.
+Caches. Workers keep test data on local disk (content-addressed, LRU) and compiled programs keyed by sha256(source + language + flags + compiler version) for 10 minutes, because contestants often resubmit the same code and retries repeat jobs. Problem statements and samples come from the CDN and a Redis cache.
+Scaling and shedding. An autoscaler watches the age of the oldest message and the number of busy slots. When the queue wait passes a limit, the API sheds the lowest-value work first: rejudges stop, then practice submissions get "judge is busy" with a Retry-After, while contest and run jobs continue.
+diagram:
+  browser
+    | POST /submit                ^ events (WebSocket)
+    v                             |
+  +-------------+  1. row   +-----------+  event   +-----------------+
+  | API / auth  |---------->| Postgres  |<---------| result handler  |
+  | limits      |           +-----------+          +-----------------+
+  +-------------+                                          ^
+    | 2. message {id, attempt}                             | 6. result
+    v                                                      |
+  +--------------------------+                             |
+  | queues: run > contest >  |                             |
+  |         practice > rejudge                             |
+  +--------------------------+                             |
+    | 3. pull                                              |
+    v                                                      |
+  +-------------------------------------------------------+------+
+  | judge worker VM (32 cores, NVMe cache of tests)              |
+  |  +---------+ +---------+ +---------+     28 slots            |
+  |  | sandbox | | sandbox | | sandbox | ... ns + cgroup +      |
+  |  | run 1   | | run 2   | | run 3   |     seccomp, no net    |
+  |  +---------+ +---------+ +---------+                        |
+  +--------------------------------------------------------------+
+    ^ 4. tests by hash
+  +-------------+     autoscaler: queue age, busy slots, schedule
+  | object store|
+  +-------------+
+animation:
+== A user submits C++ code. The API stores it and queues a pointer.
+  browser --POST--> [API] --row QUEUED--> [DB]
+                      +--{id=881, attempt=1}--> [queue]
+== A worker with a free slot pulls the message. It becomes invisible.
+  browser           [API]                      [queue] (hidden, 60 s)
+                                                 |
+                                               [worker 7]  RUNNING
+== The worker compiles in a sandbox: 10 s CPU, 512 MB, no network.
+  browser           [API]                      [queue]
+                                               [worker 7]
+                                                 [sbx: g++ -O2] 1.4 s
+== Each test runs in a fresh sandbox with only that test's input.
+  browser <-- "RUNNING 12/50" -- [API]         [worker 7]
+                                                 [sbx test 12] 88 ms
+== Test 31 prints a wrong answer. The worker stops and reports.
+  browser           [API] <--result attempt=1-- [worker 7]
+                                                 WA on test 31
+== The API saves the verdict and pushes it. The message is deleted.
+  browser <== WebSocket: Wrong Answer on test 31 == [API] --> [DB]
+deepdive: Building the sandbox. A fork and exec under a normal user account is not a sandbox. We stack independent layers, so one mistake is not enough. Namespaces: a new PID namespace so the program sees only itself; a new mount namespace whose root is a read-only bind of a minimal file system (runtime libraries only) plus one small tmpfs for writing; a new network namespace with only a down loopback, so there is no network at all. Permissions: the program runs as an unprivileged user id (mapped through a user namespace), with all capabilities dropped and no-new-privileges set, so a setuid binary cannot raise rights. Seccomp: a filter allows about 60 system calls that ordinary programs need (read, write, mmap, brk, exit_group) and kills the process on others such as ptrace, mount or socket. The tools isolate (used at IOI and by Judge0) and nsjail wrap exactly this set.
+Limits with cgroups. Memory: set memory.max in a cgroup v2 group and memory.swap.max to 0, so the kernel kills the process at the limit and nothing goes to disk. After the run, memory.peak gives the true peak, which is more reliable than polling the resident size. Processes: pids.max = 64 stops fork bombs. CPU: the verdict uses CPU time from the cgroup (cpu.stat, usage_usec), not wall time. A separate wall limit of 2 to 3 times the CPU limit catches programs that sleep or wait for input. Output: stdout goes to a file with a hard cap (64 MB), so a printing loop cannot fill the disk.
+Fair timing. The same program must get the same time. We pin each sandbox to one dedicated physical core with cpuset, fix the CPU frequency, keep the sibling hyper-thread idle, and never run more sandboxes than cores. Languages have different baselines: Python is often 10 to 50 times slower than C++, and the JVM needs 50 to 100 ms to start. So each language has a time multiplier, shown to the user. A test that fails only by timeout is run once more, and the better time counts. Each worker runs calibration programs with known times at startup and every hour; a worker whose reference times drift by more than 15 percent leaves the pool.
+Why containers alone are not enough. Containers share the host kernel. A kernel bug such as Dirty COW (CVE-2016-5195) or Dirty Pipe (CVE-2022-0847) turns local code execution into root, and a judge gives local code execution to every visitor. gVisor puts a user-space kernel written in Go between the program and the host, so most system calls never reach the host kernel, at a cost for syscall-heavy programs. A microVM such as Firecracker gives each run its own guest kernel and starts in under 125 ms with under 5 MiB of overhead, which fits 50 ms tests only if one VM serves a whole submission. Our choice: namespaces, cgroups and seccomp inside a worker VM that holds no credentials and is replaced every few hours. An attacker who escapes lands on a machine that can reach only the job API with a token for one job. For a public API with anonymous users we add gVisor or a microVM.
+Judging once on an at-least-once queue. A message may arrive twice: the worker is slow and the visibility timeout expires, or it dies after finishing but before deleting the message. Each dispatch increments the attempt number. The result update is `UPDATE submissions SET status='DONE', verdict=... WHERE id=? AND attempt=? AND status<>'DONE'`. A late result from attempt 1 matches no row and is dropped. Judging is deterministic, so a duplicate would give the same verdict; it only wastes CPU. After three failed receives the message goes to a dead-letter queue, because a submission that keeps killing workers is either a judge bug or an attack.
+Burst at contest start. A contest opens at 19:30. The problem pages and samples come from the CDN. Submissions begin after 2 to 3 minutes, when people finish reading. Starting a worker from nothing takes 2 to 4 minutes, so 30 minutes before the start the scheduled autoscaler grows the fleet from 36 to 100 workers, from an image that already has compilers and test data. The queue absorbs the rest. If 330 jobs per second arrive for one minute and the fleet finishes 100 per second, 230 x 60 = 13,800 jobs wait and the last one waits 138 seconds. That is too slow, so the warm fleet is sized to the peak rate and not the average.
+Real-time delivery. One WebSocket per open submission page is cheap: 30,000 contestants are 30,000 sockets, which a few gateways hold easily. The gateway subscribes to a pub/sub channel per submission. After a dropped connection the client reconnects and asks for the current status once; the fallback is polling with backoff. The scoreboard is pushed as one diff per second, so 330 verdicts per second become one message per viewer per second.
+tradeoffs: Pull queue versus push dispatch. Choose a pull queue (workers ask for jobs) when jobs take seconds, workers differ in speed and you want queue length as the load signal. Choose push (a scheduler assigns jobs) only for very low latency under 100 ms, such as the Run button served from a warm sandbox pool. Push needs a registry of live workers and handles failure worse. Pull costs about 20 ms of waiting.
+Sandbox strength. Choose namespaces, cgroups and seccomp in a disposable VM when you know your users (a hiring platform, a school) and want 50 ms start and low cost. Choose gVisor when users are anonymous, and accept slower system calls and incomplete Linux compatibility. Choose a microVM per submission when one escape would be very costly (a multi-tenant cloud product), and accept the boot time and memory. Never rely on default Docker settings alone.
+Sandbox per test or per submission. Choose a fresh sandbox per test when tests must not influence each other and 5 to 10 ms of setup is small next to the test. Choose one per submission when startup is expensive (the JVM) or the problem is interactive, and clean the work directory between tests.
+Stop at the first failure or run all tests. Choose to stop at the first failing test for contest judging: wrong solutions are the majority, and this saves half their CPU. Choose to run everything when the score is partial (subtasks). The price is up to 2 times the CPU for failing submissions.
+Local test cache versus shared file system. Choose a cache on each worker's NVMe disk, filled by content hash from the object store, because a 100 MB test over NFS adds seconds. Choose a shared file system only for fleets under 10 machines. The cost is a cold start (15 GB over 1 Gbit/s takes about 2 minutes), removed by a pre-built image.
+Scale on queue age or utilization. Choose queue age (how long the oldest message has waited) as the main signal: users feel it, and it reacts before CPU shows anything. Use utilization only to block scale-in while workers are busy, and add a schedule for known contests.
+failures: A worker dies in the middle of a job. Its message becomes visible after the timeout (60 s, extended every 20 s while the worker lives). Another worker takes it, the attempt number grows, and the user sees only a pause on "Running".
+A submission hangs or crashes the judge itself. The supervisor in the worker has a hard deadline per job, kills the sandbox and reports "System error". After three failed receives the message goes to the dead-letter queue. Worker VMs are short-lived, so a bug leaves no state.
+The database or queue is down. We write the row first and the message second. A repair job re-sends QUEUED rows older than 30 seconds, and idempotency keys stop duplicates. If the database is down, Submit returns 503 but problem pages still work from cache.
+Overload. When queue wait passes 30 seconds, load shedding starts: stop rejudges, reject practice Submit with Retry-After, allow one pending submission per user. Contest and Run jobs are never shed. The API stays fast because it never waits for a worker.
+A zone fails. The fleet loses a third of its capacity, queue age rises, and the autoscaler adds workers in the other zones in 3 to 4 minutes. In contests we keep 30 percent headroom for this case.
+Bad test data. A wrong expected output turns correct solutions into Wrong Answer. Test files are versioned and content-addressed. A new version first runs against reference solutions and a sample of old accepted submissions; if the accepted rate drops, the release is blocked. A rejudge goes to the lowest queue and updates scores only after it ends.
+Leaking hidden tests. A program may learn the tests from the verdict, for example by exiting with a different status for each guess. We show no hidden input or output, limit submissions per user and problem, and put only the current input in the sandbox.
+evolution: At 1,000 users, one server runs the web app and a judge process in a simple container; jobs are rows that the judge polls. At 100,000 users, use separate workers, a real queue, the isolate-style sandbox and the compile cache. At 1 million users, add priority queues, a schedule-aware autoscaler, the push channel and the scoreboard service. At 10 million users, split by region, add gVisor for the public API, build a rejudge system that can replay 100 million old submissions on idle capacity, and use spot machines for rejudges.
+followups: Why not run the code in a plain Docker container? || A container shares the host kernel, default settings allow many system calls, and a kernel bug allows escape. Use namespaces, cgroups, seccomp, dropped capabilities and no network, inside a disposable VM without secrets. For anonymous code add gVisor or a microVM.
+How do you stop a fork bomb or a program that eats all memory? || Run it in a cgroup with pids.max (for example 64) and memory.max with swap off. The kernel kills the group at the limit, and the worker reads the counters to report Runtime Error or Memory Limit Exceeded. A wall-time limit covers programs that sleep.
+How do you measure time fairly on a busy machine? || Use CPU time from the cgroup, not wall time. Pin each run to its own physical core, avoid hyper-thread sharing, fix the CPU frequency, and never run more sandboxes than cores. Calibrate workers with reference programs, apply language multipliers, and re-run a test that fails by a small margin.
+A message is delivered twice. What prevents a double verdict? || Give each dispatch an attempt number and make the result update conditional on the latest attempt and a non-final status. Judging is deterministic, so a duplicate is only wasteful. Repeated failures go to a dead-letter queue.
+30,000 users submit in the same minute. How do you survive? || Accept into a durable queue and return 202 at once. Pre-scale the fleet on a schedule from a pre-baked image, because cold workers take minutes. Use priorities so contest jobs go first, and shed practice and rejudge work when queue age passes a limit.
+How does the user see the verdict without 30,000 polls per second? || Open a WebSocket per submission page and push events from the result handler through a pub/sub channel. Fall back to polling with backoff. Send the scoreboard as one diff per second per viewer.
+ref: docs | Control Group v2 | Linux kernel documentation | https://docs.kernel.org/admin-guide/cgroup-v2.html
+ref: paper | Firecracker: Lightweight Virtualization for Serverless Applications | Agache et al., NSDI 2020 | https://www.usenix.org/conference/nsdi20/presentation/agache
+ref: docs | gVisor documentation | gVisor project | https://gvisor.dev/docs/
+ref: docs | Amazon SQS visibility timeout | AWS documentation | https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html
+ref: docs | isolate: sandbox for programming contests | Martin Mares and Bernard Blackham, IOI |
+ref: book | The Linux Programming Interface | Michael Kerrisk, 2010 |
+
+@@ fitness-tracker
+title: Design an activity tracker like Strava
+category: Web & product
+level: Senior / Staff
+concepts: spatialidx, tsdb, mobilearch, objectstore, partitioning, cachelayer, mqueue, batching, queuesbuf, redis
+summary: An activity tracker records runs and rides from a phone or a watch, turns a stream of GPS points into a map and statistics, compares each effort with other people on the same stretch of road (segments), and shows it to friends in a feed. Three things make it hard. The phone must record for hours without losing data, with the screen off, a weak signal and a small battery. The server must match every uploaded track against millions of segments in seconds. And the data is personal: a track shows where someone lives, so privacy controls are part of the core design. We design the recording client, the upload pipeline, the segment matcher with a spatial index, the leaderboards, the feed and the heatmap.
+requirements: Functional requirements. Record an activity (type, GPS, heart rate, cadence, power) on a phone or import it from a watch as a FIT or GPX file. Upload it, even after hours offline. Show the map, distance, moving time, pace and elevation gain. Match the track to segments and update segment leaderboards. Follow athletes, show a feed, give kudos and comments. Privacy: hide start and end near home (privacy zones), make activities private or followers-only. A global heatmap shows where people move.
+Non-functional requirements. Client: no data loss if the app crashes or the phone dies mid-activity (at most 10 seconds lost); battery use during recording must be low enough for a 5-hour ride. Upload: an activity appears in the feed within 10 seconds with basic stats; segment results can follow within 1 minute. Feed read p99 under 300 ms. Availability 99.9 percent. Durability: an uploaded activity is never lost. Privacy rules apply to every derived product, including the heatmap and the leaderboards.
+Assumptions. 30 million monthly active athletes, 10 million uploaded activities per day, 45 minutes on average, 1 GPS and sensor sample per second. 15 million daily active users who open the feed 10 times a day. 5 million segments, 50,000 of them very popular.
+estimates: Upload rate. 10,000,000 per day divided by 86,400 is 116 per second on average. Weekend mornings are the peak, about 6 times: 700 per second. Each athlete uploads once per activity, so this also equals the processing rate.
+Track size. 45 minutes is 2,700 samples. Raw, a sample has time, latitude, longitude, altitude, heart rate, cadence and power, about 40 bytes, so 2,700 x 40 = 108 KB. With delta coding (store the difference to the previous point) and a general compressor, a position needs about 5 to 6 bytes and the whole sample about 8. So 2,700 x 8 = 22 KB. For 10 million activities that is 220 GB per day, 80 TB per year, kept in object storage. At roughly 20 to 25 dollars per TB-month in standard storage, 80 TB costs under 2,000 dollars per month, less in colder tiers.
+Summary rows. One row per activity of about 500 bytes with a down-sampled polyline of 100 points: 10 million x 500 B = 5 GB per day, 1.8 TB per year. This is the hot data and lives in a sharded database.
+Feed. 15 million DAU x 10 loads = 150 million loads per day = 1,740 per second on average, 8,700 at peak (5 times). Each load shows 20 items. With a cache hit rate of 90 percent, the database sees about 870 feed queries per second at peak.
+Segment matching. A track has 2,700 points. For each point we look up the cell in the spatial index: about 1 microsecond for a hash lookup in memory. 2,700 lookups are about 3 ms. Perhaps 5 candidate segments pass the start test, and checking each takes 0.2 ms. So the match costs about 5 ms of CPU per activity, 700 x 5 ms = 3.5 cores at peak. The index is small: 5 million segments x 2 cells x 16 bytes = 160 MB, so every matcher holds a full copy in memory.
+Heatmap. 10 million x 2,700 = 27 billion points per day, about 10 trillion per year. A Web Mercator tile at zoom 16 covers 40,075 km / 65,536 = 611 m, so a 256-pixel tile has 2.4 m per pixel. A batch job counts points per pixel per tile. The output is a pyramid of tiles served by a CDN; most tiles at high zoom are empty and are never stored.
+Client battery. GPS at 1 Hz with the screen off is the largest cost. We cannot change the physics, but we can avoid waking the CPU for every sample: the OS delivers a batch of locations, and we write them in one transaction every 5 to 10 seconds.
+api: The client uses a few simple calls. Everything that changes data takes a client-generated id.
+POST /v1/uploads with {external_id, type, size, sha256} returns {upload_id, parts[]} with pre-signed object-storage URLs. The client sends the file in parts with PUT, which can resume after a failure. external_id is a UUID made on the phone when recording starts; a repeated call returns the same upload.
+POST /v1/uploads/{upload_id}/complete with the part ETags returns 202 and {activity_id, status: "processing"}. Processing then runs in the background.
+GET /v1/activities/{activity_id} returns the summary, the map polyline and the segment efforts. GET /v1/activities/{activity_id}/streams?keys=latlng,altitude,heartrate&resolution=medium returns arrays, served from the object store through the cache.
+GET /v1/feed?cursor=...&limit=20 returns activities of people the user follows, newest first. The cursor is an opaque position (time and id) and not a page number, so inserts do not shift the pages.
+GET /v1/segments/{segment_id}/leaderboard?filter=overall|friends|age_group&date_range=... returns the top entries and the caller's rank. POST /v1/activities/{activity_id}/kudos is idempotent: a second call changes nothing.
+datamodel: Activity summary lives in a relational store sharded by athlete_id, because the common reads are "my activities" and "this athlete's profile".
+```sql
+CREATE TABLE activities (
+  athlete_id   BIGINT NOT NULL,
+  activity_id  BIGINT NOT NULL,         -- time-ordered id
+  external_id  UUID NOT NULL,           -- from the phone, unique
+  type         SMALLINT NOT NULL,
+  start_time   TIMESTAMPTZ NOT NULL,
+  distance_m   INT, moving_s INT, elapsed_s INT, elev_gain_m REAL,
+  polyline     BYTEA,                   -- ~100 points, for list maps
+  stream_key   TEXT NOT NULL,           -- object store key
+  visibility   SMALLINT NOT NULL,       -- public|followers|private
+  PRIMARY KEY (athlete_id, activity_id),
+  UNIQUE (athlete_id, external_id)
+);
+```
+Streams. The full track is one compressed blob per activity in the object store, "streams/{athlete_id}/{activity_id}.bin", with columns for time, position, altitude and sensors, each delta coded. It is read whole, never queried by point, so a blob store is a better fit than a database.
+Segment efforts. A table (segment_id, athlete_id, activity_id, elapsed_ms, start_time) partitioned by segment_id, so a leaderboard is one partition. A second copy keyed by athlete_id serves the profile page; both are written from the same event. A popular segment has millions of efforts, so its top 1,000 are also kept in a Redis sorted set.
+Time series. Per athlete and day: distance, moving time, training load, heart-rate zones, in a time-series store with rollups to weeks and years. This feeds the fitness chart.
+Feed. For each user a Redis sorted set of the last 200 activity ids, score = start time. The social graph is a pair of tables, follows(follower, followee) and the reverse, partitioned by user id.
+design: Recording on the phone. A sensor thread receives locations from the OS and puts them into an in-memory ring buffer. A writer drains the buffer every 5 to 10 seconds and appends the samples to a local SQLite database in one transaction. A crash loses at most that window. On the next start the app finds a recording without an end mark and offers to resume or save it. The recorder runs as a foreground service on Android and with a background location mode on iOS. The screen can be off, and the UI reads its numbers from the same database.
+Upload. When the user presses Finish, the app writes a final record, builds a compact file and puts an upload job in a persistent local queue. A background worker (WorkManager or a background task on iOS) runs it when the network is good, with exponential backoff. The upload is multi-part and resumable. The external_id makes it idempotent: if the response is lost and the app retries, the server finds the same activity.
+Processing pipeline. Completing the upload writes a message to a queue with the object key. A pool of workers does the steps. Parse the FIT or GPX file. Clean the data: drop GPS spikes (for example a speed over 12 m/s for a run), fill short gaps, smooth altitude, and correct elevation from a terrain model. Compute distance, moving time (speed above a small threshold), pace and elevation gain. Trim the privacy zones. Write the summary row and the stream blob. Publish an "activity.created" event. The athlete sees the activity after these steps, in a few seconds.
+Segment matching. A consumer of the event runs the matcher (explained in the deep dive), writes the efforts and updates the leaderboards. Because this takes a bit longer and can be retried safely, it is separate from the first pipeline, and the activity page shows "matching segments" until it finishes.
+Feed and social. Another consumer pushes the activity id into the feed sets of the followers, if the athlete has fewer than about 10,000 followers (fan-out on write). For larger accounts the feed merges their latest activities at read time. Kudos and comment counters go to Redis first and are flushed to the database in batches every few seconds.
+Read path. The app asks the feed endpoint, which reads the id list from Redis, loads summaries from a cache or the database, and returns them with signed image URLs. Map thumbnails are rendered once per activity from the polyline and stored in the object store; the CDN serves them. Full streams are loaded only when the user opens the detail page.
+diagram:
+  phone / watch                                   web / other apps
+  +--------------------------+
+  | sensors -> ring buffer   |
+  |   -> SQLite (5-10 s) -> upload queue
+  +--------------------------+
+        | multipart PUT (resumable)
+        v
+  +-----------+   complete    +-------------+
+  | object    |-------------->| API / auth  |
+  | store     |               +-------------+
+  +-----------+                     | message {object key}
+        ^   read streams            v
+        |                    +-------------+
+        |                    |  queue      |
+        |                    +-------------+
+        |                      |         |
+        |            +---------v--+   +--v-----------+
+        +------------| pipeline   |   | segment      |
+        | stream.bin | clean,stats|   | matcher      |
+        |            +------------+   | (S2/geohash  |
+        |                 | event     |  index in RAM)|
+        |                 v           +--------------+
+        |         +---------------+         | efforts
+        |         | activities DB |   +-----v-------+
+        |         | (by athlete)  |   | Redis:      |
+        |         +---------------+   | feeds, tops |
+        |                             +-------------+
+        +--- batch job (Spark) -> heatmap tiles -> CDN
+deepdive: Segment matching with a spatial index. A segment is a polyline with a start and an end, for example 800 m up a hill. We must find the segments an activity covers without comparing the track with 5 million segments. We index each segment by the geohash or S2 cell of its start point at a level where a cell is about 150 m (geohash with 7 characters is about 153 m by 153 m; S2 level 16 is about 140 m). 5 million segments land in a hash map: cell id to list of segment ids. For each track point we compute its cell and the 8 neighbours (a start point can sit near a cell border), and collect candidates. For each candidate we check that the track passes within about 25 m of the start, then follow the segment's polyline, checking that the track stays within 25 to 30 m of it and reaches the end in the right direction. If it does, the effort time is the time at the end point minus the time at the start point, linearly interpolated between samples. Doing the cheap cell test first removes more than 99.9 percent of the work.
+Why spatial indexes work. Latitude and longitude are two numbers, and an ordinary B-tree can sort by only one of them. A geohash or S2 or H3 cell id maps a place to one integer in which nearby places usually share a prefix. A range scan on the id is then a proximity query. The cost is the border problem: two close points can have very different ids, so we always look at neighbour cells. S2 cells are squares on a cube projection with small distortion, and H3 cells are hexagons with equal distance to all neighbours; for this job any of the three is fine.
+Leaderboards at scale. A popular segment can have 5 million efforts. The overall leaderboard keeps only the best effort per athlete. We keep it in a Redis sorted set (score = elapsed ms) holding the top 10,000, and write every new best with ZADD only if it improves the athlete's time. Rank of the caller: for those inside the top 10,000, use ZRANK. Others are ranked by a count query on the segment partition, cached for a minute. The friends filter takes the user's follows (about 200) and reads their efforts for this segment directly, so it needs no global ranking. Filters by age group or by year need either extra sets or a query on a columnar table; we precompute the ones most users use.
+Time series for training data. An athlete's heart rate, power and pace are series. We keep the raw streams as blobs, and the daily and weekly numbers in a time-series database. Its storage tricks apply to the blobs too: delta of delta coding for timestamps (a 1 Hz timestamp costs about 1 bit) and XOR coding for values, as in the Gorilla paper, which brought samples to about 1.4 bytes on average for the data Facebook measured. We use the same idea for the 8-byte samples above: positions in units of 1e-5 degrees (1.1 m), stored as small deltas, compress very well. The TSDB itself is needed for the rollups, such as fitness and fatigue curves (moving averages of training load over 42 and 7 days), that need fast range scans per athlete.
+Privacy. Privacy zones hide the first and last 200 m to 1 km around a saved address. We cut those samples before the stream is written for other viewers, but keep the original for the owner, so the system holds two versions or applies the cut at read time with a flag. The heatmap uses only public activities from users who allow it, and drops tiles with fewer than a minimum number of distinct athletes, so a single person's route is not visible. Segment leaderboards honour each athlete's setting. Every derived product must pass through the same visibility check; we put this in one library.
+Batching in many places. The client writes sensors in batches. Kudos counts are flushed in batches. Segment efforts are written in batches of 500 per partition. The heatmap is a daily batch job over new activities plus a weekly full build: tiles are recomputed only where points arrived. Batching trades freshness (a few seconds for counters, a day for the heatmap) for large savings in writes.
+Idempotence and ordering. A job can run twice. Activity creation is guarded by the (athlete_id, external_id) unique key. The matcher deletes the old efforts of an activity before writing new ones, so a re-run replaces and does not duplicate. Leaderboard updates use "improve only" semantics. Editing an activity (for example cropping it) re-runs the pipeline with a new version number.
+tradeoffs: Streams in a blob store or in a time-series database. Choose blobs in an object store when each activity is written once and read whole (a map, a graph), which is true here: 80 TB per year costs little and scales without work. Choose a time-series database when you need queries across many series, such as "average heart rate of all my runs in March" or live dashboards. We use both: blobs for raw streams, a TSDB for per-day numbers. Putting 27 billion points per day into a TSDB would cost a lot for queries nobody runs.
+Fan-out on write or on read for the feed. Choose fan-out on write (push the id into every follower's list) when most athletes have fewer than 10,000 followers and the feed is read much more than written, as here: 8,700 reads per second against 700 uploads per second. Choose fan-out on read (merge at request time) for accounts with very many followers, because one upload would otherwise cause a million writes. A hybrid costs more code and gives stable latency.
+Geohash, S2 or H3. Choose geohash when you want simple strings and a prefix scan in any database. Choose S2 when you need exact cell hierarchies and covering of regions with few cells. Choose H3 when you analyse neighbourhoods and want equal distances. For matching segments, the three give the same result; the choice is the tools your team already has.
+Process on upload or on demand. Choose to process everything on upload when users expect segment results at once and the matching cost is small (5 ms). Choose lazy work, such as the heatmap or yearly statistics, in a batch job. You pay with a complex pipeline in the first case and with stale numbers in the second.
+Client recording design. Choose a local database with batched writes when you need crash safety; choose a plain file with periodic fsync when you want fewer moving parts and can accept the loss of a few seconds. The cost of the database is a bit more battery, and the gain is a clear resume path.
+failures: The phone dies or the app crashes. Samples up to the last flush are in SQLite. On restart the app offers to resume or finish. Watches have their own storage and sync later.
+Upload fails or the network is bad. Parts are retried with backoff, the upload resumes from the last part, and the external_id makes the final step safe to repeat.
+The queue or a worker fails. Messages are redelivered. Because each step is idempotent, the result is the same. A track that crashes the parser three times goes to a dead-letter queue and the user sees "could not process" with an option to download the original.
+A hot segment or a viral athlete. A Saturday race with 50,000 people uploading in 20 minutes makes thousands of efforts on the same segments. Writes to one segment partition are batched, and the sorted set is updated by one writer per segment partition. The feed for a famous account uses fan-out on read.
+Redis loses a node. Feeds and top lists are caches that can be rebuilt from the database. Until then reads fall back to the database with a lower page size. Counters might lose a few seconds of kudos, and the batch flush is the source of truth.
+A zone is down. Stateless services run in three zones. The database has replicas in each. The object store is replicated across zones by design. The upload continues; processing is delayed by the lost capacity.
+Bad GPS data. Tunnels, canyons and cheaters (a ride in a car recorded as a run) produce impossible speeds or jumps. Cleaning removes spikes, a flag marks activities with speeds over the type limit, and flagged efforts are held out of leaderboards until checked.
+evolution: At 100,000 users, one database, one queue and a small worker pool are enough, and segments are matched with a simple bounding-box query. At 10 million users, add the object store for streams, the in-memory index for segments and the Redis feeds. At 100 million users, shard the database by athlete, partition efforts by segment, add regional processing near the data, and run the heatmap as a distributed batch job. Next, expensive features, such as live tracking and route recommendations, get their own services.
+followups: How do you avoid losing data if the phone crashes in the middle of a ride? || Put samples in a ring buffer and flush to a local database every 5 to 10 seconds in one transaction. Mark the recording as open and finish it with a final record. On the next start, resume or save. Accept a loss of the last few seconds.
+How do you match a track against 5 million segments quickly? || Index each segment by the cell of its start point at a level of about 150 m. For every track point, look up its cell and neighbours in memory, test the few candidates for start, path and end, and interpolate times. The cell test removes almost all candidates, and a match costs about 5 ms.
+How do you rank an athlete on a segment with 5 million efforts? || Keep the best effort per athlete. Keep the top few thousand in a Redis sorted set, use ZRANK there, and compute the rank of others with a count query on the segment partition, cached for a short time. Friends leaderboards read only the friends' efforts.
+Why store streams as blobs? || A stream is written once and read whole, 20 KB per activity. An object store gives cheap, durable storage with no index to maintain. Per-day statistics go to a time-series database, where range queries and rollups matter.
+How do you handle a user with 5 million followers posting an activity? || Do not push the id to 5 million lists. Mark the account as large and merge its recent activities at read time. Keep the push for normal accounts. Cache the merged result for a short time.
+How do you protect privacy in the heatmap? || Use only public activities from users who opted in, cut privacy zones before aggregation, and publish only tiles with a minimum number of distinct athletes. Apply the same visibility check in one shared library for all derived data.
+How do you make uploads safe to retry? || Create an external_id on the phone, use a unique key on (athlete, external_id) in the database, make part uploads resumable, and make every pipeline step idempotent by deleting and rewriting its outputs.
+ref: paper | Gorilla: A Fast, Scalable, In-Memory Time Series Database | Pelkonen et al., VLDB 2015 | https://www.vldb.org/pvldb/vol8/p1816-teller.pdf
+ref: docs | S2 Geometry | Google, s2geometry.io | http://s2geometry.io/
+ref: docs | H3: Uber's hexagonal hierarchical spatial index | Uber, h3geo.org | https://h3geo.org/docs
+ref: book | Designing Data-Intensive Applications | Martin Kleppmann, 2017 |
+ref: docs | Web Mercator tile scheme (slippy map tilenames) | OpenStreetMap wiki |
+
+@@ news-aggregator
+title: Design a news aggregator like Google News
+category: Web & product
+level: Senior / Staff
+concepts: workflow, lsh, invindex, funnel, cachelayer, cdn, httpcaching, apidesign, pubsub, mqueue, ratelimit
+summary: A news aggregator collects articles from tens of thousands of publishers, groups the articles that tell the same story, ranks the stories, and shows a front page that is fresh within minutes and personal to each reader. The hard parts are the crawl and the grouping. We must find new articles quickly without hurting the publishers' servers, recognise that 400 sites copied the same wire story, and decide which of 90 million recent articles deserve the top ten slots. We design a crawl layer with polite per-host scheduling, an extraction and de-duplication pipeline with locality-sensitive hashing, a freshness-aware inverted index, a multi-stage ranking funnel, and a read path that uses CDN and HTTP caching for the large anonymous part of the traffic.
+requirements: Functional requirements. Ingest articles from RSS and Atom feeds, news sitemaps and push hubs (WebSub). Extract title, text, author, publish time, language, images. Remove exact and near duplicates. Group articles about the same event into a story cluster. Serve a top-stories page per edition (country and language), topic pages (sport, business), search over recent news, and a personalised "for you" page. Show the cluster with the original source first, and link out to the publisher.
+Non-functional requirements. Freshness: a story from a major publisher appears in p50 under 2 minutes after publication, and breaking news within 1 minute. Politeness: never overload a publisher; respect robots.txt and crawl-delay hints. Read latency: p99 under 300 ms for a page, under 150 ms for the ranking step. Availability 99.95 percent for reads; ingest can lag during failures but must not lose articles. Quality: near-duplicate detection should catch most copies of a wire story (recall above 90 percent) with few false merges.
+Assumptions. 50,000 sources, 3 million new articles per day, heavy-tailed (5,000 sources produce 80 percent). 20 million daily active readers, 5 page views per day each. A 30-day search window.
+estimates: Article rate. 3,000,000 per day divided by 86,400 is 35 per second. Breaking news can multiply this by 5: 175 per second.
+Feed polling. 5,000 hot sources polled every 60 seconds give 83 requests per second. 45,000 tail sources polled every 15 minutes give 50 per second. Total 133 feed fetches per second, 11.5 million per day. Most return "304 Not Modified" because we send If-None-Match and If-Modified-Since, which costs the publisher almost nothing. Push (WebSub) and news sitemaps cut the polling for cooperating publishers.
+Article fetch. 35 per second at 150 KB uncompressed HTML (about 40 KB on the wire) is 1.4 MB per second of network input. This is tiny. The cost is in the many connections, DNS and parsing, about 20 ms of CPU per page, so 175 per second needs 4 cores.
+Storage. Raw HTML 3 million x 100 KB = 300 GB per day. We keep 30 days hot, 9 TB, and archive older HTML to cheap object storage. Extracted text plus metadata is 5 KB x 3 million = 15 GB per day. The 30-day index covers 90 million documents. At about 2 KB per document in the inverted index plus fields, that is 180 GB, which fits in 6 index shards of 30 GB with replicas in memory-mapped files.
+Near-duplicate signatures. 128 MinHash values of 4 bytes = 512 bytes per article. For a 7-day comparison window, 21 million articles x 512 B = 10.7 GB, which fits in memory on a few machines.
+Read traffic. 20 million x 5 = 100 million page views per day = 1,160 per second on average, 5,800 at peak. About 70 percent are anonymous or share a page across a whole edition (the top-stories page for one country). With 100 editions and a 60-second cache, the origin sees 100 pages per minute for these, which is nothing. Personalised pages are 30 percent: 1,740 per second at peak, with a ranking budget of 150 ms.
+Ranking compute. For a personalised request: retrieve 2,000 candidates, score them with a light model (5 microseconds each, 10 ms), then score the best 200 with a heavier model (100 microseconds each, 20 ms), then re-rank 50. This is about 50 ms of CPU per request, so 1,740 per second needs about 90 cores. Cached candidate pools per user segment reduce this further.
+api: Public read API. GET /v1/editions/{edition}/top?topic=&cursor=&limit=20 returns story clusters: {cluster_id, headline, lead_image, updated_at, articles[]: {source, url, title, published_at}}. The cursor is an opaque token with position and a snapshot id, so that page 2 is consistent with page 1 even when the ranking changes.
+GET /v1/stories/{cluster_id} returns the whole cluster, with a timeline. GET /v1/search?q=&since=&sort=relevance|date&cursor= searches the recent window. GET /v1/foryou?cursor= is the personalised feed and needs a signed-in user or a device id.
+All responses carry ETag and Cache-Control: public, max-age=60, stale-while-revalidate=300 for anonymous pages, and private, max-age=0 for personalised ones. A client that sends If-None-Match gets 304 with no body when nothing changed. Versions are in the path (/v1) and fields are only added, never changed.
+Rate limits protect the API: 60 requests per minute for anonymous keys and more for partners, returned with 429 and Retry-After. Publisher-side endpoint: POST /v1/hub/subscribe (WebSub) lets a publisher push new article URLs to us.
+datamodel: Sources: (source_id, domain, feed_urls[], language, country, authority_score, crawl_interval_s, last_etag, last_modified, robots_cache). Articles: (article_id, source_id, url_canonical, url_hash, title, text, published_at, fetched_at, language, entities[], simhash, minhash[128], cluster_id, quality).
+```sql
+CREATE TABLE articles (
+  article_id    BIGINT PRIMARY KEY,
+  source_id     INT NOT NULL,
+  url_hash      BYTEA NOT NULL UNIQUE,   -- sha256 of canonical URL
+  title         TEXT, body_key TEXT,     -- body in object store
+  published_at  TIMESTAMPTZ,
+  language      TEXT,
+  minhash       BYTEA,                   -- 128 x 4 bytes
+  cluster_id    BIGINT
+);
+CREATE INDEX ON articles (cluster_id);
+```
+Clusters: (cluster_id, headline_article_id, first_seen, last_updated, size, topic, entities[], embedding). Clusters change as articles arrive, so they live in a store with updates by key (a wide-column or key-value store) and are partitioned by cluster_id.
+Search index. An inverted index of title and body terms per time segment: a new segment every hour and a merged daily segment, so that expiry means dropping a segment. Fields: terms, entities, language, edition, published_at, cluster_id, source_id, quality.
+LSH tables. For 16 bands of 8 hash values, a table band_id -> (band hash -> list of article ids), kept in memory and sharded by band hash, with a 7-day expiry.
+Fetch frontier. Per-host queues with next_allowed_time. Per-host state is small: 50,000 hosts x 1 KB.
+design: Discovery. A scheduler decides when to poll each source. It starts with a base interval (60 s for hot, 15 min for tail) and adapts: a source that published 3 times in the last hour is polled sooner, a quiet one later. It also reads news sitemaps, which list the articles of the last 48 hours, and receives WebSub pushes, which arrive in seconds. New URLs are canonicalised (strip tracking parameters) and checked against a URL hash table, so we never fetch twice.
+Fetching with politeness. Each URL goes into a per-host queue. A fetcher takes a host only when its token bucket allows it, by default 1 request per second per host and lower if robots.txt says so. Because a few hosts have many URLs and many hosts have few, the fetcher pool picks across hosts; the global work queue is a set of per-host lists, and workers pull the next host that is ready. Conditional requests (ETag, If-Modified-Since) are used for feeds. HTTP errors cause backoff per host.
+Extraction. The page is parsed, boilerplate (menus, ads, comments) is removed, and title, text, publish time (from schema.org metadata, Open Graph tags or the visible date), author and main image are extracted. Language is detected. Named entities (people, places, organisations) are linked to a knowledge base. The output is written to the article store and an event "article.extracted" is published.
+Deduplication and clustering. The consumer computes a MinHash signature over 5-word shingles, looks it up in the LSH tables and finds candidates with an estimated similarity above 0.7. The best match joins the same near-duplicate group. Then the story clustering step compares the article with the open clusters of the last 48 hours using entity overlap and a text embedding, and either joins one or opens a new cluster. The cluster record is updated and "cluster.updated" is published.
+Indexing and ranking features. An indexer adds the article to the current hourly segment of the inverted index with the cluster fields. Cluster features are updated: size, number of distinct sources, growth rate in the last 15 minutes, freshest article, best source authority. These features feed the ranking funnel.
+Serving. For anonymous editions a "top stories" job runs every 30 seconds per edition and per topic, runs the funnel, writes the ranked list as a snapshot to a cache and an object store, and the API serves it. The CDN caches the result for 60 seconds with stale-while-revalidate, so a million readers cost a few requests to the origin. For personalised pages, the API fetches the user's profile, retrieves candidates from the index, runs the funnel with personal features, and caches the result per user for a few minutes.
+Orchestration. The per-article path is a streaming pipeline of queues. The periodic and long jobs are workflows: recompute source authority daily, retrain rankers, rebuild the daily merged index segment, re-crawl the history of a new source, and backfill after a bug. A workflow engine gives retries, timers, state and visibility for these steps.
+diagram:
+  publishers         WebSub push        sitemaps, RSS (conditional GET)
+      |                    |                  |
+      v                    v                  v
+  +--------------------------------------------------+
+  | scheduler -> per-host queues (token bucket)      |
+  +--------------------------------------------------+
+      |  fetch (robots.txt, 1 req/s/host)
+      v
+  +-----------+  article.fetched  +----------------+
+  | fetchers  |------------------>|  event bus     |
+  +-----------+                   | (pub/sub)      |
+                                  +----------------+
+        +--------------+--------------+----------+
+        v              v              v          v
+  +-----------+  +-----------+  +-----------+ +--------+
+  | extract   |  | dedup:    |  | cluster   | | indexer|
+  | clean text|  | MinHash + |  | entities +| | hourly |
+  | entities  |  | LSH bands |  | embedding | | segment|
+  +-----------+  +-----------+  +-----------+ +--------+
+                                       |           |
+                              +--------v-----------v----+
+                              | stores: articles, clusters
+                              | inverted index shards   |
+                              +-------------+-----------+
+                                            |
+      user ---> CDN (60 s) ---> API ---> ranking funnel
+                                 |   2000 -> 200 -> 50 -> page
+                                 +--> Redis: user profile, caches
+deepdive: Near-duplicate detection with MinHash and LSH. Two articles are near duplicates when their sets of 5-word shingles have a high Jaccard similarity (size of the intersection divided by size of the union). Comparing every new article with 21 million others is impossible. MinHash gives a short signature: for each of 128 hash functions we keep the smallest hash over all shingles, and the chance that two signatures agree at one position equals the Jaccard similarity. LSH then cuts the signature into 16 bands of 8 values. Two articles are candidates if they agree on all 8 values of at least one band. For similarity s, the chance to become a candidate is \( 1 - (1 - s^{8})^{16} \). At s = 0.8 this is 95 percent, at s = 0.5 it is 6 percent, and the threshold is near \( (1/16)^{1/8} \approx 0.71 \). So a rewritten wire story with 80 percent shared shingles is found, and two articles about the same event with different wording are not. A lookup is 16 hash table reads. We then verify candidates with the full Jaccard on the shingle sets, which removes the false positives.
+From copies to stories. Near-duplicate groups handle syndication. Different articles about one event share entities and meaning, not words. We use a text embedding (a vector of a few hundred numbers), find the nearest open clusters by cosine similarity, and require shared named entities and a time window of 48 hours. A new article joins a cluster if the score passes a threshold; otherwise it starts one. Clusters can merge when a bridging article arrives (two clusters about the same event that started separately), so merges are part of the design and happen in a batch step every few minutes. Bad merges are the most visible failure, so we prefer to keep two clusters over wrongly joining two events.
+Freshness in the index. The index is split into time segments. The newest segment is small, lives in memory and is searched by every query. Older segments are immutable and memory-mapped. Dropping 31-day-old data means deleting one segment file, with no per-document delete. A query hits all segments in parallel, and ranking boosts by age with a decay such as \( 0.5^{t/h} \) with a half-life \( h \) of a few hours for news.
+The ranking funnel. Scoring 90 million documents with a neural model is impossible, so we use stages. Retrieval takes about 2,000 candidates from the index using terms, entities, the user's topics and the edition, with a cheap score. A light ranker (a gradient-boosted tree on a few dozen features) cuts to 200. A heavy ranker (a neural model that sees user and cluster features) cuts to 50. A final step chooses the page: it keeps only one article per cluster, with the original reporting first, limits one source to a few slots, mixes topics, and fills a fixed number of slots with local news. Each stage has a latency budget, and the total stays under 150 ms. Signals include recency, cluster size and the number of distinct sources, source authority, clicks, location match, and user interests. Quality filters remove spam and content farms before ranking.
+Polite and fast crawling. Respect for publishers is a hard rule. A token bucket per host stops us from overloading one site, and we reduce speed on timeouts or 5xx responses. Fresh content has a high value, so we spend our request budget where news appears: a scheduler gives each source a priority from its history, and breaking-news signals (a spike of similar articles in a cluster) trigger extra polls of the same sources. Cooperating publishers can push through WebSub or list articles in a news sitemap, which is cheaper for both sides.
+Caching in three places. The CDN holds anonymous pages and images for 60 seconds. The API keeps the ranked snapshot and cluster cards in a Redis cache, with a short TTL and request coalescing, so that one slow recompute serves all waiting requests. The browser keeps the page with an ETag and revalidates. Cache invalidation is by short TTL and not by purge: for news, being 60 seconds late is acceptable, and purging 100 editions is complex.
+tradeoffs: Polling or push for discovery. Choose polling with conditional GET for the long tail of 45,000 sources that offer only RSS: 50 requests per second is cheap and needs nothing from the publisher. Choose push (WebSub, sitemaps with pings) for the top publishers, where a delay of one minute matters. The cost of push is a subscription to manage and a fallback poll when pushes stop.
+Streaming pipeline or workflow engine. Choose queues and pub/sub topics for the per-article path: 35 per second sustained, each step takes milliseconds, and replay from a log is simple. Choose a workflow engine for jobs with long timers, human review, many steps and a need to see state, such as a daily recompute or a source backfill. A workflow per article would add overhead at 3 million per day and gives little.
+Exact hashing, SimHash or MinHash with LSH. Choose an exact hash of cleaned text to catch identical copies (cheap and exact). Choose SimHash (a 64-bit fingerprint, compare by Hamming distance) when documents are long and you need small memory. Choose MinHash with LSH when you need a tunable similarity threshold and good recall for partial copies, such as a wire story with a new headline and an extra paragraph. We run the exact hash first, because it removes about half of the duplicates at almost no cost.
+Precompute or compute on request. Choose precomputed snapshots for the many readers who share an edition: one computation serves millions. Choose request-time ranking for personal feeds, with a small candidate pool and caching. The split keeps the compute cost close to 90 cores and not to thousands.
+Freshness or quality. Choose a fast path (publish within a minute) for sources with high authority, because their errors are rare. Choose a slower path with extra checks (a second source, quality scores) for new or unknown sources, at the price of delay. This is a business choice as much as a technical one.
+failures: A publisher is down or slow. The host queue backs off with exponential delay, other hosts continue, and the source's last good articles remain in the index.
+The fetcher fleet falls behind. The scheduler sees the age of the oldest due URL and drops low-priority tail polls first, keeping hot sources on time. Fetchers are stateless and are added by an autoscaler.
+A bad parse. A site redesign makes the extractor return empty text. A quality check compares text length and publish time per source with its own history. If the empty rate jumps, the source goes to a quarantine queue and an alert is sent; the old extractor rules stay for other sources.
+Wrong cluster merge. Two events join into one cluster and the top page looks wrong. We keep a human override table, merge only with entity agreement, and re-split in a batch job when the internal similarity drops.
+Duplicate or out-of-order events. Consumers see an article twice or "updated" before "created". Every event carries the article id and a version, and writes are keyed by the id with "latest version wins", so replays are safe.
+Cache stampede after a deploy or an edition refresh. Thousands of requests ask for the same stale page. Request coalescing and stale-while-revalidate let one request recompute while others get the old page.
+Index shard loss. Replicas serve reads. A lost shard is rebuilt by replaying the last 30 days of articles from the log and object store, which takes hours, so we keep two replicas of every shard.
+Abuse of the API. A scraper requests 1,000 pages per second. The rate limiter at the edge returns 429 with Retry-After; partners have keys with their own quotas.
+evolution: At 1,000 articles per day, a cron job polls feeds, a single database stores articles, and Postgres full-text search plus a simple "same title" rule is enough. At 100,000 per day, add a queue, a real search engine, a MinHash dedup service, and a simple time-decay ranking. At 3 million per day, add the per-host crawler, hourly index segments, the ranking funnel, CDN caching and clusters. At 30 million per day and many countries, split by region and language: each region runs its own crawl, extraction, index and ranking, with a global layer that links clusters across languages through multilingual embeddings.
+followups: How do you find that 400 sites published the same wire story? || Shingle the text, compute a MinHash signature, and use LSH bands to find candidates with Jaccard similarity above about 0.7 without comparing all pairs. Verify candidates exactly, and run an exact hash first for identical copies.
+How do you choose the number of bands and rows in LSH? || The candidate probability is 1 - (1 - s^r)^b. With 128 hashes, b = 16 and r = 8 gives a threshold near 0.71. More bands with fewer rows gives higher recall and more false candidates. Choose from the cost of verifying a candidate and the cost of a miss.
+How do you crawl fast without harming publishers? || Keep one queue per host with a token bucket, honour robots.txt and backoff on errors, use conditional GET so unchanged feeds cost a 304, and use push or sitemaps from cooperating publishers. Spend the request budget on sources that publish often.
+Why a multi-stage ranking funnel? || A heavy model cannot score 90 million documents in 150 ms. Cheap retrieval cuts it to 2,000, a light ranker to 200, a heavy ranker to 50, and a last step enforces diversity. Each stage is more costly per item and sees fewer items.
+How do you serve 5,800 page views per second cheaply? || Most traffic is anonymous and the same per edition, so cache it at the CDN for 60 seconds with stale-while-revalidate. The origin computes each edition snapshot every 30 seconds. Only personalised pages hit the ranking service, and their results are cached for a few minutes.
+How do you keep pagination consistent when ranking changes? || Return a cursor that includes a snapshot id and the last position, and keep the snapshot for a few minutes. Page 2 then continues the same ordered list instead of shifting.
+How do you expire 30-day-old news from the index? || Use time-based segments. A new segment per hour, merged daily, and expiry is the deletion of the oldest segment file. There are no per-document deletes and no compaction cost.
+What would you do differently to reduce the risk of a filter bubble? || Reserve slots for top stories for everyone, cap the share of one topic or source in the personal page, and measure diversity as a metric next to clicks. Let users see and change their interests.
+ref: paper | On the resemblance and containment of documents | Andrei Broder, 1997 |
+ref: book | Mining of Massive Datasets, chapter 3: Finding Similar Items | Leskovec, Rajaraman and Ullman |
+ref: spec | WebSub | W3C Recommendation, 2018 | https://www.w3.org/TR/websub/
+ref: spec | RFC 9111: HTTP Caching | Fielding, Nottingham and Reschke, 2022 | https://www.rfc-editor.org/rfc/rfc9111
+ref: paper | Google News Personalization: Scalable Online Collaborative Filtering | Das et al., WWW 2007 | https://research.google/pubs/google-news-personalization-scalable-online-collaborative-filtering/
+ref: docs | Build a news sitemap | Google Search Central | https://developers.google.com/search/docs/crawling-indexing/sitemaps/news-sitemap
+
+@@ price-tracker
+title: Design a price tracking and alert service
+category: Web & product
+level: Senior / Staff
+concepts: workflow, mqueue, tsdb, fanout, idempotence, ratelimit, cachelayer, cdc, partitioning, pubsub
+summary: A price tracker lets people paste a product link, shows the price history, and sends an alert when the price falls below a target. The product is simple, but the system has two sides that fight each other. On the input side we must check millions of product pages often enough to catch a price drop while it lasts, without being blocked and without breaking the rules of the shops. On the output side one price change can trigger a notification for 500,000 people at once, and nobody should receive it twice or receive a false alert caused by a parsing error. We design a tiered check scheduler, a change-only price history in a time-series store, a change data capture stream, an indexed watch table that finds exactly the users to alert, and a durable workflow for confirmation and delivery.
+requirements: Functional requirements. A user adds a product by URL or search, with an optional target price. The system shows the current price, a price chart (30 days, 1 year, all time) and the lowest price seen. It sends an alert by push, email or both when the price reaches the target, with a limit on how often it may alert. Users can pause, edit or delete a watch. A public "deals" page shows the biggest recent drops.
+Non-functional requirements. Freshness: popular products are checked every 30 minutes, so a drop that lasts a few hours is seen. Alert latency: p95 under 2 minutes from detection to the notification leaving our system. Correctness: no duplicate alerts for one price event, and no alert for a price that is a parsing error. Politeness and legality: respect each shop's robots.txt, terms and rate limits; prefer official APIs and affiliate feeds to scraping. Availability of the website 99.9 percent; the check pipeline can lag without losing watches. Scale: 20 million users, 50 million active watches.
+Assumptions. 10 million distinct products (50 million watches, so 5 per product on average, but heavy-tailed: 100,000 products have over 100 watchers, and the top product has 500,000). About 5 percent of checks find a changed price.
+estimates: Check load. Tier 1: 100,000 popular products every 30 minutes = 48 checks per day each = 4.8 million per day. Tier 2: 900,000 medium products every 6 hours = 4 per day = 3.6 million. Tier 3: 9 million tail products once per day = 9 million. Total 17.4 million checks per day, 201 per second on average. During sales events (Black Friday) we raise the frequency of tier 1 and use 3 times the load: 600 per second.
+Price changes. 5 percent of 17.4 million = 870,000 changes per day, 10 per second. If we stored every check as a point, we would write 17.4 million x 24 bytes = 418 MB per day = 152 GB per year. Storing only changes (plus the last-checked time on the product row) is 870,000 x 24 B = 21 MB per day = 7.6 GB per year. This is 20 times less, and the chart is identical because a price stays flat between changes.
+Alerts. Suppose 2 percent of the 50 million watches reach their target on a given day: 1 million alerts per day, 12 per second on average. A sale event gives 20 times that: 240 per second. A viral product drop can create a burst of 500,000 alerts within a few minutes: at 5 minutes that is 1,700 per second just for this product.
+Watch lookup. For a price drop on product P to a new price X, we need all watches of P with target at or above X. With an index on (product_id, target_price) this is a range scan that returns only the users to alert. Without it, a scan of 500,000 watches would be needed for every change of the top product, even if nobody is triggered.
+Notification limits. Push providers accept thousands of messages per second. Email providers have per-account send rates; assume we are allowed 500 emails per second. A burst of 500,000 emails then needs 1,000 seconds, about 17 minutes. We therefore send push first, email next, and rate limit by channel.
+Read traffic. 20 million users, 2 million daily active, 5 page views each: 10 million per day = 116 per second, 600 at peak. A product page needs the current price and a chart, which are cache hits in 95 percent of cases.
+api: POST /v1/watches with {url | product_id, target_price?, currency, channels[]} creates a watch and returns {watch_id, product, current_price}. If the product is new, the call creates it and queues a first check. The header Idempotency-Key makes a retry return the same watch.
+PATCH /v1/watches/{watch_id} changes the target or the channels, and DELETE removes it. GET /v1/watches?cursor= returns the user's watches with current prices.
+GET /v1/products/{product_id} returns the current price, the lowest and highest price, and the last-checked time. GET /v1/products/{product_id}/history?range=30d|1y|all&resolution=day|raw returns points {t, price}, down-sampled for long ranges.
+POST /v1/webhooks lets developers register a URL for price events; each delivery carries an event id and a signature, and the receiver must treat repeated ids as the same event.
+Internal: POST /internal/observations from collectors with {product_id, price, currency, availability, source, observed_at, parser_version}.
+datamodel: Products and watches are relational. The watch index is the key design choice.
+```sql
+CREATE TABLE products (
+  product_id    BIGINT PRIMARY KEY,
+  retailer_id   INT NOT NULL,
+  url_canonical TEXT NOT NULL UNIQUE,
+  current_price NUMERIC(12,2),
+  currency      CHAR(3),
+  last_checked  TIMESTAMPTZ,
+  next_check    TIMESTAMPTZ,
+  tier          SMALLINT NOT NULL
+);
+CREATE TABLE watches (
+  product_id   BIGINT NOT NULL,
+  user_id      BIGINT NOT NULL,
+  target_price NUMERIC(12,2) NOT NULL,
+  channels     SMALLINT NOT NULL,
+  last_alerted TIMESTAMPTZ,
+  PRIMARY KEY (product_id, user_id)
+);
+CREATE INDEX watches_by_target ON watches (product_id, target_price);
+CREATE TABLE alerts (
+  alert_id   UUID PRIMARY KEY,           -- deterministic, see below
+  user_id    BIGINT NOT NULL,
+  product_id BIGINT NOT NULL,
+  price      NUMERIC(12,2) NOT NULL,
+  state      TEXT NOT NULL,              -- PENDING|SENT|FAILED
+  created_at TIMESTAMPTZ NOT NULL
+);
+```
+Partitioning. products, watches and the Kafka topics for prices are partitioned by product_id, so all data for one product sits together. A second table user_watches (user_id, product_id) is partitioned by user_id for the "my watches" page; it is filled from the change stream. alerts are partitioned by user_id.
+Price history is a time series: (product_id, t, price, currency, availability) stored in a time-series table, for example a TimescaleDB hypertable in the same PostgreSQL cluster, so that the price row and the history point commit together. The product is the series key, chunks cover one week, and data older than a year is rolled up to daily min, max and last. alert_id is a UUID computed as a hash of (user_id, product_id, price_event_id), so repeating the work gives the same key.
+design: The loop has five parts. Scheduler: picks products whose next_check time has passed, by tier, and puts check jobs in queues per retailer. Collectors: fetch and parse. Price service: stores the price, detects a change and emits events. Matcher: finds the watches to alert. Notifier: sends the messages and tracks their state.
+Scheduling. The scheduler scans products by next_check in batches, in order of tier and how long they are overdue. It adapts the tier: a product whose price changed twice this week moves up, one with no change in 90 days moves down. A product with many watchers is always in tier 1. The scheduler writes jobs to one queue per retailer, so the rate of each shop can be controlled without affecting others.
+Collecting. A pool of collectors takes jobs from a retailer queue at the rate that the retailer's token bucket allows, for example 2 requests per second per outgoing address and shop. Where a shop offers a product API or a feed, we use it. Otherwise we fetch the page and use a parser that is versioned per shop. The collector sends an observation {product_id, price, availability, parser_version} to the price service. It does not decide whether this is a real change.
+Detecting a change. The price service reads the last known price, compares, and if different, writes the new price to the history store and to the products row in one transaction. Large moves are suspicious. If the price falls by more than 50 percent, or becomes zero, or the currency changes, the service does not publish the change. It starts a confirmation workflow instead (below). Otherwise it commits and the change data capture stream publishes the new row to the topic price.changed.
+Change data capture. We do not write to the database and to Kafka in two separate steps, because one could fail and leave them different. The database is the source of truth; a CDC connector (such as Debezium) reads its log and publishes each committed change as an event in order per product. Consumers of the topic: the matcher, the cache invalidator, the deals page builder, the search index and analytics. This is publish and subscribe: the price service does not know who listens.
+Matching and fan-out. The matcher consumes price.changed for a product. For a drop to X it runs `SELECT user_id FROM watches WHERE product_id = ? AND target_price >= ? AND (last_alerted IS NULL OR last_alerted < now() - interval '12 hours')`. For a popular product the result is large, so the matcher splits it into pages of 1,000 users and writes one message per page to the notification queue. Each page is a job that can be retried alone. This is fan-out on write at the moment of the event, and the work spreads over many workers.
+Notifying. A notification worker handles a page: for each user it inserts an alert row with the deterministic alert_id (ON CONFLICT DO NOTHING), skips users whose row already exists, checks the user's daily limit, and sends push or email. It marks the alert SENT. Email goes through a provider with a rate limiter in front.
+Read path. A product page reads current price and a 30-day chart from a Redis cache, falling back to the database and the history store. The cache entry is deleted or replaced when price.changed arrives; a short TTL of 10 minutes covers a lost event. Charts for long ranges are precomputed daily.
+diagram:
+  scheduler (next_check, tier)
+        |  jobs per retailer
+        v
+  +--------------+   token bucket per shop
+  | retailer     |---------------------------+
+  | queues       |                           v
+  +--------------+                     +-----------+
+                                       | collectors|-> shop API / pages
+                                       +-----------+
+                                             | observation
+                                             v
+  +------------+  commit   +-----------------------+
+  | price      |---------->| DB: products, watches |
+  | service    |  history  | TSDB: price history   |
+  +------------+           +-----------------------+
+        | big drop?                    | CDC (log tail)
+        v                              v
+  +-------------+              +----------------+
+  | confirm     |              | topic          |
+  | workflow    |-- ok ------->| price.changed  |
+  +-------------+              +----------------+
+                                |      |       |
+                    +-----------+  +---+---+  +--------+
+                    v              v       v           v
+              +---------+     +-------+ +-------+  +-------+
+              | matcher |     | cache | | deals |  | search|
+              +---------+     +-------+ +-------+  +-------+
+                    | pages of 1,000 users
+                    v
+              +---------------+   push / email providers
+              | notify queue  |-> workers + rate limit
+              +---------------+
+animation:
+== A collector reads 49.99 for product 7 (last price 59.99).
+  collector --obs {7, 49.99}--> [price service]   DB: 59.99
+== The service commits the new price and history in one transaction.
+  [price service] --COMMIT--> [DB]                DB: 49.99
+                              CDC log: row(7, 49.99)
+== CDC publishes price.changed. Matcher and cache both consume it.
+  [DB log] --> (price.changed {7, 59.99 -> 49.99}) --> matcher, cache
+== The matcher range-scans watches with target >= 49.99. 3,200 hits.
+  matcher: product 7, target >= 49.99  ->  3,200 users, 4 pages
+== Each page becomes a job. A worker inserts alert rows and sends.
+  notify queue: [page 1][page 2][page 3][page 4] -> workers
+  alerts: INSERT ... ON CONFLICT DO NOTHING
+== A crashed worker's page is redelivered. Existing rows are skipped.
+  page 3 retried -> 400 rows exist, 600 new -> only 600 sent
+deepdive: Idempotence for alerts. The queues deliver at least once, so a page can run twice, and a worker can crash after sending an email but before marking the alert SENT. We reduce duplicates in three layers. First, the alert_id is a hash of (user_id, product_id, price_event_id), where price_event_id comes from the CDC event (product id and version of the price row). A second run of the same page computes the same ids, and INSERT ... ON CONFLICT DO NOTHING stops the second insert; only users that were newly inserted are notified. Second, we pass alert_id to the email or push provider as an idempotency or collapse key, so the provider drops a repeat within its window. Third, the last_alerted column and a cooldown (12 hours) stop a new alert for the same product after a small further drop. A crash between "provider accepted" and "row marked SENT" can still cause one duplicate; we accept that rare case, because exactly-once delivery to a person's phone is not possible.
+Confirming suspicious prices. Scrapers fail in funny ways: a page shows a price for a different size, a "from" price, a monthly instalment or a coupon price, or a parser reads 0.99 from "save 0.99". A false alert costs trust. Rules: any move over 50 percent, any price of zero, and any change that appears only in one collector start a durable workflow. The workflow waits 2 minutes, asks a second collector from a different network (or the other parser version), compares both, and only then publishes the event; if they disagree it marks the observation as a doubt and moves on. If a product is flagged several times, it goes to a review queue for a parser fix. A workflow engine is a good fit because the steps have timers and retries, and its state survives restarts. The same engine runs alert digests (a daily summary instead of ten emails) and long retries for failed deliveries.
+Hot products and the fan-out burst. A popular game console price drop reaches 500,000 watchers. The matcher splits the range into pages with a keyset query (target_price, user_id > last_seen), so each page costs the same and no query uses OFFSET. The pages enter a queue that workers drain in parallel. The email provider limit (500 per second) is a bottleneck, so we send push first (fast and free) and spread email over 17 minutes with priority by target price: the users whose target was lowest, who wait for the best deals, go first. Per-user limits (for example 10 alerts per day, then a digest) bound the cost of a bad day.
+Rate limiting in four places. Per shop: a token bucket controls collectors, sized from the shop's terms and our observed errors. A 429 or 503 from a shop reduces its rate by half and slowly increases it again. Per user: add-watch calls (100 per day) and alerts (10 per day). Per channel: the email and push senders. Per API key: public API calls. Each is a counter in Redis, as in a distributed rate limiter.
+Caching. The product page cache has the current price and the 30-day sparkline. Updates arrive through price.changed, so the cache is almost always right, and a TTL is the safety net. To avoid a stampede when a popular key is evicted, one request recomputes while the others wait for it. The chart for one year is built from daily roll-ups, not from raw points.
+Partitioning and ordering. Events for one product must be processed in order: a price of 49.99 followed by 54.99 must not be reversed. The topic is partitioned by product_id, so one consumer instance sees them in order. A consumer that is slow for one product slows all products in its partition, so we limit the work per event (the matcher only creates pages, and workers do the real sending). Price rows carry a version, and a consumer ignores an event with an older version than the one it has applied.
+Legal and ethical side. Many shops forbid scraping in their terms. We prefer affiliate and partner feeds, honour robots.txt, identify our crawler, and remove a shop on request. This is a business risk and also a design input: the check frequency of each shop is a configurable budget.
+tradeoffs: Store every check or only changes. Choose change-only storage when prices are flat most of the time: 20 times less data and a chart that is the same. Choose every check when you sell data about availability, or need to prove that a check happened (for audit). The middle way is to store changes plus a per-day "last checked" marker.
+Scrape, API or feed. Choose the official API or the affiliate feed when the shop offers one: stable and legal, but with a rate limit and sometimes delayed prices. Choose scraping only for shops without a feed and where terms allow it; it is cheap to start but breaks at every redesign and needs proxies. Many products need a mix.
+Fan-out on write or on read for alerts. Choose matching at write time (on each price change, find the watches to alert) because price changes are rare (10 per second) and watches are many (50 million). Choose a periodic scan of watches at read time only for tiny systems, where one query per hour is enough. Write-time matching costs an index on (product_id, target_price) and some storage.
+Workflow engine or plain queues. Choose a workflow engine for confirmation, digests and retries with timers, where state across minutes or days matters. Choose plain queues for the high-volume, short, stateless steps, such as sending one email. At 1 million alerts per day a workflow per alert would be costly and needless.
+Database triggers or CDC. Choose CDC when many consumers need the same changes and you want the database to be the single source of truth, with no dual write. Choose a transactional outbox table when your database cannot expose its log. Choose direct publishing from the service only if losing an event is acceptable, which here it is not.
+failures: A shop blocks us or changes its layout. The collector sees errors or empty prices. The quality check per shop and parser version raises an alert when the failure rate passes 5 percent, and the shop's rate drops until a fix is ready. Prices stay stale, and the product page says when it was last checked.
+The queue backs up. If collectors fall behind, the scheduler uses next_check and tier to skip tail products first. Hot products keep their frequency.
+Duplicate or reordered events. Versions and deterministic alert ids make processing safe to repeat. Out-of-order events are ignored if older than the applied version.
+The notification provider is down. Pages go to a retry queue with exponential backoff, and alerts are in PENDING. After 1 hour, push alerts of lower priority are dropped as stale (a price alert after the sale has ended is worse than none), and we show them in the in-app inbox instead.
+A bad parser deploy reports many false drops. The 50 percent rule and the confirmation workflow stop most of them. A kill switch pauses alerts for one parser version. Because history is append-only with a parser_version column, we can delete the bad points and recompute current prices.
+A database shard fails. The shard has a replica that is promoted. Collectors retry observations for that shard; matching resumes from the last consumed CDC position, which is stored by the connector.
+Alert storms. A shop bug sets all prices to 1 dollar. Rate limits per user and a global circuit breaker on "drops per minute" pause alerting and page an operator. This is a case where a human is the right control.
+evolution: At 10,000 users, one database, a cron job that checks every product every hour, and a loop that sends email. At 1 million users, add queues and a collector pool, a time-series table for history, and the index on target price. At 20 million users, add tiers, per-shop queues, CDC, partitioning by product_id and the confirmation workflow. At 100 million users, shift more of the volume to partner feeds, add a regional collector fleet near the shops, predict price drops with a model to schedule checks better, and offer price-history data to shops and partners through an API.
+followups: How do you find all users to alert when a price drops? || Keep a table of watches with an index on (product_id, target_price). A drop to X is a range scan on target_price >= X for that product. Page through it with a keyset cursor, and enqueue one job per page.
+How do you avoid sending an alert twice? || Compute a deterministic alert id from user, product and price event, insert it with ON CONFLICT DO NOTHING and notify only new rows. Pass the id to the provider as an idempotency key. Accept that a crash after the provider accepts can still rarely repeat a message.
+How do you decide how often to check each product? || Use tiers from watcher count and price volatility: popular products every 30 minutes, medium every 6 hours, tail daily. Move products between tiers by observed changes. Spend the budget where a missed drop costs the most users.
+Why store only price changes? || Prices are flat most of the time: about 5 percent of checks find a change, so storing only changes uses about 20 times less space. The chart is the same, and a last-checked time on the product row keeps freshness information.
+How do you protect against bad scraped prices? || Treat big drops, zeros and single-source changes as suspicious. Confirm them with a second fetch after a delay, using a different network or parser, in a durable workflow. Track parser versions and failure rates per shop, and keep a kill switch.
+Why use CDC instead of publishing from the application? || The application cannot write to the database and the broker atomically. CDC reads committed changes from the database log, so every change is published once in order, and new consumers can be added without changing the writer.
+How do you handle a product with 500,000 watchers? || Split the matching result into pages of 1,000 with a keyset query, process pages in parallel, send push first and spread email under the provider's rate limit, order by target price, and apply per-user daily limits and digests.
+How do you limit the load on a shop? || Use a token bucket per shop and per outgoing address, honour robots.txt, back off on 429 and 5xx, prefer official feeds, and set the check budget per shop in configuration.
+ref: docs | Debezium documentation | Debezium project | https://debezium.io/documentation/
+ref: blog | Designing robust and predictable APIs with idempotency | Brandur Leach, Stripe, 2017 | https://stripe.com/blog/idempotency
+ref: docs | Temporal documentation | Temporal Technologies | https://docs.temporal.io/
+ref: paper | Gorilla: A Fast, Scalable, In-Memory Time Series Database | Pelkonen et al., VLDB 2015 | https://www.vldb.org/pvldb/vol8/p1816-teller.pdf
+ref: book | Designing Data-Intensive Applications | Martin Kleppmann, 2017 |
+
+@@ online-chess
+title: Design online chess with matchmaking
+category: Web & product
+level: Senior / Staff
+concepts: realtime, websocket, occ, idempotence, cachelayer, queuesbuf, partitioning, ntp, redis, leaderelect
+summary: Online chess pairs two strangers of similar strength, lets them exchange moves in real time against a clock that must be fair, and updates their ratings when the game ends. The data is tiny, one move is a few bytes, but the problem has strict rules. A move must reach the opponent in tens of milliseconds. Exactly one server must own each game, even when servers fail. The clock must not favour the player with the faster network or the cheating client. And a reconnect, a double click or a retried message must never play a move twice. We design a matchmaking service on sorted sets, game servers that hold the live state in memory and write every move to a fast store, WebSocket gateways, a server-side clock, and the rating pipeline.
+requirements: Functional requirements. A player chooses a time control (for example 3+2: three minutes plus two seconds per move), rated or casual, and joins the pool. The system finds an opponent with a similar rating, creates a game, assigns colours, and starts the clocks. Players make moves, offer draws, resign, and can abort in the first moves. The server validates every move, detects checkmate, stalemate, draws and time-outs, and records the game. Spectators can watch a game live. After the game both ratings change. A player who loses the connection can come back and continue.
+Non-functional requirements. Latency: a move reaches the opponent in under 100 ms (server time under 10 ms on top of the network). Fairness: the clock is controlled by the server only, and lag is handled by clear rules. Consistency: each game has one linear history; no move is lost or applied twice. Availability: a server failure must not end the games it hosts; the games continue after a few seconds. Matchmaking: median wait under 5 seconds for popular pools, with rating difference as small as possible. Scale: 10 million games per day, 400,000 players online at peak.
+Assumptions. A game has 80 plies (half moves) and lasts 7 minutes on average, because most games are bullet and blitz. Peak load is 4 times the average. About 20 percent of seeks are cancelled or time out. Most games are rated.
+estimates: Game rate. 10,000,000 per day divided by 86,400 is 116 games per second. Peak is 4 times: 463 games per second. Each game needs two players, and 20 percent more seeks are cancelled, so peak seeks are about 463 x 2 x 1.2 = 1,100 per second.
+Concurrent games. By Little's law, concurrent games = arrival rate x duration. Average: 116 x 420 s = 48,700. Peak: 463 x 420 = 194,000, about 200,000 games and 400,000 players.
+Move rate. 200,000 games x 80 plies / 420 s = 38,000 moves per second at peak.
+Connections. 400,000 players, plus about 300,000 spectators and lobby viewers, make 700,000 WebSockets. A tuned gateway holds 30,000 to 50,000 connections, using 20 to 40 KB each for buffers. 700,000 / 35,000 = 20 gateway nodes; with headroom and three zones we run 24, so 8 per zone. Total memory for connections: 700,000 x 30 KB = 21 GB.
+Game state and CPU. A live game needs about 2 KB (the move list, the position, clocks, flags). 200,000 x 2 KB = 400 MB for the whole fleet. Validating a move with a chess library costs about 20 to 50 microseconds, so 38,000 moves per second need about 2 cores. The real limits are connections and failover, not CPU. We still use 12 game servers (4 per zone) for isolation and fast recovery: each holds about 17,000 games at peak.
+Move log. We write each move to Redis before we acknowledge it: 38,000 writes per second. One Redis node does about 100,000 simple commands per second, so we use 3 shards by game id for failover capacity. A game log is about 80 x 10 B = 800 B.
+Storage. A finished game as PGN text is about 700 bytes with headers and clock times: 10 million x 700 B = 7 GB per day, 2.5 TB per year.
+Ratings. 2 updates per game: 232 per second on average. Small.
+api: The main channel is a WebSocket at wss://play.example/socket, with JSON or a compact binary format. Messages from the client: {t: "seek", pool: "blitz-3+2", rated: true}, {t: "cancel"}, {t: "move", game: "g8x1", ply: 23, uci: "e2e4", mid: "c91"}, {t: "resign"}, {t: "draw", act: "offer|accept|decline"}, {t: "resume", game: "g8x1", seen: 22}, {t: "ping", ts: 123456}.
+Messages from the server: {t: "matched", game: "g8x1", color: "white", opp: {...}, clock: {...}}, {t: "move", ply: 23, uci: "e2e4", clock: {w: 178400, b: 179000}}, {t: "end", result: "1-0", reason: "checkmate", rating_delta: +7}, {t: "pong", ts: 123456, srv: 987654}.
+HTTP for the rest: GET /v1/games/{id} returns the PGN and the result; GET /v1/users/{id}/games?cursor= lists games; GET /v1/leaderboard?pool= returns top players from a cache; POST /v1/games/{id}/claim-abandon handles a player that left.
+Idempotency. Every move carries the expected ply number and a message id (mid). The server treats (game, ply) as the key: a repeat of the same move at the same ply gets the same acknowledgement and changes nothing.
+datamodel: Live state is in memory on the owner game server and mirrored in Redis. Finished games go to a durable store.
+Redis keys (partitioned by game id with a hash tag so that all keys of a game are on one shard): game:{id}:meta (hash: white, black, pool, rated, start_ts, version), game:{id}:moves (list of UCI moves, appended with RPUSH), game:{id}:clock (hash: white_ms, black_ms, turn, since_ms, version). Keys expire one hour after the game ends.
+Seek pools. pool:{name} is a sorted set: member = seek id, score = rating. A second hash seek:{id} holds user id, created time, accepted range and preferences (colour, avoid-recent-opponent).
+```sql
+CREATE TABLE games (
+  game_id    BIGINT PRIMARY KEY,
+  white_id   BIGINT NOT NULL,
+  black_id   BIGINT NOT NULL,
+  pool       TEXT NOT NULL,
+  rated      BOOLEAN NOT NULL,
+  result     TEXT NOT NULL,           -- 1-0, 0-1, 1/2-1/2
+  reason     TEXT NOT NULL,
+  pgn        TEXT NOT NULL,           -- moves with clock times
+  started_at TIMESTAMPTZ NOT NULL,
+  ended_at   TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE ratings (
+  user_id BIGINT, pool TEXT, rating REAL, rd REAL, vol REAL,
+  version INT NOT NULL,                -- for optimistic concurrency
+  PRIMARY KEY (user_id, pool)
+);
+```
+games is partitioned by month and indexed by user for the history page (through a second table user_games(user_id, ended_at, game_id)). The games table is write-once, so replication and caching are simple.
+design: Joining a game. The client opens a WebSocket to a gateway (reached through a load balancer, which picks a node by connection count). It sends a seek. The gateway forwards it to the matchmaker shard for that pool. The matchmaker stores the seek in the pool's sorted set. A matcher loop runs every 500 ms, scans the pool in time order and, for each waiting seek, looks for another seek whose rating lies within the current window. The window starts at plus or minus 50 points and widens by 25 points every 5 seconds up to 400, so the wait trades against fairness. When a pair is found, the matcher removes both seeks in one atomic step and creates a game.
+Creating a game. The matcher picks a game server by consistent hashing on the new game id and sends it a "create game" command with the two users. The game server loads nothing: it builds the initial state, writes game:{id}:meta and the clock to Redis, takes ownership with a lease, and replies. The gateways of both players are told "matched", bind the two connections to the game id, and the clocks start.
+The move path. A player's client sends a move to its gateway. The gateway looks up the game owner (a table in memory, refreshed from the lease store) and forwards the message to the game server. The game server checks: the game is live, it is this player's turn, the ply matches, the move is legal. It updates the clock, appends the move to the Redis list, and only after Redis confirms does it send the move and the clock to the opponent, to spectators and back to the mover. Typical server time: 0.5 ms for Redis plus 50 microseconds of logic.
+Clocks. The server owns the clocks. When a move arrives, the server charges the mover with the time since the turn started, minus a lag credit, and adds the increment. A timer is scheduled for the moment the mover's time would reach zero (a timer wheel or priority queue per game server, so no polling). When the timer fires and no move has arrived, the opponent wins on time. Clients show a local countdown that is corrected by every server message.
+Reconnect. If a socket breaks, the client reconnects, sends resume with the last ply it saw, and the gateway routes it to the owner. The server replays missing moves from a ring buffer of the last messages for this game and, if the gap is bigger than the buffer, sends a full state snapshot. Meanwhile the clock keeps running, as in over-the-board play; if the opponent is gone for 20 to 60 seconds the other player may claim victory.
+Finishing. The game server decides the result, writes it to Redis, emits a "game finished" event to a queue, and tells both players. A rating worker reads the event, loads the two ratings, computes the new values and writes them. A persistence worker writes the PGN to the durable store. Spectators of the game get the final message and their sockets leave the game channel.
+diagram:
+  players          +--------------------+
+  (browser/app)    |  load balancer     |
+       |           +--------------------+
+       | WebSocket          |
+       v                    v
+  +---------+  +---------+  +---------+      24 gateway nodes
+  | gateway |  | gateway |  | gateway |  ...  (35k sockets each)
+  +---------+  +---------+  +---------+
+       |  route by game id (owner table)        | seek / cancel
+       v                                        v
+  +-------------------------+     +----------------------------+
+  | game servers (12)       |<----| matchmaker per pool shard  |
+  | live state, clocks,     |     | sorted set by rating,      |
+  | timers; lease per game  |     | matcher = leader of shard  |
+  +-------------------------+     +----------------------------+
+       | RPUSH move (sync)                    ^ seeks
+       v                                      |
+  +-----------------------+          +-----------------+
+  | Redis x3 (by game id) |          | Redis pools     |
+  | moves, clock, meta    |          +-----------------+
+  +-----------------------+
+       | game finished event
+       v
+  +-------------+  +-----------------+  +------------------+
+  | rating      |  | persistence     |  | analysis /       |
+  | worker      |  | worker -> DB    |  | fair-play queue  |
+  +-------------+  +-----------------+  +------------------+
+animation:
+== White sends e2e4 for ply 23 to its gateway.
+  white --{move g8x1 ply23 e2e4}--> [gw A] ---> [game srv 5]
+                                     turn: white  ply 22
+== The server checks turn, ply and legality, then charges the clock.
+  [game srv 5]  legal? yes   clock w: 180000 - 1600 + 2000 = 180400
+== The move is appended to Redis before anyone is told.
+  [game srv 5] --RPUSH moves e2e4--> [Redis]   ok (0.5 ms)
+== The server sends the move to the opponent and to spectators.
+  [game srv 5] --> [gw B] --> black     [gw C] --> 3 spectators
+== White's retry arrives again after a timeout. It is ignored.
+  white --{move g8x1 ply23 e2e4}--> [game srv 5]  ply 23 exists
+  [game srv 5] --> white: ack(ply 23), no change
+== Black replies. The server's timer for black's flag is reset.
+  black --{move ply24 e7e5}--> [game srv 5]   timer: 178400 ms
+deepdive: One owner per game. Two servers must never apply moves to the same game. Each game has a lease: a record (game id, owner node, fencing token, expiry) in a strongly consistent store such as etcd. The owner renews it every second with a 5-second expiry. If the owner stops, the lease expires, a manager picks a new node by consistent hashing and bumps the fencing token. Every write from the game server to Redis carries the token, and the Redis script rejects an older one. This protects against a paused node (a long garbage collection) that wakes up and thinks it is still the owner. It is leader election per game, and the same pattern elects the matcher of each pool shard. One global leader would be a bottleneck and a single point of failure.
+Recovering a game. A new owner reads game:{id}:meta, :moves and :clock from Redis, rebuilds the position by replaying the moves (microseconds) and reschedules the flag timer. The outage is not charged to the mover: the clock advances only up to the last lease renewal of the previous owner. Failover takes about 5 s for the lease plus 1 s for loading, and the 17,000 games of a lost node are spread over the other 11 nodes.
+Optimistic concurrency on the move. Several events for one game can arrive together: a move, a resign, a draw acceptance and the flag timer. The game state has a version, and each event is applied as read at version v, compute, write only if the version is still v. Inside the owner process a per-game mailbox handles one event at a time, so the check never fails there; but the same condition sits in the Redis script, so a stale owner after a failover cannot overwrite the new owner's work. The ply in the client message is a second check: "I am answering ply 22". Two moves for the same ply, or a move that arrives after the opponent's flag fell, are refused. Ratings use the same idea in the database: UPDATE ratings SET rating=?, version=version+1 WHERE user_id=? AND pool=? AND version=?, and the worker re-reads and recomputes on a conflict.
+Idempotence everywhere. A client on a bad connection sends the same move twice, or a gateway retries after a timeout. The server answers a repeated (game, ply, move) with the stored acknowledgement. Matchmaking is idempotent too: the game id is a hash of the two seek ids, so a retried "create game" gives the same game. The "game finished" event is keyed by game id and the rating worker records processed ids, so a rating changes once even if the event arrives twice.
+Time and clocks. The time for a move is measured on one machine with a monotonic clock, which never jumps. Wall clocks are needed for lease expiry across nodes, for logs and audits, for tournament start times and for failover. All servers run NTP (chrony), so offsets stay within a few milliseconds, and lease timeouts are much larger than the possible skew. For a tournament that starts at 18:00:00, each client estimates its offset to the server with the NTP exchange: it records send time t0, the server records receive time t1 and send time t2, the client records receive time t3, and the offset is \( \theta = \frac{(t_1 - t_0) + (t_2 - t_3)}{2} \). The client never sends its own clock as proof of when it moved. Lag has a rule: the mover is charged \( \max(0,\ \Delta - \min(\ell, \ell_{max})) \), where \( \Delta \) is the time between sending the turn and receiving the move, \( \ell \) the player's measured lag and \( \ell_{max} \) a cap, for example 1 second. A slow connection is partly compensated, but faking lag cannot buy more than the cap.
+Matchmaking quality. "Closest rating first" for one seek at a time can leave a player waiting while two others are matched badly. Taking the oldest seeks first, then the best partner for each, bounds the wait. We also avoid an immediate rematch and pairing two accounts from one device. Ratings use Glicko-2 (rating, deviation, volatility). The older Elo model gives the expected score of A against B as \[ E_A = \frac{1}{1 + 10^{(R_B - R_A)/400}} \] and the update \( R_A' = R_A + K (S_A - E_A) \). New players have a high deviation, so their rating moves faster and their window is wider.
+Caching and the ring buffer. Profiles, leaderboards, opening statistics and finished games are read much more than written, so a cache layer in Redis (TTL 1 to 5 minutes) and the CDN serve them. In the live path each game keeps a ring buffer of its last 64 outbound messages, and each connection has a small outbound queue. If a client is so slow that its queue fills, we drop the connection and let it resume with a snapshot, because a stalled socket must not block the game server.
+Fan-out to spectators. A game with 50,000 spectators would need 50,000 sends per move. The game server publishes one message to a channel for the game, and each gateway delivers it to its local sockets, so the server sends 24 messages. Spectators may lag by a second; the players' path has priority.
+tradeoffs: Server-authoritative or client-authoritative. Choose server-authoritative state and clock for a competitive game: a client can be modified, so it cannot decide legality or time. Choose client-side prediction only for display (premoves, the local countdown). You pay with every move going through the server, which costs about 1 round trip, but chess has no need for faster.
+In-memory game process or stateless servers with a database. Choose an in-memory owner per game when you want the move path under 10 ms server time and a simple per-game mailbox that serialises events. Choose stateless servers that read and write state for each message when the number of games is small and simplicity matters more than latency. In-memory needs a lease and a recovery path; stateless needs a database write per move and an optimistic version check.
+Redis or a database for the move log. Choose Redis with replication when the log is short-lived (an hour) and 38,000 writes per second at under 1 ms are needed. Choose a durable database when you need to keep the log forever and can afford 5 to 10 ms per write. We use Redis during the game and write the PGN to the database after it. The risk: Redis can lose the last second on a crash with asynchronous replication; use a replica acknowledgement (WAIT) for rated games if that loss is not acceptable.
+Lease store: etcd or Redis. Choose etcd (or ZooKeeper) for game leases, because a wrong owner would corrupt games and etcd gives linearizable writes. Choose a Redis lock only for best-effort jobs such as the matcher, where a short double-leader period is harmless because the atomic removal of seeks rejects a second match. Always add a fencing token; a timeout alone is not safe.
+Wide or narrow matching. Choose a narrow window (plus or minus 50) in busy pools, where waiting 2 seconds costs little. Choose a fast-widening window in rare pools (long time controls, variants), where a poor match is better than 2 minutes of waiting.
+failures: A gateway node dies. 35,000 players lose the socket. Clients reconnect with jitter to other gateways within a few seconds and send resume. The games continue because game servers hold the state, and the clocks run. Reconnect with random backoff avoids a stampede.
+A game server dies. Its leases expire in 5 s, other nodes take the games and rebuild them from Redis. Players see a short freeze of about 6 seconds, and clocks do not charge for it.
+A Redis shard fails. Its replica is promoted. Moves written after the last replicated one may be lost. With WAIT, the server does not acknowledge a move before the replica has it. If the shard is down for seconds, the games on it pause and the clocks are frozen by the server, which is the fairest answer.
+Network partition between a game server and the lease store. The server cannot renew, so it stops accepting moves before its lease would expire (a shorter local deadline). The new owner takes over after the timeout, and the fencing token blocks the old node.
+Matcher failure. If the matcher leader of a pool shard stops, another instance becomes leader after the lease expires (5 s) and continues from the sorted set in Redis. No seek is lost. Double matching is prevented by the atomic removal of both seeks with one Lua script.
+Overload at an event. A famous player streams a game and 200,000 people join in a minute. Spectators use a separate gateway pool with sampled clock updates; if the pool is full, new spectators wait. The game itself is untouched.
+Cheating. Engine help cannot be stopped in the live path. Finished games go to a queue for statistical analysis (accuracy against an engine, time patterns) and accounts are flagged for review. This is offline, and its failure does not stop play.
+evolution: At 1,000 concurrent players, one process holds all games and sockets, with a database for results. At 100,000, split gateways from game servers, add Redis for moves and pools, and lease-based ownership. At 1 million, shard pools and games by id, add regional clusters, a separate spectator tier and a batch rating recompute. At 10 million, add a global matching layer to join sparse pools and cell-based deployment, where each cell serves part of the users independently.
+followups: How do you make sure a move is not applied twice? || Every move carries the game id, the ply number and a message id. The server applies it only if the ply is the next one, and answers a repeat with the stored result. Retries from the client, the gateway or a reconnect cannot change the game.
+Who keeps the clock, and how do you handle lag? || The game server alone, with a monotonic clock. The mover is charged the time between sending the turn and receiving the move, minus a capped credit for their measured lag. The client shows a countdown corrected by every server message and never sends its own time.
+What happens when the game server crashes? || The lease expires after about 5 seconds. Another node takes the game by consistent hashing, bumps the fencing token, rebuilds the position from the move list in Redis and reschedules the flag timer. The outage is not charged to the mover.
+Why is a fencing token needed? || A paused owner can wake up after its lease has expired and still believe it owns the game. Writes carry the token and the store rejects a lower one, so the old owner cannot corrupt the new owner's state.
+How do you match players fairly but quickly? || Keep a sorted set of seeks per pool by rating, scan the oldest seeks first, find the closest rating inside a window that widens with waiting time, and remove both seeks atomically. Add rules for recent opponents and colours.
+How do you scale to 50,000 spectators on one game? || Publish one message per move to a channel, let each gateway deliver it to its local sockets, serve spectators from a separate pool, and send them fewer clock updates. Players' traffic has priority.
+How do you update ratings without lost updates? || Process the finished-game event once by recording game ids, and update each rating row with a version check (optimistic concurrency), retrying on conflict. The result is the same when the event is delivered twice.
+ref: spec | RFC 6455: The WebSocket Protocol | Fette and Melnikov, 2011 | https://www.rfc-editor.org/rfc/rfc6455
+ref: paper | Example of the Glicko-2 system | Mark Glickman, 2013 | https://www.glicko.net/glicko/glicko2.pdf
+ref: blog | How to do distributed locking | Martin Kleppmann, 2016 | https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+ref: book | The Rating of Chessplayers, Past and Present | Arpad Elo, 1978 |
+ref: book | Designing Data-Intensive Applications | Martin Kleppmann, 2017 |
+
+@@ harmful-content
+title: Design harmful content detection
+category: AI & ML
+level: Senior / Staff
+concepts: multimodal, embeddings, contrastive, clfmetrics, featureeng, anomaly, ann, evals, mlops, sampling, experimentation
+summary: A social platform receives 1.5 billion new posts, comments, images and videos every day. A very small part, perhaps 0.1 percent, breaks the rules: nudity, graphic violence, hate, harassment, self-harm, scams, terrorism, child abuse. We must find most of it before many people see it, without removing the 99.9 percent that is fine. This is a classification problem with extreme imbalance, adversaries who change tactics every week, meaning that depends on culture and context, and a cost of error on both sides: a missed post hurts people, a wrong removal silences a user. We design a layered system: hash matching for known bad content, a shared multimodal embedding with light classifier heads for the bulk, a heavier model for the uncertain band, human review ordered by expected harm, and a measurement loop built on sampling that tells us honestly how well we do.
+requirements: Objective. Reduce the harm that users experience, measured as prevalence: the share of content views that are violating, and the time that violating content stays visible. Secondary goals: low wrongful removal, fast action on the worst content, legal compliance (for example reporting child sexual abuse material to the authorities), and consistent decisions across languages and regions.
+Functional requirements. Score every new item (text, image, video, audio, links, and combinations such as memes) against a policy taxonomy of about 20 classes with severity levels. Decide an action: allow, allow but reduce distribution, hold for human review, remove, or remove and escalate. Block known illegal content at upload. Accept user reports and appeals. Support policy changes in days, not months.
+Non-functional requirements. Latency: synchronous checks at upload (image, short text) finish in under 300 ms at p99. Video, long text and audio are scored asynchronously within minutes. Availability: if the system is down, posting continues (fail open) except for known illegal content. Auditability: every decision stores the model version, scores and policy version.
+Offline metrics. Per class: precision, recall, PR-AUC (area under the precision-recall curve), recall at a fixed precision such as 95 percent, calibration error, and slices (language, region, dialect, format). Online metrics: prevalence by sampling, proactive rate (share of removed content found before any user report), time to action, reviewer agreement, appeal overturn rate (a proxy for false positives) and reports per 1,000 views.
+Assumptions. 1.0 billion text items, 450 million images and 50 million videos (30 seconds on average) per day. Violating prevalence is 0.1 percent overall, but ranges from 0.001 percent for the most severe classes to 0.5 percent for spam.
+estimates: Item rates. Text: 1,000,000,000 / 86,400 = 11,600 per second on average, 23,000 at peak (2 times). Images: 450 million / 86,400 = 5,200 per second, 10,400 at peak. Videos: 50 million / 86,400 = 580 per second, 1,160 at peak.
+Video frames. One frame every 2 seconds gives 15 frames for a 30-second video: 580 x 15 = 8,700 frames per second on average, 17,400 at peak. We add the audio track as a transcript for the text model.
+Image encoder load. Peak image-like items: 10,400 + 17,400 = 27,800 per second. About 25 percent are exact or near-exact copies of items seen in the last day (reposts, memes), found by a hash lookup, and reuse the earlier score: 27,800 x 0.75 = 20,900 per second. Assume (and measure!) that one inference GPU serves 800 images per second with a ViT-B/16 sized encoder in half precision, including image decoding on the CPU. 20,900 / 800 = 26 GPUs. With 50 percent headroom for spikes and failures: 39, rounded to 40.
+Text load. A distilled multilingual encoder of about 100 million parameters serves about 5,000 texts per second per GPU at 64 tokens (assumption). 23,000 / 5,000 = 4.6, so 8 GPUs with headroom. A second-stage model about 10 times larger scores the 5 percent that the first stage flags: 1,150 per second at 300 per second per GPU = 4 GPUs, 6 with headroom.
+Review capacity. If 0.05 percent of items go to humans, that is 750,000 per day. A reviewer handles about 600 items per shift, so 750,000 / 600 = 1,250 reviewers per day across time zones and languages. This number sets how wide the review band can be.
+Embedding index. 100 million confirmed violating items as 256-dimension vectors, compressed with product quantization to 64 bytes each, take 6.4 GB plus ids and graph or lists. A few machines with 64 GB hold it in memory.
+Labels needed for measuring prevalence. For a prevalence p with margin of error e at 95 percent confidence, the sample size is \[ n = \frac{z^2 \, p (1 - p)}{e^2} \] With p = 0.001 and e = 0.0002 (so 0.1 percent plus or minus 0.02 points), n = 3.84 x 0.001 x 0.999 / (0.0002)^2 = 0.003836 / 0.00000004 = 95,900 labels. Stratifying by model score and weighting (see below) cuts this by about 10 times.
+api: Synchronous check (called by the upload service): POST /v1/classify with {item_id, kind: text|image|video|link, content_ref or text, author_id, surface, locale}. It returns {decision: allow|review|block, scores: {class: p}, model_version, policy_version, latency_ms} in under 300 ms. A timeout of 250 ms makes the caller proceed (fail open) and queue the item for async scoring.
+Async events: topic content.created is consumed by the video, audio and deep-scan pipelines. Topic content.scored carries the scores to enforcement, ranking (to reduce distribution) and the review queue.
+Review API: GET /v1/review/next?queue=hate-hi returns the next item with context; POST /v1/review/{item_id} records {label, class, severity}. POST /v1/appeals sends an appeal to a second reviewer.
+Policy API: PUT /v1/policy/thresholds with {class, region, action, min_score, version} changes operating points without a model release.
+datamodel: Three kinds of data matter: decisions, labels and features.
+```sql
+CREATE TABLE decisions (
+  item_id       BIGINT, version INT,
+  author_id     BIGINT, kind SMALLINT, created_at TIMESTAMPTZ,
+  model_version TEXT, policy_version TEXT,
+  scores        JSONB,              -- class -> probability
+  action        TEXT, reason TEXT,
+  reviewed_by   BIGINT, reviewed_label TEXT,
+  PRIMARY KEY (item_id, version)
+);
+```
+Labels come from five sources: expert reviewers (high quality, expensive; 10 percent double-reviewed, agreement measured with Cohen's kappa, target above 0.7); user reports (many but noisy); appeal outcomes (biased toward items we removed); a random audit sample (the only unbiased source, and small); and synthetic or red-team examples for new threats. Each label stores the policy version, because rules change.
+Features. Content: the multimodal embedding, text in the image (OCR), the speech transcript, language, URLs and domains, hashtags. Context: account age, past violations, follower count, posting rate, device and network reputation, the group or page where it was posted. Interaction: early reports, the share of negative reactions, toxicity of the replies. Context features are computed in a feature store with both an online table (low latency lookups, keyed by account id) and an offline table with timestamps, so that training uses the value that existed at the time of the post and not a later one.
+Indexes. A hash store (perceptual hashes of known bad media, exact SHA-256 for files) with a lookup under 5 ms; an ANN index of embeddings of confirmed violating items; and a cache from content hash to the last scores (24 hours).
+design: Layers. Layer 0: exact and perceptual hash matching against lists of known violating media. For child abuse material this uses lists from specialised bodies and is mandatory; the platform may not train on such content, and has a legal duty to report to the national centre (in the United States under 18 U.S.C. 2258A). For terrorism the industry shares hashes. A perceptual hash such as PDQ is 256 bits and two images are the same if their Hamming distance is small (the PDQ study used a threshold near 30 of 256 bits; random pairs average 128). Layer 1: a fast model on every item. Layer 2: a heavier model for items in the uncertain band. Layer 3: human review. Layer 4: enforcement, appeals and learning.
+Layer 1: shared embedding plus heads. Each item becomes an embedding from a multimodal encoder: images and text are mapped to one vector space, as in CLIP, which was trained with a contrastive loss that pulls an image and its caption together. A small head per class (a linear layer or a small network) predicts the probability of each violation from the embedding and a few context features. All heads share one expensive forward pass. A new class needs a new head trained on a few thousand labels in hours, not a new encoder in weeks.
+Why multimodal. Some harm exists only in the combination. In the Hateful Memes challenge (Facebook AI, 2020) a benign image plus a benign caption can be hateful together, and the dataset adds "benign confounders" where one change flips the label. Scoring image and text separately and averaging misses these. The cheap Layer 1 uses late fusion (separate embeddings joined in a head); the heavy Layer 2 uses a joint transformer over image and text tokens.
+Layer 2: heavy model on the uncertain band. Items with a score in the grey zone (for example 0.2 to 0.9 for a class) and items from risky contexts go to a larger fine-tuned multimodal transformer, with OCR text and thread context. It runs on 5 percent of text and 3 percent of images. Latency is 1 to 3 seconds, so it runs asynchronously unless the item is high risk.
+Decisions. Each class has thresholds from costs. If a wrong removal costs \( c_{FP} \) and a missed violation costs \( c_{FN} \), the best rule removes when the probability exceeds \[ t^{*} = \frac{c_{FP}}{c_{FP} + c_{FN}} \] when scores are calibrated. For graphic violence with a high \( c_{FN} \) this is low, for satire-prone classes high. So we calibrate each head (isotonic regression on a clean validation set) and set three thresholds per class and region: auto-remove at a precision of at least 99 percent, send to review in the middle band, and reduce distribution in the low band. Reducing distribution is a softer action that makes errors cheaper.
+Human review ordering. The queue is sorted by expected harm = P(violating) x severity x predicted views in the next hours. A post from an account with 2 million followers goes ahead of one with 20. This spends 1,250 reviewers well: the goal is fewer views of violating content, not an empty queue.
+Feedback and learning. Reviewer labels, appeal results and audit samples go back to training data. Reviewer wellbeing is part of the design: media is blurred or grayscale by default, audio muted, exposure limited per shift, and counselling provided.
+diagram:
+  upload (text / image / video / audio)
+        |
+        v
+  +----------------------+  hit   +--------------------------+
+  | L0 hashes: SHA-256,  |------->| block + report + log     |
+  | PDQ/TMK, blocklists  |        +--------------------------+
+  +----------------------+
+        | miss
+        v
+  +----------------------+      +--------------------------+
+  | content-hash cache   |      | feature store (online):  |
+  | 24 h score reuse     |      | account, context, history|
+  +----------------------+      +--------------------------+
+        | miss                          |
+        v                               v
+  +------------------------------------------------+
+  | L1: encoder (GPU, dynamic batching)            |
+  | text / image / frames -> embedding (256-d)     |
+  | class heads + ANN match to confirmed-bad items |
+  +------------------------------------------------+
+     |  score < low        |  low..high band     |  score > high
+     v                     v                     v
+   allow        +-------------------+      auto-action
+   (sampled     | L2: heavy         |      (remove / reduce)
+    for audit)  | multimodal model  |           |
+                +-------------------+           |
+                     |   review band            |
+                     v                          v
+              +--------------------+    +---------------+
+              | human review queue |--->| enforcement,  |
+              | by expected harm   |    | appeals, logs |
+              +--------------------+    +---------------+
+                     |  labels                  |
+                     +----> training data <-----+
+animation:
+== A user uploads a meme. The hash lookup finds no known match.
+  upload --> [L0 hash] miss --> [cache] miss
+== The encoder makes one embedding from the image and OCR text.
+  image + "text on image" --> [encoder] --> e = [0.12, -0.8, ...]
+== The heads score hate 0.55, violence 0.02, nudity 0.01.
+  heads: hate 0.55 | violence 0.02 | nudity 0.01
+== ANN search finds 3 confirmed-bad memes within a small distance.
+  e --> [ANN] --> nearest: 0.93, 0.91, 0.90 (confirmed hate)
+== The score is in the grey band, so the heavy model runs.
+  [L2 multimodal] hate 0.88 -> above remove threshold 0.85
+== The post is removed. The decision is logged with versions.
+  action: remove | model v41 | policy v17 | audit row written
+deepdive: Embeddings, contrastive training and ANN. A contrastive model learns by pulling matching pairs together and pushing others apart. CLIP trained on 400 million image and text pairs with this loss, so an image of a dog and the words "a dog" land close in one space. For us this gives three things. A good starting point: a head on frozen embeddings reaches usable accuracy with a few thousand labels. A way to adapt quickly: fine-tuning the last layers of the encoder with our labelled data, with a contrastive loss that pulls together variants of the same harmful image (crops, filters, overlays) so the embedding is stable against evasion. And similarity search: an approximate nearest neighbour index (HNSW graph or IVF with product quantization) over 100 million confirmed items answers "does this look like something we removed?" in about 5 ms at high recall. A match with cosine similarity above a tuned threshold is a strong feature and, for the most severe classes, an action by itself. This catches variants that defeat exact and perceptual hashes. The cost of the index is memory and a periodic rebuild; new confirmed items are added to a small, fresh index that is searched together with the large one.
+Class imbalance and sampling. With prevalence of 0.1 percent, a classifier that always says "fine" has 99.9 percent accuracy, so accuracy is useless, and even the area under the ROC curve hides the problem. We report precision, recall and PR-AUC per class. For training, we keep all positives and sample the negatives, for example 1 in 50, and give each sampled negative a weight of 50 so that the loss and calibration stay correct; or we calibrate again on an unsampled validation set. Hard negatives matter more than random ones: items that look violating but are not (news reports about violence, medical images, reclaimed words). We find them from reviewer decisions and appeal overturns. Active learning picks the items near the threshold for labelling, because a label there teaches the most.
+Measuring prevalence honestly. The only unbiased estimate is a random sample of views, labelled by experts. To get a precise number with fewer labels we stratify: sample heavily from high-score items (where most violations are) and lightly from low-score items, and weight each label by the inverse of its sampling probability. The estimate stays unbiased, and the number of labels drops about 10 times from the 96,000 computed above. The same sample gives recall (how many violations did the system miss?) and checks precision of auto-actions. We also draw a random sample of what the model allowed, because if reviewers see only what the model flagged, the training data would never contain what the model misses.
+Anomaly detection for new attacks. Supervised models know yesterday's harm. New campaigns show as shifts in behaviour. We watch for a sudden growth of a cluster in embedding space (a new meme variant is spreading), a spike of near-identical items from new accounts, a jump in reports per view for a topic, and accounts whose posting pattern differs from their peers. These signals do not remove content; they raise alerts and priority labelling tasks. When analysts confirm a pattern, a few examples go into a few-shot head or the ANN index within hours, and retraining follows within a week.
+Features and leakage. Context features raise accuracy a lot: the same sentence is a joke between friends and abuse in a reply to a stranger. But features computed after the post leak the answer: the number of reports in the next hour is a label in disguise. The feature store keeps timestamps, and training joins "as of" the decision time. Slice metrics are a release gate: research on hate speech datasets found that models trained on common data flagged African-American English more often (Sap et al., 2019).
+Serving. Requests reach a gateway that checks the hash store and the content-hash cache first. A miss goes to a GPU service with dynamic batching: requests wait up to 8 ms to form a batch of up to 32 images, because a GPU is much more efficient per image in batches. Latency budget for an image at upload: hash lookup 5 ms, cache 2 ms, decode and resize 15 ms, batch wait 8 ms, encoder 20 ms, heads 1 ms, ANN 5 ms, policy and logging 3 ms, network 10 ms, which is 69 ms at p50; queueing gives a p99 under 300 ms. Frames and text use a separate lower-priority pool, so a flood of video cannot slow uploads.
+MLOps. Models are trained in a pipeline with versioned data, code and configuration. A registry stores each version with its evaluation report and model card. Release steps: an offline gate (per-class and per-slice metrics must not drop), shadow mode (score live traffic without acting, compare with reviewer labels), a canary on 1 percent of traffic, then gradual rollout with automatic rollback if the flagged rate or appeal rate leaves a band. Heads are retrained weekly; the encoder is fine-tuned monthly.
+Experimentation. We cannot run a classic A/B test that knowingly shows more severe harm to a control group. For severe classes we use shadow mode and offline evaluation on sampled labels, then a canary where the new model only adds actions, with human review of the extra removals. For milder classes (spam, borderline content) an A/B test on thresholds is acceptable, with prevalence, appeal overturn rate and reports as guardrails and a stop rule set in advance. Review ordering is tested by interleaving two rankings and measuring violating views prevented per reviewer hour.
+tradeoffs: Cascade or one big model. Choose a cascade (hash, light model, heavy model, human) when volume is 1.5 billion items per day and 95 percent are easy: the light layers cost about 1 percent of the heavy model's compute. Choose one big model for a small platform (under 1 million items per day), where operations are simpler and the cost is low. You give up some accuracy of the light stage on hard cases, which the cascade fixes with the uncertain band.
+Frozen embeddings or end-to-end fine-tuning. Choose a frozen encoder with trained heads when you need new classes fast, training is cheap, and labels are few. Choose fine-tuning the encoder when the domain differs from the pre-training data (screenshots, memes, local languages) and you have tens of thousands of labels per class. Fine-tuning gives a few points of recall at the same precision, but each new encoder version means re-embedding the index of 100 million items.
+Early fusion or late fusion for multimodal input. Choose late fusion (separate embeddings, concatenated into a head) for the first stage, because it is cheap and can reuse a cached image embedding for different captions. Choose early fusion (a joint transformer) for the heavy stage, when meaning depends on the interaction, as in memes. The joint model costs 3 to 5 times more per item.
+Precision or recall. Choose a high-precision threshold for automatic removal of context-dependent classes (hate, harassment), where a wrong removal harms trust. Choose a high-recall threshold with review for the most severe classes (self-harm, child safety, terrorism), where a miss is very costly. Use soft actions (reduced distribution, warning screens) where neither is clear. The deciding numbers are \( c_{FP} \), \( c_{FN} \) and review capacity.
+failures: Model or GPU service down. The upload service times out after 250 ms and lets posts through (fail open), except for the hash check, which is a separate, simple service with replicas. Queued items are scored when the service returns. A backlog is worked from the highest expected harm.
+Feature store outage. Models are trained with context features randomly dropped, so they still work on content alone; thresholds for risky classes become more cautious.
+Bad model release. A new version removes legitimate posts at twice the rate. Shadow and canary stages catch most of this, and a guard on flagged rate and appeal overturn rate rolls back automatically. Decisions store the model version, so affected items can be found and restored.
+Adversarial adaptation. Users add noise, crop, put text in images, write "unalive" or insert dots between letters. Defences: normalise text (Unicode forms, leetspeak, spacing), OCR on images, training augmentations that copy the attacks, the ANN index for variants, and a fast path from analyst to model. It is a race, so the process matters as much as the model.
+Label noise and feedback loops. If we train only on items we flagged, the model learns its own habits. A random audit sample, labels on allowed items and periodic double review break the loop. Groups can brigade reports to remove opponents' posts, so we weight reports by the reporter's past accuracy.
+Drift. New slang, a new language or an event (a war, an election) shifts the inputs. We monitor embedding shift per language, the score histogram, the flagged rate and precision from audits. A drop triggers a labelling push and retraining for that slice.
+evolution: At 10,000 users, a vendor moderation API, a keyword list and a small reviewer queue are enough, and cheaper than building models. At 1 million, train your own text classifier, add hash lists, a review tool and an audit sample. At 100 million, build the shared embedding with class heads, the cascade, the ANN index and the feature store. At 1 billion and many regions, add regional models and policy owners, automatic retraining, red-team exercises and a rapid-response system for crises.
+followups: Why is accuracy a bad metric here, and what do you use? || With 0.1 percent positives, a model that says "fine" is 99.9 percent accurate. Use per-class precision, recall and PR-AUC, recall at a fixed precision, and calibration. Measure prevalence with a random labelled sample, not from the model's own flags.
+How do you estimate prevalence cheaply? || Sample views at random, label them with experts and compute the share with a confidence interval; about 96,000 labels give plus or minus 0.02 points at 0.1 percent. Stratify by model score and weight by inverse sampling probability to cut labels about 10 times without bias.
+How do you catch variants of known bad images? || Exact and perceptual hashes catch copies and light edits. For crops, overlays and re-renders, search an ANN index of embeddings of confirmed items. Train the encoder with a contrastive loss so variants map close together.
+How do you set the thresholds? || Calibrate the scores, then choose per class and region by costs: act when the probability exceeds \( c_{FP} / (c_{FP} + c_{FN}) \), and check it against the precision on audit samples and the review capacity. Use soft actions between the thresholds.
+How do you test a new model safely? || Shadow mode first, then a canary where the model only adds actions with review of the extra removals. A/B tests only for low-severity classes, with guardrails on prevalence and appeal overturn. Automatic rollback on flagged rate or overturn rate.
+How do you keep up with adversaries? || Monitor clusters and spikes for new patterns (anomaly detection), add confirmed examples to the ANN index and a few-shot head in hours, retrain weekly, normalise text and use OCR, and run red-team tests. Keep the model and the policy separate, so thresholds change without a release.
+ref: paper | Learning Transferable Visual Models From Natural Language Supervision (CLIP) | Radford et al., 2021 | https://arxiv.org/abs/2103.00020
+ref: paper | The Hateful Memes Challenge: Detecting Hate Speech in Multimodal Memes | Kiela et al., NeurIPS 2020 | https://arxiv.org/abs/2005.04790
+ref: paper | The Risk of Racial Bias in Hate Speech Detection | Sap et al., ACL 2019 | https://aclanthology.org/P19-1163/
+ref: paper | Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs | Malkov and Yashunin, 2016 | https://arxiv.org/abs/1603.09320
+ref: paper | PDQ and TMK+PDQF: A Test Drive of Facebook's Perceptual Hashing Algorithms | Dalins et al., 2019 | https://arxiv.org/abs/1912.07745
+ref: paper | Model Cards for Model Reporting | Mitchell et al., FAT* 2019 | https://arxiv.org/abs/1810.03993
+

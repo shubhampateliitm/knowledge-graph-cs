@@ -1,0 +1,787 @@
+@@ ad-click-prediction
+title: Design ad click prediction
+category: Ads & media
+level: Senior / Staff
+concepts: ctrpred, featureeng, embeddings, clfmetrics, featurestore, streamproc, auction, experimentation, regression, boosting, mlops
+summary: Click prediction answers one question for every ad that could be shown: what is the probability that this user clicks this ad in this context? The answer, called pCTR, is multiplied by the advertiser's bid to rank ads in an auction, so it directly decides who wins, what the advertiser pays and how much revenue the platform makes. What makes it hard is a mix of scale and money. The model must score tens of ads per request inside about 10 ms. Clicks are rare (well under 1 percent of impressions), so the data is very unbalanced. Labels arrive late. The feature space has billions of sparse values such as user ids, ad ids and site ids. And the output must be a calibrated probability, not only a good ranking, because a 20 percent over-estimate is a 20 percent price error. We design the full system: data and labels, features, model, training pipeline, serving, evaluation and monitoring.
+requirements: Functional requirements. For each ad request the system receives a user (or device) id, page or app context, device data, and a list of candidate ads that already passed targeting and budget filters. It returns a pCTR for each candidate. The auction multiplies pCTR by the bid to get the expected value per thousand impressions (eCPM) and picks the winner. The same service should also give a pCVR (conversion probability) head later, so the design must allow more than one label. New ads, new users and new sites must get sensible predictions on day one (the cold start problem).
+Objective and metrics. The training objective is log loss (cross entropy) on the click label. We choose it because it is a proper scoring rule: it is minimised when the predicted probability equals the true probability, so it rewards calibration and not only order. Offline metrics: log loss and normalized entropy (log loss divided by the log loss of always predicting the average CTR), AUC for ranking quality, and the calibration ratio (sum of predicted clicks divided by sum of actual clicks), measured overall and per slice (per ad format, per country, per advertiser size, per device). Online metrics: revenue per thousand requests, click-through rate, advertiser cost per click and cost per conversion, and guardrails such as latency, user complaints and the share of requests with no ad. A good offline AUC that does not move the online metrics is not a win.
+Non-functional requirements. Scoring adds at most 10 ms at p99 inside a 100 ms ad request budget. Availability is 99.99 percent: if the model fails, the platform must still serve ads with a fallback score. Freshness: new ads and new campaigns must be learned within an hour, and the model must follow daily and weekly patterns. Privacy: the system must respect consent flags and deletion requests, and must not use sensitive categories as features.
+Assumptions. The platform serves 8.6 billion ad requests per day, which is 100,000 per second on average. After targeting and pacing filters, each request has about 50 candidate ads. The click rate is 0.5 percent. About 300 million users are active in a month.
+estimates: Request load. 8.6 billion requests per day divided by 86,400 seconds is 100,000 requests per second on average. Ad traffic has strong daily peaks; we use a peak factor of 3, so 300,000 requests per second at peak.
+Scores per second. At peak, 300,000 requests times 50 candidates is 15 million scores per second. Most of the cost is shared: user features and context features are read once per request, and only the ad part changes between candidates. We score the 50 candidates of one request as one batch.
+Compute per score. Assume a model with 40 sparse fields, each with a 16-number embedding, followed by a small multilayer network of 640 inputs, 256, 128, 1. The multiply-add count is 640 x 256 + 256 x 128 + 128 = about 197,000, so about 0.4 MFLOP per score. Embedding lookups cost memory reads, 40 x 16 x 4 bytes = 2.5 KB per score. At 15 million scores per second this is 6 TFLOP per second and 38 GB per second of memory reads. One 16-core CPU machine delivers roughly 20,000 to 40,000 such scores per second once memory access is counted, so 15 million divided by 30,000 is 500 machines at peak, and with 30 percent headroom about 650. A GPU can do more per box, but at this small model size the batch transfer cost is often higher than the compute, so many ad systems stay on CPU for serving and use GPUs for training. If the ad part of the network is cached per ad (an "ad tower"), cost drops by several times.
+Training data. Each impression log row has about 300 features and metadata. With compression it is about 1 KB. 8.6 billion rows per day is 8.6 TB per day. Clicks are 0.5 percent, which is 43 million per day. We keep all clicks and a 10 percent sample of non-clicks: 43 million + 0.1 x 8.56 billion = about 900 million rows per day, or 0.9 TB. Training on the last 14 days is 12.6 billion rows and 12.6 TB. The sample keeps the positive rate at 43 / 900 = 4.8 percent, which makes learning faster.
+Calibration after down-sampling. If negatives are kept with probability w = 0.1, the model learns inflated probabilities. The correction is p = q w / (1 - q + q w), where q is the model output. Example: q = 0.05 gives p = 0.005 / (0.95 + 0.005) = 0.00524, which is close to the true 0.5 percent.
+Feature store. The user profile feature row is about 2 KB. 300 million users times 2 KB is 600 GB, which fits a sharded key-value store with 6 to 10 nodes holding data in memory or on SSD. One lookup per request at 300,000 requests per second needs 300,000 reads per second, which is fine for a store designed for 100,000+ per node. A local cache with a 60 second time to live removes 60 to 80 percent of the reads for heavy users.
+api: Scoring call (internal, gRPC from the ad server): Score(request_id, user_id, context{site, app, device, geo, time}, candidates[]{ad_id, campaign_id, creative_id, format}) returns scores[]{ad_id, pctr, pcvr, model_version}. Timeout 10 ms. On timeout the ad server uses a fallback score from a table of ad-level average CTR.
+Event logging (ad server to the log pipeline): LogImpression(request_id, user_id, ad_id, position, features_snapshot_ref, model_version, pctr_served, ts) and LogClick(request_id, ad_id, click_id, ts). The impression log stores the exact feature values and the pCTR that were used, so training can reproduce serving.
+datamodel: Impression log. A table partitioned by hour. Columns: request_id, ts, user_id_hash, ad_id, campaign_id, advertiser_id, site_id, position, device fields, the full feature vector as served, pctr_served, bid, model_version, exploration_flag. The request_id and ad_id together are the key. It is written by the ad server to a message queue and then stored in object storage as columnar files.
+```sql
+CREATE TABLE training_examples (
+  request_id   STRING,
+  ad_id        BIGINT,
+  event_hour   TIMESTAMP,
+  label_click  TINYINT,        -- 0 or 1, final after the join window
+  label_conv   TINYINT,        -- filled later by a correction job
+  sample_w     FLOAT,          -- 1.0 clicks, 10.0 kept negatives
+  features     MAP<STRING, ARRAY<BIGINT>>,
+  model_version STRING
+) PARTITIONED BY (event_date DATE);
+```
+Feature store. Online store keys: "user:{user_id}" with a row of aggregated features (clicks and impressions in the last 1 hour, 1 day, 7 days and 30 days, by category and format), "ad:{ad_id}" with the same counts for the ad, and "ctx:{site_id}". Each value has a write timestamp. The offline store keeps the same features as time-travel tables, so a training row can read the value as it was at the impression time. One definition of each feature produces both copies.
+design: The request path. The user opens an app and the ad server receives an ad request. It runs targeting and budget pacing, which leaves about 50 candidates. It sends the candidates and the context to the model server, which is a fleet of stateless machines with the model and the embedding tables loaded in memory. The model server first fetches user features (one call to the feature store, usually served from a local cache), then builds the sparse and dense inputs for each candidate, runs the model in one batch, applies the calibration layer and returns 50 pCTR values. The ad server computes eCPM = bid x pCTR x 1000 for each ad, runs the auction, serves the winner and logs the impression with all features and the served pCTR.
+Features. Feature engineering is the biggest source of gain. Four families are used. Categorical ids (user, ad, advertiser, site, app, creative) become embeddings through a hash into a fixed table, so unseen values still map to some row. Crosses of ids such as user_segment x ad_category capture interaction, and the neural network learns many of these on its own. Count features such as "this user's clicks on this category in the last 7 days" or "this ad's CTR in the last hour" carry fresh behaviour and are computed in a stream job. Dense context features such as hour of day, day of week, position, network speed and screen size are bucketed or normalised. Count features must be computed with a strict "as of" time: a feature that includes the click it tries to predict is a leak.
+Model. We start from logistic regression on hashed sparse features, trained with an online optimiser such as FTRL-Proximal, which gives sparse weights and works with billions of features. It is the baseline, it is easy to debug, and its output is already a probability. For better accuracy we use a deep model that follows the Wide and Deep, DeepFM and DLRM pattern: embeddings for sparse ids, a pairwise interaction layer or a multilayer network for the dense part, and a final sigmoid. Gradient boosted trees are used in two places: as a strong model for dense-only problems such as new ad formats with little data, and as a feature transformer where each tree leaf becomes a binary feature for the linear model, an approach reported by Facebook in 2014. The deep model wins when the data has billions of rows and many high-cardinality ids.
+Training pipeline. A stream job (stream processing on Kafka and Flink) joins the impression stream with the click stream by request_id. The join is a windowed one: an impression waits 30 minutes for a click, and after that it is emitted as a negative. A click that arrives later is emitted as a correction row. Rows are written to the training table. Every hour, a job reads the last hours of new data and continues training the current model (warm start) on a GPU cluster. Every day a full retrain on 14 days of data checks that the incremental path did not drift. The new model is evaluated on the next hours of held-out data, never on a random split, because ads and users change over time.
+Calibration and serving. The raw model output is corrected for down-sampling and then passed through a calibration layer, an isotonic regression or a small logistic model per slice, trained on the most recent hour of data. This keeps the average predicted CTR equal to the actual CTR for each format and country. The model server loads new versions without restart, serves the old and new version together during a rollout, and exports the version in every response.
+Exploration. Ads that are never shown never get clicks. A small share of traffic (1 to 2 percent) is spent on exploration: new ads get a boosted score or a random slot, and these requests are flagged in the log. The flag lets the training job use them with the right weights and lets analysts measure the true CTR of ads that the model would not have picked.
+Auction link. In a second-price style auction the winner pays the smallest bid that would still have won, divided by its own pCTR. This means the price of every click depends on the pCTR of the winner and of the runner-up. Bias in the model changes both ranking and price, which is why calibration is a first-class metric and not only AUC.
+diagram:
+  ad request
+      |
+      v
+  +-----------+  targeting+pacing   +--------------------------+
+  | ad server |-------------------->| 50 candidates            |
+  +-----------+                     +--------------------------+
+      |  Score(user, ctx, cands)
+      v
+  +--------------------------------------------+      +-------------+
+  | model server (stateless, 650 nodes)        |<-----| feature     |
+  |  features -> embeddings -> net -> calibrate|      | store (KV)  |
+  +--------------------------------------------+      +-------------+
+      | pCTR x50                                           ^
+      v                                                    | updates
+  +-----------+  eCPM = bid * pCTR     +-----------+  +------------+
+  | auction   |----------------------->| impression|->| stream job |
+  +-----------+       winner           | log (Kafka)|  | join+count |
+                                       +-----------+  +------------+
+                                             |              |
+                                             v              v
+                                   +----------------+  +-----------+
+   click events ------------------>| training table |->| trainer   |
+                                   | (object store) |  | GPU, hourly|
+                                   +----------------+  +-----------+
+                                                             |
+                                  registry -> shadow -> canary -> all
+animation:
+== An ad request arrives and targeting leaves 50 candidates.
+  user U --ad request--> [ad server]       model v41 (serving)
+  candidates: ad 17, ad 42, ad 77 ...      feature store (U row)
+  nothing scored yet                       pCTR table: empty
+== The model server fetches the user row and builds inputs for all ads.
+  user U --ad request--> [ad server] --> [model server]
+  candidates: ad 17, ad 42, ad 77 ...      user row: 7d clicks=12
+  features + embeddings for 50 ads         pCTR table: empty
+== One batch forward pass gives raw scores, then calibration fixes them.
+  user U --ad request--> [ad server] --> [model server]
+  candidates: ad 17, ad 42, ad 77 ...      user row: 7d clicks=12
+  raw q: 0.050, 0.031, 0.012 -> calibrate  pCTR table: filling
+== Calibrated pCTR values go back: 0.0052, 0.0033, 0.0013 and so on.
+  user U <--------------- [ad server] <--- [model server]
+  pCTR: ad17=0.0052 ad42=0.0033 ad77=0.0013
+  bids : ad17=$2.0  ad42=$4.0  ad77=$9.0   pCTR table: ready
+== The auction ranks by bid x pCTR x 1000. Ad 42 wins (13.2 vs 10.4).
+  eCPM : ad17=10.4  ad42=13.2  ad77=11.7
+  winner: ad 42 (CPC bid $4.0)             price set by runner-up
+  second price = 11.7 / (0.0033 x 1000) = $3.55 per click
+== The impression is logged with features and the served pCTR.
+  log: request R, ad 42, pctr_served=0.0033, model=v41, features=...
+  Kafka -> join window 30 min -> waits for a click event
+  no click yet                              label pending
+deepdive: Delayed and missing labels. A click usually comes within seconds, but a conversion can come hours or days later. If the pipeline waits for all labels, the model is a week old. If it labels every young impression as a negative, the model learns that fresh traffic converts less and its predictions are too low. Two methods are common. The first is to emit an early negative and a later correction (a positive row with a negative weight on the old one), so the model sees the truth as it arrives. The second is to model the delay, with one head for "will convert" and a second for the delay distribution, and to train with a loss that corrects for the unobserved part. For clicks, a 30 minute window captures more than 99 percent of the labels, and we use the correction path for the rest.
+Selection bias and the feedback loop. The model only gets labels for ads it showed, and it showed what it ranked high. So the training data is a biased sample of the world, and the model can become confident about the same ads forever. Counter-measures: the exploration slice, logging the served pCTR and the probability of choosing each ad (propensity) so that off-policy corrections are possible, position as a feature at training time with a fixed default at serving time (the click depends on the position, but we want the quality of the ad), and regular evaluation on exploration traffic only.
+Cold start. A new ad has no history. The model uses its content and metadata: advertiser id (often has history), category, creative format, landing page text embedding, and similar ads' average CTR through the embedding of the category. Ad-level count features have a prior: the CTR estimate is (clicks + a) / (impressions + b), where a/b is the category average and b is a pseudo count such as 100, so a new ad starts at the category CTR and moves as evidence comes. Exploration gives it the first impressions.
+Train and serve consistency. The most frequent cause of lost accuracy in production is skew: a feature computed in batch for training and in a different code path for serving. The remedies are one feature definition used for both (the feature store), logging the served feature values and training from the log, and a daily job that compares feature distributions between the log and fresh training data. The check is cheap and finds bugs that metrics find only weeks later.
+Latency. The 10 ms budget is split into 2 ms for the network, 2 ms for the user feature fetch (0.1 ms on a cache hit), 4 ms for model compute on a batch of 50, and 2 ms of slack. We batch the 50 candidates, keep embeddings in memory, quantize them to 8 bits, cache ad-side activations per ad for 1 minute, and cap the number of candidates. If the model server is slow, the ad server cancels at 10 ms and uses the fallback table.
+tradeoffs: Linear model versus deep model. Choose logistic regression with hashed features and FTRL when you have little data, need a model you can explain and debug in minutes, need updates every few minutes, or run on a very small budget. Choose a deep model with embeddings when you have billions of rows, many high-cardinality ids and enough engineering to run GPU training and careful serving. The deep model typically gives a relative gain of a few percent in log loss, which at ad revenue scale is worth millions, but it costs 10 to 100 times more compute and makes calibration harder.
+Boosted trees versus neural networks. Choose gradient boosted trees when the features are mostly dense and numeric, the dataset is millions to hundreds of millions of rows, and you need strong results with little tuning. Choose a neural network when the main signal is in sparse ids, when you want to share one embedding table across tasks (click, conversion, view) or when you need to train continuously on a stream. Trees cannot learn embeddings of ids with millions of values, and networks need more care with feature scaling.
+Batch retrain versus online learning. Choose a daily batch retrain when the data is stable, the team is small and you want simple rollback. Choose hourly or streaming updates when new ads appear all the time, when advertisers change budgets and creatives daily, or when seasonality moves fast (for example holidays). The cost of online updates is more moving parts, a risk of learning from a bad hour of data (bot traffic) and harder reproducibility. A common answer is both: a daily full retrain as the anchor and hourly incremental updates on top, with a guardrail that rejects an update if its metrics on a clean holdout drop.
+failures: The feature store is slow or down. The model server uses its local cache for the user row, and if there is none, it uses default values (the population average) and a flag feature "features_missing". The model was trained with random feature dropout, so it handles this. Revenue falls a little, but the service stays up.
+A bad model version is deployed. It may have a bug in a feature, or a data issue in the last hour. Rollout goes shadow (scores logged, not used), then 1 percent canary, then 10 percent, then all. Automatic checks compare the calibration ratio, the average pCTR and the revenue per request against the old version. A drop beyond a threshold rolls back in under a minute, because the old model is still loaded in memory.
+The label pipeline is delayed. The click stream lags by 3 hours. The hourly trainer would train on impressions without their clicks and learn a CTR near zero. The trainer checks the label freshness watermark and refuses to train on hours that are not complete. An alert fires when lag is above 30 minutes.
+Click fraud and bot traffic. A burst of fake clicks makes some ads look excellent. The system filters invalid traffic before the click enters the training stream (known bot networks, impossible click rates, repeated clicks from one device), down-weights suspicious sources, and trains with robust statistics. Advertisers are credited for invalid clicks they were charged for.
+evolution: At the start, a logistic regression trained nightly on 30 features is enough; calibrate it, log everything and set up A/B testing before anything else. At 100 million requests per day, add a stream job for count features, a feature store and hourly warm-start training. At 10 billion, move to a deep model with embeddings, shadow and canary rollout, and per-slice calibration. At 100 billion, add multi-task heads (click, conversion), a two-tower retrieval stage and distributed embedding training.
+followups: Why do you use log loss and not accuracy or AUC as the training loss? || Log loss is a proper scoring rule, so its minimum is the true probability, which the auction needs. Accuracy ignores the probability and with a 0.5 percent click rate a model that always says no is 99.5 percent accurate. AUC measures order only, so a model can rank well and still price badly. We report AUC but optimise and monitor log loss and calibration.
+How do you correct for negative down-sampling? || Keep all positives and a fraction w of the negatives, train on that data, then map the output q to p = q w / (1 - q + q w). The odds of the sampled data are 1/w times the true odds, so multiplying the odds by w restores them. Verify with the calibration ratio on unsampled data.
+How do you handle position bias? || The click rate depends on the slot, so a model that does not know the position learns that ads shown at the top are better. Add position as a feature (or a separate tower) in training, and at serving set it to a fixed value or sum over the positions. Randomised position experiments give unbiased estimates to check it.
+How do you run an A/B test when the auction and budgets link the two groups? || Split by user hash, but remember that both arms spend from the same advertiser budgets, so a better model in arm B may use up budget that arm A would have used and the effect is shared. Use a long enough test, budget-split or advertiser-split experiments for pricing changes, and look at both per-request revenue and advertiser outcomes. Keep a small long-term holdout.
+ref: paper | Ad Click Prediction: a View from the Trenches | McMahan et al., Google, 2013 |
+ref: paper | Practical Lessons from Predicting Clicks on Ads at Facebook | He et al., Facebook, 2014 |
+ref: paper | Wide & Deep Learning for Recommender Systems | Cheng et al., Google, 2016 | https://arxiv.org/abs/1606.07792
+ref: paper | DeepFM: A Factorization-Machine based Neural Network for CTR Prediction | Guo et al., 2017 | https://arxiv.org/abs/1703.04247
+ref: paper | Deep Learning Recommendation Model for Personalization and Recommendation Systems | Naumov et al., Meta, 2019 | https://arxiv.org/abs/1906.00091
+ref: book | Computational Advertising | Jun Wang, Weinan Zhang and Shuai Yuan, 2017 |
+@@ ml-news-feed
+title: Design personalized news feed ranking
+category: AI & ML
+level: Senior / Staff
+concepts: funnel, recsys, ctrpred, featureeng, featurestore, embeddings, fanout, clfmetrics, experimentation, bandits
+summary: A news feed shows each user a short, ordered list of posts chosen from thousands of posts that friends, followed accounts, groups and recommendation systems produced in the last days. The old design was "newest first". The ML design predicts, for every candidate post, what this user will do with it (click, like, comment, share, hide, spend time) and orders posts by a weighted value of these predictions. What makes it hard is the shape of the problem: there are billions of possible posts but only about 50 ms to choose among them, the best objective is not the same as the easiest label to predict, posts are fresh and decay in hours, celebrities have millions of followers, and every change to the ranker changes what people post and how they behave. We design the retrieval and ranking funnel, the feature and label pipelines, the models, serving, evaluation and monitoring.
+requirements: Functional requirements. A user opens the app and sees page one of 25 posts within 400 ms at p99. Scrolling loads the next pages without repeats and without a jump in order. Candidates come from three sources: posts by accounts the user follows (the "in-network" source), posts recommended from outside the network (based on interests and what similar users did) and ads or sponsored posts, which are mixed in by a separate system and are not part of this design. The system respects blocks, mutes, privacy settings, age rules and integrity filters (posts marked as spam, misinformation or harmful are removed or demoted). A new post must be eligible within a minute of publication. Users can say "show less of this", and this must change the feed on the next refresh.
+Objective. The target is long-term user value, which we cannot measure directly. We use a proxy: a value score that is a weighted sum of predicted event probabilities, for example \( V = w_c\,p_{click} + w_l\,p_{like} + w_m\,p_{comment} + w_s\,p_{share} + w_t\,\hat{t}_{dwell} - w_h\,p_{hide} - w_r\,p_{report} \). The weights are product decisions tuned by experiments against retention and survey metrics. Training for a single "click" label would favour clickbait, so we use several heads and negative signals.
+Metrics. Offline: AUC and normalized cross entropy per head, calibration per head, recall at K for retrieval, and NDCG on logged sessions. Online: session time, daily active users, retention at 7 and 28 days, share of posts from close friends, hide and report rates, and creator-side metrics such as the share of creators who get at least one reaction. A rise in clicks with a fall in retention is a failure.
+Non-functional requirements. Latency of 400 ms at p99 for page one, availability 99.95 percent with a degraded mode (a simple chronological or popularity feed). Freshness: a post is rankable in under 60 seconds. Fairness and diversity: no single author takes more than 2 of 10 slots, and new creators get a chance.
+Assumptions. 200 million daily active users, each opening the feed 10 times a day. 150 million new posts per day. Average user follows 300 accounts. About 1 percent of accounts have more than 100,000 followers.
+estimates: Request load. 200 million users x 10 opens = 2 billion feed requests per day. Divided by 86,400 seconds this is 23,000 per second on average. With a peak factor of 3 we plan for 70,000 per second. Page two and later add about 50 percent more requests but they come from the cached ranked list.
+Candidate funnel. Per request we retrieve about 2,000 candidates: 1,500 in-network posts (recent posts of the 300 followed accounts, a few per account) and 500 out-of-network posts from the embedding index. A light ranker scores all 2,000 and keeps 300. A heavy ranker scores the 300 and keeps 100. A re-ranker applies diversity and rules and returns the top 25 for page one and the rest for later pages. Each stage cuts the number of items by 5 to 10 times, and the model cost per item grows by about 100 times from the first to the last stage. This is the multi-stage retrieval and ranking funnel.
+Compute. Light ranker: 70,000 x 2,000 = 140 million scores per second. With a small model of 20,000 operations per score (a boosted tree ensemble or a 2-layer network on 50 features) this is 2.8 trillion operations per second, which is about 100 CPU cores at 30 giga-operations each with good vectorisation. In practice, with feature fetch and memory costs, plan for 1,000 cores. Heavy ranker: 70,000 x 300 = 21 million scores per second. With a multi-task network of 200 million operations per score, the load is 4.2 x 10^15 operations per second. A modern accelerator gives about 50 teraoperations per second in practice (mixed precision, batching, imperfect use). So 4.2 x 10^15 / 5 x 10^13 = 84 accelerators; with 30 percent headroom and a zone failure margin, about 130.
+Fan-out on write. 150 million posts x 300 followers on average is 45 billion inbox writes per day, or 520,000 per second on average. The distribution is skewed: the top 1 percent of accounts hold about two thirds of all follow edges. If accounts above 100,000 followers are handled on read, the write fan-out falls to around 15 billion per day, about 175,000 writes per second, which a sharded in-memory list store can absorb.
+Features. Real-time post counters (likes, comments, shares, hides per 5 minutes) for 150 million new posts, 16 bytes per counter and 10 counters is 160 bytes, times 150 million = 24 GB, small. User features: 500 million x 4 KB = 2 TB. The author-user affinity table (interactions between a user and each of the accounts they follow) is 500 million x 300 x 12 bytes = 1.8 TB.
+Training logs. 2 billion requests x 100 impressions logged per request (what was shown or scrolled past) is 200 billion impression rows per day, which is too many to keep at full detail. We log every shown post with its features for a 5 percent user sample, and a small slice of all users for measurement, so about 10 billion rows per day. At 1 KB each that is 10 TB per day.
+api: Get feed page: GET /v1/feed?cursor={opaque}&limit=25 returns {items[]{post_id, author_id, reason, rank_position}, next_cursor, session_id}. The first call has no cursor. The cursor encodes the session id and the position in the cached ranked list.
+Feedback events: POST /v1/feed/events with {session_id, events[]{type: impression|dwell|like|comment|share|hide|report|see_less, post_id, ts, dwell_ms, position}}. Batched on the client every few seconds and on app background.
+Internal ranking call: Rank(user_id, session_context, candidates[]) returns scored candidates with the head outputs and the final value score. Retrieval call: Retrieve(user_id, source, k) returns up to k candidate post ids with a source tag.
+datamodel: Post metadata: key post_id, columns author_id, created_at, type, language, topic ids, text embedding id, media embedding id, integrity labels, visibility rules. Partition by post_id hash; a secondary index by author_id and time for the in-network lookup.
+Social graph: edges (follower_id, followee_id, created_at, weight) stored twice, once keyed by follower (to find who I follow) and once by followee (to find who to fan out to). Mutes and blocks are small per-user sets.
+Inbox: key "inbox:{user_id}", value a bounded list of (post_id, author_id, ts) with the newest first, trimmed to 800. It is a hint of candidates, never the truth about visibility; visibility is checked again at read time.
+```sql
+CREATE TABLE feed_impressions (
+  session_id   STRING,
+  user_id      BIGINT,
+  post_id      BIGINT,
+  position     INT,
+  shown_ts     TIMESTAMP,
+  source       STRING,        -- inbox, celebrity_pull, ann, explore
+  stage_scores MAP<STRING, FLOAT>,   -- light score, head outputs, final
+  features_ref STRING,        -- pointer to the logged feature vector
+  label_click  TINYINT,
+  label_like   TINYINT,
+  label_hide   TINYINT,
+  dwell_ms     INT
+) PARTITIONED BY (dt DATE);
+```
+Feature store. Online keys: "user:{id}" (profile, history embedding, 7 and 30 day topic counts), "uxa:{user_id}:{author_id}" (affinity counters), "post:{id}" (type, age, embedding, live counters), "author:{id}" (quality scores, follower count). Offline tables hold the same features with timestamps for point-in-time joins.
+design: The request path. The app calls GET /v1/feed. The feed service loads the user context (the user row, the seen set, preferences, mutes) and starts retrieval from three sources in parallel. Source one reads the inbox list of the user (posts pushed there when friends posted). Source two pulls the latest posts of the few "celebrity" accounts the user follows, because those posts were not pushed. Source three queries an approximate nearest neighbour index of post embeddings with the user's embedding and returns the 500 nearest posts, filtered for freshness and quality. The union is de-duplicated, filtered (blocked, muted, already seen, visibility, integrity) and left with about 2,000 candidates.
+Light ranker. Stage one uses a small model, for example gradient boosted trees or a two-layer network, on cheap features: author affinity, post age, early engagement rates, the dot product of the user and post embeddings, and the source. It is trained to predict the same events as the heavy ranker but with a smaller input. Its job is recall: do not drop a post the heavy ranker would have put on top. We measure this as "recall of the heavy ranker's top 100 inside the light ranker's top 300".
+Heavy ranker. Stage two scores 300 posts with a multi-task neural network. Inputs are sparse ids (user, author, post, group) turned into embeddings, dense counters, the user's recent history (last 50 items, encoded by attention), and context (time, device, network). The shared layers feed one head per event. The output is a set of calibrated probabilities. The value score combines them with product weights. This is click prediction generalised to many events: the same issues of delayed labels, calibration and sparse ids apply.
+Re-ranking. The last stage takes the top 100 by value and applies list-level rules that a per-item model cannot know: no more than 2 posts from the same author in the top 10, a mix of formats (not 10 videos in a row), a cap on posts from out-of-network sources, a boost for posts from close friends, a demotion for borderline integrity content, and a freshness bonus for the first 30 minutes of a post. A greedy algorithm picks the next post that maximises value minus a similarity penalty to the posts already chosen (maximal marginal relevance).
+Pagination. The ranked list of 100 is stored in a cache keyed by session id for 10 minutes. The cursor points into it, so page two returns items 26 to 50 in the same order, with no repeats and no extra ranking cost. After 10 minutes or at pull-to-refresh, a new session starts. Impressions are logged from the client with positions.
+Write path and fan-out. When a user publishes a post, the post service stores it, runs the integrity classifiers and emits an event. The fan-out worker reads the author's follower list in pages and pushes the post id into each follower's inbox if the author is below the celebrity threshold. For celebrity authors only the author's own "recent posts" list is updated; readers pull it. This is the hybrid of fan-out on write and fan-out on read: writes stay bounded and read cost for a normal user stays at about 5 to 10 extra lookups.
+Learning loop. Events from the app go to a message queue. A stream job turns them into near-real-time counters per post and per user-author pair (for the feature store), and writes labeled examples for training. The embedding models and the rankers are retrained daily (rankers also have an hourly incremental update). New models go to an A/B test, and the weights of the value score are tuned in separate experiments.
+Exploration. A new post has no engagement signal, so a ranker would never show it and it would never get any. For the first few hundred impressions, we treat the post's click and like rates as unknown values with a prior from the author's history and the post's type, and use Thompson sampling: draw a plausible rate from the posterior and use it as the score. Posts with high uncertainty get a fair number of tries, and the uncertainty shrinks as data arrives. This is a multi-armed bandit inside the ranker.
+diagram:
+  app --GET /feed--> [feed service] --------------------------+
+                          |                                    |
+         +----------------+-----------------+                  |
+         v                v                 v                  v
+  +------------+  +--------------+  +---------------+  +------------+
+  | inbox      |  | celebrity    |  | ANN index of  |  | user ctx:  |
+  | (pushed)   |  | pull (recent)|  | post embeds   |  | seen,mutes |
+  +------------+  +--------------+  +---------------+  +------------+
+         \                |                 /
+          +---------------+----------------+
+                          v  ~2000 candidates, filtered
+                  +---------------+
+                  | light ranker  |  cheap features, CPU
+                  +---------------+
+                          | 300
+                          v
+                  +---------------+      +----------------+
+                  | heavy ranker  |<-----| feature store  |
+                  | multi-task NN |      | (online, KV)   |
+                  +---------------+      +----------------+
+                          | 100 x heads -> value score
+                          v
+                  +---------------+
+                  | re-ranker     |  diversity, rules, freshness
+                  +---------------+
+                          | top 25 + cache of 100 (session)
+                          v
+                         app
+  publish --> post svc --> fan-out workers --> inbox lists
+  events  --> queue --> stream job --> counters + training data
+animation:
+== A user opens the app. The feed service starts three retrievals.
+  app --GET /feed--> [feed svc]    inbox: 120 posts
+  candidates: none yet             celeb pull: waiting
+  funnel: 0 items                  ANN: waiting
+== Sources answer: inbox 120, celebrity pull 40, ANN 500, then merge.
+  app --GET /feed--> [feed svc]    inbox: 120 posts
+  candidates: 660 raw              celeb pull: 40 posts
+  funnel: 660 -> filter 540        ANN: 500 posts
+== Filters remove blocked, muted, seen and policy-violating posts.
+  app --GET /feed--> [feed svc]    removed: seen 90, muted 20
+  candidates: 540 left             removed: policy 10
+  funnel: 540 -> light ranker      ANN: done
+== The light ranker keeps the 300 best by cheap features.
+  app --GET /feed--> [light rank]  scored 540, keep 300
+  candidates: 300 left             recall check: logged
+  funnel: 540 -> 300               heavy ranker next
+== The heavy ranker predicts click, like, comment, share, hide.
+  app --GET /feed--> [heavy rank]  post 8841: click .09 like .04
+  candidates: 300 scored           comment .01 share .005 hide .002
+  funnel: 300 -> value score       V = 0.62
+== The re-ranker enforces diversity and returns the first 25.
+  app <--25 posts---- [re-rank]    session cache: 100 ids
+  top 10 has max 2 per author      cursor -> position 26
+  funnel: 100 -> 25                p95 latency 310 ms
+== The app logs impressions and dwell; they become labels and counters.
+  app --events--> queue --> stream job
+  post 8841: shown pos 3, dwell 4.2 s, like=1
+  counters +1, training row written        next ranker retrain tonight
+deepdive: What to optimise. The label that is easiest to collect (clicks) is not the goal. Clicks reward clickbait, and likes reward easy content. A mature feed predicts many events and combines them with weights, and it also uses survey data: a small sample of users answers "was this post worth your time?" and a model predicts that answer for all posts, which is added to the value score. The weights are tested as experiments, and the real measure is retention and long-term satisfaction. We keep negative signals (hide, report, "see less") in the score with strong weights, because one hide costs more than one like gains. Weight changes are the most powerful lever of the product and must be reviewed like code.
+Candidate retrieval quality. The in-network source is easy but biased to recent posts of prolific accounts; we cap posts per author to give quiet friends a chance. The embedding source uses a two-tower model: a user tower and a post tower trained with a contrastive (in-batch softmax) loss on positive engagement, so that the dot product of the two embeddings is high for pairs where the user engaged. Post embeddings go to an ANN index (a graph-based index such as HNSW or an inverted file with product quantization) rebuilt in minutes, and the newest posts are added to a small real-time index. User embeddings are recomputed hourly from recent history. We evaluate recall at 500 on held-out engagement.
+Feature freshness and consistency. Feature engineering for a feed is mostly about freshness. A post's early engagement rate is the strongest feature in the first hour, but it is also the noisiest. The stream job computes counters in tumbling windows of 1, 5 and 60 minutes, with smoothing: rate = (likes + 2) / (impressions + 50). At serving time the model reads the same definition from the online store. For training, the logged feature vector is stored with each impression, so there is no recomputation and no leak from future counters. The most dangerous bug is a counter that includes the label event itself.
+Position and exposure bias. Posts at the top get more clicks because they are on top. If we train on raw logs, the model learns that whatever was on top is good. We add position as a feature in training, set it to a constant at serving, and run small randomisation experiments (swap positions 2 and 3 for 0.1 percent of sessions) to estimate the true effect and calibrate. Items never shown have no label at all, which is why we keep an exploration slice.
+Multi-task learning and calibration. A shared network with one head per event uses data well, because likes are 10 times more common than shares, and the shared layers learn from all. But tasks can pull in different directions, so we balance the loss weights and watch each head's calibration. The value score is a sum of probabilities times weights, so the sum is only as good as each probability. Each head gets a calibration layer fitted on the last day, and the weights are applied afterwards.
+tradeoffs: Fan-out on write versus fan-out on read. Choose fan-out on write (push the post id into each follower's inbox) for accounts with up to about 100,000 followers: it makes reads cheap, which matters because reads outnumber writes by 10 to 100 times. Choose fan-out on read (pull at request time) for celebrity accounts, where a push would write millions of entries per post and most of them go to inactive users. The hybrid costs more code and two paths to test. A third option is to push only to active users, those who opened the app in the last 7 days.
+Number of stages. Choose two stages (retrieval and one ranker) when the candidate set is under a few hundred, the model is small and the team is small. Choose three or four stages when you must pick from thousands of candidates under 100 ms, because the heavy model cannot afford them all. Each additional stage adds a place where good items can be lost, so measure the recall of each stage against the next, and keep the early stages simple.
+One objective versus a value model with many heads. Choose a single head (for example, "meaningful interaction") when the product is young and you want to learn quickly. Choose multi-head with a weighted value score when you have several actions with different meaning and need to steer the product with weights without retraining. The cost is calibration work per head and a larger space of weights to tune.
+failures: The feature store is slow. The heavy ranker reads user and post features, and a slow store would break the 400 ms budget. Each fetch has a 30 ms timeout. On timeout the ranker uses cached or default features and the light ranker's score. The feed gets slightly worse but still loads.
+The fan-out queue backs up. A celebrity posts and a burst of 10 million inbox writes starts, or a worker fleet fails. The inbox for some users is late. The feed service sees that the inbox is missing recent posts (because it knows the latest post time from the followed authors) and falls back to pull for those authors. The user sees the post a bit later at worst.
+A bad ranker deployed. A subtle bug can reduce engagement by 2 percent, which no alert sees in the first minute. All rankers go through shadow scoring, then a 1 percent canary with guardrail metrics (latency, error rate, average predicted probability per head, hide rate, session length) and then an A/B test for at least a week. The old model stays loaded for instant rollback.
+A viral harmful post. A post gets a high early engagement rate, so the ranker promotes it, and the harm spreads in an hour. Integrity classifiers run before ranking and at fixed engagement thresholds (a post that reaches 10,000 impressions is checked again with a heavier model), and reports from users cut its reach quickly. A kill switch can remove a post id or an author from all candidate sources.
+evolution: With 10,000 users, a SQL query on posts of followed accounts, ordered by time, is enough. At a million users, add an inbox cache and a logistic regression trained nightly. At 100 million, introduce the funnel with a light and a heavy ranker, the feature store with stream counters, and the hybrid fan-out. At 1 billion, add embedding retrieval with ANN, multi-task heads, regional deployment and an experimentation platform that handles interference.
+followups: Why not rank everything with one big model? || With 2,000 candidates per request and 70,000 requests per second, a model that costs 200 million operations per score would need about 28 petaoperations per second, more than six times the heavy ranker budget. A funnel spends cheap compute on many items and expensive compute on few. We make sure the early stages have high recall of what the final stage would choose.
+How do you decide the weights of the value score? || Start with product judgment, then run experiments where each arm changes one weight, and measure retention, session time, hide and report rates and a survey of satisfaction. Prefer long-term metrics. Fit weights from a model of long-term outcomes when there is enough data, and review them regularly.
+How does position bias enter, and how do you remove it? || Items on top get more clicks regardless of quality. Add position as a training feature, use a fixed value at serving, and verify with small randomisation experiments. Also use inverse propensity weights when the data comes from a stable logging policy.
+How do you test a ranker when users affect each other? || A user's feed depends on the posts of other users, and a ranker that favours some creators changes what others see. Per-user randomisation is still the main tool, but we also use cluster or geography randomisation for network effects, creator-side metrics, and a long holdout. Check A/A tests and sample ratio mismatch.
+What does a cold start look like for a new user and for a new post? || A new user has no history, so we use context (country, language, device), popular and diverse posts, and ask for interests; learning happens in the first session through fast counters. A new post gets its embedding from content and the author's history, and gets exploration traffic with Thompson sampling.
+ref: paper | Deep Neural Networks for YouTube Recommendations | Covington, Adams and Sargin, Google, 2016 |
+ref: paper | Graph Convolutional Neural Networks for Web-Scale Recommender Systems | Ying et al., Pinterest, 2018 | https://arxiv.org/abs/1806.01973
+ref: paper | Deep Learning Recommendation Model for Personalization and Recommendation Systems | Naumov et al., Meta, 2019 | https://arxiv.org/abs/1906.00091
+ref: paper | Embedding-based Retrieval in Facebook Search | Huang et al., Facebook, 2020 | https://arxiv.org/abs/2006.11632
+ref: book | Designing Machine Learning Systems | Chip Huyen, 2022 |
+ref: book | Trustworthy Online Controlled Experiments | Kohavi, Tang and Xu, 2020 |
+@@ visual-search
+title: Design visual image search
+category: AI & ML
+level: Senior / Staff
+concepts: embeddings, contrastive, ann, vectorsearch, cv, quant, clfmetrics, hybridsearch, objectstore, featureeng
+summary: Visual search lets a user search with a picture instead of words: take a photo of a chair, and get the chairs in the catalog that look like it. A neural network turns every image into an embedding, a list of a few hundred numbers, such that images with similar content get nearby points. Search then becomes nearest neighbour search over billions of points. What makes it hard is the combination: the index holds 2 billion images and must answer in under 150 ms, the query photo is taken in a messy real world (angles, light, clutter) while the catalog photos are clean, the notion of "similar" depends on the product (same item, same style, same colour), memory is the main cost, and a new embedding model means rebuilding the whole index. We design the system end to end: the image pipeline, the model and its training, the index, the query path, evaluation and operations.
+requirements: Functional requirements. Query by image: the user uploads a photo or picks an image already on the platform and may crop a region. The system returns the 50 most visually similar items with product data. Detect-and-search: the system finds the objects in a photo (a sofa, a lamp, a rug) and offers a search for each. Query by text: the same index answers a text query such as "mid-century walnut sideboard" through a text encoder trained to share the space with the image encoder. Filters: category, price range, availability, country and brand, combined with similarity. Related items: for any catalog item, "more like this". New items must be searchable within 15 minutes of upload.
+Non-functional requirements. Latency: 150 ms at p99 from request received to response, without the image upload time. Quality: for the "find this exact product" task, the correct item should be in the top 10 for at least 70 percent of queries (recall at 10). Recall of the ANN index against exact search should be at least 95 percent. Availability 99.9 percent. Safety: block adult and illegal images in queries and results. Cost: memory is the main driver, so the target is under 100 GB of index memory per billion images before replication.
+Metrics. Offline: recall at K (K = 1, 10, 50) on a labeled set of query and target pairs, mean average precision, NDCG with graded human judgements (exact match, same style, different), ANN recall against brute force, and the quality loss from compression. Online: click-through rate on results, add-to-cart or save rate, the share of sessions with no click, reformulation rate, and latency. Slices: category (fashion is harder than books), query source (camera vs catalog image), and image quality.
+Assumptions. The catalog has 2 billion images (800 million items with several images each, plus user-generated images). 20 million new images arrive per day. The service handles 3,000 visual queries per second on average and 8,000 at peak. Embeddings have 256 dimensions.
+estimates: Query load. 8,000 queries per second at peak. If a photo has 3 detected objects and we search each, the peak is 8,000 x 3 = 24,000 ANN searches per second in the worst case. We plan for an average of 1.8 searches per query, so 14,400 per second at peak.
+Compressed size. Product quantization (PQ) splits the vector into 64 parts of 4 numbers and stores one byte for each part: 64 bytes per vector, a 16 times reduction. With an 8-byte id, one vector is 72 bytes. 2 billion x 72 bytes = 144 GB. Add the inverted file structure: about 4 bytes of overhead per vector, so 8 GB more. The total is about 152 GB, which is 76 GB per billion images. This meets the target.
+Sharding. Choose 40 shards of 50 million vectors each. A shard holds 50 million x 76 bytes = 3.8 GB, which fits comfortably in the RAM of a small machine. Searches go to all 40 shards in parallel and the results are merged (scatter-gather).
+Search cost per shard. Each shard has about 16,384 inverted lists (50 million / 3,000 vectors per list). A query probes 16 lists and scans 16 x 3,000 = 48,000 codes. With lookup tables, each code costs about 64 table lookups, so 48,000 x 64 = 3 million lookups, or about 0.7 ms on one core. Per query across 40 shards: 40 x 0.7 = 28 core-milliseconds. At 14,400 searches per second at peak: 14,400 x 0.028 = 403 cores busy. With 50 percent headroom, about 600 cores. If each node has 16 cores, that is 38 nodes, or one replica set of about 1 node per shard. We run 3 replicas per shard for availability and zone failure: 120 nodes.
+Re-ranking memory. After the ANN step we fetch the full 256-float vectors of the top 200 results to re-rank them exactly. These are stored in a key-value store or object store: 2 TB on SSD, fetched at 200 x 1 KB = 200 KB per search, so 14,400 x 200 KB = 2.9 GB per second of reads at peak. Too much, so we store the re-rank vectors as 8-bit integers (scalar quantization): 256 bytes each, 512 GB total, and 0.7 GB per second of reads, which a small SSD cluster handles.
+Embedding compute. Ingest: 20 million images per day is 230 per second. A vision transformer of base size runs about 500 images per second on one modern GPU with batching, so 1 GPU handles it with room; we run 4 for safety. Backfill after a model change: 2 billion images at 500 per second per GPU is 4 million seconds of GPU time, which is 46 GPU-days. With 100 GPUs it takes 11 hours. Query-time embedding: 8,000 per second at peak, with the 3 detected crops, about 14,400 embeddings per second, so 29 GPUs at peak; we use a distilled query model, about 3 times cheaper, to bring this down.
+api: Upload: POST /v1/images with the image bytes (or a signed URL for direct upload to object storage) returns {image_id, width, height, detected_objects[]{object_id, box, label, score}}.
+Visual search: POST /v1/search/visual with {image_id | image_url, box?, text?, filters{category, price_min, price_max, in_stock, country, brand}, k: 50, cursor?} returns {results[]{item_id, image_id, score, title, price, thumbnail_url}, query_embedding_version, next_cursor}.
+Similar items: GET /v1/items/{item_id}/similar?k=50&filters=... returns the same result shape. The query vector is the stored vector of the item.
+Text to image: GET /v1/search/images?q=mid-century+sideboard&filters=...&k=50 returns the same shape. The text goes through the text encoder; a lexical query over titles runs in parallel (hybrid retrieval).
+Admin and feedback: POST /v1/feedback with {query_id, item_id, action: click|save|purchase|hide, position}. This feeds training data. POST /v1/index/rebuild with {model_version} starts a new index build.
+datamodel: Image metadata (document store or SQL): image_id, item_id, owner_id, object_store_key, width, height, category, color_hist, brand, price, availability, country_mask, safety_label, embedding_version, created_at.
+```sql
+CREATE TABLE image_embeddings (
+  image_id          BIGINT,
+  model_version     SMALLINT,
+  vec_int8          BINARY(256),    -- scalar-quantized, for re-ranking
+  pq_code           BINARY(64),     -- compressed, for the ANN index
+  crop_box          ARRAY<FLOAT>,   -- null for full image
+  updated_at        TIMESTAMP,
+  PRIMARY KEY (image_id, model_version)
+);
+
+CREATE TABLE search_feedback (
+  query_id    STRING,
+  query_image BIGINT,
+  query_text  STRING,
+  result_item BIGINT,
+  position    INT,
+  action      STRING,
+  ts          TIMESTAMP
+) PARTITIONED BY (dt DATE);
+```
+Index files. Each shard is a set of immutable segments in object storage: a coarse quantizer (list centroids), the PQ codebooks, the list contents (ids and codes) and a small attribute column store (category id, price bucket, availability bit, country mask) aligned to the vector order. A shard node downloads its segments at start and keeps them in RAM. New images go into a small in-memory "delta" index with a graph (HNSW) structure on uncompressed vectors, merged into the main index by a nightly job.
+Training data. Triplets and pairs: (query image, positive image, negatives). Positives come from three sources: same item photographed differently, a user photo and the catalog image the user bought, and engagement logs (a query image and an item that was saved). Negatives are other items in the batch and hard negatives from the nearest neighbours of the anchor that are known to be a different product.
+design: The query path. The client sends the photo to the upload endpoint, which writes it to object storage and runs a fast safety classifier. An object detector (a small convolutional or transformer detector, 10 to 20 ms on GPU) proposes boxes for known product classes. The client shows them as dots on the photo; the user taps one or the system picks the largest. The crop is resized to 224 by 224, normalised and sent to the embedding service, which runs the image encoder and projects the output to 256 numbers, then normalises the vector to length 1. This takes 8 to 15 ms in a batch on a GPU. The vector goes to the search service.
+Retrieval. The search service sends the vector to all 40 shards in parallel (and, if filters are present, sends the filters too). Each shard probes 16 inverted lists, computes approximate distances with lookup tables and applies the filter on attribute columns while scanning, keeping the top 100 items. The coordinator merges 40 x 100 candidates and keeps the top 200. This is ANN search over a vector index. A single round takes 5 to 20 ms. With filtering inside the scan (pre-filtering by bit mask), the index returns enough results even when the filter keeps only 1 percent of items; post-filtering would return nothing for narrow filters.
+Re-ranking. The top 200 candidates are fetched with their 8-bit vectors and attributes. The re-ranker computes exact cosine similarity, then a small learned model adds other signals (this is the feature engineering around the embedding): category match, colour histogram similarity, price band, brand match when the query has a logo, popularity and quality of the item image, and the user's earlier behaviour. This is a small gradient boosted model or a linear model trained on click logs and human judgements. The output is the top 50, with business rules for diversity (not 20 photos of the same item from the same seller).
+Text and hybrid queries. When the user types text, a text encoder trained with the image encoder in the same embedding space (the CLIP approach) turns it into a vector. The text query also goes to a lexical index of titles and attributes (BM25). The two candidate lists are fused with reciprocal rank fusion and passed to the re-ranker. Hybrid search helps with exact words that embeddings handle poorly, such as brand names and model numbers, while the vector part handles "style" words.
+Ingest path. A new image lands in object storage and an event goes to a queue. The embedding workers (GPU, batch of 128) compute the embedding and detected crops, the safety classifier labels it and the metadata service stores attributes. The vector is added to the delta index of the right shard (shard = hash of image id) within minutes and also appended to a log for the next nightly merge. Deleted or unavailable items are marked in a tombstone bitmap and filtered at query time.
+Feedback and learning loop. Clicks, saves and purchases are logged with the query image, the result and the position. A daily job builds new training pairs, mining hard negatives from the current index. The model is retrained weekly or when a new hardware or architecture is ready. Any new model goes through offline evaluation, an index rebuild in the background and a shadow comparison before traffic moves.
+diagram:
+  client app
+     | photo
+     v
+  +----------+    +---------------+    +------------------+
+  | upload   |--->| object store  |    | safety classifier|
+  | service  |    | (images)      |    +------------------+
+  +----------+    +---------------+
+     |  crop / detect
+     v
+  +-----------+   224x224    +----------------+
+  | detector  |------------->| image encoder  |  256-d, unit length
+  | (GPU)     |              | (GPU, batched) |
+  +-----------+              +----------------+
+                                    | query vector (+ filters, text)
+                                    v
+                         +--------------------+
+                         | search coordinator |
+                         +--------------------+
+                   scatter  |   |   |   |  gather top 100 each
+              +-------+-----+---+---+---+------+
+              v       v         v       v      v
+          +-------+ +-------+ +-------+  ...  +-------+
+          |shard 0| |shard 1| |shard 2|       |shard39|  IVF-PQ in RAM
+          +-------+ +-------+ +-------+       +-------+  + delta HNSW
+                         | top 200
+                         v
+          +--------------------------+     +-----------------------+
+          | re-ranker                |<----| int8 vectors + attrs  |
+          | exact cos + learned model|     | (SSD key-value store) |
+          +--------------------------+     +-----------------------+
+                         | top 50
+                         v
+                      results
+animation:
+== The user photographs a chair and taps the chair in the photo.
+  photo -> upload -> object store          crop box: (120,80)-(520,610)
+  detector: chair 0.97, rug 0.91           vector: none yet
+  shards searched: 0 of 40                 candidates: 0
+== The crop is resized and the encoder produces a 256-number vector.
+  photo -> crop 224x224 -> encoder         crop box: (120,80)-(520,610)
+  q = [0.04, -0.11, 0.07, ... ]            vector: ready, |q| = 1
+  shards searched: 0 of 40                 candidates: 0
+== The coordinator sends q to all 40 shards in parallel.
+  q ---> shard 0  shard 1  shard 2 ... shard 39
+  each shard probes 16 of its 16,384 lists
+  shards searched: 0 of 40 (in flight)     candidates: 0
+== Each shard scans about 48,000 PQ codes and returns its top 100.
+  q ---> shard 0 ok   shard 1 ok   shard 2 ok ... shard 39 ok
+  codes scanned per shard: 48,000          time: 9 ms
+  shards searched: 40 of 40                candidates: 4,000
+== The coordinator merges to the top 200 by approximate distance.
+  merge 40 x 100 = 4,000 -> keep 200
+  filter: in_stock=true, category=chair    already applied in scan
+  shards searched: 40 of 40                candidates: 200
+== The re-ranker fetches int8 vectors and orders by exact similarity.
+  fetch 200 x 256 bytes from SSD store    5 ms
+  cos(q, v): 0.91, 0.90, 0.88, ...         model adds colour, price
+  shards searched: 40 of 40                candidates: 200 -> 50
+== The top 50 items return with thumbnails; the user taps one.
+  results: item 9917 (0.93), item 4402 (0.91) ...
+  click logged: query_id, item 9917, position 2
+  total latency: 96 ms                     feedback -> training data
+deepdive: What the embedding must capture. A generic image classifier gives embeddings that group "chairs" but not "this chair". For product search we need fine-grained similarity: the same item from another angle, and also items with the same shape and material. We train the encoder with a contrastive loss. A batch holds B pairs (anchor, positive); every other positive in the batch is a negative for the anchor. The loss is
+\[ \mathcal{L} = -\frac{1}{B}\sum_{i=1}^{B} \log \frac{\exp(s_{ii}/\tau)}{\sum_{j=1}^{B} \exp(s_{ij}/\tau)} \]
+Here \( s_{ij} \) is the cosine similarity of anchor i and positive j and \( \tau \) is a temperature, often about 0.05. Large batches (4,096 or more) give more negatives and a better embedding. Hard negatives, such as a similar but different chair, teach fine detail. We start from a model pre-trained on a large image-text dataset, then fine-tune on our pairs. The same recipe, with a text tower, gives the shared text and image space.
+Domain gap. Catalog images are shot on white backgrounds, while query photos have clutter, bad light and partial views. The fix is in the data and the augmentation: use real "street-to-shop" pairs (user photos linked to purchased items) when available, and apply strong augmentation to catalog images (random crops, colour shifts, background replacement, blur) so that the model learns to ignore clutter. The detector and crop step also removes most of the background. Evaluation must use queries taken from real camera uploads, not catalog images, or the metric will look better than the product.
+Compression and recall. PQ with 64 bytes per vector typically keeps recall at 10 near 90 to 95 percent of exact search for 256-dimension embeddings. Re-ranking the top 200 with the 8-bit vectors recovers almost all of the loss. We measure three numbers on 1 million held-out queries: recall of the ANN against exact search at 100, quality of the final list (recall at 10 against labels) with exact versus compressed re-ranking, and the effect of nprobe. Raising nprobe from 16 to 32 doubles the scan cost and may add 2 to 3 points of recall. A graph index (HNSW) gives better recall per query cost but needs about 10 to 15 times more memory per vector, because it keeps the full vector and the graph links, so it is used in the smaller delta index and not in the main 2 billion index.
+Filters with vector search. Business filters (in stock, price, country) are essential and tricky. If we search first and filter after, a filter that keeps 1 percent of items leaves about 2 results out of 200. We use filter-aware scanning: while scanning a list, skip vectors whose attribute bits fail the filter. For very selective filters (under 0.1 percent), we switch to a brute-force scan of a pre-computed subset, since the subset is small. The planner decides by estimating the filter selectivity from statistics.
+Model versioning. Embeddings from different model versions cannot be compared. A model change means re-embedding 2 billion images (11 hours on 100 GPUs), building a second full index (152 GB), and switching traffic. During the switch we run both: the query is embedded by both models and each goes to its own index. Keep the old index until the new one passes shadow tests; the alias switch is atomic. Image vectors are stored with their model version for this reason. Backward-compatible training (training the new model to stay in the old space) is possible but loses some gain.
+tradeoffs: Exact search versus ANN. Choose exact (brute force) search when the index has under about 5 million vectors, when you have GPUs, or when you need 100 percent recall: at 5 million vectors x 1 KB, a scan is 5 GB of reads, a few milliseconds on a GPU with high memory bandwidth. Choose ANN when the index is hundreds of millions or billions of vectors; exact search at 2 billion vectors would read 2 TB per query. You give up a few points of recall, and you add an index to build and monitor.
+HNSW versus IVF-PQ. Choose HNSW (graph index) when the index fits in memory uncompressed, you need very high recall (over 98 percent) at low latency, and updates are frequent. Choose IVF with product quantization when memory is the main cost, the index is above a few hundred million vectors, and you can accept batch updates and a re-ranking step. A hybrid uses a graph on the compressed codes or an IVF to choose partitions and a graph inside each partition. Disk-based graph indexes (like DiskANN) are another path when memory is the limit and SSD latency is acceptable.
+Embedding dimension. Choose 128 dimensions when memory dominates and the domain is narrow (one category). Choose 256 to 512 when the catalog is broad and fine-grained detail matters (fashion, furniture). Going from 256 to 512 doubles the vector size, the scan cost and the PQ codes, and often gains only one or two points of recall at 10. A common move is to train with 512 and then project down with a learned linear layer or train with Matryoshka-style losses, so that the first 128 or 256 numbers are good by themselves.
+failures: A shard node dies. Each shard has 3 replicas in different zones. The coordinator sends each sub-query to the replica with the lowest load, uses a 30 ms timeout, and retries once on another replica. If a whole shard is lost, the result is missing 2.5 percent of the catalog. We return results with a flag, rather than fail. Hedged requests (a second request after the 95th-percentile time) cut tail latency.
+The GPU embedding service is overloaded. Query traffic spikes at a holiday. The service has a queue with a deadline; requests that would exceed 50 ms are rejected, and the client falls back to a smaller distilled encoder on CPU or to a text-only fallback. Autoscaling adds GPUs in minutes, but the fallback covers the gap.
+A bad model is deployed. If the new encoder has a bug (for example, different image normalisation), all queries match nothing. A shadow phase compares the top-10 overlap with the old model on live traffic; very low overlap on easy queries blocks the rollout. Canary at 1 percent checks click-through rate and zero-result rate. The old index stays warm for instant rollback.
+evolution: With 1 million images, compute embeddings with a pre-trained model, store them in a single table and do exact search with a matrix multiplication on one machine. At 100 million images, use an HNSW index on one or two large-memory machines and a simple filter. At 2 billion images, shard, compress with PQ, add the delta index, the re-rank store and the training loop on click logs. At 10 billion images, add a tiered index (hot items in RAM, long tail on SSD with a disk-based graph), regional shards, learned routing of the query to the likely shards (searching 8 of 100 shards instead of all), and a continuous training system that refreshes the encoder and re-embeds incrementally.
+followups: Why not store raw 256-float vectors and use exact search? || At 2 billion vectors that is 2 TB, and every query would read all of it. Even with sharding over 100 machines it costs far more memory and CPU than IVF-PQ at 76 GB per billion. ANN gives 95 percent of the recall at a small part of the cost, and a re-ranking step on the top 200 fixes most of the loss.
+How does product quantization work? || Split the vector into m parts, learn 256 centroids per part with k-means, and store for each part the id of the nearest centroid (1 byte). For a query, precompute a table of distances from each query part to its 256 centroids; the distance to any stored vector is then the sum of m table lookups. It is a 16 times compression with fast approximate distance.
+What if you must change the embedding model? || Vectors from two models are not comparable, so you need a full re-embedding and a new index. Run both indexes, shadow test, switch with an alias, and keep the old one until sure. Use the version number in storage. Consider backward-compatible training if re-embedding is too costly.
+How do you make search work with filters like price and stock? || Store attribute columns next to the vectors and check them while scanning the inverted lists. For very selective filters, scan a pre-built subset by brute force. Do not search first and filter after, because narrow filters would return too few results.
+How do you build training data without human labels? || Use user behaviour (a query image and the item saved or bought), item groups from the catalog (several photos of one item), and augmentations of one image as positives. Use in-batch and mined hard negatives. Clean noise with confidence filters, and validate on a small human-labeled set.
+ref: paper | Visual Search at Pinterest | Jing et al., 2015 | https://arxiv.org/abs/1505.07647
+ref: paper | Visual Search at eBay | Yang et al., 2017 | https://arxiv.org/abs/1706.03154
+ref: paper | Learning Transferable Visual Models From Natural Language Supervision (CLIP) | Radford et al., OpenAI, 2021 | https://arxiv.org/abs/2103.00020
+ref: paper | Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs | Malkov and Yashunin, 2016 | https://arxiv.org/abs/1603.09320
+ref: paper | Billion-scale similarity search with GPUs | Johnson, Douze and Jegou, 2017 | https://arxiv.org/abs/1702.08734
+ref: paper | Product Quantization for Nearest Neighbor Search | Jegou, Douze and Schmid, 2011 |
+@@ video-search
+title: Design video search for a video platform
+category: AI & ML
+level: Senior / Staff
+concepts: hybridsearch, multimodal, embeddings, contrastive, ann, invindex, bm25, funnel, nlp, clfmetrics
+summary: A video platform has hundreds of millions of videos, but a video is not text. The system must find the right video from a few typed words, even when the title is vague, and even when the answer is a 20-second moment inside a 40-minute lecture. The design combines two kinds of retrieval. A lexical leg uses an inverted index and BM25 over the title, description, tags, channel name and the speech transcript. A semantic leg uses embeddings of the query and of the video (frames, audio and text together) and an approximate nearest neighbour index. The two candidate lists are fused and passed through a funnel of rankers that predict relevance and viewer satisfaction. What makes it hard is that the content is multimodal and expensive to process (speech recognition and frame encoding for every upload), the best label is noisy (clicks and watch time), new videos must be found within minutes, and a search that is only slightly off sends the viewer away. We design the indexing pipeline, the query path, the models and the evaluation.
+requirements: Functional requirements. Text query returns a ranked list of videos with title, thumbnail, channel, duration and a snippet of why it matched. Typed queries are short (2 to 4 words), often misspelled, in many languages. The system supports navigational queries ("channel name"), how-to and informational queries ("replace a bike chain"), news queries that need fresh videos, and moment queries ("where does he explain the Kalman filter") which return a video with a start time. Filters: duration, upload date, language, type (video, live, short). Autocomplete and "did you mean" are part of the experience but their design is only touched here. Results must respect age and region restrictions, and remove removed or private videos.
+Metrics. Offline: NDCG at 10 and MRR with graded human relevance labels (rated by trained raters on a sample of queries); recall at 100 of each retrieval leg; for the semantic leg, recall at K against the full-precision search. Online: click-through rate, but mainly "successful search" (a click followed by a watch of at least 30 seconds or half of the video), watch time per search session, reformulation rate (the user types again), abandonment (no click), and the share of queries with zero results. Slices: query length, language, head versus tail queries, fresh queries, and new videos with little engagement.
+Non-functional requirements. Latency: 250 ms at p99 for the first page (autocomplete is separate and must be under 100 ms). Availability 99.95 percent with fallbacks. Freshness: a new video is searchable by title and description within 2 minutes, and by transcript and visual content within 30 minutes of upload for videos up to an hour. Scale: hundreds of millions of videos, billions of queries per day. Cost: ASR and frame encoding are the biggest compute bills and must be controlled.
+Assumptions. 800 million videos in the index with an average length of 8 minutes. 4 million new videos per day. 1 billion searches per day. The language mix is wide, with 20 languages carrying 95 percent of traffic.
+estimates: Query load. 1 billion searches per day divided by 86,400 is 11,600 per second. Peak is about 3 times, so 35,000 queries per second. A cache of results for popular queries (assume the top 1 million queries by volume cover about 35 percent of traffic; the real share depends on the product) would cut the load to about 23,000 per second to the full path.
+Text size. Title, description and tags are about 2 KB per video. A transcript of 8 minutes at 130 words per minute is about 1,000 words or 6 KB. So about 8 KB per video, or 800 million x 8 KB = 6.4 TB of raw text. An inverted index with compressed postings and positions is about 40 percent of raw size: 2.6 TB. We use document partitioning: 100 shards of 8 million videos, each shard index about 26 GB, which fits in RAM plus SSD on one machine. With 3 replicas this is 300 machines. Each shard handles every query (scatter-gather), so each machine must answer 23,000 queries per second divided by the number of replicas per shard, which is 3, so 7,700 queries per second per machine. A BM25 top-1000 over an 8-million-document shard with early termination takes about 1 to 3 ms of one core for a short query, so a 16-core machine does about 5,000 to 8,000 per second. This matches, with slim headroom, so we use 4 replicas in the busiest regions: 400 machines.
+Embedding sizes. One vector per video: 256 numbers. As float32 it is 1 KB, so 800 million is 800 GB. With product quantization at 64 bytes plus an 8-byte id, it is 72 bytes, so 58 GB in total for videos. For moment search, we index key moments (one vector for each 30-second window) only for the 10 percent of videos with the most views, 80 million videos. They have 16 moments on average, so 1.3 billion vectors x 72 bytes = 94 GB. In all, about 150 GB of vector index, split into 20 shards of 7.5 GB.
+Semantic query cost. A query embedding by a text encoder of 60 million parameters costs about 2 ms on a GPU in a batch. At 23,000 queries per second this is 46 GPU-seconds per second, but batching and a small model reduce this to about 10 GPUs. ANN search over 20 shards, each probing 16 lists of 3,000 codes, costs about 20 x 0.5 ms = 10 core-ms per query, so 23,000 x 0.010 = 230 cores.
+Ingest compute. Speech recognition: 4 million videos x 8 minutes = 32 million minutes = 533,000 hours of audio per day. A large ASR model on a modern GPU runs about 100 times faster than real time with batching, so 5,330 GPU-hours per day, which is 222 GPUs running all day. Frame encoding: we sample one frame every 5 seconds, so 96 frames per 8 minute video. 4 million x 96 = 384 million frames per day. A vision encoder does 500 frames per second per GPU, so 768,000 GPU-seconds, which is 8.9 GPUs. So the ASR cost is 25 times bigger than the visual cost. We use cheaper ASR for low-view videos and run the large model only for videos with many views or in the languages that matter.
+api: Search: GET /v1/search?q=replace+bike+chain&lang=en&region=US&filters=duration:short,date:month&page_token=... returns {results[]{video_id, title, channel, duration_s, thumbnail, start_s?, snippet, match_reason}, next_page_token, corrected_query?, query_id}.
+Moment search: the same endpoint with type=moment returns results with start_s and end_s, for example {video_id, start_s: 412, end_s: 470, snippet: "...now the Kalman gain is computed..."}.
+Suggest: GET /v1/suggest?q=repl&lang=en returns up to 10 completions. Backed by a separate prefix index.
+Feedback: POST /v1/search/events with {query_id, events[]{type: impression|click|watch, video_id, position, watch_ms, ts}}. Batched from the client.
+Indexing (internal): the upload pipeline emits VideoPublished(video_id, metadata) and then VideoEnriched(video_id, transcript, ocr_text, frame_embeddings, audio_embedding, language, topics) events. The indexer consumes both and updates the lexical and the vector indexes.
+datamodel: Document store for video metadata (key video_id): title, description, tags, channel_id, language, duration, upload_ts, category, view counts (updated in batches), policy state, thumbnail id, transcript pointer.
+```sql
+CREATE TABLE video_features (
+  video_id         BIGINT,
+  model_version    SMALLINT,
+  video_vec        BINARY(64),     -- PQ code of the 256-d video vector
+  quality_score    FLOAT,          -- from a quality model
+  views_7d         BIGINT,
+  watch_ratio_7d   FLOAT,          -- average share of the video watched
+  ctr_by_query_cls MAP<STRING, FLOAT>,
+  language         STRING,
+  safety_state     STRING,
+  updated_at       TIMESTAMP
+);
+
+CREATE TABLE moments (
+  video_id   BIGINT,
+  start_s    INT,
+  end_s      INT,
+  moment_vec BINARY(64),
+  asr_text   STRING,
+  PRIMARY KEY (video_id, start_s)
+);
+```
+Lexical index. A document is a video. Fields: title (boost high), tags, channel name, description, transcript, OCR text. Each field has its own postings, so BM25 can weight them separately (the BM25F idea). Postings are stored with term positions for phrase queries. Documents are partitioned by video_id hash across 100 shards; every shard has a mutable in-memory segment for fresh videos plus immutable on-disk segments merged in the background.
+Vector index. IVF-PQ shards for video vectors and a separate set for moment vectors, each entry carrying the video id (and start time for moments). Attribute columns (language, upload date bucket, duration bucket, safety bit) sit next to the vectors for filtering during the scan.
+Query logs. Hourly partitioned tables of (query_id, user hash, query text, normalised query, results with positions and scores, clicks, watch times). Used for training, evaluation and query suggestions. Retention is limited by privacy policy and user hashes are rotated.
+design: The query path. The client calls the search API. The query understanding service runs first. It normalises the text (Unicode, case, punctuation), detects the language, corrects spelling with a model trained on the logs (a "did you mean" with a confidence threshold), expands synonyms and abbreviations, recognises entities (channels, people, game names), classifies the intent (navigational, how-to, news, entertainment) and decides if freshness matters. The output is a structured query: terms with weights, filters inferred from the text ("2024", "10 hours"), the intent class and a query embedding computed by the text encoder. This is the NLP part of the system, and it improves both legs.
+Dual retrieval. The coordinator sends the structured query to all lexical shards and all vector shards in parallel. Each lexical shard runs BM25F with early termination (WAND or block-max WAND) and returns its top 100. The coordinator merges them into the top 1,000. Each vector shard returns its top 50 by approximate cosine similarity between the query vector and the video vector (and the moment index for moment queries). The merged list is the top 1,000. Both legs use the same filters. The two lists are fused with reciprocal rank fusion: score = sum over legs of 1/(60 + rank). This is robust because BM25 scores and cosine similarities live on different scales. A video found by both legs rises to the top.
+Funnel. This is a multi-stage retrieval and ranking funnel. Stage 1 is retrieval (2,000 candidates from both legs, fused to 1,000). Stage 2 is a light ranker, a gradient boosted tree model on about 60 cheap features: BM25 per field, query and video embedding similarity, query-title term overlap, freshness, language match, channel authority, historical click-through rate for the query class, view count, watch ratio and quality score. It keeps 200. Stage 3 is the heavy ranker: a cross-encoder transformer that reads the query together with the title, channel and a transcript snippet, and a multi-task head that predicts relevance, click and satisfied watch. It scores 200 candidates. Stage 4 is a policy and diversity layer: remove duplicates and re-uploads, limit one channel to 3 results in the top 10, mix formats, apply demotion for low-quality or borderline content and boost authoritative sources for sensitive topics (health, news).
+Why a multimodal video embedding. Titles are written for people and algorithms, not for retrieval. Many videos have a vague title ("Part 3") but a clear speech transcript and clear frames. A video embedding built from frame embeddings (sampled every 5 seconds), the title and the transcript lets the query "how to tile a bathroom" match a video where the narrator says it and the frames show tiles. Text-only retrieval would miss videos in languages with poor transcripts or silent videos (timelapse, music). The semantic leg also handles paraphrase and cross-language queries.
+Indexing pipeline. At upload, the video goes through transcoding (needed for playback anyway). A publish event makes title, description and tags searchable in the in-memory segment within 2 minutes. In parallel, workers run ASR on the audio, OCR on sampled frames, a frame encoder (on every 5th second) and an audio tagger. Frame embeddings are pooled (mean, or an attention-based pooling) with the text embedding into one video vector, and per-30-second moment vectors for eligible videos. Each result is written to the feature store and an enrichment event updates the lexical document (adds transcript, OCR) and the vector shard's delta segment. A video is complete after about 10 to 30 minutes.
+diagram:
+  query "replace bike chain"
+        |
+        v
+  +----------------------+      +------------------+
+  | query understanding  |----->| text encoder     |
+  | lang, spell, intent  |      | -> query vector  |
+  +----------------------+      +------------------+
+        |  terms, filters, intent          |
+        v                                  v
+  +-------------------+            +----------------------+
+  | lexical shards x100|           | vector shards x20    |
+  | BM25F / WAND       |           | IVF-PQ videos+moments|
+  | top 100 each       |           | top 50 each          |
+  +-------------------+            +----------------------+
+        \                                  /
+         +--------- RRF fusion -----------+
+                        | 1,000
+                        v
+              +--------------------+
+              | light ranker (GBDT)|  60 cheap features
+              +--------------------+
+                        | 200
+                        v
+              +--------------------+      +--------------------+
+              | heavy ranker       |<-----| feature store      |
+              | cross-encoder+heads|      | quality, ctr, ...  |
+              +--------------------+      +--------------------+
+                        | 200 scored
+                        v
+              +--------------------+
+              | policy + diversity |
+              +--------------------+
+                        | top 20 -> page 1
+   upload -> transcode -> ASR/OCR/frames -> indexer -> both indexes
+animation:
+== The user types "replace bike chain". Query understanding runs.
+  query: "replace bike chain"            spell: ok
+  lang=en  intent=how-to  fresh=no       vector: ready (256-d)
+  lexical: -     semantic: -     fused: -     ranked: -
+== The lexical leg finds videos whose words match, scored by BM25F.
+  query: "replace bike chain"            spell: ok
+  lang=en  intent=how-to  fresh=no       vector: ready (256-d)
+  lexical: 100 per shard x 100   semantic: -   fused: -   ranked: -
+== The semantic leg finds videos whose meaning is close to the query.
+  query: "replace bike chain"            spell: ok
+  lang=en  intent=how-to  fresh=no       vector: ready (256-d)
+  lexical: 10,000 -> 1,000   semantic: 50 x 20 = 1,000   fused: -
+== Reciprocal rank fusion merges both lists; videos in both rise.
+  video 77: lexical rank 3, semantic rank 8 -> 1/63 + 1/68 = 0.0306
+  video 91: lexical rank 1, semantic rank - -> 1/61 = 0.0164
+  lexical: 1,000   semantic: 1,000   fused: 1,000   ranked: -
+== The light ranker keeps 200; the cross-encoder scores them.
+  video 77 title: "Fix a slipped chain in 5 min"  (no word 'replace')
+  light score 0.71 -> heavy: rel 0.92, click 0.31, satisfied 0.24
+  lexical: -   semantic: -   fused: 200   ranked: 200 scored
+== Policy and diversity pick the first page of 20 results.
+  top 10: max 3 per channel, 1 live, 0 duplicates
+  video 77 at position 2; video 91 at position 5
+  page 1: 20 results       total time 180 ms
+== The viewer clicks video 77 and watches 6 minutes of 9.
+  event: click(77, pos 2), watch_ms=360000, ratio=0.67
+  label: satisfied search -> training pair (query, video 77)
+  next weekly training uses it; video 77 stats updated
+deepdive: Lexical leg details. BM25 scores a document for a query term t as
+\[ \text{score}(d,t) = \text{IDF}(t)\cdot\frac{f_{t,d}\,(k_1+1)}{f_{t,d}+k_1\,(1-b+b\,|d|/\text{avgdl})} \]
+Here \( f_{t,d} \) is the term frequency, \( |d| \) the field length and \( k_1 \) and \( b \) are tuning constants, often 1.2 and 0.75. Video text fields are short for titles and long for transcripts, so each field has its own length normalisation and boost (BM25F). A term in the title counts several times more than in the transcript. WAND-style algorithms keep an upper bound of the score per term and skip documents that cannot reach the current top-K threshold; this often cuts the work of a query by several times. The inverted index also supports phrases, filters and per-language analysers (tokenisation for Chinese and Japanese needs a segmenter; Hindi and Arabic need normalisation).
+Semantic leg details. The video tower takes frame embeddings, the title text embedding and the transcript embedding and combines them (an attention pooling or a small transformer). The text tower encodes the query. Both output 256 numbers with unit length. Training uses in-batch negatives: positives are (query, satisfied video) pairs; negatives are other videos in the batch plus hard negatives (videos shown above the clicked one that users skipped, and videos with high BM25 but low satisfaction). A known risk is the popularity bias: popular videos are positives in many pairs, so the embedding drifts towards them. We balance by sampling pairs with a cap per video and by adding a popularity-corrected term in the logit. The result is evaluated on rated queries where the right answer is an unpopular video.
+Moments. Long videos hold many topics. For moment search we split the transcript into 30-second windows with a 10-second overlap, and embed each window with the text tower plus the average frame embedding in that window. A moment hit returns the video id and the start time, and the player jumps there. Only popular and long videos get moments, because the index cost grows with video length: a 60-minute video has 120 windows. A second pass can add moments on demand when a video becomes popular.
+Freshness. News queries need videos from the last hours. The system detects freshness intent from the query (a model trained on logs where recent videos got clicks) and from query volume spikes (a stream job counts queries per entity in 5-minute windows). Fresh queries get a boost on recency and use only the in-memory segment plus the recent-days shards in the first stage. New videos have no engagement data, so we reserve a few slots for exploration, with a bandit that allocates impressions to uncertain new videos and learns their satisfaction rate quickly.
+Labels and bias. Clicks are biased by position, thumbnails and titles (clickbait gets clicks and short views). We use a satisfaction label (watch of at least 30 seconds or half the video) rather than a click, correct position bias with an examination model or randomised swaps on a small traffic share, and train a separate head for "skip within 10 seconds". Human relevance labels from raters, with guidelines and agreement checks, anchor the evaluation. LLM-based judges are used to label larger samples cheaply but are validated against humans on a monthly set.
+tradeoffs: Lexical only, semantic only or hybrid. Choose lexical-only (inverted index and BM25) when the corpus is small, text fields are good, and the queries are mostly exact names; it is cheap and explainable. Choose semantic-only when you have strong multilingual embeddings and mostly descriptive queries, and accept that exact tokens (version numbers, rare names) are weak. Choose hybrid for a video platform, where titles are noisy and queries are mixed. It costs two indexes, two pipelines and a fusion step, but it covers each leg's blind spots. Published reports of hybrid retrieval often show clear recall gains over either leg alone.
+Cross-encoder versus bi-encoder for the heavy stage. Choose a bi-encoder (separate query and video encoders, dot product) when you must score thousands of candidates cheaply and can precompute video vectors. Choose a cross-encoder (query and document read together) for the last 100 to 200 candidates, where the interaction between query words and the text matters; it is 100 times more costly per candidate and cannot be precomputed. A funnel uses the first for recall and the second for precision.
+Where to spend ASR budget. Choose high-quality ASR for videos likely to be searched (high views, long, in major languages), and a cheap model or titles and descriptions only for the long tail. Choose full ASR for everything only if transcripts are also needed for captions or policy review, since then the cost is shared. The risk of the cheap path is that unpopular but relevant videos become invisible; a periodic upgrade of videos that start getting traffic fixes this.
+failures: A lexical shard is slow or fails. The coordinator uses a 100 ms deadline per leg and returns what it has. A missing shard drops 1 percent of videos from the result. Replicas cover most failures; hedged requests handle slowness. Results from a partial answer are marked so that they are not cached for long.
+Indexing backlog. After a big event, uploads double and ASR falls behind. The pipeline processes the title and description first, so videos are findable by metadata. The enrichment queue is ordered by expected value (channel size, early views), and the backlog age is an alert metric. Low-priority videos get the cheap ASR path when the backlog is large.
+Bad model release. A new cross-encoder promotes irrelevant videos for a language. Offline evaluation by language slice, a shadow period comparing the overlap of top-10 results, a canary with guardrails (zero-click rate, reformulation rate, satisfied search rate) and an automatic rollback protect the system. Judgement sets are updated monthly to avoid overfitting.
+evolution: At 100,000 videos, a single search server with an inverted index over title and description is enough; add spell correction and synonyms. At 10 million videos, add transcripts from ASR and an embedding index with HNSW on one big machine, with RRF fusion, and a GBDT ranker trained on clicks. At 800 million videos and billions of queries, shard both indexes, add the funnel with a cross-encoder, the multimodal video embeddings, moment search for popular videos, progressive indexing, and a large human rating programme. At several billion videos, add per-language indexes and regional serving, learned routing of the queries to shards, a generative layer that answers with a summary and a time-coded citation to the moment, and query-time personalisation with strict privacy controls.
+followups: Why do you need both BM25 and embeddings? || BM25 is strong on exact words, rare names and model numbers, and gives explainable matches, but it fails on paraphrase and on videos with poor text. Embeddings handle meaning, other languages and visual content, but are weaker on exact tokens and cost more memory. Hybrid retrieval with fusion covers both. We measure the share of relevant results found only by each leg.
+How do you fuse two ranked lists with different score scales? || Reciprocal rank fusion uses only the ranks: a document gets the sum of 1/(k + rank) over lists, with k around 60. It needs no calibration. A learned model with both scores and many features does better with labels. Normalising scores per query is fragile because the distributions change with the query.
+How do you get a label for relevance when clicks are noisy? || Use satisfied watch as a label, not click only, correct position bias with randomised experiments or a click model, and combine with human ratings for evaluation. Use skip-within-10-seconds as a negative. Check by slice because clickbait varies by category.
+How would you handle a query like "where does he explain gradient descent in this lecture series"? || Detect the moment intent, search the moment index (transcript windows plus frame vectors), group hits by video, return the video with a start time, and let the cross-encoder rerank the windows. The player starts at the offset. Restrict the moment index to long videos to bound cost.
+How do you keep search latency under 250 ms with two retrieval legs and a cross-encoder? || Run the legs in parallel, use deadlines and hedged requests, keep the cross-encoder to 200 candidates with a distilled model on GPU in batches, cache head queries, and skip stages by intent (navigational queries skip the semantic leg). Track a latency budget per stage.
+ref: paper | Frozen in Time: A Joint Video and Image Encoder for End-to-End Retrieval | Bain et al., 2021 | https://arxiv.org/abs/2104.00650
+ref: paper | Learning Transferable Visual Models From Natural Language Supervision (CLIP) | Radford et al., OpenAI, 2021 | https://arxiv.org/abs/2103.00020
+ref: paper | Embedding-based Retrieval in Facebook Search | Huang et al., Facebook, 2020 | https://arxiv.org/abs/2006.11632
+ref: paper | Deep Neural Networks for YouTube Recommendations | Covington, Adams and Sargin, Google, 2016 |
+ref: paper | The Probabilistic Relevance Framework: BM25 and Beyond | Robertson and Zaragoza, 2009 |
+ref: book | Introduction to Information Retrieval | Manning, Raghavan and Schutze, 2008 |
+@@ people-you-may-know
+title: Design People You May Know
+category: AI & ML
+level: Senior / Staff
+concepts: gnn, graphdb, graphsalgo, funnel, embeddings, ann, clfmetrics, featureeng, idgraph, batchproc
+summary: People You May Know (PYMK) suggests other members whom a user may want to connect with. It is a link prediction problem on a social graph with a billion nodes and hundreds of billions of edges. Most suggestions come from the structure of the graph itself (friends of friends, shared workplaces or schools, address book matches), but the best systems also learn node embeddings with a graph neural network and rank with a model that predicts both that the user will send an invitation and that the other person will accept it. What makes it hard is scale (the number of candidate pairs is quadratic in the number of members), the heavy tail of the degree distribution (a few members have millions of connections), a two-sided objective, privacy (a wrong suggestion can expose a stalker, an ex-partner or a person who blocked you), and freshness (the best suggestion is often someone you just met). We design the candidate generators, the batch and real-time pipelines, the graph store, the ranking funnel and the evaluation.
+requirements: Functional requirements. The user sees a list of up to 20 suggested members on the home screen, in the "My network" tab and in emails and notifications. Each suggestion shows a name, a photo, a headline, and a reason such as "12 mutual connections" or "Also studied at IIT Madras". The user can connect, dismiss, or open the profile. A dismissed suggestion must not come back for at least 90 days. Suggestions must never include members who are already connected, who blocked the user, who are blocked by them, who have disabled discoverability, or who are minors when the viewer is an adult stranger. New members with no connections still get useful suggestions from their address book, employer and school. The list updates within minutes after a significant event (a new connection, a new job).
+Objective. The product goal is a healthy network, not a maximum number of invitations. We optimise the expected number of accepted connections that lead to later value (messages, shared engagement), with penalties for ignored invitations, spam reports and receiver overload. A simple form is \( V = p_{invite}\cdot p_{accept}\cdot(1 + \lambda\, v_{future}) - \mu\, p_{report} \), where \( v_{future} \) is a predicted value of the new connection. Because the receiver must also like the invitation, the model scores the pair in both directions.
+Metrics. We use the usual classification and ranking metrics. Offline: precision and recall at K and AUC on edges formed in a held-out future week, calibration of the invite and accept probabilities, and recall of each candidate generator. Online: invitations sent per impression, acceptance rate, accepted connections per user per week, share of users with at least 10 connections after 30 days, dismiss rate, spam and "I don't know this person" reports, and the Gini coefficient of invitations received (to detect a few members getting flooded).
+Non-functional requirements. Latency of 100 ms at p99 for the serving call. Freshness within minutes for events, with a full refresh of the precomputed lists daily. Availability 99.9 percent; if the system fails, the page shows no suggestion box, not an error. Privacy compliance: consent for address book use, deletion on request, no exposure of non-member data.
+Assumptions. 1 billion members, 300 million monthly active and 100 million daily active. Mean degree is 300 connections but the median is about 90. There are 150 billion undirected edges in total. Each daily active member sees the PYMK box 3 times a day.
+estimates: Graph size. 1 billion nodes with a mean degree of 300 means 300 billion adjacency entries (each edge is stored twice, once for each side), which is 150 billion edges. With a 4-byte delta-encoded id per entry (sorted lists compress well), the graph is 300 billion x 4 bytes = 1.2 TB, and 2.4 TB with 8-byte ids. This fits in memory of a cluster of 20 machines with 128 GB each, or it can sit on SSD.
+Naive pair count. Each member has 300 friends and each friend has 300 friends, so a member has up to 90,000 friend-of-friend paths. For 300 million active members this is 2.7 x 10^13 paths. In a real graph with a heavy tail, the sum of squared degrees is much larger than the mean squared: if the average of deg squared is 5 x 10^5 (not 9 x 10^4), the number of 2-hop paths for all members is 1 billion x 5 x 10^5 = 5 x 10^14. Shuffling this in a join would move more than 5 petabytes at 10 bytes per path. This cannot be done naively.
+Pruned pair count. We cap the intermediate friend at 2,000 connections (very large hubs are poor evidence of shared context: knowing a celebrity says little), sample at most 200 neighbours of each intermediate when the degree is high, and only compute for the 300 million active members. The paths fall to about 300 million x 300 x 100 = 9 x 10^12. A map-side combine groups equal (member, candidate) pairs before the shuffle and cuts the data by 5 times, so about 2 x 10^12 records x 12 bytes = 24 TB of shuffle. On a cluster of 3,000 cores this runs in several hours, which is acceptable for a daily batch job.
+Embeddings. A graph neural network with 128-dimensional float16 outputs gives 256 bytes per member; for 1 billion members this is 256 GB. Quantized (product quantization with 32 bytes) plus ids, the ANN index is 1 billion x 40 bytes = 40 GB. Inference with two layers and 25 sampled neighbours per layer touches 25 x 128 values per member per layer. With layer-wise full-graph inference, all 1 billion members are processed in about 2 to 4 hours on 100 GPUs, limited by memory traffic and not arithmetic.
+Serving load. 100 million daily active members x 3 views = 300 million calls per day, which is 3,500 per second on average and about 12,000 per second at peak. Each call reads one precomputed list (8 KB), fetches fresh features for 100 candidates, scores them with the online ranker and returns 20. Feature reads: 100 candidates x 3 stores = 300 reads per call, 3.6 million reads per second at peak, mostly served from a local cache.
+api: Suggestions: GET /v1/pymk?member_id=...&limit=20&surface=home returns {suggestions[]{member_id, score, reason_type, reason_text, mutual_count, mutual_sample[]}, impression_id}. Authenticated. The server removes anything the viewer must not see.
+Actions: POST /v1/pymk/actions with {impression_id, member_id, action: connect|dismiss|view|report}. Connect creates an invitation through the invitation service; dismiss writes a suppression with an expiry of 90 days.
+Contacts upload: POST /v1/contacts/uploads with {hashed_entries[], consent_token} returns {accepted_count}. Matching is done server side; non-members are never revealed or stored beyond the retention rule.
+datamodel: Graph store. Adjacency lists in a sharded key-value or graph database, keyed by member_id (hash partitioned), value a compressed sorted array of neighbour ids with a small edge attribute (connection time, strength bucket). An edge is written to both endpoints. A second index keyed by (company_id, year) and (school_id, year) holds member lists for shared-context generators; large groups (over 50,000 members) are split by time and department.
+```sql
+CREATE TABLE pymk_candidates (
+  member_id    BIGINT,
+  cand_id      BIGINT,
+  gen_mask     INT,         -- bit per generator that proposed the pair
+  mutual_cnt   INT,
+  adamic_adar  FLOAT,
+  ctx_overlap  FLOAT,       -- shared employer/school years
+  emb_cos      FLOAT,       -- cosine of GNN embeddings
+  contact_hit  TINYINT,     -- found in address book
+  score_batch  FLOAT,
+  computed_at  TIMESTAMP
+) PARTITIONED BY (dt DATE);
+
+CREATE TABLE pymk_impressions (
+  impression_id STRING, member_id BIGINT, cand_id BIGINT,
+  position INT, ts TIMESTAMP, features_ref STRING,
+  action STRING            -- none, connect, dismiss, report
+) PARTITIONED BY (dt DATE);
+```
+Suppression store. Keyed by (member_id, cand_id): dismissals, blocks, reports, pending invitations and existing connections, with expiry. It is checked on every serve and is the final authority. For fast checks a per-member Bloom filter of suppressed ids sits in the cache, backed by the exact store.
+Identity graph. A table that maps hashed contact keys (normalised email, phone) to member ids, and links accounts of the same person across devices or merged accounts. It supports contact matching and removes duplicates among candidates.
+Feature store. Online features per member (industry, seniority, location, activity level, last-active time, degree, invitation acceptance rate as sender and as receiver) and per pair (mutual count, shared groups, profile views either way, message history). Per-pair features are computed on demand for the 100 candidates from the graph store and a pair cache.
+design: Candidate generation. Several generators run in parallel and feed one pool, because each finds a different kind of person. Generator one, triangle closing: friends of friends ranked by the number of mutual connections and by Adamic-Adar weight, \( \sum_{z \in N(u)\cap N(v)} 1/\log |N(z)| \), which gives less weight to a mutual connection who knows everybody. Generator two, shared context: people who work or worked at the same company in overlapping years, studied at the same school and period, or share a group or event, with more weight for small groups. Generator three, address book: members whose email or phone appears in the user's uploaded contacts, or who have the user in their contacts (the reverse direction is very strong evidence). Generator four, embeddings: the nearest neighbours (approximate nearest neighbour search, ANN) of the user in a GNN embedding space, which find people with similar position in the graph and similar profile who do not share many direct mutual friends. Generator five, graph walks: personalized PageRank or random walks with restart from the user, which find nodes that are close through many short paths. Generator six, engagement: people who viewed the user's profile, who searched for the user, or who were just invited by the user's friends.
+Batch pipeline. A daily batch processing job on Spark reads the latest graph snapshot, computes the 2-hop counts with pruning, joins context tables and embedding neighbours, adds pair features (the feature engineering is shared with the online path), and scores the pairs with the light ranker. It writes the top 500 candidates per active member to the key-value store and to the training store. A weekly job refreshes the GNN embeddings and the ANN index; a daily job updates embeddings for members whose neighbourhood changed a lot.
+Real-time layer. Events such as a new connection, an accepted invitation, a job change or a contact upload go through a stream. A real-time generator handles the most valuable pattern: when A connects with B, B's neighbours become candidates for A and A's neighbours become candidates for B ("the friend of my new friend"). These candidates are written to a small per-member fresh list with a time to live of 3 days. Contact uploads trigger an immediate matching job for that member.
+Online ranking. The whole system is a multi-stage retrieval and ranking funnel: generators produce thousands of pairs, the batch scorer keeps 500, and the online ranker keeps 20. The serving call merges the batch list (500) and the fresh list, removes suppressed ids and anyone invalid, takes the top 100 by batch score, fetches fresh pair and member features, and scores them with a heavy ranker. The heavy ranker predicts \( p_{invite} \), \( p_{accept} \) and negative outcomes (dismiss, report) and combines them into a value score. A post-processing step enforces diversity (not 20 people from one company), caps the number of candidates from the same weak signal, and applies receiver protection: members who have received many pending invitations are penalised. The top 20 are returned with the reason text of the strongest signal.
+diagram:
+  graph snapshot (daily)      events (stream)       contacts upload
+        |                          |                      |
+        v                          v                      v
+  +-----------------+     +------------------+   +----------------+
+  | batch (Spark)   |     | real-time gens   |   | identity graph |
+  | 2-hop, context, |     | new-friend path  |   | contact match  |
+  | PPR, GNN nbrs   |     +------------------+   +----------------+
+  +-----------------+              |                      |
+        | top 500 / member         | fresh list (TTL 3d)  |
+        v                          v                      |
+  +--------------------------------------------+          |
+  | candidate store (KV, 300M members x 8 KB)  |<---------+
+  +--------------------------------------------+
+        |
+        |  GET /pymk
+        v
+  +-----------+  merge  +-----------+  100  +----------------+
+  | serving   |-------->| suppress  |------>| heavy ranker   |
+  | service   |         | + filters |       | invite, accept |
+  +-----------+         +-----------+       +----------------+
+        ^                    ^                     | top 20, diversity
+        |                    |                     v
+  +-------------+     +-------------+         response + impression log
+  | graph store |     | feature     |                |
+  | adjacency   |     | store       |                v
+  +-------------+     +-------------+      training store -> GNN, ranker
+animation:
+== Maria accepts Raj's invitation. The event enters the stream.
+  event: connect(Maria, Raj)
+  Maria nbrs: A, B, C          Raj nbrs: X, Y, Z
+  Maria fresh list: -          Raj fresh list: -
+== The real-time generator proposes Raj's friends to Maria and back.
+  event: connect(Maria, Raj)
+  candidates for Maria: X, Y, Z (via Raj)
+  candidates for Raj: A, B, C (via Maria)     lists not stored yet
+== The suppression store removes people already connected or dismissed.
+  Maria candidates: X, Y, Z -> Y dismissed 30 days ago, removed
+  Raj candidates:   A, B, C -> all valid
+  Maria fresh: X, Z (pending)  Raj fresh: A, B, C (pending)
+== Fresh candidates are written with a 3-day time to live.
+  Maria fresh list: X, Z  (TTL 3 days)
+  Raj fresh list:   A, B, C (TTL 3 days)
+  batch list (500) unchanged until tonight
+== Next day Maria opens the app. The serving call merges both lists.
+  batch 500 + fresh 2 -> 502 unique -> top 100 by score
+  mutual counts fetched from the graph store
+  suppress check passed         features fetched
+== The heavy ranker scores 100 pairs; the top 20 are returned.
+  X: p_invite 0.31 p_accept 0.72 value 0.22 reason: 14 mutual
+  Z: p_invite 0.18 p_accept 0.65 value 0.11 reason: 3 mutual
+  returned 20, X at position 1    impression logged
+== Maria sends an invitation to X; the outcome becomes a label.
+  action: connect(Maria, X) -> pending
+  X accepts in 2 hours -> label accept=1
+  pair (Maria, X) is positive for tomorrow's training
+deepdive: Pruning the two-hop computation. The core of triangle closing is a join of the edge table with itself on the middle node. Its cost per middle node of degree d is d squared, so a few hubs dominate. We apply four rules: skip middle nodes above a degree cap (2,000), down-sample the neighbours of large middle nodes, weight each path by 1/log(d) so that hubs matter less even when kept, and only emit pairs for members who need suggestions (active or new). Then we aggregate counts per (member, candidate) pair with a combiner. A second trick uses sorted adjacency lists and intersection by merge or by bitmaps to count mutual connections for a specific pair in time proportional to the shorter list. Another trick is locality-sensitive hashing of neighbour sets (MinHash) to find pairs with high Jaccard overlap without enumerating all paths.
+The graph neural network. A GNN builds an embedding of each member from its own features and from its neighbours. In a GraphSAGE-style layer, the new vector of node v is
+\[ h_v^{(k)} = \sigma\left( W^{(k)} \cdot \text{concat}\left(h_v^{(k-1)},\ \text{mean}_{u \in S(v)}\, h_u^{(k-1)}\right) \right) \]
+Here S(v) is a sample of neighbours. Two layers cover friends and friends of friends. Training uses link prediction: a connected pair should have a high dot product, and random or hard non-connected pairs a low one, with a loss such as \( \mathcal{L} = -\log \sigma(z_u^\top z_v) - \log \sigma(-z_u^\top z_n) \). Hard negatives are 2-hop neighbours who never connected, since random pairs are too easy. Because the layers use features, the model works for new members (inductive learning) and handles missing edges. For serving we run full-graph layer-wise inference, then index the vectors for ANN.
+Two-sided objective and receiver load. A suggestion that is sent but ignored is a cost to the receiver (a notification) and to the sender (a feeling of rejection). So the ranker predicts acceptance and we multiply. We also track the number of pending invitations per receiver. If a popular member already has 200 pending, the penalty grows. Without it, the system sends everyone to the same few popular members, who stop trusting the product.
+Privacy and safety. Suggestions can leak information: showing a person who looked at your profile reveals that they did; a suggestion based on a contact match reveals that a person has your phone number. We follow strict rules: no suggestions that expose the viewing behaviour unless the product tells the user; honour block lists in both directions; no suggestions between a victim and a reported abuser; limit the use of address book data to matching; do not show sensitive reasons (health, religion); and test the system with privacy reviews. A "do not suggest me" setting is applied before any candidate is shown. Contact data in hashed form is still personal data, because a phone number space is small and hashes can be reversed by brute force, so we treat it as such.
+Evaluation without leakage. We freeze the graph at time T, generate suggestions as the system would have, and compare with edges formed in [T, T+7 days]. Random splits leak, because a future edge can help predict a past one through triangles. We also compare the recall by generator and by segment (new users, sparse users, dense users), since the average hides the new-user problem. Offline gains are checked online because suggestions also change behaviour: people connect with people the system shows them, so logs are biased by the previous system. We use a small random exploration slice to estimate the true acceptance rate of candidates that the ranker would not show.
+tradeoffs: Batch versus real time. Choose daily batch candidate generation when the graph changes slowly in relation to the refresh (most members add a few connections a week), when the computation is large (24 TB of shuffle), and when you can afford a few hours of staleness. Choose real-time generation for the high-value events (a new connection, a job change, a contact upload) where relevance decays in days. The hybrid costs two code paths that must produce comparable scores, so share the feature code and keep real-time rules simple.
+Counts and rules versus GNN. Choose rule-based generators (mutual connections, shared context) first. They are cheap, explainable, strong, and give a reason string for the user. Choose to add a GNN when you have many sparse members, enough engineering for GPU training and embedding serving, and a ranking model that can use the extra signals. A GNN is not a replacement; it adds recall in the long tail at the price of inference over 1 billion nodes and weekly retraining.
+Graph database versus key-value adjacency lists. Choose a graph database with a query language when you do many ad-hoc multi-hop traversals, need flexible schema and the graph fits a cluster with good traversal speed. Choose adjacency lists in a sharded key-value store plus batch processing for the main path when the graph is the hot dataset, the queries are simple (neighbours, intersection) and you need predictable sub-millisecond latency at 100,000 reads per second. Most large social networks use a purpose-built graph store, because a general graph database does not scale as easily to 300 billion entries.
+failures: The batch job fails or is late. The candidate store keeps yesterday's lists, with their timestamps. The serving layer still works with older lists and the fresh real-time list. A freshness alert fires at 6 hours, and a degraded fallback computes 2-hop candidates on request for the 5 percent of members whose list is older than 3 days.
+A graph store shard is slow. Mutual counts and neighbour lists are needed for fresh pair features. Each lookup has a 20 ms timeout. On timeout, the ranker uses the pair features from the batch table (the pre-computed mutual count) and sets the missing flag for other features. Candidate quality drops slightly, and the call finishes.
+Stale suppression. A member blocks another one, and the batch list still has the pair. The suppression check at serve time is the authority and reads the live suppression store; it must be strongly consistent for blocks. A failure of this store is treated as a failure of the whole feature for that call (fail closed): it is better to show nothing than to show a blocked person.
+Spam and fake accounts. Fake profiles use the system to find victims, or create many connections to look real. The ranker uses account trust scores, new accounts get a stricter invitation limit, and clusters of accounts with tight connections to each other and few outside edges are detected by graph algorithms (connected components, label propagation, density) and removed from the candidate pools.
+evolution: At 100,000 members, a single database with an edges table and one SQL query for friends of friends ranked by mutual count is enough. At 10 million members, move the graph to adjacency lists in a key-value store, run a nightly batch job for 2-hop candidates and add a simple model on 20 features trained on past invitations. At 100 million members, add the shared context and address book generators, the real-time new-connection path, the feature store, and the two-sided ranker. At 1 billion members, add GNN embeddings with ANN retrieval, degree-aware pruning of all graph jobs, large-scale privacy review, anti-abuse graph analysis and exposure caps, and run separate regional stacks for data residency.
+followups: Why is the naive friend-of-friend computation impractical, and how do you fix it? || The number of two-hop paths is the sum of squared degrees, which with hubs reaches 10^14 to 10^15 for a billion members, and shuffling it costs petabytes. Fix it with a degree cap, neighbour sampling, weights like 1/log(degree), computation only for active members, map-side combining and top-K per member.
+Why predict acceptance as well as invitation? || An invitation that the receiver ignores is a cost to the receiver and does not create a connection. The value of a suggestion is the chance of an accepted connection, so the score multiplies the sender's chance to invite by the receiver's chance to accept, and adds penalties for reports and receiver overload.
+How does a GNN handle a new member? || GraphSAGE-style models are inductive: they compute the embedding from the member's features and sampled neighbours, so a new member gets an embedding as soon as it has features and a few edges. The weights do not depend on the node id. Rebuild or add the new vector to the ANN index in the delta segment.
+How do you stop the system from suggesting someone the user blocked or who blocked them, or an abuser? || Apply suppression at serve time against a strongly consistent store for blocks and safety flags, in both directions, as the last filter, and fail closed when the store is not reachable. Exclude such pairs from generators too and from emails and notifications.
+ref: paper | Inductive Representation Learning on Large Graphs (GraphSAGE) | Hamilton, Ying and Leskovec, 2017 | https://arxiv.org/abs/1706.02216
+ref: paper | Graph Convolutional Neural Networks for Web-Scale Recommender Systems (PinSage) | Ying et al., Pinterest, 2018 | https://arxiv.org/abs/1806.01973
+ref: paper | Link Prediction Based on Graph Neural Networks (SEAL) | Zhang and Chen, 2018 | https://arxiv.org/abs/1802.09691
+ref: paper | The Link Prediction Problem for Social Networks | Liben-Nowell and Kleinberg, 2003 |
+ref: paper | Friends and neighbors on the Web | Adamic and Adar, 2003 |
+ref: book | Networks, Crowds, and Markets | Easley and Kleinberg, 2010 |
+@@ event-recs
+title: Design event recommendations
+category: AI & ML
+level: Senior / Staff
+concepts: recsys, funnel, spatialidx, featureeng, featurestore, boosting, bandits, clfmetrics, experimentation
+summary: An events platform lists concerts, meetups, classes, markets and sports games. Event recommendation chooses, for each user, a short ranked list of events that are near them, happen at a time they can attend, and match their taste. It looks like a normal recommender system, but four things change the design. Every item is new and expires: an event has a date, so there is almost no click history for it when it matters most, and it disappears after it happens. Location is a hard filter: an event 400 km away is useless however good it is. Time is a hard filter too, and it has structure (tonight, this weekend, next month, a recurring weekly class). And supply is limited: a venue has 80 seats, so showing the event to 100,000 users makes no sense. We design the geo and time candidate retrieval with a spatial index, the ranking funnel with gradient boosted trees, cold-start exploration with bandits, the feature pipelines, and the evaluation.
+requirements: Functional requirements. The home screen shows a ranked list of 30 events with a title, image, date, venue, distance, price and a reason ("3 friends are going", "Because you attended Jazz Night"). Tabs and filters: Today, This weekend, Next 30 days, category, price, online or in person, and distance. A weekly email and push notifications recommend a few events. The system excludes cancelled, sold-out, past, age-restricted (for users who do not qualify) and conflicting events (the user already has a ticket for the same time). Users can say "not interested" or hide an organiser. Results update within minutes when an event is created, sold out or cancelled.
+Objective. Predict the probability that a user will RSVP or buy a ticket for an event if it is shown, and the probability that they will attend. We optimise a value score close to expected attendance, \( V = p_{rsvp}\cdot p_{attend|rsvp} \), with constraints: no more than the remaining capacity share (diminishing value when an event is nearly full), diversity, and organiser fairness (new organisers must get a chance). Attendance is the best label but arrives after the event, so RSVP and ticket purchase are the main training labels, and check-in is a second, delayed label.
+Metrics. Offline: NDCG at 10 and recall at 20 of future RSVPs, AUC and log loss with calibration per slice (city size, category, time to event), coverage of events (share of upcoming events that get at least 50 impressions before they happen), and distance and diversity statistics of the lists. Online: RSVP per thousand impressions, attendance rate, ticket revenue, notification opt-out rate, hide rate, and organiser-side metrics such as the share of events that reach 50 percent of capacity.
+Non-functional requirements. Latency: 150 ms at p99 for the home list. Freshness: a new event is recommendable in 5 minutes. Availability 99.9 percent, with a fallback of "popular events near you". Privacy: location is coarse (a cell of about 36 square kilometres), precise location is used only with permission and never stored in training data.
+Assumptions. 100 million monthly users, 20 million daily active. 6 million upcoming events at any time (100,000 new events per day with an average lead time of 60 days). A big city has 20,000 upcoming events within 25 km, a typical city 1,500, and a small town 50. A user opens recommendations 3 times a day on average.
+estimates: Request load. 20 million daily users x 3 calls = 60 million calls per day, divided by 86,400 is 700 per second on average. Traffic peaks on weekday evenings and Thursday and Friday (planning the weekend); we use a peak factor of 5, so 3,500 per second.
+Geo-time candidate sizes. A 25 km radius is covered by hexagonal cells of about 36 square kilometres (H3 resolution 6). A hexagon of 36 square kilometres has a distance between neighbouring centres of about 6.5 km (the square root of 2 x 36 / 1.73). So 25 / 6.5 is about 4 rings around the user's cell: 1 + 3 x 4 x 5 = 61 cells. With a 30-day time window, a typical city gives about 1,500 candidates and a big city 20,000. After a cheap eligibility filter (not full, not conflicting, user's age, category blocks), about 60 percent remain.
+Ranking cost. The light stage keeps the top 500 of up to 20,000 candidates using 6 cheap features and a linear scoring rule: 20,000 x 50 ns = 1 ms. The boosted tree model has 500 trees of depth 6, so about 3,000 comparisons per score and about 5 to 10 microseconds. 500 candidates x 10 microseconds = 5 ms per call on one core. At 3,500 calls per second this is 17.5 cores. With 3x headroom and feature fetch overhead, 100 cores is plenty. The ranking is cheap; the effort is in features and data.
+Features and storage. User features: 100 million x 2 KB = 200 GB (category affinity vectors with decay, distance preferences, day-of-week and hour profile, attendance history summary, price band). Event features: 6 million x 1 KB = 6 GB, with live counters. Social features need the friend list of the user (average 150 friends) and the RSVP lists of events: a join of 150 friends with events in the candidate set; we precompute "friends going" counts for each candidate through a stream job.
+Training data. 60 million calls x 30 shown events = 1.8 billion impressions per day. RSVP rate per impression is about 0.3 percent, so 5.4 million positives. We keep all positives and 5 percent of negatives: 5.4 million + 90 million = about 95 million rows per day, and train on 60 days (5.7 billion rows). With 150 features at 4 bytes each, a row is 600 bytes, so 3.4 TB. Gradient boosted trees train on this in about an hour on a cluster of 50 machines with histogram-based algorithms.
+api: Home list: GET /v1/recs/events?limit=30&cursor=...&time=weekend&radius_km=25&categories=music,tech&online=false returns {items[]{event_id, score, reason_type, reason_text, distance_km, starts_at}, next_cursor, impression_id}. Location comes from the user's profile cell, or from a coarse cell sent by the app when the user allows it.
+Similar events: GET /v1/events/{event_id}/similar?limit=10 returns events like this one (same category, nearby, different dates, same series).
+Feedback: POST /v1/recs/events/feedback with {impression_id, event_id, action: view|rsvp|buy|hide_event|hide_organizer|not_interested|share, ts}. Check-in events come from the ticket scanner or the app: POST /v1/events/{event_id}/checkins.
+Event ingest (organiser tools): POST /v1/events creates an event, PATCH /v1/events/{id} changes time, venue or capacity, POST /v1/events/{id}/cancel cancels it. Each call emits an event-changed message for the indexer.
+datamodel: Event table (document store or SQL): event_id, series_id (for recurring events), organiser_id, title, description, category ids, starts_at, ends_at, timezone, venue_id, lat, lng, h3_r6 (cell id), h3_r8, capacity, tickets_sold, price_min, price_max, online flag, age limit, status (draft, live, sold_out, cancelled, past), created_at.
+```sql
+CREATE TABLE event_geo_index (
+  h3_r6      BIGINT,         -- cell id of the venue
+  start_day  DATE,
+  starts_at  TIMESTAMP,
+  event_id   BIGINT,
+  category   SMALLINT,
+  status     TINYINT,
+  PRIMARY KEY (h3_r6, start_day, starts_at, event_id)
+);
+
+SELECT event_id
+FROM event_geo_index
+WHERE h3_r6 IN (:cells)               -- k-ring of the user's cell
+  AND start_day BETWEEN :d0 AND :d1
+  AND status = 1;
+```
+Interaction log. Impressions (user, event, position, ts, features_ref, source), actions (view, rsvp, buy, hide, share) and check-ins. Partitioned by day. The impression row stores the feature values served, so training can rebuild the exact input.
+Feature store. Online keys: "user:{id}" (affinity, history, home cell, distance profile), "event:{id}" (static features, live RSVP counters and velocity), "series:{id}" (number of past editions, average attendance), "org:{id}" (organiser quality: cancellation rate, average rating, attendance ratio), "friends_going:{user_id}" (candidate events with friend counts, refreshed every 10 minutes). Offline tables keep the same features by timestamp for point-in-time training.
+design: Candidate generation. The request starts with the user's cell and the requested time window. The service computes the k-ring of cells around the user and reads the event ids for those cells and days from the geo index (a spatial index with a time dimension). Hexagonal cells such as H3 are used because all six neighbours are at the same distance, which makes radius queries uniform, and because every cell has a parent cell, so large events and low-density regions can use a coarser level. Geohash and S2 work in the same way. Besides the geo candidates, the service adds online events, events from series the user attended before (even if far away, flagged), events that friends are attending, and the top popular events in the region. The union is deduplicated and filtered, leaving 1,500 to 20,000 candidates.
+Light stage. A cheap score keeps the best 500. It uses distance, time to event, category match, popularity in the last 24 hours and organiser quality, combined by a hand-tuned or learned linear function. The aim is recall: never drop a candidate the main model would put in the top 30. We measure "recall of the main model's top 30 within the light stage's top 500" and keep it above 98 percent.
+Main ranker. Gradient boosted decision trees trained with a ranking objective (LambdaMART) score the 500 candidates. Boosted trees are a good fit here: features are mostly numeric and categorical with strong interactions (distance matters less for a festival than for a yoga class), data volume is hundreds of millions of rows, training takes an hour, inference is microseconds, and they work well with missing values. The model outputs a score used for ordering; a second model with a logistic objective gives calibrated \( p_{rsvp} \), used for thresholds in notifications and for value computation.
+Features. Feature engineering carries most of the quality. User-event cross features: distance in km and its ratio to the user's typical travel distance (a person who usually goes 3 km is unlikely to go 25 km); time features (hours until the event, day of week and hour of day compared with the user's attendance profile, weekend or weekday); category match (cosine between the user's category affinity vector and the event's category vector); text similarity (embedding of the event title and description versus the average embedding of events attended); price relative to the user's usual price; series familiarity (the user attended this series 3 times); organiser affinity; social features (number of friends going, whether a close friend is going, number of friends who attended earlier events of this organiser); popularity features (RSVPs so far, RSVP velocity in the last 6 hours, fill ratio, days since creation); and context (current day, device, location accuracy).
+Re-ranking and slotting. After scoring, a re-ranker builds the list of 30. It limits the number of events per category and organiser, makes sure the list has time diversity (some for tonight, some for the weekend, some later), adds one or two exploration slots, and removes events that conflict with each other or with the user's calendar (an RSVP at the same time). A time-aware rule deprioritises events that start within 2 hours when the user is far away. The reason text is chosen from the strongest feature.
+Cold start and exploration. A new event has zero RSVPs, but it may be great. The model uses the event's content, the organiser's history and the series history, so it is not blind. In addition, a bandit allocates a small exploration budget. For each new event we keep a Beta distribution of its RSVP rate per impression, initialised from the prior (organiser and category average) with a weight of about 100 pseudo-impressions. At serving time, for exploration slots, we draw a sample from each candidate's Beta (Thompson sampling) and pick the highest. The budget is limited in time: an event that starts in 3 days needs its learning in the first day, so exploration weights grow when the date is near and the event has few impressions. A capacity guard stops exploration when the remaining seats are low.
+Supply awareness. If an event has 80 seats and 70 are taken, showing it to 10,000 users creates frustration. The value score includes a term for the expected fill: events likely to sell out soon are shown to fewer users with a high \( p_{rsvp} \), and sold-out events are removed by a status update that arrives from the ticket service within seconds. For events with a lot of free capacity, a boost helps organisers.
+diagram:
+  user opens app (cell c, window "weekend")
+        |
+        v
+  +----------------+   k-ring(c, 4) = 61 cells
+  | geo/time index |   + online + series + friends + popular
+  | (H3 cells x day)|--------------------------+
+  +----------------+                           |
+                                               v
+                                  +------------------------+
+                                  | filter: status, age,   |
+                                  | conflicts, blocks      |
+                                  +------------------------+
+                                               | 1.5k-20k
+                                               v
+                                  +------------------------+
+                                  | light stage (linear)   |
+                                  +------------------------+
+                                               | 500
+                                               v
+   +-------------+  user/event/cross   +------------------------+
+   | feature     |-------------------->| GBDT ranker (LambdaMART)|
+   | store       |                     | + calibrated p(rsvp)   |
+   +-------------+                     +------------------------+
+                                               | scores
+                                               v
+                                  +------------------------+
+                                  | re-rank: diversity,    |
+                                  | time slots, bandit slots|
+                                  +------------------------+
+                                               | 30
+                                               v
+                                         response + log
+  event created/changed/sold out -> stream -> index + live counters
+  RSVP/click/check-in -> log -> labels -> nightly GBDT training
+animation:
+== Sara opens the app on Thursday evening and asks for "this weekend".
+  user cell: c = 862a1072fffffff           window: Sat-Sun
+  candidates: -                             after filter: -
+  light stage: -    ranker: -               list: -
+== The service builds the k-ring of cells and reads the geo index.
+  user cell: c = 862a1072fffffff           window: Sat-Sun
+  cells: 61     events read: 3,400          after filter: -
+  light stage: -    ranker: -               list: -
+== Eligibility removes sold-out, conflicting and age-restricted events.
+  user cell: c = 862a1072fffffff           window: Sat-Sun
+  cells: 61     events read: 3,400          after filter: 2,100
+  light stage: -    ranker: -               list: -
+== The light stage keeps the 500 events with the best cheap score.
+  user cell: c = 862a1072fffffff           window: Sat-Sun
+  cells: 61     events read: 3,400          after filter: 2,100
+  light stage: 500 kept    ranker: -         list: -
+== The GBDT scores 500 events with 150 features each in 5 ms.
+  event 9001 jazz night: dist 2 km, 2 friends going -> p_rsvp 0.041
+  event 9250 new startup meetup: no history -> p_rsvp 0.012 (prior)
+  light stage: 500    ranker: 500 scored   list: -
+== The re-ranker mixes days and categories and adds a bandit slot.
+  slot 1 Sat jazz night   slot 2 Sun farmers market ...
+  slot 9 (explore): startup meetup, Thompson draw 0.031 wins
+  light stage: 500    ranker: 500          list: 30 events
+== Sara RSVPs to the jazz night; the new meetup gets an impression.
+  log: impression(9250, pos 9)  action: rsvp(9001)
+  Beta for event 9250: (a=1.2, b=98.8) -> (1.2, 99.8) after no RSVP
+  labels written; tomorrow's model learns from them
+deepdive: Location handling. The user's location has three sources: the declared home cell, the current coarse location from the app (when permitted), and the cell of recent attendance. The service uses the current location when the user travels (the distance to home above 100 km) and shows a "you are in Lisbon" mode. We learn a distance preference per user: the median and 90th percentile of distances of events attended. Features are relative: distance divided by the user's typical radius. For dense cities, the nearest 61 cells give thousands of candidates; for small towns the system widens the radius by moving up one level in the cell hierarchy (resolution 5, about 253 square kilometres) until it has at least 100 candidates. Event venues near cell borders are indexed in neighbouring cells as well so that a radius query does not miss them. Distance is computed exactly (great-circle distance) after the cell filter.
+Labels, bias and delayed outcomes. RSVP is a choice made after seeing the event, so the data tells us about shown events only. Position bias exists: the first item gets more RSVPs. We log the position, include it in training, and set it to a constant at serving time. A second effect is capacity: an RSVP to a free event is cheap and many people do not come, so RSVP over-states interest; the attendance label (check-in) corrects it. Attendance is known only after the event, so we train a second model on past events and blend: the RSVP model gives fast signals and the attendance model removes events with a high no-show rate. Paid ticket purchase is the cleanest signal and gets a higher weight.
+Exploration under a deadline. Standard bandit analysis assumes unlimited time. An event has a deadline. If an event is created 5 days before it starts, there are only 5 days to learn its attractiveness, and the best seat-fill is reached with early information. We use Thompson sampling with a prior from the organiser and category, with a weight that grows with the remaining time, and with a cap on exploration share (3 to 5 percent of slots). Exploration should be placed where the user can most easily say no: a lower position or a "new in your area" shelf. We evaluate it by comparing the final fill of explored versus unexplored similar events, and the cost in RSVP rate.
+Experimentation with limited supply. Events have limited seats, so two users in different experiment arms compete for the same seats. If the treatment arm is better at selling the seats of an event, the control arm sees the event sold out earlier, and the measured gain is partly a transfer, not a net gain. The standard user-level A/B test can therefore over- or under-state effects. We use cluster randomisation by city or by region for changes that affect supply, measure total attendance per event and per organiser as well as per-user RSVP, and run tests over at least two full weekly cycles because behaviour has a weekly rhythm. For purely ranking-quality changes in high capacity events, user-level tests remain fine.
+tradeoffs: Content-based versus collaborative filtering. Choose content-based and feature-driven ranking (the design above) when items are short-lived and every event is new: collaborative filtering needs item history, which events never have before the date. Choose collaborative signals (embeddings from user-event matrices) for the stable entities around events: organisers, venues, series and categories. A two-tower model that embeds users and organisers adds recall and can feed the ranker as a feature, at the cost of a training pipeline and an index.
+Boosted trees versus neural networks. Choose gradient boosted trees when the features are mostly tabular, the training set is up to a few billion rows, you need fast iteration, and the team wants to explain the ranking to organisers. Choose a neural network when you add text and image embeddings of events end to end, many sparse ids, or multi-task learning (RSVP, attendance, hide) with shared layers. A common path is trees first, then a neural model whose output becomes a feature in the trees.
+Spatial index choice. Choose H3 hexagons when you need uniform neighbour distances, k-ring queries and a clean hierarchy; choose S2 cells when you work on the sphere with polygon coverings and your stack already has it; choose geohash when you need a simple string prefix that works in any key-value store or SQL database, and accept the uneven cells and edge effects at cell borders. For a few million events, even a plain R-tree or a database with a geospatial index (PostGIS) is enough; a custom cell index wins when you need in-memory lookups at thousands of queries per second.
+failures: The geo index is stale. A new event or a venue change is not in the index for 30 minutes. The indexer reads the event-changed stream and applies updates to the in-memory index in seconds. A lag alert fires at 5 minutes. If the index is down, serving machines use their last in-memory copy, and the status filter at read time (a quick lookup of event status from the cache) protects against cancelled or sold-out events.
+A cancelled or sold-out event is shown. Users hate this. The final filter checks the live status of the 30 chosen events with one batch lookup (about 2 ms) before returning, and the client re-validates when the event page opens. Push notifications are checked again at send time.
+Model or feature failure. If the feature store is slow, the main ranker runs with defaults and the light stage score; if the model service fails, the light stage with a popularity rule serves the list. A bad model version is caught by shadow scoring and a canary with guardrails on RSVP rate per impression, list distance distribution and hide rate. Rollback takes a minute.
+evolution: With 1,000 events in one city, sorting by date and distance in SQL is enough. At 100,000 events, add the cell index and a logistic regression on distance, time and category. At 6 million events, use the funnel with a boosted tree ranker, live counters, social features and the bandit for new events. At global ticketing scale, add multi-task neural models with text and image embeddings, two-tower retrieval for organisers and series, and supply-aware optimisation.
+followups: Why not use collaborative filtering as the main method? || Events are new and short-lived, so at the time we need to recommend them they have almost no interactions. Collaborative filtering needs item history. Use content, organiser, series and context features for the event, and use collaborative signals for stable entities like organisers and categories. Embeddings of those entities can feed the ranker.
+How do you retrieve candidates by location and time efficiently? || Index events by spatial cell (H3, S2 or geohash) and start day. For a user, compute the cells that cover the radius (a k-ring), read the event ids in those cells for the time window, filter by exact distance, and merge with other sources. Cell-level lookups are in memory and take microseconds. Widen the cell level in sparse areas.
+How do you handle a brand new event with no data? || Use a prior from the organiser, series and category as features and as the start of a Beta distribution, add a small time-bounded exploration budget with Thompson sampling, and place explored events where the cost is low. Monitor the final fill of explored events and the exploration cost.
+How would you run an A/B test when events have limited seats? || Users compete for seats, so arms interfere. Use cluster randomisation by city or region for supply-affecting changes, measure attendance and fill per event and per organiser as well as per user, run for at least two weekly cycles, and use a user-level test only for changes that do not change which seats are taken.
+How do you make sure a sold-out or cancelled event is never shown? || Keep the status in the index and apply a final live status check on the chosen items just before returning. Push status changes through a stream to the index and cache within seconds. The client checks again when opening the event, and notifications check at send time.
+ref: paper | LightGBM: A Highly Efficient Gradient Boosting Decision Tree | Ke et al., 2017 |
+ref: paper | XGBoost: A Scalable Tree Boosting System | Chen and Guestrin, 2016 | https://arxiv.org/abs/1603.02754
+ref: paper | From RankNet to LambdaRank to LambdaMART: An Overview | Burges, Microsoft Research, 2010 |
+ref: paper | A Tutorial on Thompson Sampling | Russo et al., 2018 |
+ref: docs | H3: Uber's Hexagonal Hierarchical Spatial Index | Uber, H3 documentation | https://h3geo.org/
+ref: book | Trustworthy Online Controlled Experiments | Kohavi, Tang and Xu, 2020 |

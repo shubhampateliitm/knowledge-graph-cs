@@ -205,7 +205,7 @@ def({ id:"binsearch", group:"Searching", title:"Binary search", concepts:["bigo"
     R.step(6, `lo passed hi: ${t} is not in the array (${R.c.cmp||0} comparisons).`, S({lo, hi})); },
   draw(s){ return cells(s.a, {[s.mid]:s.found!==undefined?"done":"cmp"}, ptrs({lo:s.lo, mid:s.mid, hi:s.hi}), i=>i<s.lo||i>s.hi); } });
 
-def({ id:"twoptr", group:"Searching", title:"Two pointers: pair with a target sum", concepts:["bigo","sorting"],
+def({ id:"twoptr", group:"Arrays & strings", title:"Two pointers: pair with a target sum", concepts:["bigo","sorting"],
   text:"In a sorted array, find two values that add up to the target. Start one pointer at each end. If the sum is too small, only moving the left pointer right can make it bigger; if too big, move the right pointer left. Each step rules out one value for good, so it is O(n) instead of checking all O(n²) pairs.",
   inputs:[{k:"a", label:"Numbers (sorted for you)", def:"1, 3, 4, 6, 8, 11, 14, 15, 19"},{k:"t", label:"Target sum", def:"25", w:6}],
   random:()=>{ const a = [...new Set(Array.from({length:10},()=>rint(1,40)))].sort((x,y)=>x-y); return {a:a.join(", "), t:String(a[rint(0,3)]+a[rint(5,a.length-1)])}; }, counters:["cmp","steps"],
@@ -220,7 +220,7 @@ def({ id:"twoptr", group:"Searching", title:"Two pointers: pair with a target su
     R.step(6, `The pointers met: no pair adds up to ${t}.`, {a, i, j}); },
   draw(s){ return cells(s.a, {[s.i]:s.found?"done":"cmp", [s.j]:s.found?"done":"cmp"}, ptrs({i:s.i, j:s.j}), k=>k<s.i||k>s.j); } });
 
-def({ id:"window", group:"Searching", title:"Sliding window: longest substring without repeats", concepts:["hashtables","bigo"],
+def({ id:"window", group:"Arrays & strings", title:"Sliding window: longest substring without repeats", concepts:["hashtables","bigo"],
   text:"Keep a window [left, right] with no repeated character, and a map from each character to the last place it was seen. Move right one step at a time; if the new character is already inside the window, jump left to just after its last position. Each pointer only moves forward, so the whole scan is O(n).",
   inputs:[{k:"s", label:"Text (up to 24 characters)", def:"abcabcbbxyzab"}],
   random:()=>({s:Array.from({length:rint(10,16)},()=>"abcdefg"[rint(0,6)]).join("")}), counters:["cmp"],
@@ -923,7 +923,682 @@ def({ id:"knapsack", group:"Dynamic programming", title:"0/1 knapsack", concepts
     R.step(5, `Take items ${take.map(x=>"#"+x).join(", ")||"none"}: weight ${take.reduce((s,x)=>s+w[x-1],0)}, value ${T[n][W]}.`, S({path, note:"take: "+take.map(x=>"#"+x).join(", ")})); },
   draw:dpDraw });
 
-const GROUPS = ["Sorting","Searching","Graphs","Data structures","Probabilistic & distributed","Dynamic programming"];
+/* ================= interview patterns: each one pairs with a template in content/practice/templates.json ================= */
+Object.assign(COUNT, {push:"pushes", pop:"pops", calls:"calls", depth:"deepest stack", memo:"cache hits", prune:"pruned", sol:"answers",
+  nodes:"nodes visited", w:"total weight", look:"map lookups", check:"feasibility checks", ev:"events", cross:"crossed out", shift:"shifts"});
+const ARROWH = `<defs><marker id="av-arrh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="hot"/></marker></defs>`;
+/* a drawing that may be wider than a phone: it keeps a readable size (at least `min` of its width) and scrolls inside its own frame */
+const wide = (W, H, body, label, min, cls) => `<div class="av-scroll"><svg class="av-svg${cls?" "+cls:""}" viewBox="0 0 ${W} ${H}" style="max-width:${W}px;min-width:${Math.min(W, Math.round(W*(min||.8)))}px" role="img" aria-label="${esc(label)}">${body}</svg></div>`;
+/* a stack drawn top first; items [{t, cls}] from bottom to top */
+function stackHTML(title, items, empty, out){
+  return `<div class="av-stack" role="list" aria-label="${esc(title)}, top first"><div class="av-h mono">${esc(title)}</div>${out?`<div class="sti out">${out}</div>`:""}${items.length ? items.slice().reverse().map((x,i)=>`<div class="sti ${x.cls||""}" role="listitem">${i===0?'<span class="tp mono">top</span>':""}${x.t}</div>`).join("") : `<div class="sti nil mono">${esc(empty||"empty")}</div>`}</div>`;
+}
+/* rows of boxes in one SVG, so ranges and offsets line up: rows [{label, cells:[{v, cls}], off}] (off = -0.5 puts a cell on the fence between two others) */
+function rowsSVG(rows, o){
+  o = o || {}; const PW = o.pw || 36, CW = PW - 4, CH = 28, LX = o.lx === undefined ? 40 : o.lx, RH = 46, TOP = o.top || 18;
+  const n = Math.max(...rows.map(r=>r.cells.length + (r.off||0))), W = LX + n*PW + 8, H = TOP + rows.length*RH + (o.extra||0);
+  let g = "";
+  if(o.index!==false) for(let i=0;i<(o.index||rows[0].cells.length);i++) g += `<text x="${LX + (i + (o.idxOff||0))*PW + PW/2}" y="${TOP-5}" text-anchor="middle" class="sub">${i}</text>`;
+  rows.forEach((r,ri)=>{ const y = TOP + ri*RH + 6;
+    g += `<text x="${LX-8}" y="${y+CH/2+4}" text-anchor="end" class="rl">${esc(r.label)}</text>`;
+    r.cells.forEach((c,i)=>{ const x = LX + (i + (r.off||0))*PW + 2; c = c && typeof c==="object" ? c : {v:c};
+      g += `<g class="rc ${c.cls||""}"${c.focus?" data-focus":""}><rect x="${x}" y="${y}" width="${CW}" height="${CH}" rx="5"/><text x="${x+CW/2}" y="${y+CH/2+4.5}" text-anchor="middle">${esc(c.v===null||c.v===undefined?"":c.v)}</text>${c.sub!==undefined?`<text x="${x+CW/2}" y="${y+CH+11}" text-anchor="middle" class="sub">${esc(c.sub)}</text>`:""}</g>`; });
+    (r.spans||[]).forEach(sp=>{ const x1 = LX + (sp[0] + (r.off||0))*PW + 2, x2 = LX + (sp[1] + (r.off||0))*PW + CW + 2;
+      g += `<path d="M${x1},${y-3} v-4 H${x2} v4" class="span ${sp[2]||""}"/>`; }); });
+  return wide(W, H, g + (o.add ? o.add(LX, PW, TOP, RH) : ""), o.label || "Array", o.min || .8);
+}
+const fmtInf = x => x===null || x===undefined ? "" : x >= 1e9 ? "∞" : x <= -1e9 ? "-∞" : x;
+
+/* ---- monotonic stack ---- */
+const MS_MODES = [{v:"next", label:"Next greater element", set:{a:"2, 7, 3, 5, 4, 6, 8, 1"}},
+  {v:"temps", label:"Daily temperatures (days to wait)", set:{a:"73, 74, 75, 71, 69, 72, 76, 73"}},
+  {v:"hist", label:"Largest rectangle in a histogram", set:{a:"2, 1, 5, 6, 2, 3"}}];
+def({ id:"monostack", group:"Arrays & strings", title:"Monotonic stack: next greater element", concepts:["amortized","bigo","callstack"],
+  text:v=>v.mode==="hist" ? "For each bar, find how far it can stretch before a lower bar stops it. Keep a stack of bar indexes whose heights go up from bottom to top. When a lower bar arrives, every taller bar on the stack has found its right edge (the new bar) and its left edge (the bar under it on the stack): pop it and measure height × width. A last bar of height 0 empties the stack. Each bar is pushed once and popped once, so it is O(n)."
+    : "Keep a stack of indexes still waiting for a bigger value; their values go down from bottom to top. A new value that beats the top answers it: pop the top and write the answer, and keep popping while the new value wins. Then push the new index. Each index is pushed once and popped at most once, so the scan is O(n) instead of O(n²). The arcs show which value answered which.",
+  inputs:[{k:"mode", label:"Problem", def:"next", opts:MS_MODES},{k:"a", label:"Numbers (up to 14, from 0 to 99)", def:"2, 7, 3, 5, 4, 6, 8, 1"}],
+  random:()=>({a:randArr(rint(7,11), 1, 30)}), counters:["push","pop","cmp"],
+  code:v=>v.mode==="hist"
+    ? ["stack = []; best = 0   (indexes; heights go up)","for i from 0 to n   (bar n has height 0):","  while stack and h[top] >= h[i]:","    j = stack.pop(); left = new top, or -1","    best = max(best, h[j] * (i - left - 1))","  stack.push(i)","return best"]
+    : ["ans = [" + (v.mode==="temps"?"0":"-1") + "] * n; stack = []   (indexes; values go down)","for i from 0 to n-1:","  while stack and a[top] < a[i]:", v.mode==="temps" ? "    j = stack.pop(); ans[j] = i - j   (days to wait)" : "    j = stack.pop(); ans[j] = a[i]","  stack.push(i)", "the rest of the stack never meets a bigger value"],
+  run(v, R){ const mode = MS_MODES.some(m=>m.v===v.mode) ? v.mode : "next", a = nums(v.a, 0, 99, 14), n = a.length, ans = Array(n).fill(null), st = [], links = [];
+    let best = 0, bestR = null;
+    const S = o => Object.assign({a, mode, ans:ans.slice(), st:st.slice(), links:links.slice(), best, bestR}, o);
+    if(mode==="hist"){
+      const h = a.concat([0]);
+      R.step(0, `Find the largest rectangle under ${n} bars. An extra bar of height 0 at the end will empty the stack.`, S({}));
+      for(let i=0;i<=n;i++){
+        R.step(1, i<n ? `Look at bar ${i} (height ${h[i]}).` : "The extra bar of height 0: every bar still on the stack gets measured now.", S({i}));
+        while(st.length && h[st[st.length-1]] >= h[i]){ R.inc("cmp"); const j = st.pop(); R.inc("pop"); const left = st.length ? st[st.length-1] : -1, w = i-left-1, area = h[j]*w, better = area > best;
+          if(better){ best = area; bestR = [left+1, i-1, h[j]]; }
+          ans[j] = area; links.push([j, i]);
+          R.step(better ? 4 : 3, `Bar ${i} (${h[i]}) is not taller than bar ${j} (${h[j]}), so pop ${j}. Bar ${j} reaches from ${left+1} to ${i-1}: ${left<0 ? "nothing lower on its left" : `bar ${left} below it on the stack is lower`}. Area ${h[j]} × ${w} = ${area}${better ? ": a new best." : "."}`, S({i, j, rect:[left+1, i-1, h[j]]})); }
+        if(st.length && i<n) R.inc("cmp");
+        if(i<n){ st.push(i); R.inc("push"); R.step(5, `Push bar ${i}${st.length>1 ? ` (bar ${st[st.length-2]} below it is lower, so stop popping)` : ""}. Heights on the stack still go up.`, S({i, push:i})); } }
+      R.step(6, bestR ? `The largest rectangle has area ${best}: bars ${bestR[0]} to ${bestR[1]}, height ${bestR[2]}. ${R.c.push} pushes and ${R.c.pop} pops for ${n} bars: O(n).` : "Every bar has height 0, so the largest area is 0.", S({end:true, rect:bestR}));
+      return; }
+    const word = mode==="temps" ? "a warmer day" : "a bigger value";
+    R.step(0, `Scan ${n} values from left to right. The stack holds indexes still waiting for ${word}.`, S({}));
+    for(let i=0;i<n;i++){
+      R.step(1, `Look at a[${i}] = ${a[i]}.`, S({i}));
+      while(st.length && a[st[st.length-1]] < a[i]){ R.inc("cmp"); const j = st.pop(); R.inc("pop"); ans[j] = mode==="temps" ? i-j : a[i]; links.push([j, i]);
+        R.step(3, mode==="temps" ? `${a[i]} > ${a[j]}: day ${j} waits ${i-j} day${i-j===1?"":"s"} for a warmer one. Pop ${j}.` : `${a[i]} > ${a[j]}: a[${i}] is the next greater element of a[${j}]. Pop ${j}; its answer is ${a[i]}.`, S({i, j})); }
+      if(st.length) R.inc("cmp");
+      st.push(i); R.inc("push");
+      R.step(4, `Push ${i}${st.length>1 ? ` (the top before it, ${a[st[st.length-2]]}, is not smaller than ${a[i]}, so popping stopped)` : ""}. The stack's values still go down.`, S({i, push:i})); }
+    const left = st.slice(); left.forEach(j=>{ ans[j] = mode==="temps" ? 0 : -1; });
+    R.step(5, `${left.length ? `Index${left.length===1?"":"es"} ${left.join(", ")} never met ${word}: the answer stays ${mode==="temps"?0:-1}.` : "Every index found its answer."} ${R.c.push} pushes and ${R.c.pop||0} pops for ${n} values: O(n).`, S({end:true, rest:left})); },
+  draw(s){ const a = s.a, n = a.length, hist = s.mode==="hist", m = n + (hist?1:0), BW = 24, PW = 30, X0 = 8, HH = 120, TOP = 40, max = Math.max(...a, 1);
+    const x = i => X0 + i*PW, hy = v => TOP + HH - Math.round(HH*v/max), base = TOP + HH, W = X0*2 + m*PW - (PW-BW), H = base + 34;
+    const st = new Set(s.st), rest = new Set(s.rest||[]);
+    let g = ARROWH;
+    if(s.rect){ const [l, r, ht] = s.rect; if(r >= l) g += `<rect x="${x(l)-2}" y="${hy(ht)}" width="${x(r)+BW-x(l)+4}" height="${base-hy(ht)}" class="ms-rect${s.end?" best":""}"/>`; }
+    for(let i=0;i<m;i++){ const v = i<n ? a[i] : 0, cls = i===s.j ? "pop" : i===s.i ? "cur" : rest.has(i) ? "rest" : st.has(i) ? "stk" : s.ans[i]!==null && i<n ? "done" : "";
+      g += `<g class="ms-b ${cls}${i>=n?" ghost":""}"${i===s.i?" data-focus":""}><rect x="${x(i)}" y="${Math.min(hy(v), base-2)}" width="${BW}" height="${Math.max(2, base-hy(v))}" rx="3"/><text x="${x(i)+BW/2}" y="${base+14}" text-anchor="middle">${v}</text><text x="${x(i)+BW/2}" y="${base+28}" text-anchor="middle" class="sub">${i}</text></g>`; }
+    s.links.forEach(([j,i],k)=>{ const hot = k===s.links.length-1 && s.j===j, x1 = x(j)+BW/2, x2 = x(i)+BW/2, y1 = hy(a[j])-3, y2 = hy(i<n?a[i]:0)-3, top = Math.max(4, Math.min(y1, y2) - 12 - Math.min(20, (i-j)*4));
+      g += `<path d="M${x1},${y1} C${x1},${top} ${x2},${top} ${x2},${y2}" class="ms-arc${hot?" hot":""}"${hot?' marker-end="url(#av-arrh)"':""}/>`; });
+    const items = s.st.map(j=>({t:`<span class="mono">${j}</span><b>${a[j]}</b>`, cls:j===s.push?"new":""}));
+    const ans = s.ans.map((x,i)=>({v:x===null?"·":x, cls:i===s.j?"done":rest.has(i)?"cmp":""}));
+    return `<div class="av-ms"><div class="ms-chart">${wide(W, H, g, `Bars for ${n} values; the stack holds ${s.st.length}`, .85)}</div>${stackHTML("stack (index, value)", items, "empty", s.j!==undefined ? `<span class="mono">${s.j}</span><b>${a[s.j]}</b><span class="mono">just popped</span>` : "")}</div>
+      ${rowsSVG([{label:hist?"area":"ans", cells:ans}], {lx:40, pw:30, label:"Answers", index:n})}
+      <p class="av-aux">${hist ? `area = the biggest rectangle that uses bar i as its lowest bar. Best so far: ${s.best}.` : "An arc goes from each value to the value that answered it."}</p>`; } });
+
+/* ---- sliding window with counts ---- */
+const W2_MODES = [{v:"kdist", label:"Longest with at most K distinct letters", set:{s:"eceebaaccbd", p:"2"}},
+  {v:"minwin", label:"Shortest window that contains T", set:{s:"ADOBECODEBANC", p:"ABC"}},
+  {v:"anagram", label:"Anagrams of P (fixed size window)", set:{s:"cbaebabacd", p:"abc"}}];
+def({ id:"window2", group:"Arrays & strings", title:"Sliding window with counts", concepts:["hashtables","bigo","amortized"],
+  text:v=>v.mode==="minwin" ? "Grow the window on the right until it is valid (it holds every letter of T as often as T needs it). Then shrink it from the left while it stays valid, recording the shortest. A count map and one number (how many letters are fully covered) make each check O(1), and each pointer only moves forward: O(n)."
+    : v.mode==="anagram" ? "The window always has exactly len(P) letters: one letter enters on the right and one leaves on the left. Keep a count of the letters inside; when the counts equal P's counts, the window is an anagram of P. O(n) moves, with a count compare for each window."
+    : "Grow the window one letter at a time on the right and count the letters inside it. As soon as it has more than K different letters it is invalid, so shrink it from the left until it is valid again; then record its length. Each pointer moves at most n times, so the scan is O(n) instead of checking all O(n²) substrings.",
+  inputs:[{k:"mode", label:"Problem", def:"kdist", opts:W2_MODES},{k:"s", label:"Text (up to 24 characters)", def:"eceebaaccbd"},{k:"p", label:v=>v.mode==="minwin"?"T (letters to cover)":v.mode==="anagram"?"P (pattern)":"K", def:"2", w:8}],
+  random:v=>{ const al = v.mode==="minwin" ? "ABCDE" : "abcde"; const s = Array.from({length:rint(12,18)},()=>al[rint(0,4)]).join("");
+    return {s, p:v.mode==="kdist" ? String(rint(1,3)) : v.mode==="minwin" ? [...new Set(Array.from({length:3},()=>al[rint(0,3)]))].join("") : s.slice(rint(0,8)).slice(0,3)}; },
+  counters:["steps","cmp"],
+  code:v=>v.mode==="minwin" ? ["need = counts of T; have = 0   (letters fully covered)","for right from 0 to n-1:","  count[s[right]] += 1; if it now equals need: have += 1","  while have == number of different letters in T:","    record the window if it is the shortest so far","    count[s[left]] -= 1; if below need: have -= 1","    left += 1   (shrink while it stays valid)","return the shortest window recorded"]
+    : v.mode==="anagram" ? ["need = counts of P; k = len(P); count = {}","for right from 0 to n-1:","  count[s[right]] += 1   (a letter enters)","  if right >= k: count[s[right-k]] -= 1   (a letter leaves)","  if count == need: record right-k+1   (an anagram starts here)"]
+    : ["left = 0; count = {}; best = 0","for right from 0 to n-1:","  count[s[right]] += 1   (grow)","  while count has more than K keys:","    count[s[left]] -= 1; delete it at 0; left += 1   (shrink)","  best = max(best, right - left + 1)   (valid: record)"],
+  run(v, R){ const mode = W2_MODES.some(m=>m.v===v.mode) ? v.mode : "kdist", s = String(v.s||"").replace(/\s/g,""); if(!s) throw new Error("Type some text."); if(s.length>24) throw new Error("At most 24 characters.");
+    const cnt = {}, need = {}; let left = 0, bl = 0, br = -1, found = [], have = 0, req = 0;
+    const win = (l, r) => s.slice(l, r+1), D = () => Object.keys(cnt).length;
+    const S = (right, o) => Object.assign({s, mode, left, right, cnt:Object.assign({}, cnt), need, best:[bl,br], found:found.slice(), have, req}, o);
+    const add = c => { cnt[c] = (cnt[c]||0) + 1; }, drop = c => { cnt[c]--; if(!cnt[c]) delete cnt[c]; };
+    if(mode==="kdist"){ const K = nums(v.p, 1, 26, 1)[0];
+      R.step(0, `Find the longest part of "${s}" with at most ${K} different letter${K===1?"":"s"}.`, S(-1, {K}));
+      for(let right=0; right<s.length; right++){ const c = s[right]; add(c); R.inc("steps");
+        R.step(2, `Add '${c}' on the right (count ${cnt[c]}). "${win(left,right)}" has ${D()} different letter${D()===1?"":"s"}${D()>K?`, more than ${K}`:""}.`, S(right, {K, hl:c}));
+        while(D() > K){ const o = s[left]; drop(o); left++; R.inc("steps"); R.inc("cmp");
+          R.step(4, `Too many different letters: drop '${o}' from the left${cnt[o]?` (${cnt[o]} left inside)`:`; its count is 0, so it leaves the map`}. Now ${D()} different.`, S(right, {K, hl:o, out:left-1})); }
+        R.inc("cmp");
+        if(right-left+1 > br-bl+1){ bl = left; br = right; R.step(5, `Valid. "${win(left,right)}" has length ${right-left+1}: a new best.`, S(right, {K})); }
+        else R.step(5, `Valid. "${win(left,right)}" has length ${right-left+1}; the best is still ${br-bl+1}.`, S(right, {K})); }
+      R.step(5, `Done: the longest is "${win(bl,br)}" (length ${br-bl+1}). Each pointer moved at most ${s.length} times: O(n).`, S(s.length-1, {K, end:true})); return; }
+    const p = String(v.p||"").replace(/\s/g,""); if(!p) throw new Error(mode==="minwin" ? "Type the letters T to cover." : "Type the pattern P.");
+    if(p.length > 10) throw new Error("At most 10 letters in the pattern.");
+    for(const c of p) need[c] = (need[c]||0) + 1; req = Object.keys(need).length;
+    const needStr = Object.entries(need).map(([c,k])=>k>1?`${k}× '${c}'`:`'${c}'`).join(", ");
+    if(mode==="minwin"){ let bestLen = Infinity;
+      R.step(0, `Find the shortest part of "${s}" that contains ${needStr}.`, S(-1, {}));
+      for(let right=0; right<s.length; right++){ const c = s[right]; add(c); R.inc("steps");
+        if(need[c] && cnt[c]===need[c]){ have++; R.step(2, `Add '${c}': now ${cnt[c]} of ${need[c]} needed, so '${c}' is covered. ${have} of ${req} letters covered.`, S(right, {hl:c})); }
+        else R.step(2, need[c] ? `Add '${c}' (${cnt[c]} inside, ${need[c]} needed). ${have} of ${req} letters covered.` : `Add '${c}': T does not need it. ${have} of ${req} letters covered.`, S(right, {hl:c}));
+        while(have===req){ R.inc("cmp"); const len = right-left+1;
+          if(len < bestLen){ bestLen = len; bl = left; br = right; R.step(4, `Every letter is covered: "${win(left,right)}" (length ${len}) is the shortest so far. Try to shrink it.`, S(right, {})); }
+          else R.step(4, `Still valid: "${win(left,right)}" (length ${len}), but not shorter than ${bestLen}.`, S(right, {}));
+          const o = s[left]; drop(o); left++; R.inc("steps");
+          if(need[o] && (cnt[o]||0) < need[o]){ have--; R.step(5, `Drop '${o}' from the left. Now only ${cnt[o]||0} of ${need[o]} '${o}' inside: no longer valid, so grow again.`, S(right, {hl:o, out:left-1})); }
+          else R.step(6, `Drop '${o}' from the left; ${need[o] ? `still ${cnt[o]} '${o}' inside, enough` : "T does not need it"}.`, S(right, {hl:o, out:left-1})); }
+        if(have<req) R.inc("cmp"); }
+      R.step(7, br>=bl ? `Done: the shortest window is "${win(bl,br)}" (length ${br-bl+1}). Both pointers only moved forward: O(n).` : `Done: no part of "${s}" contains ${needStr}.`, S(s.length-1, {end:true})); return; }
+    const k = p.length;
+    R.step(0, `Find every place where ${k} letters in a row are a reordering of "${p}" (the same letter counts).`, S(-1, {}));
+    for(let right=0; right<s.length; right++){ const c = s[right]; add(c); R.inc("steps");
+      R.step(2, `'${c}' enters on the right.`, S(right, {hl:c}));
+      if(right >= k){ const o = s[right-k]; drop(o); left = right-k+1; R.inc("steps"); R.step(3, `'${o}' leaves on the left, so the window keeps exactly ${k} letters.`, S(right, {hl:o, out:right-k})); }
+      if(right >= k-1){ R.inc("cmp"); const eq = Object.keys(need).every(x=>cnt[x]===need[x]) && Object.keys(cnt).every(x=>need[x]);
+        if(eq){ found.push(left); R.step(4, `The counts equal P's counts: "${win(left,right)}" is an anagram, starting at ${left}.`, S(right, {match:true})); }
+        else { const extra = Object.keys(cnt).filter(x=>(cnt[x]||0) > (need[x]||0));
+          R.step(4, `"${win(left,right)}" is not an anagram: it has too many ${extra.map(x=>`'${x}'`).join(", ")}.`, S(right, {})); } } }
+    R.step(4, found.length ? `Done: anagrams of "${p}" start at ${found.join(", ")}.` : `Done: no anagram of "${p}" in "${s}".`, S(s.length-1, {end:true})); },
+  draw(s){ const m = {}, n = s.s.length;
+    for(let i=s.left;i<=s.right;i++) m[i] = s.match ? "done" : "win";
+    if(s.out!==undefined) m[s.out] = "swp"; if(s.right>=0 && !s.end && s.out===undefined) m[s.right] = "cmp";
+    if(s.end && s.best[1]>=s.best[0]) for(let i=s.best[0];i<=s.best[1];i++) m[i] = "done";
+    if(s.end && s.mode==="anagram"){ Object.keys(m).forEach(k=>delete m[k]); s.found.forEach(f=>{ m[f] = "done"; }); }
+    const letters = [...new Set(Object.keys(s.need).concat(Object.keys(s.cnt)))].sort();
+    const rows = [["letter", ...letters.map(c=>({v:c, cls:c===s.hl?"cur":""}))], ["in window", ...letters.map(c=>({v:s.cnt[c]||0, cls:c===s.hl?"cur":s.need[c]&&(s.cnt[c]||0)>=s.need[c]?"done":""}))]];
+    if(s.mode!=="kdist") rows.push(["needed", ...letters.map(c=>s.need[c]||0)]);
+    const info = s.mode==="kdist" ? `different letters: ${Object.keys(s.cnt).length} (at most ${s.K})` : s.mode==="minwin" ? `covered: ${s.have} of ${s.req} letters` : `anagrams found at: ${s.found.join(", ")||"none yet"}`;
+    const best = s.mode==="anagram" ? "" : ` · best: ${s.best[1]>=s.best[0] ? `"${esc(s.s.slice(s.best[0], s.best[1]+1))}" (${s.best[1]-s.best[0]+1})` : "none yet"}`;
+    return cells(s.s.split(""), m, ptrs({L:s.right>=0 && n ? s.left : -1, R:s.right})) + (letters.length ? `<div class="av-dpwrap">${table(rows, {side:true})}</div>` : "") + `<p class="av-aux mono">${esc(info)}${best}</p>`; } });
+
+/* ---- backtracking: the recursion tree ---- */
+/* a recursion tree drawn as it grows: T = {id:{label, kids, st, why}}; st is path | cur | sol | done | prn (pruned, drawn small) */
+function recTreeSVG(T, o){
+  const P = {}; let next = 8; const LW = 30, PWID = 17, UY = 46, R = 12;
+  const lay = (id, d) => { const n = T[id], ks = n.kids.filter(k=>T[k]);
+    if(!ks.length){ const w = n.st==="prn" ? PWID : LW; P[id] = {x:next + w/2, d}; next += w; return; }
+    ks.forEach(k=>lay(k, d+1)); P[id] = {x:(P[ks[0]].x + P[ks[ks.length-1]].x)/2, d}; };
+  lay(0, 0);
+  const maxD = Math.max(...Object.values(P).map(p=>p.d)), W = Math.max(160, next + 8), H = 20 + maxD*UY + R + 22, Y = d => 18 + d*UY;
+  let e = "", n = "";
+  Object.entries(P).forEach(([id, p])=>{ const nd = T[id];
+    nd.kids.forEach(k=>{ const q = P[k]; if(!q) return; const c = T[k].st; e += `<line x1="${p.x}" y1="${Y(p.d)}" x2="${q.x}" y2="${Y(q.d)}" class="${c==="prn"?"prn":c==="path"||c==="cur"?"hot":""}"/>`; });
+    if(nd.st==="prn") n += `<g class="rt prn"${+id===o.cur?" data-focus":""}><title>pruned: ${esc(nd.why||"")}</title><circle cx="${p.x}" cy="${Y(p.d)}" r="6"/><path d="M${p.x-3},${Y(p.d)-3} l6,6 m0,-6 l-6,6"/>${+id===o.cur?`<text x="${p.x}" y="${Y(p.d)+19}" text-anchor="middle" class="why">${esc(nd.label)} ✕</text>`:""}</g>`;
+    else n += `<g class="rt ${nd.st||""}"${+id===o.cur?" data-focus":""}><circle cx="${p.x}" cy="${Y(p.d)}" r="${R}"/><text x="${p.x}" y="${Y(p.d)+4}" text-anchor="middle">${esc(nd.label)}</text>${nd.sub!==undefined?`<text x="${p.x}" y="${Y(p.d)+R+12}" text-anchor="middle" class="sub">${esc(nd.sub)}</text>`:""}</g>`; });
+  return wide(W, H, e + n, o.label || "Recursion tree", .9, "av-rt");
+}
+const BK_MODES = [{v:"subsets", label:"Subsets (duplicates skipped)", set:{a:"1, 2, 2, 3"}},{v:"perms", label:"Permutations", set:{a:"1, 2, 3"}},
+  {v:"combsum", label:"Combination sum (reuse allowed)", set:{a:"2, 3, 6, 7", t:"7"}},{v:"queens", label:"N-Queens", set:{n:"4"}}];
+const BK_CODE = {
+  subsets:["sort the items (equal items sit together)","backtrack(start, path):","  record a copy of path   (every node is a subset)","  for i from start to n-1:","    if i > start and a[i] == a[i-1]: skip   (duplicate)","    path.push(a[i])   (choose)","    backtrack(i + 1, path)   (explore)","    path.pop()   (un-choose)"],
+  perms:["sort the items; used = all false","backtrack(path):","  if len(path) == n: record a copy; return","  for i from 0 to n-1:","    if used[i], or a[i] == a[i-1] and not used[i-1]: skip","    used[i] = true; path.push(a[i])   (choose)","    backtrack(path)   (explore)","    path.pop(); used[i] = false   (un-choose)"],
+  combsum:["sort the candidates","backtrack(start, path, sum):","  if sum == target: record a copy; return","  for i from start to n-1:","    if sum + c[i] > target: prune and stop   (the rest are bigger)","    path.push(c[i])   (choose; it may be used again)","    backtrack(i, path, sum + c[i])   (explore)","    path.pop()   (un-choose)"],
+  queens:["backtrack(row):","  if row == n: record the board; return","  for col from 0 to n-1:","    if a queen above shares the column or a diagonal: prune","    put a queen at (row, col)   (choose)","    backtrack(row + 1)   (explore)","    remove the queen   (un-choose)"] };
+def({ id:"backtrack", group:"Recursion & trees", title:"Backtracking: the recursion tree", concepts:["csp","callstack","graphsalgo","proofs"],
+  text:"Backtracking builds an answer one choice at a time: choose, explore deeper, then un-choose and try the next option. The calls form a tree: each node is a partial answer and each edge is one choice. Pruning cuts a branch as soon as it cannot lead to a new answer (a duplicate, a sum that is already too big, a queen under attack), so the search visits far fewer nodes than the full tree.",
+  inputs:[{k:"mode", label:"Problem", def:"subsets", opts:BK_MODES},{k:"a", label:v=>v.mode==="combsum"?"Candidates (up to 4, from 1 to 9)":"Items (up to "+(v.mode==="perms"?4:5)+", from 0 to 9)", def:"1, 2, 2, 3", when:v=>v.mode!=="queens"},
+    {k:"t", label:"Target sum", def:"7", w:4, when:v=>v.mode==="combsum"},{k:"n", label:"Board size n (3 or 4)", def:"4", w:4, when:v=>v.mode==="queens"}],
+  random:v=>v.mode==="queens" ? {n:String(Math.random()<.8?4:3)} : v.mode==="combsum" ? {a:[...new Set(Array.from({length:4},()=>rint(2,7)))].join(", "), t:String(rint(6,10))} : {a:randArr(v.mode==="perms"?3:4, 1, 4)},
+  counters:["nodes","prune","sol"],
+  code:v=>BK_CODE[v.mode] || BK_CODE.subsets,
+  run(v, R){ const mode = BK_CODE[v.mode] ? v.mode : "subsets", T = {0:{label:"", kids:[], st:"cur"}}, sols = []; let nid = 1, path = [0];
+    const add = (par, label, st, why) => { if(nid >= 120) throw new Error("The tree got too big to draw. Use a smaller input."); const id = nid++; T[id] = {label:String(label), kids:[], st, why}; T[par].kids.push(id); return id; };
+    const S = (cur, o) => { Object.keys(T).forEach(k=>{ if(T[k].st==="cur" || T[k].st==="path") T[k].st = T[k].sol ? "sol" : ""; }); path.forEach(k=>{ T[k].st = "path"; }); if(T[cur] && T[cur].st!=="prn") T[cur].st = "cur";
+      return Object.assign({T, cur, sols:sols.slice(-12), nsol:sols.length, mode}, o); };
+    const mark = id => { T[id].sol = true; };
+    const restore = () => Object.keys(T).forEach(k=>{ if(T[k].sol) T[k].st = "sol"; else if(T[k].st==="cur"||T[k].st==="path") T[k].st = "done"; });
+    const fin = (full, o) => { restore(); R.step(0, `Done: ${sols.length} answer${sols.length===1?"":"s"}, ${R.c.nodes||0} nodes visited${R.c.prune?`, ${R.c.prune} branches pruned`:""}. ${full}`, Object.assign({T, cur:-1, sols:sols.slice(-12), nsol:sols.length, mode, end:true}, o)); };
+    if(mode==="queens"){ const n = nums(v.n, 3, 4, 1)[0], cols = [];
+      const hit = (r, c) => { for(let q=0;q<r;q++){ if(cols[q]===c) return [q, "same column"]; if(Math.abs(cols[q]-c)===r-q) return [q, "same diagonal"]; } return null; };
+      R.step(0, `Place ${n} queens on a ${n}×${n} board, one per row, so that no two share a column or a diagonal.`, S(0, {n, cols:[]}));
+      const go = (row, node) => {
+        if(row===n){ sols.push(cols.map(c=>c+1).join("")); mark(node); R.inc("sol"); R.step(1, `All ${n} rows have a queen: record this board (answer ${sols.length}).`, S(node, {n, cols:cols.slice()})); return; }
+        for(let c=0;c<n;c++){ const h = hit(row, c);
+          if(h){ const id = add(node, c+1, "prn", h[1]); R.inc("prune"); R.step(3, `Row ${row+1}, column ${c+1}: the queen in row ${h[0]+1} attacks it (${h[1]}). Prune this branch.`, S(id, {n, cols:cols.slice(), tryc:[row, c], by:h[0]})); continue; }
+          cols.push(c); const id = add(node, c+1, ""); path.push(id); R.inc("nodes");
+          R.step(4, `Row ${row+1}, column ${c+1} is safe: put a queen there.`, S(id, {n, cols:cols.slice()}));
+          go(row+1, id);
+          cols.pop(); path.pop(); if(!T[id].sol) T[id].st = "done";
+          R.step(6, `Remove the queen from row ${row+1}, column ${c+1}, and try the next column.`, S(node, {n, cols:cols.slice()})); } };
+      go(0, 0); let full = 0; for(let k=0;k<=n;k++) full += Math.pow(n, k);
+      fin(`Without pruning the tree would have ${full} nodes.`, {n, cols:[]}); return; }
+    const a = nums(v.a, mode==="combsum"?1:0, 9, mode==="perms"?4:mode==="combsum"?4:5).sort((x,y)=>x-y);
+    if(mode==="combsum"){ const t = nums(v.t, 1, 12, 1)[0], c = [...new Set(a)], cur = [];
+      R.step(0, `Find every combination of ${c.join(", ")} that adds up to ${t}. A number may be used more than once. Sorted, so a too-big number ends the loop.`, S(0, {}));
+      const go = (start, sum, node) => {
+        if(sum===t){ sols.push(cur.slice()); mark(node); R.inc("sol"); R.step(2, `The sum is ${t}: record [${cur.join(", ")}].`, S(node, {})); return; }
+        for(let i=start;i<c.length;i++){
+          if(sum + c[i] > t){ const id = add(node, "+"+c[i], "prn", "too big"); R.inc("prune"); R.step(4, `${sum} + ${c[i]} = ${sum+c[i]} is more than ${t}: prune. Every later candidate is bigger, so stop this loop.`, S(id, {})); break; }
+          cur.push(c[i]); const id = add(node, "+"+c[i], ""); T[id].sub = sum + c[i]; path.push(id); R.inc("nodes");
+          R.step(5, `Choose ${c[i]}: path [${cur.join(", ")}], sum ${sum+c[i]}.`, S(id, {}));
+          go(i, sum + c[i], id);
+          cur.pop(); path.pop(); if(!T[id].sol) T[id].st = "done"; R.step(7, `Un-choose ${c[i]}: back to [${cur.join(", ")}] (sum ${sum}).`, S(node, {})); } };
+      go(0, 0, 0); fin("Without the size check the tree would never end, since numbers can repeat.", {}); return; }
+    if(mode==="perms"){ const n = a.length, used = Array(n).fill(false), cur = [];
+      R.step(0, `List every ordering of ${a.join(", ")}. The items are sorted so equal ones sit together.`, S(0, {}));
+      const go = node => {
+        if(cur.length===n){ sols.push(cur.slice()); mark(node); R.inc("sol"); R.step(2, `All ${n} items are placed: record [${cur.join(", ")}].`, S(node, {})); return; }
+        for(let i=0;i<n;i++){ if(used[i]) continue;
+          if(i>0 && a[i]===a[i-1] && !used[i-1]){ const id = add(node, a[i], "prn", "duplicate"); R.inc("prune"); R.step(4, `Skip this ${a[i]}: an equal ${a[i]} was just tried in this position, so it would repeat the same orderings.`, S(id, {})); continue; }
+          used[i] = true; cur.push(a[i]); const id = add(node, a[i], ""); path.push(id); R.inc("nodes");
+          R.step(5, `Choose ${a[i]}: path [${cur.join(", ")}].`, S(id, {}));
+          go(id);
+          used[i] = false; cur.pop(); path.pop(); if(!T[id].sol) T[id].st = "done"; R.step(7, `Un-choose ${a[i]}: back to [${cur.join(", ")}].`, S(node, {})); } };
+      go(0); let full = 0, f = 1; for(let k=0;k<=n;k++){ full += f; f *= (n-k); }
+      fin(`With all items different the tree has ${full} nodes and ${[1,1,2,6,24][n]} leaves (n!).`, {}); return; }
+    const n = a.length, cur = [];
+    R.step(0, `List every subset of ${a.join(", ")}. The items are sorted so equal ones sit together.`, S(0, {}));
+    const go = (start, node) => {
+      sols.push(cur.slice()); mark(node); R.inc("sol"); R.step(2, `Record [${cur.join(", ")}] as a subset.`, S(node, {}));
+      for(let i=start;i<n;i++){
+        if(i>start && a[i]===a[i-1]){ const id = add(node, "+"+a[i], "prn", "duplicate"); R.inc("prune"); R.step(4, `Skip ${a[i]} here: the same value was just tried at this level, so it would repeat the same subsets.`, S(id, {})); continue; }
+        cur.push(a[i]); const id = add(node, "+"+a[i], ""); path.push(id); R.inc("nodes");
+        R.step(5, `Choose ${a[i]}: path [${cur.join(", ")}].`, S(id, {}));
+        go(i+1, id);
+        cur.pop(); path.pop(); R.step(7, `Un-choose ${a[i]}: back to [${cur.join(", ")}].`, S(node, {})); } };
+    go(0, 0); fin(`With all items different there are 2^${n} = ${Math.pow(2,n)} subsets.`, {}); },
+  draw(s){ let board = "";
+    if(s.mode==="queens"){ const n = s.n, at = new Set();
+      board = `<div class="av-board" style="--n:${n}" role="img" aria-label="Board: queens in columns ${s.cols.map(c=>c+1).join(", ")||"none"}">`;
+      for(let r=0;r<n;r++) for(let c=0;c<n;c++){ const q = s.cols[r]===c, tr = s.tryc && s.tryc[0]===r && s.tryc[1]===c, by = s.tryc && s.by===r && s.cols[r]===c;
+        board += `<span class="sq${(r+c)%2?" dk":""}${tr?" bad":""}${by?" by":""}">${q?"♛":tr?"✕":""}</span>`; }
+      board += `</div>`; }
+    const done = s.sols.map(x=>Array.isArray(x)?`[${x.join(", ")}]`:x);
+    return `<div class="av-bk">${board}<div class="bk-tree">${recTreeSVG(s.T, {cur:s.cur, label:`Recursion tree with ${Object.keys(s.T).length} nodes`})}</div></div>
+      <p class="av-aux av-key"><span><i class="cur"></i>current call</span><span><i class="cmp"></i>on the path</span><span><i class="done"></i>answer recorded</span><span><i class="prn"></i>pruned ✕</span></p>
+      <p class="av-aux mono">answers (${s.nsol}): ${esc(s.mode==="queens" ? done.map(x=>"cols "+x.split("").join("-")).join("  ") : done.join(" ")) || "none yet"}${s.nsol>s.sols.length?" …":""}</p>`; } });
+
+/* ---- tree DFS with return values ---- */
+function parseTree(str){
+  const t = String(str||"").split(/[\s,;]+/).filter(Boolean), nil = x => /^(null|none|nil|#|-|x)$/i.test(x);
+  if(!t.length || nil(t[0])) throw new Error("Write the tree level by level, like 1, 2, 3, null, 5 (null = no child).");
+  const vals = t.map(x=>nil(x) ? null : Number(x));
+  if(vals.some(x=>x!==null && (!Number.isInteger(x) || x < -99 || x > 99))) throw new Error("Node values are whole numbers from -99 to 99; write null for a missing child.");
+  const N = [], mk = v => { N.push({v, l:-1, r:-1}); return N.length-1; }, q = [mk(vals[0])]; let i = 1;
+  while(q.length && i < vals.length){ const p = q.shift();
+    if(vals[i]!==null && vals[i]!==undefined){ N[p].l = mk(vals[i]); q.push(N[p].l); } i++;
+    if(i < vals.length){ if(vals[i]!==null){ N[p].r = mk(vals[i]); q.push(N[p].r); } i++; } }
+  if(N.length > 15) throw new Error("At most 15 nodes, so the tree stays readable.");
+  return N;
+}
+/* binary tree drawn with x = inorder position, so left and right children never swap sides */
+function binTreeSVG(N, o){
+  const X = [], D = []; let k = 0; const walk = (i, d) => { if(i<0) return; walk(N[i].l, d+1); X[i] = k++; D[i] = d; walk(N[i].r, d+1); }; walk(0, 0);
+  const UX = 36, UY = 58, R = 15, W = 16 + N.length*UX, maxD = Math.max(...D), H = 26 + maxD*UY + R + 22, px = i => 8 + UX/2 + X[i]*UX, py = i => 22 + D[i]*UY;
+  let e = "", n = "";
+  N.forEach((nd, i)=>{ [nd.l, nd.r].forEach(c=>{ if(c>=0) e += `<line x1="${px(i)}" y1="${py(i)}" x2="${px(c)}" y2="${py(c)}" class="${(o.edge&&o.edge(i,c))||""}"/>`; });
+    const st = o.cls ? o.cls(i) : "", sub = o.sub ? o.sub(i) : undefined, tag = o.tag ? o.tag(i) : "";
+    n += `<g class="tn ${st}"${i===o.cur?" data-focus":""}><circle cx="${px(i)}" cy="${py(i)}" r="${R}"/><text x="${px(i)}" y="${py(i)+4}" text-anchor="middle">${esc(nd.v)}</text>${sub!==undefined&&sub!==""?`<text x="${px(i)}" y="${py(i)+R+13}" text-anchor="middle" class="sub ret">${esc(sub)}</text>`:""}${tag?`<text x="${px(i)+R+3}" y="${py(i)-R+2}" class="sub tag">${esc(tag)}</text>`:""}</g>`; });
+  return wide(W, H, e + n, o.label || "Binary tree", .85);
+}
+const TD_MODES = [{v:"height", label:"Height (max depth)", set:{}},{v:"diameter", label:"Diameter (longest path)", set:{}},{v:"maxpath", label:"Maximum path sum", set:{tree:"-10, 9, 20, null, null, 15, 7, 3, -8"}},
+  {v:"pre", label:"Preorder: visit before the children", set:{}},{v:"in", label:"Inorder: visit between the children", set:{}},{v:"post", label:"Postorder: visit after the children", set:{}}];
+const TD_TREE = "1, 2, 3, 4, 5, null, 6, 7, null, null, 8";
+const TD_CODE = {
+  height:["dfs(node):","  if node is null: return 0","  L = dfs(node.left)","  R = dfs(node.right)","  return 1 + max(L, R)   (my height, handed to my parent)"],
+  diameter:["best = 0","dfs(node): if node is null: return 0","  L = dfs(node.left)","  R = dfs(node.right)","  best = max(best, L + R)   (longest path that bends here)","  return 1 + max(L, R)   (height, for the parent)"],
+  maxpath:["best = -∞","dfs(node): if node is null: return 0","  L = max(0, dfs(node.left))   (drop a negative branch)","  R = max(0, dfs(node.right))","  best = max(best, node.val + L + R)   (path that bends here)","  return node.val + max(L, R)   (one side only, for the parent)"],
+  order:["dfs(node): if node is null: return","  visit(node)   ← preorder visits here","  dfs(node.left)","  visit(node)   ← inorder visits here","  dfs(node.right)","  visit(node)   ← postorder visits here"] };
+def({ id:"treedfs", group:"Recursion & trees", title:"Tree DFS with return values and the call stack", concepts:["trees","callstack","proofs"],
+  text:"Each call works on one node: it calls itself on the left child, then on the right child, and combines the two answers it gets back into one value it returns to its parent. The call stack on the right holds the calls that are waiting for a child. Many tree problems are one such function plus a global best: the diameter and the maximum path sum look at the path that bends at each node, but return only one side to the parent. Every node is visited once: O(n) time, O(height) stack.",
+  inputs:[{k:"mode", label:"Problem", def:"diameter", opts:TD_MODES},{k:"tree", label:"Tree, level by level (null = no child; up to 15 nodes)", def:TD_TREE}],
+  presets:[{name:"A long thin tree", v:{tree:"1, 2, null, 3, null, 4, null, 5"}},{name:"Full tree", v:{tree:"1, 2, 3, 4, 5, 6, 7"}}],
+  random:()=>{ const n = rint(6,11), out = [String(rint(1,9))]; let real = 1; while(real < n){ if(Math.random()<.22) out.push("null"); else { out.push(String(rint(-9,9))); real++; } } return {tree:out.join(", ")}; },
+  counters:["calls","depth"],
+  code:v=>TD_CODE[["pre","in","post"].includes(v.mode) ? "order" : v.mode] || TD_CODE.diameter,
+  run(v, R){ const mode = TD_MODES.some(m=>m.v===v.mode) ? v.mode : "diameter", N = parseTree(v.tree), order = ["pre","in","post"].includes(mode);
+    const ret = {}, stack = [], out = []; let best = mode==="maxpath" ? -Infinity : 0, bestAt = -1, maxd = 0;
+    const L0 = mode==="height" ? 0 : 1, nm = i => `dfs(${N[i].v})`;
+    const S = (cur, o) => Object.assign({N, mode, cur, ret:Object.assign({}, ret), stack:stack.map(f=>Object.assign({}, f)), out:out.slice(), best:best===-Infinity?null:best, bestAt}, o);
+    const visit = (i, line, when) => { out.push(i); R.step(line, `Visit ${N[i].v} ${when}. The order so far: ${out.map(j=>N[j].v).join(", ")}.`, S(i, {vis:i})); };
+    const kid = (i, side) => { const c = side==="L" ? N[i].l : N[i].r; return c; };
+    const dfs = (i, from) => {
+      const fr = {id:i, L:null, R:null}; stack.push(fr); R.inc("calls"); if(stack.length > maxd){ R.inc("depth", stack.length - maxd); maxd = stack.length; }
+      const leaf = N[i].l<0 && N[i].r<0;
+      R.step(order ? 0 : L0, `Call ${nm(i)}${from===undefined ? " on the root" : ` from ${nm(from)}`}. ${stack.length} call${stack.length===1?" is":"s are"} on the stack.${leaf ? ` Both children are empty${order ? "" : `, so they give ${mode==="maxpath" ? "0" : "0"}`}.` : ""}`, S(i, {}));
+      if(mode==="pre") visit(i, 1, "first, before its children");
+      for(const side of ["L","R"]){ const c = kid(i, side);
+        if(order && side==="R" && mode==="in") visit(i, 3, "after its left subtree, before its right");
+        if(c<0){ fr[side] = 0; if(!leaf && !order) R.step(side==="L"?L0+1:L0+2, `${N[i].v} has no ${side==="L"?"left":"right"} child: that side gives 0.`, S(i, {})); continue; }
+        fr.wait = side; const got = dfs(c, i); fr.wait = null;
+        if(order) continue;
+        if(mode==="maxpath"){ fr[side] = Math.max(0, got);
+          R.step(side==="L"?2:3, `Back in ${nm(i)}: the ${side==="L"?"left":"right"} child returned ${got}${got<0 ? `, which is negative, so this side counts as 0 (leave that branch out)` : ""}. ${side} = ${fr[side]}.`, S(i, {from:c})); }
+        else { fr[side] = got; R.step(side==="L"?L0+1:L0+2, `Back in ${nm(i)}: the ${side==="L"?"left":"right"} child returned ${got}, so ${side} = ${got}.`, S(i, {from:c})); } }
+      let r;
+      if(order){ if(mode==="post") visit(i, 5, "last, after both children"); r = null; }
+      else if(mode==="height"){ r = 1 + Math.max(fr.L, fr.R); }
+      else if(mode==="diameter"){ const p = fr.L + fr.R; if(p > best || bestAt<0){ best = p; bestAt = i; }
+        R.step(4, `A path can bend at ${N[i].v}: down ${fr.L} edge${fr.L===1?"":"s"} on the left plus ${fr.R} on the right = ${p}.${bestAt===i ? ` A new best: ${best}.` : ` The best stays ${best}.`}`, S(i, {})); r = 1 + Math.max(fr.L, fr.R); }
+      else { const p = N[i].v + fr.L + fr.R; if(p > best || bestAt<0){ best = p; bestAt = i; }
+        R.step(4, `The best path that bends at ${N[i].v}: ${fr.L} + ${N[i].v} + ${fr.R} = ${p}.${bestAt===i ? ` A new best: ${best}.` : ` The best stays ${best}.`}`, S(i, {})); r = N[i].v + Math.max(fr.L, fr.R); }
+      stack.pop(); ret[i] = r;
+      if(!order) R.step(mode==="height" ? 4 : 5, mode==="maxpath" ? `${nm(i)} returns ${N[i].v} + max(${fr.L}, ${fr.R}) = ${r}: a path to the parent can use only one side.` : `${nm(i)} returns 1 + max(${fr.L}, ${fr.R}) = ${r}${mode==="diameter" ? ", its height, so the parent can measure longer paths" : ""}.`, S(i, {back:i}));
+      else R.step(0, `${nm(i)} is finished and leaves the stack.`, S(i, {back:i}));
+      return r; };
+    R.step(order ? 0 : (mode==="height" ? 0 : 0), mode==="height" ? "Find the height: the number of nodes on the longest path from the root down to a leaf." : mode==="diameter" ? "Find the diameter: the number of edges on the longest path between any two nodes. It may not pass through the root." : mode==="maxpath" ? "Find the largest sum along any path (it need not pass through the root, and it can bend at one node). Values can be negative." : `Walk the tree depth first and list the nodes in ${mode}order.`, S(-1, {}));
+    const r = dfs(0);
+    R.step(order ? 0 : mode==="height" ? 4 : 5, order ? `Done: ${mode}order is ${out.map(j=>N[j].v).join(", ")}. ${N.length} calls, never more than ${maxd} on the stack (the height).` : mode==="height" ? `The height is ${r}. ${N.length} calls; the stack was at most ${maxd} deep.` : `Done: the ${mode==="diameter"?"diameter":"maximum path sum"} is ${best}, on the path that bends at ${N[bestAt].v}. ${N.length} calls, at most ${maxd} on the stack.`, S(-1, {end:true})); },
+  draw(s){ const N = s.N, onStack = new Set(s.stack.map(f=>f.id)), top = s.stack.length ? s.stack[s.stack.length-1].id : -1, order = ["pre","in","post"].includes(s.mode);
+    const svg = binTreeSVG(N, { cur:s.cur, label:`Binary tree with ${N.length} nodes`,
+      cls:i => (i===s.vis ? "done " : "") + (i===top || i===s.back ? "cur" : onStack.has(i) ? "cmp" : (order ? s.out.includes(i) : s.ret[i]!==undefined) ? "fin" : "") + (s.end && i===s.bestAt && !order ? " best" : ""),
+      sub:i => order ? (s.out.includes(i) ? "#" + (s.out.indexOf(i)+1) : "") : s.ret[i]!==undefined ? "↑" + s.ret[i] : "",
+      tag:i => i===s.bestAt && !order ? "★" : "",
+      edge:(p,c) => onStack.has(p) && onStack.has(c) ? "hot" : "" });
+    const fmt = x => x===null || x===undefined ? "?" : x;
+    const items = s.stack.map(f=>({t:`<b>dfs(${esc(N[f.id].v)})</b>${order ? "" : `<span class="mono">L=${fmt(f.L)} R=${fmt(f.R)}</span>`}${f.wait ? `<span class="mono">waits for ${f.wait==="L"?"left":"right"}</span>` : ""}`, cls:f.id===top?"cur":""}));
+    const best = order ? `order: ${s.out.map(j=>N[j].v).join(", ") || "(nothing yet)"}` : s.mode==="height" ? "" : `best so far: ${s.best===null ? "-∞" : s.best}${s.bestAt>=0 ? ` (bends at ${N[s.bestAt].v} ★)` : ""}`;
+    return `<div class="av-bk"><div class="bk-tree">${svg}</div>${stackHTML("call stack", items, "empty: no call running")}</div>
+      <p class="av-aux av-key"><span><i class="cur"></i>running call</span><span><i class="cmp"></i>waiting on the stack</span><span><i class="done"></i>${order ? "visited (#order)" : "returned (↑ value)"}</span></p>${best ? `<p class="av-aux mono">${esc(best)}</p>` : ""}`; } });
+
+/* ---- 1-D DP: the same recurrence as a table, as memoized recursion, and as plain recursion ---- */
+const INF = 1e9;
+const D1_MODES = [{v:"stairs", label:"Climbing stairs (1 or 2 steps)", set:{}},{v:"robber", label:"House robber (no two neighbours)", set:{}},{v:"coins", label:"Coin change (fewest coins)", set:{}}];
+const D1_METHODS = [{v:"table", label:"Bottom-up table (tabulation)", set:{}},{v:"memo", label:"Top-down recursion with a memo", set:{}},{v:"plain", label:"Plain recursion (no memo)", set:{}}];
+function d1Problem(v){
+  const mode = D1_MODES.some(m=>m.v===v.mode) ? v.mode : "stairs";
+  if(mode==="robber"){ const a = nums(v.a, 0, 99, 10), m = a.length;
+    return {mode, m, a, start:2, what:"f(i) = the most money from the first i houses", base:i=>i===0?0:i===1?a[0]:undefined, baseStr:"f(0) = 0; f(1) = a[0]", rec:"max(f(i-1), f(i-2) + a[i-1])",
+      deps:i=>[i-1, i-2], calc:(i,f)=>Math.max(f[i-1], f[i-2]+a[i-1]),
+      expl:(i,f,r)=>`f(${i}) = max(skip house ${i-1}: f(${i-1}) = ${f[i-1]}, rob it: f(${i-2}) + ${a[i-1]} = ${f[i-2]+a[i-1]}) = ${r}.`,
+      intro:`Rob houses with ${a.join(", ")} in them, never two next to each other.`}; }
+  if(mode==="coins"){ const c = [...new Set(nums(v.c, 1, 9, 4))].sort((x,y)=>x-y), m = nums(v.amt, 1, 15, 1)[0];
+    return {mode, m, c, start:1, what:"f(i) = the fewest coins that make the amount i (∞ = impossible)", base:i=>i===0?0:undefined, baseStr:"f(0) = 0", rec:"1 + min over coins c ≤ i of f(i-c)",
+      deps:i=>c.filter(x=>x<=i).map(x=>i-x), calc:(i,f)=>{ const ds = c.filter(x=>x<=i).map(x=>f[i-x]).filter(x=>x<INF); return ds.length ? 1 + Math.min(...ds) : INF; },
+      expl:(i,f,r)=>{ const ds = c.filter(x=>x<=i); return ds.length ? `f(${i}) = 1 + min(${ds.map(x=>`f(${i-x}) = ${fmtInf(f[i-x])}`).join(", ")}) = ${fmtInf(r)}.` : `f(${i}): no coin is ${i} or less, so it is impossible (∞).`; },
+      intro:`Make the amount ${m} with the fewest coins from ${c.join(", ")} (each coin can be used many times).`}; }
+  const m = nums(v.n, 1, 15, 1)[0];
+  return {mode, m, start:2, what:"f(i) = the number of ways to climb to step i", base:i=>i<=1?1:undefined, baseStr:"f(0) = 1; f(1) = 1", rec:"f(i-1) + f(i-2)",
+    deps:i=>[i-1, i-2], calc:(i,f)=>f[i-1]+f[i-2], expl:(i,f,r)=>`f(${i}) = f(${i-1}) + f(${i-2}) = ${f[i-1]} + ${f[i-2]} = ${r}: the last move was 1 step or 2 steps.`,
+    intro:`Count the ways to climb ${m} steps, taking 1 or 2 steps at a time.`};
+}
+def({ id:"dp1d", group:"Dynamic programming", title:"1-D DP: table, memo or plain recursion", concepts:["dp","callstack","bigo"],
+  text:"One recurrence, three ways to run it. Bottom-up fills the table from the smallest case up, so every value it needs is already there (arrows). Top-down calls the recurrence from the top and stores each answer in a memo, so a repeated call is a cache hit. Plain recursion stores nothing and solves the same small cases again and again: its calls grow exponentially, while both DP versions do O(n) work.",
+  inputs:[{k:"mode", label:"Problem", def:"stairs", opts:D1_MODES},{k:"method", label:"Method", def:"table", opts:D1_METHODS},
+    {k:"n", label:"Steps n (1 to 15)", def:"7", w:4, when:v=>(v.mode||"stairs")==="stairs"},{k:"a", label:"Money in each house (up to 10)", def:"2, 7, 9, 3, 1, 4", when:v=>v.mode==="robber"},
+    {k:"c", label:"Coins (up to 4, from 1 to 9)", def:"1, 3, 4", w:10, when:v=>v.mode==="coins"},{k:"amt", label:"Amount (1 to 15)", def:"10", w:4, when:v=>v.mode==="coins"}],
+  random:v=>v.mode==="robber" ? {a:randArr(rint(5,8), 1, 15)} : v.mode==="coins" ? {c:[...new Set([1, rint(2,5), rint(4,7)])].join(", "), amt:String(rint(6,13))} : {n:String(rint(4,9))},
+  counters:v=>v.method==="memo" ? ["calls","memo","cells"] : v.method==="plain" ? ["calls"] : ["cells"],
+  code:v=>{ let p; try{ p = d1Problem(v); }catch(e){ p = d1Problem({mode:"stairs", n:"5"}); }
+    return v.method==="memo" ? ["memo = {}", `f(i): base cases ${p.baseStr}`, "  if i is in memo: return memo[i]   (cache hit)", `  memo[i] = ${p.rec}`, "  return memo[i]"]
+      : v.method==="plain" ? [`f(i): base cases ${p.baseStr}`, "  (no memo: the same f(i) is solved again and again)", `  return ${p.rec}`]
+      : [`${p.baseStr}   (base cases)`, `for i from ${p.start} to n:`, `  f[i] = ${p.rec}`, "return f[n]"]; },
+  run(v, R){ const p = d1Problem(v), method = ["memo","plain"].includes(v.method) ? v.method : "table", m = p.m, f = Array(m+1).fill(null), cnt = Array(m+1).fill(0), stack = [];
+    const S = (o) => Object.assign({p:{mode:p.mode, m, a:p.a, c:p.c, what:p.what}, method, f:f.slice(), cnt:cnt.slice(), stack:stack.map(x=>Object.assign({}, x))}, o);
+    if(method==="table"){
+      for(let i=0;i<=m;i++) if(p.base(i)!==undefined){ f[i] = p.base(i); R.inc("cells"); }
+      R.step(0, `${p.intro} ${p.what}. Fill the base cases first: ${p.baseStr}.`, S({}));
+      for(let i=p.start;i<=m;i++){ const r = p.calc(i, f); R.inc("cells");
+        R.step(1, `Next cell: f(${i}). Everything it needs is to its left and already filled.`, S({cur:i, deps:p.deps(i)}));
+        f[i] = r; R.step(2, p.expl(i, f, r), S({cur:i, deps:p.deps(i), fresh:true})); }
+      R.step(3, `The answer is f(${m}) = ${fmtInf(f[m])}. ${m+1} cells, each filled once: O(n) time${p.mode==="coins" ? " × the number of coins" : ""}.`, S({cur:m, end:true})); return; }
+    const memo = method==="memo", LIM = 70, STOP = {};
+    // count the calls plain recursion would make, without recording them
+    const total = (() => { const cc = {}; const go = i => { if(p.base(i)!==undefined) return 1; if(cc[i]!==undefined) return cc[i]; let s = 1; p.deps(i).forEach(d=>{ s += go(d); }); return cc[i] = Math.min(s, 1e12); }; return go(m); })();
+    let calls = 0;
+    R.step(0, `${p.intro} ${p.what}. Start with the call f(${m}) and let it ask for what it needs.`, S({}));
+    const call = (i, from) => {
+      calls++; R.inc("calls"); if(!memo && calls > LIM) throw STOP;
+      stack.push({i, w:null});
+      const b = p.base(i);
+      if(b!==undefined){ cnt[i]++; if(memo || f[i]===null) f[i] = b; R.step(memo?1:0, `f(${i}) is a base case: return ${b}.`, S({cur:i})); stack.pop(); return b; }
+      if(memo && f[i]!==null){ R.inc("memo"); R.step(2, `f(${i}) is already in the memo: return ${fmtInf(f[i])} at once (a cache hit, no more calls).`, S({cur:i, hit:true})); stack.pop(); return f[i]; }
+      const ds = p.deps(i);
+      R.step(memo?3:2, `Call f(${i})${from!==undefined?` (asked by f(${from}))`:""}. It needs ${ds.length ? ds.map(d=>`f(${d})`).join(" and ") : "nothing"}${!memo && cnt[i] ? `. f(${i}) was already solved ${cnt[i]} time${cnt[i]===1?"":"s"}, but nothing was kept` : ""}.`, S({cur:i, deps:ds}));
+      const got = {}; ds.forEach(d=>{ stack[stack.length-1].w = d; got[d] = call(d, i); }); stack[stack.length-1].w = null;
+      const g = Object.assign([], f); Object.keys(got).forEach(d=>{ g[d] = got[d]; });
+      const r = p.calc(i, g); cnt[i]++; f[i] = r; if(memo) R.inc("cells");
+      R.step(memo?4:2, p.expl(i, g, r) + (memo ? ` Store it in the memo.` : cnt[i]>1 ? ` (Solved ${cnt[i]} times so far.)` : ""), S({cur:i, deps:ds, fresh:true}));
+      stack.pop(); return r; };
+    try { const r = call(m);
+      R.step(memo?4:2, memo ? `f(${m}) = ${fmtInf(r)}. ${R.c.calls} calls and ${R.c.memo||0} cache hits: each f(i) was computed once, so it is O(n) like the table, plus stack space.` : `f(${m}) = ${fmtInf(r)} after ${R.c.calls} calls. A memo would need only about ${p.mode==="coins"?"n × coins":"2n"} calls; plain recursion grows exponentially.`, S({end:true})); }
+    catch(e){ if(e!==STOP) throw e; stack.length = 0;
+      R.step(1, `Stopped after ${LIM} calls. Plain recursion makes ${total >= 1e12 ? "more than a trillion" : total.toLocaleString("en-US")} calls in total for f(${m}), because every f(i) is solved again each time it is needed. The table fills only ${m+1} cells.`, S({end:true, stopped:true})); } },
+  draw(s){ const m = s.p.m, deps = new Set(s.deps||[]);
+    const fc = s.f.map((x,i)=>({v:x===null ? "" : fmtInf(x), cls:i===s.cur ? (s.hit ? "done" : "cur") : deps.has(i) ? "cmp" : x===null ? "nil" : s.method==="plain" ? "dim" : "", sub:s.method==="plain" && s.cnt[i] ? "×" + s.cnt[i] : undefined, focus:i===s.cur}));
+    const rows = [{label:"f", cells:fc}];
+    if(s.p.mode==="robber") rows.unshift({label:"house", cells:s.p.a.map(x=>({v:x})), off:1});
+    const arcs = (LX, PW, TOP, RH) => { if(s.cur===undefined || !s.deps) return ""; const yb = TOP + (rows.length-1)*RH + 6, cx = i => LX + i*PW + PW/2;
+      return s.deps.filter(d=>d>=0).map(d=>{ const x1 = cx(d), x2 = cx(s.cur), up = Math.min(40, 14 + (s.cur-d)*5), y = rows.length>1 ? yb : TOP - 16;
+        return rows.length>1 ? `<path d="M${x1},${y+30} C${x1},${y+48} ${x2},${y+48} ${x2},${y+30}" class="ms-arc hot" marker-end="url(#av-arrh)"/>` : `<path d="M${x1},${y} C${x1},${y-up} ${x2},${y-up} ${x2},${y}" class="ms-arc hot" marker-end="url(#av-arrh)"/>`; }).join(""); };
+    const svg = rowsSVG(rows, {lx:46, pw:34, top:rows.length>1 ? 18 : 56, extra:rows.length>1 ? 22 : (s.method==="plain" ? 10 : 0), label:"DP values f(0) to f(" + m + ")", add:(a,b,c,d)=>ARROWH + arcs(a,b,c,d), index:m+1, min:.85});
+    const stack = s.method==="table" ? "" : stackHTML("call stack", s.stack.map((x,k)=>({t:`<b>f(${x.i})</b>${x.w!==null ? `<span class="mono">waits for f(${x.w})</span>` : ""}`, cls:k===s.stack.length-1 ? (s.hit ? "hit" : "cur") : ""})), "empty");
+    return `<div class="av-bk"><div class="bk-tree">${svg}<p class="av-aux">${esc(s.p.what)}${s.p.mode==="coins" ? ` · coins: ${s.p.c.join(", ")}` : ""}${s.method==="plain" ? " · ×k = how many times f(i) was solved" : ""}</p></div>${stack}</div>`; } });
+
+/* ---- prefix sums and difference arrays ---- */
+const PS_MODES = [{v:"range", label:"Range sums with a prefix array", set:{a:"3, -1, 4, 1, 5, -9, 2, 6"}},{v:"subk", label:"Subarrays that sum to K (hash map)", set:{a:"1, 2, 1, -1, 3, -2, 2, 1"}},
+  {v:"diff", label:"Range adds with a difference array", set:{a:"0, 0, 0, 0, 0, 0, 0, 0"}}];
+const PS_CODE = {
+  range:["P[0] = 0","for i from 0 to n-1: P[i+1] = P[i] + a[i]","sum(a[l..r]) = P[r+1] - P[l]   (one subtraction: O(1))"],
+  subk:["seen = {0: 1}; sum = 0; count = 0","for i from 0 to n-1:","  sum = sum + a[i]   (P[i+1])","  count += seen[sum - K]   (each earlier P equal to sum - K","     starts a subarray that ends here and sums to K)","  seen[sum] += 1","return count"],
+  diff:["d = [0] * (n + 1)","add v to a[l..r]: d[l] += v; d[r+1] -= v   (O(1) each)","run = 0; for i from 0 to n-1:","  run = run + d[i]; a[i] = a[i] + run   (one pass at the end)"] };
+def({ id:"prefix", group:"Arrays & strings", title:"Prefix sums and difference arrays", concepts:["prefixsums","hashtables","rangeq"],
+  text:v=>v.mode==="diff" ? "To add v to a whole range many times, do not touch every cell. Write +v where the range starts and −v just after it ends, in a difference array d. One prefix pass at the end turns d into the total added to each cell. k updates and one pass cost O(n + k) instead of O(n·k). Car pooling and flight bookings are this."
+    : v.mode==="subk" ? "A subarray a[j..i] sums to K exactly when P[i+1] − P[j] = K, that is when an earlier prefix sum equals sum − K. Walk once, keep a hash map from each prefix sum to how many times it was seen, and add that count at every step: O(n) instead of trying all O(n²) subarrays. Negative numbers are fine, unlike a sliding window."
+    : "Store running totals once: P[k] is the sum of the first k values (P sits on the fence before a[k]). Then the sum of any range a[l..r] is one subtraction, P[r+1] − P[l], so each query is O(1) after O(n) work. SQL window sums and Fenwick trees build on the same idea.",
+  inputs:[{k:"mode", label:"Problem", def:"range", opts:PS_MODES},{k:"a", label:"Numbers (up to 12, from -50 to 50)", def:"3, -1, 4, 1, 5, -9, 2, 6"},
+    {k:"q", label:"Queries (l r)", def:"0 3, 2 5, 4 4", w:16, when:v=>(v.mode||"range")==="range"},{k:"k", label:"K", def:"3", w:4, when:v=>v.mode==="subk"},
+    {k:"u", label:"Updates (l r v)", def:"1 4 2, 3 6 5, 0 2 -1", w:20, when:v=>v.mode==="diff"}],
+  random:v=>v.mode==="diff" ? {u:Array.from({length:3},()=>{ const l = rint(0,5); return `${l} ${rint(l,7)} ${rint(-3,6)}`; }).join(", ")} : v.mode==="subk" ? {a:randArr(8, -2, 4), k:String(rint(2,5))} : {a:randArr(rint(6,9), -5, 9), q:"0 2, 1 4, 3 5"},
+  counters:v=>v.mode==="subk" ? ["cells","look","sol"] : v.mode==="diff" ? ["wr","cells"] : ["cells","look"],
+  code:v=>PS_CODE[v.mode] || PS_CODE.range,
+  run(v, R){ const mode = PS_CODE[v.mode] ? v.mode : "range", a = nums(v.a, -50, 50, 12), n = a.length, P = Array(n+1).fill(null);
+    const S = o => Object.assign({mode, a, P:P.slice()}, o);
+    if(mode==="diff"){
+      const ups = ops(v.u).map(t=>{ const [l, r, x] = t.map(Number); if(t.length!==3 || ![l,r,x].every(Number.isInteger) || l<0 || r<l || r>=n || Math.abs(x)>99) throw new Error(`Write updates as "l r v" with 0 ≤ l ≤ r ≤ ${n-1}, like "1 4 2".`); return [l, r, x]; });
+      if(ups.length > 6) throw new Error("At most 6 updates.");
+      const d = Array(n+1).fill(0), run = Array(n).fill(null), res = Array(n).fill(null);
+      const T = o => S(Object.assign({d:d.slice(), run:run.slice(), res:res.slice()}, o));
+      R.step(0, `Start with a difference array d of ${n+1} zeros. Nothing in a changes until the end.`, T({}));
+      ups.forEach(([l, r, x])=>{ d[l] += x; d[r+1] -= x; R.inc("wr", 2);
+        R.step(1, `Add ${x} to a[${l}..${r}]: d[${l}] += ${x} and d[${r+1}] -= ${x}. Two writes, however long the range is.`, T({ul:[l, r], dl:[l, r+1]})); });
+      let acc = 0;
+      for(let i=0;i<n;i++){ acc += d[i]; run[i] = acc; res[i] = a[i] + acc; R.inc("cells");
+        R.step(3, `run = ${acc - d[i]} + d[${i}] (${d[i]}) = ${acc}, the total added to a[${i}]; a[${i}] becomes ${a[i]} + ${acc} = ${res[i]}.`, T({i})); }
+      R.step(3, `Done: ${ups.length} range updates with ${R.c.wr} writes, then one pass of ${n}. Updating every cell directly would have taken ${ups.reduce((s,u)=>s+u[1]-u[0]+1,0)} writes.`, T({end:true})); return; }
+    P[0] = 0; R.inc("cells");
+    if(mode==="range") R.step(0, `P[0] = 0: the sum of no values. P[k] will be the sum of the first k values.`, S({k:0}));
+    if(mode==="subk"){ const K = nums(v.k, -99, 99, 1)[0], seen = {0:[0]}; let count = 0; const found = [];
+      const T = o => S(Object.assign({K, seen:Object.fromEntries(Object.entries(seen).map(([s,l])=>[s, l.slice()])), count, found:found.slice()}, o));
+      R.step(0, `Count the subarrays that sum to ${K}. The map starts with {0: 1}: the empty prefix.`, T({k:0}));
+      for(let i=0;i<n;i++){ P[i+1] = P[i] + a[i]; R.inc("cells"); const want = P[i+1] - K, hits = seen[want] || [];
+        R.step(2, `sum = ${P[i]} + ${a[i]} = ${P[i+1]} (P[${i+1}]).`, T({k:i+1, i}));
+        R.inc("look"); hits.forEach(j=>found.push([j, i])); count += hits.length; R.inc("sol", hits.length);
+        R.step(3, hits.length ? `Look up ${P[i+1]} − ${K} = ${want}: seen ${hits.length} time${hits.length===1?"":"s"} (P[${hits.join("], P[")}]). So ${hits.map(j=>`a[${j}..${i}]`).join(" and ")} sum${hits.length===1?"s":""} to ${K}. count = ${count}.` : `Look up ${P[i+1]} − ${K} = ${want}: not seen yet, so no subarray ending at ${i} sums to ${K}.`, T({k:i+1, i, hit:hits, want}));
+        (seen[P[i+1]] = seen[P[i+1]] || []).push(i+1);
+        R.step(5, `Remember sum ${P[i+1]}: seen[${P[i+1]}] = ${seen[P[i+1]].length}.`, T({k:i+1, i, put:P[i+1]})); }
+      R.step(6, `Done: ${count} subarray${count===1?"":"s"} sum to ${K}${found.length ? ": " + found.map(([j,i])=>`a[${j}..${i}]`).join(", ") : ""}. One pass and ${n} map lookups: O(n).`, T({end:true})); return; }
+    const qs = ops(v.q).map(t=>{ const [l, r] = t.map(Number); if(t.length!==2 || !Number.isInteger(l) || !Number.isInteger(r) || l<0 || r<l || r>=n) throw new Error(`Write queries as "l r" with 0 ≤ l ≤ r ≤ ${n-1}, like "2 5".`); return [l, r]; });
+    if(qs.length > 6) throw new Error("At most 6 queries.");
+    for(let i=0;i<n;i++){ P[i+1] = P[i] + a[i]; R.inc("cells"); R.step(1, `P[${i+1}] = P[${i}] + a[${i}] = ${P[i]} + ${a[i]} = ${P[i+1]}.`, S({k:i+1, i})); }
+    R.step(1, `The prefix array is built in one pass: O(n). Now every range sum is one subtraction.`, S({}));
+    qs.forEach(([l, r])=>{ R.inc("look"); R.step(2, `sum(a[${l}..${r}]) = P[${r+1}] − P[${l}] = ${P[r+1]} − ${P[l]} = ${P[r+1]-P[l]}. P[${r+1}] counts everything up to a[${r}]; subtracting P[${l}] removes what comes before a[${l}].`, S({q:[l, r]})); });
+    R.step(2, `Done: ${qs.length} quer${qs.length===1?"y":"ies"}, each O(1).`, S({end:true})); },
+  draw(s){ const n = s.a.length;
+    if(s.mode==="diff"){ const dl = new Set(s.dl||[]);
+      const rows = [{label:"a", cells:s.a.map((x,i)=>({v:x, cls:i===s.i?"cmp":""}))},
+        {label:"d", cells:s.d.map((x,i)=>({v:x, cls:dl.has(i)?"cur":i===s.i?"cmp":x?"win":""})), spans:s.ul?[[s.ul[0], s.ul[1]]]:[]},
+        {label:"run", cells:s.run.map((x,i)=>({v:x===null?"":x, cls:i===s.i?"cur":x===null?"nil":""}))},
+        {label:"new a", cells:s.res.map((x,i)=>({v:x===null?"":x, cls:i===s.i?"done":x===null?"nil":s.end?"done":"", focus:i===s.i}))}];
+      return rowsSVG(rows, {lx:50, label:"Array, difference array and the prefix pass"}) + `<p class="av-aux">The bracket over d is the range being updated. "run" is the prefix sum of d: what was added to each cell.</p>`; }
+    const P = s.P.map((x,k)=>({v:x===null?"":x, cls:k===s.k && !s.q ? "cur" : s.q && (k===s.q[0] || k===s.q[1]+1) ? "cmp" : s.hit && s.hit.includes(k) ? "done" : x===null ? "nil" : "", focus:k===s.k, sub:k}));
+    const A = s.a.map((x,i)=>({v:x, cls:s.q ? (i>=s.q[0] && i<=s.q[1] ? "win" : "dim") : i===s.i ? "cmp" : ""}));
+    const spans = s.q ? [[s.q[0], s.q[1]]] : s.hit ? s.hit.map(j=>[j, s.i, "ok"]) : [];
+    const rows = [{label:"a", cells:A, off:.5, spans}, {label:"P", cells:P}];
+    let extra = "";
+    if(s.mode==="subk") extra = `<div class="av-h mono" style="margin-top:8px">seen prefix sums → how many times</div><div class="av-kvs">${Object.entries(s.seen).sort((x,y)=>+x[0]-+y[0]).map(([k,l])=>`<span class="kv${+k===s.want?" done":""}${+k===s.put?" cmp":""}">${esc(k)} → ${l.length}</span>`).join("")}</div><p class="av-aux mono">K = ${s.K} · count = ${s.count}${s.found.length ? " · " + esc(s.found.map(([j,i])=>`a[${j}..${i}]`).join(" ")) : ""}</p>`;
+    return rowsSVG(rows, {lx:30, label:"Array and its prefix sums", top:20, idxOff:.5, extra:8}) + `<p class="av-aux">Top numbers are indexes of a; numbers under P are k. P[k] sits on the fence before a[k]: it is the sum of everything to its left.${s.q ? ` The range a[${s.q[0]}..${s.q[1]}] = P[${s.q[1]+1}] − P[${s.q[0]}].` : ""}</p>` + extra; } });
+
+/* ---- segment tree with lazy range adds ---- */
+const SG_FN = {sum:{op:(x,y)=>x+y, id:0, sym:"+", name:"sum"}, min:{op:(x,y)=>Math.min(x,y), id:INF, sym:"min", name:"minimum"}, max:{op:(x,y)=>Math.max(x,y), id:-INF, sym:"max", name:"maximum"}};
+def({ id:"segtree", group:"Data structures", title:"Segment tree: range query, update and lazy add", concepts:["rangeq","trees","bigo"],
+  text:"Each node of a segment tree stores the answer (sum, min or max) for one range of the array; its two children split that range in half, and the leaves are single cells. A range query takes the few nodes that fit inside the range whole and skips the rest: at most about 4 log n nodes. A point update changes one leaf and fixes its log n ancestors. A range add stops at nodes that are fully covered and leaves a lazy note there, pushed down only when a later visit needs the children.",
+  inputs:[{k:"fn", label:"Each node stores", def:"sum", opts:[{v:"sum", label:"the sum"},{v:"min", label:"the minimum"},{v:"max", label:"the maximum"}]},
+    {k:"a", label:"Array (up to 10 numbers, from -99 to 99)", def:"5, 3, 8, 6, 1, 4, 7, 2"},{k:"ops", label:"Operations", def:"query 2 6, set 3 10, query 2 6, add 0 4 2, query 3 5"}],
+  random:()=>{ const n = rint(6,9); return {a:randArr(n, 1, 20), ops:`query ${rint(0,2)} ${rint(3,n-1)}, set ${rint(0,n-1)} ${rint(1,20)}, add ${rint(0,2)} ${rint(3,n-1)} ${rint(1,5)}, query ${rint(0,3)} ${rint(4,n-1)}`}; },
+  counters:["nodes"], clabel:{nodes:"node visits"},
+  code:v=>{ const s = (SG_FN[v.fn]||SG_FN.sum).sym; return ["build(node, l, r): a leaf copies a[l]",`  else build both halves; t[node] = t[left] ${s} t[right]`,"query(node, l, r): [l..r] outside the query: skip it","  [l..r] inside the query: use t[node]   (do not go down)",`  else: push down a lazy add; return query(left) ${s} query(right)`,"set(i, v): go down to the leaf for i and set it",`  on the way back up: t[node] = t[left] ${s} t[right]`,"add(l..r, v): node inside the range: apply v, lazy[node] += v","  else: push down, add into both halves, recompute t[node]"]; },
+  run(v, R){ const F = SG_FN[v.fn] || SG_FN.sum, a = nums(v.a, -99, 99, 10), n = a.length, t = {}, lz = {}, rg = {};
+    const list = ops(v.ops).map(o=>{ const x = o.slice(1).map(Number);
+      if(o[0]==="query" && x.length===2 && x[0]>=0 && x[0]<=x[1] && x[1]<n) return o;
+      if(o[0]==="set" && x.length===2 && x[0]>=0 && x[0]<n && Number.isInteger(x[1]) && Math.abs(x[1])<=99) return o;
+      if(o[0]==="add" && x.length===3 && x[0]>=0 && x[0]<=x[1] && x[1]<n && Number.isInteger(x[2]) && Math.abs(x[2])<=99) return o;
+      throw new Error(`Write "query l r", "set i v" or "add l r v", with indexes from 0 to ${n-1}.`); });
+    if(list.length > 8) throw new Error("At most 8 operations.");
+    const S = (o) => Object.assign({a:a.slice(), n, t:Object.assign({}, t), lz:Object.assign({}, lz), rg, fn:v.fn in SG_FN ? v.fn : "sum"}, o);
+    const lbl = nd => `[${rg[nd][0]}..${rg[nd][1]}]`, cls = {};
+    const snap = o => S(Object.assign({cls:Object.assign({}, cls)}, o));
+    const build = (nd, l, r) => { rg[nd] = [l, r]; R.inc("nodes");
+      if(l===r){ t[nd] = a[l]; R.step(0, `Leaf ${lbl(nd)} holds a[${l}] = ${a[l]}.`, snap({cur:nd})); return; }
+      const m = (l+r) >> 1; build(2*nd, l, m); build(2*nd+1, m+1, r); t[nd] = F.op(t[2*nd], t[2*nd+1]);
+      R.step(1, `Node ${lbl(nd)} = ${fmtInf(t[2*nd])} ${F.sym} ${fmtInf(t[2*nd+1])} = ${fmtInf(t[nd])}, from its children ${lbl(2*nd)} and ${lbl(2*nd+1)}.`, snap({cur:nd, kids:[2*nd, 2*nd+1]})); };
+    const apply = (nd, x) => { const [l, r] = rg[nd]; t[nd] += F===SG_FN.sum ? x*(r-l+1) : x; if(l<r) lz[nd] = (lz[nd]||0) + x; };
+    const push = nd => { if(!lz[nd]) return; const x = lz[nd]; apply(2*nd, x); apply(2*nd+1, x); delete lz[nd];
+      R.step(4, `Node ${lbl(nd)} has a pending add of ${x}. Push it down to both children before going below it.`, snap({cur:nd, kids:[2*nd, 2*nd+1]})); };
+    R.step(0, `Build a segment tree over ${n} values. Each node stores the ${F.name} of its range.`, S({cls:{}}));
+    build(1, 0, n-1);
+    R.step(1, `Built: ${Object.keys(t).length} nodes, the root ${lbl(1)} holds ${fmtInf(t[1])}. Building is O(n).`, S({cls:{}}));
+    for(const o of list){ const x = o.slice(1).map(Number); Object.keys(cls).forEach(k=>delete cls[k]);
+      if(o[0]==="query"){ const [ql, qr] = x; let used = [], vis = 0;
+        const q = nd => { const [l, r] = rg[nd]; R.inc("nodes"); vis++;
+          if(r < ql || l > qr){ cls[nd] = "dim"; R.step(2, `${lbl(nd)} is outside [${ql}..${qr}]: skip it.`, snap({cur:nd, q:[ql, qr]})); return F.id; }
+          if(ql <= l && r <= qr){ cls[nd] = "done"; used.push(nd); R.step(3, `${lbl(nd)} is inside [${ql}..${qr}]: use its value ${fmtInf(t[nd])} and do not go further down.`, snap({cur:nd, q:[ql, qr]})); return t[nd]; }
+          cls[nd] = "cmp"; R.step(4, `${lbl(nd)} is partly inside [${ql}..${qr}]: ask both children.`, snap({cur:nd, q:[ql, qr]}));
+          push(nd); return F.op(q(2*nd), q(2*nd+1)); };
+        R.step(2, `query ${ql} ${rg[1] ? "" : ""}${qr}: the ${F.name} of a[${ql}..${qr}]. Start at the root.`, snap({q:[ql, qr]}));
+        const res = q(1);
+        R.step(3, `The ${F.name} of a[${ql}..${qr}] is ${used.map(nd=>fmtInf(t[nd])).join(` ${F.sym} `)}${used.length>1 ? ` = ${fmtInf(res)}` : ""}, from ${used.length} node${used.length===1?"":"s"} (${used.map(lbl).join(", ")}). ${vis} nodes visited, not ${qr-ql+1} cells.`, snap({q:[ql, qr], res})); continue; }
+      if(o[0]==="set"){ const [i, val] = x; a[i] = val; const path = [];
+        R.step(5, `set ${i} ${val}: go down to the leaf for a[${i}].`, snap({pt:i}));
+        const go = nd => { const [l, r] = rg[nd]; R.inc("nodes"); path.push(nd); cls[nd] = "cmp";
+          if(l===r){ t[nd] = val; cls[nd] = "cur"; R.step(5, `Leaf ${lbl(nd)} now holds ${val}.`, snap({cur:nd, pt:i})); return; }
+          push(nd); const m = (l+r) >> 1; R.step(5, `${lbl(nd)}: index ${i} is in the ${i<=m?"left":"right"} half.`, snap({cur:nd, pt:i}));
+          go(i<=m ? 2*nd : 2*nd+1); t[nd] = F.op(t[2*nd], t[2*nd+1]); cls[nd] = "done";
+          R.step(6, `Back up at ${lbl(nd)}: recompute ${fmtInf(t[2*nd])} ${F.sym} ${fmtInf(t[2*nd+1])} = ${fmtInf(t[nd])}.`, snap({cur:nd, kids:[2*nd, 2*nd+1], pt:i})); };
+        go(1); R.step(6, `Done: ${path.length} nodes changed, one per level: O(log n).`, snap({pt:i})); continue; }
+      const [ql, qr, val] = x;
+      R.step(7, `add ${ql} ${qr} ${val}: add ${val} to every value in a[${ql}..${qr}], without visiting every leaf.`, snap({q:[ql, qr]}));
+      const ad = nd => { const [l, r] = rg[nd]; R.inc("nodes");
+        if(r < ql || l > qr){ cls[nd] = "dim"; R.step(7, `${lbl(nd)} is outside the range: nothing to do.`, snap({cur:nd, q:[ql, qr]})); return; }
+        if(ql <= l && r <= qr){ apply(nd, val); cls[nd] = "done"; R.step(7, `${lbl(nd)} is fully inside: its ${F.name} becomes ${fmtInf(t[nd])}${l<r ? `, and it keeps a lazy note "+${val}" for its children instead of updating them now` : ""}.`, snap({cur:nd, q:[ql, qr]})); return; }
+        cls[nd] = "cmp"; push(nd); R.step(8, `${lbl(nd)} is partly inside: go into both halves.`, snap({cur:nd, q:[ql, qr]}));
+        ad(2*nd); ad(2*nd+1); t[nd] = F.op(t[2*nd], t[2*nd+1]);
+        R.step(8, `Back at ${lbl(nd)}: recompute ${fmtInf(t[2*nd])} ${F.sym} ${fmtInf(t[2*nd+1])} = ${fmtInf(t[nd])}.`, snap({cur:nd, kids:[2*nd, 2*nd+1], q:[ql, qr]})); };
+      ad(1); for(let i=ql;i<=qr;i++) a[i] += val;
+      R.step(8, `Done: the range add touched O(log n) nodes. Lazy notes wait until a query or update has to go below them.`, snap({q:[ql, qr]})); }
+    R.step(3, "Done.", S({cls:{}})); },
+  draw(s){ const UX = 44, BW = 38, BH = 24, UY = 52, X0 = 30, rg = s.rg, ids = Object.keys(rg).map(Number), X = {}, D = {};
+    ids.forEach(nd=>{ const [l, r] = rg[nd]; D[nd] = Math.floor(Math.log2(nd)); X[nd] = X0 + (l + r + 1)/2*UX; });
+    const maxD = Math.max(0, ...ids.map(i=>D[i])), Y = d => 26 + d*UY, AY = Y(maxD) + UY - 6, W = X0 + s.n*UX + 10, H = AY + 50;
+    let e = "", g = "";
+    ids.forEach(nd=>{ [2*nd, 2*nd+1].filter(c=>rg[c]).forEach(c=>{ e += `<line x1="${X[nd]}" y1="${Y(D[nd])+BH/2}" x2="${X[c]}" y2="${Y(D[c])-BH/2}" class="${s.cls[c]==="done"||s.cls[c]==="cmp"?"hot":""}"/>`; });
+      const c = (nd===s.cur ? "cur " : "") + (s.kids && s.kids.includes(nd) ? "kid " : "") + (s.cls[nd]||""), [l, r] = rg[nd];
+      g += `<g class="sg ${c}"${nd===s.cur?" data-focus":""}><rect x="${X[nd]-BW/2}" y="${Y(D[nd])-BH/2}" width="${BW}" height="${BH}" rx="5"/><text x="${X[nd]}" y="${Y(D[nd])+4.5}" text-anchor="middle">${s.t[nd]===undefined?"":fmtInf(s.t[nd])}</text><text x="${X[nd]}" y="${Y(D[nd])+BH/2+11}" text-anchor="middle" class="sub">${l===r?l:l+"–"+r}</text>${s.lz[nd]?`<g class="lz"><rect x="${X[nd]+BW/2-12}" y="${Y(D[nd])-BH/2-11}" width="${String(s.lz[nd]).length*7+14}" height="15" rx="7"/><text x="${X[nd]+BW/2-5}" y="${Y(D[nd])-BH/2}">${s.lz[nd]>0?"+":""}${s.lz[nd]}</text></g>`:""}</g>`; });
+    s.a.forEach((x,i)=>{ const inq = s.q && i>=s.q[0] && i<=s.q[1], pt = s.pt===i;
+      g += `<g class="rc ${inq?"win":pt?"cur":""}"><rect x="${X0 + i*UX + (UX-BW)/2}" y="${AY}" width="${BW}" height="26" rx="5"/><text x="${X0 + i*UX + UX/2}" y="${AY+17.5}" text-anchor="middle">${x}</text><text x="${X0 + i*UX + UX/2}" y="${AY+39}" text-anchor="middle" class="sub">${i}</text></g>`; });
+    g += `<text x="${X0-6}" y="${AY+17.5}" text-anchor="end" class="rl">a</text>`;
+    return wide(W, H, e + g, `Segment tree over ${s.n} values`, .85, "av-sg") + `<p class="av-aux av-key"><span><i class="cur"></i>current node</span><span><i class="cmp"></i>partly inside: go down</span><span><i class="done"></i>used / updated</span><span><i class="prn"></i>outside: skipped</span><span><i class="swp"></i>lazy note</span></p>${s.res!==undefined ? `<p class="av-aux mono">answer: ${fmtInf(s.res)}</p>` : ""}`; } });
+
+/* ---- fast and slow pointers ---- */
+def({ id:"fastslow", group:"Arrays & strings", title:"Fast and slow pointers: cycle and middle", concepts:["proofs","bigo","numbertheory"],
+  text:v=>v.mode==="middle" ? "Move slow one node and fast two nodes at a time. When fast reaches the end, slow has gone exactly half as far: it is at the middle. One pass, O(1) extra memory, and you never need the length." :
+    "Move slow one node and fast two nodes per step (Floyd's cycle finding). Without a cycle fast falls off the end. With one, both end up going round the cycle and fast gains one node per step, so it catches slow within one lap. Then start one pointer again from the head and move both one step at a time: they meet exactly where the cycle starts, because the tail length equals the distance from the meeting point to the start, plus whole laps. O(n) time, O(1) memory.",
+  inputs:[{k:"mode", label:"Problem", def:"cycle", opts:[{v:"cycle", label:"Find the cycle and where it starts", set:{pos:"3"}},{v:"middle", label:"Middle of the list", set:{pos:"-1"}}]},
+    {k:"a", label:"List values (up to 12)", def:"3, 8, 5, 1, 9, 4, 7, 2, 6"},{k:"pos", label:"The last node links back to index (-1 = no cycle)", def:"3", w:4, when:v=>v.mode!=="middle"}],
+  random:v=>{ const n = rint(6,11); return {a:randArr(n, 1, 9), pos:v.mode==="middle" ? "-1" : String(Math.random()<.85 ? rint(0, n-2) : -1)}; },
+  counters:["steps"],
+  code:v=>v.mode==="middle" ? ["slow = fast = head","while fast and fast.next:","  slow = slow.next; fast = fast.next.next","slow is the middle (fast went twice as far)"]
+    : ["slow = fast = head","while fast and fast.next:","  slow = slow.next; fast = fast.next.next","  if slow == fast: they meet inside the cycle","no cycle: fast reached the end","phase 2: p = head; q = meeting point","while p != q: p = p.next; q = q.next","p is where the cycle starts"],
+  run(v, R){ const mode = v.mode==="middle" ? "middle" : "cycle", a = nums(v.a, -99, 99, 12), n = a.length;
+    if(n < 2) throw new Error("Use at least 2 values.");
+    const pos = mode==="middle" ? -1 : nums(v.pos, -1, n-1, 1)[0], nx = i => i===null ? null : i < n-1 ? i+1 : (pos>=0 ? pos : null);
+    const S = o => Object.assign({a, pos, mode}, o);
+    let s = 0, f = 0;
+    R.step(0, mode==="middle" ? `Find the middle of ${n} nodes in one pass. Both pointers start at the head.` : `Is there a cycle in this list${pos>=0 ? "" : ""}? Both pointers start at the head.`, S({s, f}));
+    if(mode==="middle"){
+      while(f!==null && nx(f)!==null){ s = nx(s); f = nx(nx(f)); R.inc("steps", 3);
+        R.step(2, `slow moves 1 to index ${s}; fast moves 2 to ${f===null ? "the end (null)" : "index " + f}.`, S({s, f})); }
+      R.step(3, `fast ${f===null ? "fell off the end" : "is on the last node"}, so slow (index ${s}, value ${a[s]}) is the middle${n%2===0 ? " (the second of the two middle nodes)" : ""}.`, S({s, f, end:true})); return; }
+    let k = 0;
+    for(;;){
+      if(f===null || nx(f)===null){ R.step(4, `fast ${f===null ? "fell off the end" : "is on the last node and has no next"}: there is no cycle. ${k} steps.`, S({s, f, end:true})); return; }
+      s = nx(s); f = nx(nx(f)); k++; R.inc("steps", 3);
+      if(s===f){ R.step(3, `slow moves to index ${s}, fast jumps 2 to index ${f}: they meet after ${k} steps. Fast went ${2*k} nodes, slow ${k}; the difference ${k} is a whole number of laps.`, S({s, f, meet:s})); break; }
+      R.step(2, `slow moves to index ${s}; fast jumps 2 to index ${f}.${pos>=0 && s>=pos ? ` Both are in the cycle now; fast is ${((s - f) % (n-pos) + (n-pos)) % (n-pos)} node${((s - f) % (n-pos) + (n-pos)) % (n-pos)===1?"":"s"} behind slow and gains 1 per step.` : ""}`, S({s, f})); }
+    const meet = s; let p = 0, q = meet;
+    R.step(5, `Phase 2: p starts again at the head; q stays at the meeting point (index ${meet}). Both now move 1 step at a time.`, S({p, q, meet}));
+    while(p!==q){ p = nx(p); q = nx(q); R.inc("steps", 2); R.step(6, `p moves to index ${p}; q moves to index ${q}.`, S({p, q, meet})); }
+    R.step(7, `p and q meet at index ${p} (value ${a[p]}): the cycle starts here. The tail has ${pos} node${pos===1?"":"s"} and the cycle ${n-pos}.`, S({p, q, meet, start:p, end:true})); },
+  draw(s){ const a = s.a, n = a.length, cyc = s.pos >= 0, tail = cyc ? s.pos : n, c = n - tail, PX = 46, X0 = 26, R0 = 15;
+    const Rc = cyc ? Math.max(46, c*56/(2*Math.PI)) : 0, CY = cyc ? Rc + 40 : 40, P = [];
+    for(let i=0;i<tail;i++) P[i] = [X0 + i*PX, CY];
+    const cx = X0 + tail*PX + Rc - (cyc ? 0 : 0);
+    for(let j=0;j<c;j++){ const t = Math.PI + j*2*Math.PI/c; P[tail+j] = [cx + Rc*Math.cos(t), CY - Rc*Math.sin(t)]; }
+    const W = Math.round((cyc ? cx + Rc : X0 + (n-1)*PX) + 34), H = Math.round(cyc ? CY + Rc + 42 : 92);
+    let e = ARROW, g = "";
+    for(let i=0;i<n;i++){ const j = i < n-1 ? i+1 : (cyc ? s.pos : -1); if(j<0) continue;
+      const [x1,y1] = P[i], [x2,y2] = P[j], L = Math.hypot(x2-x1, y2-y1) || 1, ux = (x2-x1)/L, uy = (y2-y1)/L;
+      e += `<line x1="${(x1+ux*R0).toFixed(1)}" y1="${(y1+uy*R0).toFixed(1)}" x2="${(x2-ux*(R0+3)).toFixed(1)}" y2="${(y2-uy*(R0+3)).toFixed(1)}" class="${i===n-1?"back":""}" marker-end="url(#av-arr)"/>`; }
+    if(!cyc) g += `<text x="${P[n-1][0] + R0 + 6}" y="${CY+4}" class="sub">null</text>`;
+    const tags = {}; const tag = (i, t) => { if(i===null || i===undefined) return; (tags[i] = tags[i] || []).push(t); };
+    if(s.p!==undefined){ tag(s.p, "p"); tag(s.q, "q"); } else { tag(s.s, "slow"); tag(s.f, "fast"); }
+    a.forEach((x,i)=>{ const [px,py] = P[i], tg = tags[i] || [];
+      // pointer names sit above a tail node, and outside the circle for a cycle node
+      let tx = px, ty = py - R0 - 6, anc = "middle";
+      if(i >= tail && i !== tail){ const dx = px - cx, dy = py - CY, L = Math.hypot(dx, dy) || 1; tx = px + dx/L*(R0+8); ty = py + dy/L*(R0+8) + 4; anc = Math.abs(dx/L) < .35 ? "middle" : dx > 0 ? "start" : "end"; if(dy > 0 && Math.abs(dx/L) < .35) ty += 8; }
+      const cls = i===s.start ? "done" : tg.length===2 ? "cur" : tg.includes("fast") || tg.includes("q") ? "cmp" : tg.length ? "sel" : i===s.meet ? "meet" : "";
+      g += `<g class="tn ${cls}"${tg.length?" data-focus":""}><circle cx="${px.toFixed(1)}" cy="${py.toFixed(1)}" r="${R0}"/><text x="${px.toFixed(1)}" y="${(py+4).toFixed(1)}" text-anchor="middle">${x}</text><text x="${px.toFixed(1)}" y="${(py+R0+12).toFixed(1)}" text-anchor="middle" class="sub">${i}</text>${tg.length?`<text x="${tx.toFixed(1)}" y="${ty.toFixed(1)}" text-anchor="${anc}" class="ptr">${tg.join(" + ")}</text>`:""}</g>`; });
+    const f = s.p===undefined && s.f===null ? `<p class="av-aux mono">fast = null (past the end)</p>` : "";
+    return wide(W, H, e + g, `Linked list of ${n} nodes${cyc ? `; the last links back to index ${s.pos}` : ""}`, .85, "av-fs") + f + `<p class="av-aux av-key"><span><i class="win"></i>${s.p===undefined?"slow":"p"}</span><span><i class="cmp"></i>${s.p===undefined?"fast":"q"}</span><span><i class="cur"></i>both</span>${cyc ? `<span><i class="done"></i>cycle start</span>` : ""}</p>`; } });
+
+/* ---- binary search on the answer ---- */
+const BA_MODES = [{v:"ship", label:"Ship packages within D days", set:{a:"1, 2, 3, 4, 5, 6, 7, 8, 9, 10", d:"5"}},{v:"koko", label:"Eating speed: finish the piles in H hours", set:{a:"3, 6, 7, 11", d:"8"}}];
+def({ id:"bsanswer", group:"Searching", title:"Binary search on the answer", concepts:["bigo","greedydc","proofs"],
+  text:"Some problems ask for the smallest value that works (the lowest ship capacity, the slowest eating speed) where any bigger value also works. Then the answers form a line of 'no' followed by 'yes', and you can binary search on that line: test the middle value with a quick simulation, and throw away the half that cannot hold the first 'yes'. O(n log(range)) instead of trying every value.",
+  inputs:[{k:"mode", label:"Problem", def:"ship", opts:BA_MODES},{k:"a", label:v=>v.mode==="koko"?"Banana piles (up to 10, from 1 to 30)":"Package weights, in order (up to 12, from 1 to 30)", def:"1, 2, 3, 4, 5, 6, 7, 8, 9, 10"},
+    {k:"d", label:v=>v.mode==="koko"?"Hours H":"Days D", def:"5", w:4}],
+  random:v=>v.mode==="koko" ? (()=>{ const a = randArr(rint(3,6), 2, 30); return {a, d:String(a.split(",").length + rint(1,5))}; })() : {a:randArr(rint(6,10), 1, 12), d:String(rint(2,5))},
+  counters:["check","steps"], clabel:{steps:"simulation steps"},
+  code:v=>[v.mode==="koko" ? "lo = 1; hi = max(piles)   (the answer is in [lo, hi])" : "lo = max(weights); hi = sum(weights)   (the answer is in [lo, hi])","while lo < hi:","  mid = (lo + hi) / 2, rounded down","  if feasible(mid): hi = mid   (mid works; maybe smaller works too)","  else: lo = mid + 1   (mid fails, and so does everything below it)","return lo   (the smallest value that works)",
+    v.mode==="koko" ? "feasible(k): sum of ceil(pile / k) hours <= H" : "feasible(cap): fill each day in order; days needed <= D"],
+  run(v, R){ const mode = v.mode==="koko" ? "koko" : "ship", a = nums(v.a, 1, 30, mode==="koko"?10:12), D = nums(v.d, 1, 99, 1)[0];
+    if(mode==="koko" && D < a.length) throw new Error(`Koko eats from one pile per hour, so H must be at least the number of piles (${a.length}).`);
+    let lo = mode==="koko" ? 1 : Math.max(...a), hi = mode==="koko" ? Math.max(...a) : a.reduce((x,y)=>x+y, 0); const L0 = lo, H0 = hi, tried = [];
+    const sim = x => { R.inc("check"); if(mode==="koko"){ const hrs = a.map(p=>Math.ceil(p/x)); R.inc("steps", a.length); return {groups:hrs, used:hrs.reduce((p,q)=>p+q, 0)}; }
+      const groups = []; let cur = [], load = 0; a.forEach(w=>{ R.inc("steps"); if(load + w > x){ groups.push(cur); cur = []; load = 0; } cur.push(w); load += w; }); groups.push(cur); return {groups, used:groups.length}; };
+    const S = o => Object.assign({mode, a, D, lo, hi, L0, H0, tried:tried.slice()}, o);
+    const unit = mode==="koko" ? "hours" : "days", what = mode==="koko" ? "speed" : "capacity";
+    R.step(0, mode==="koko" ? `The speed is at least 1 and at most ${H0} (the biggest pile: faster never helps). Find the slowest speed that finishes ${a.length} piles in ${D} hours.` : `The capacity is at least ${L0} (the heaviest package) and at most ${H0} (everything in one day). Find the smallest that ships everything in ${D} days.`, S({}));
+    while(lo < hi){ const mid = (lo + hi) >> 1;
+      R.step(2, `The answer is in [${lo}, ${hi}]. Try the middle: ${what} ${mid}.`, S({mid}));
+      const r = sim(mid), ok = r.used <= D; tried.push([mid, ok]);
+      R.step(6, mode==="koko" ? `At speed ${mid}: ${a.map((p,i)=>`${p}→${r.groups[i]}h`).join(", ")} = ${r.used} hours. ${ok ? `That is within ${D}` : `That is more than ${D}`}.` : `With capacity ${mid}: ${r.groups.map(g=>`[${g.join(" ")}]`).join(" ")}, ${r.used} days. ${ok ? `That is within ${D}` : `That is more than ${D}`}.`, S({mid, sim:r, ok}));
+      if(ok){ hi = mid; R.step(3, `${mid} works, so every ${what} above it works too. Keep ${mid} and search below: hi = ${mid}.`, S({mid, sim:r, ok})); }
+      else { lo = mid + 1; R.step(4, `${mid} fails, so every ${what} below it fails too. lo = ${mid + 1}.`, S({mid, sim:r, ok})); } }
+    const r = sim(lo);
+    R.step(5, `lo = hi = ${lo}: the smallest ${what} that works (${r.used} ${unit}). ${R.c.check} feasibility checks instead of up to ${H0 - L0 + 1}.`, S({mid:lo, sim:r, ok:true, end:true})); },
+  draw(s){ const W = 360, X0 = 22, X1 = W - 22, span = Math.max(1, s.H0 - s.L0), x = v => X0 + (X1 - X0)*(v - s.L0)/span, Y = 46;
+    let g = `<line x1="${X0}" y1="${Y}" x2="${X1}" y2="${Y}" class="axis"/>`;
+    if(s.lo > s.L0) g += `<rect x="${X0}" y="${Y-9}" width="${Math.max(2, x(s.lo) - X0 - (span?((X1-X0)/span)/2:0))}" height="18" class="ba-no"/>`;
+    if(s.hi < s.H0 || (s.end)) g += `<rect x="${x(s.hi)}" y="${Y-9}" width="${Math.max(2, X1 - x(s.hi))}" height="18" class="ba-yes"/>`;
+    s.tried.forEach(([m, ok])=>{ g += `<circle cx="${x(m)}" cy="${Y}" r="4" class="${ok?"yes":"no"}"/>`; });
+    const mk = (v, lab, cls, up) => `<g class="ba-m ${cls}"><path d="M${x(v)},${up?Y-11:Y+11} l-5,${up?-8:8} h10 z"/><text x="${x(v)}" y="${up?Y-23:Y+31}" text-anchor="middle">${esc(lab)}</text></g>`;
+    g += mk(s.lo, "lo " + s.lo, "lo", false) + (s.hi!==s.lo ? mk(s.hi, "hi " + s.hi, "hi", false) : "");
+    if(s.mid!==undefined && !s.end) g += mk(s.mid, "mid " + s.mid, "mid", true);
+    if(s.end) g += mk(s.lo, "answer " + s.lo, "mid", true);
+    g += `<text x="${X0}" y="${Y+52}" text-anchor="start" class="sub">${s.L0}</text><text x="${X1}" y="${Y+52}" text-anchor="end" class="sub">${s.H0}</text>`;
+    let sim = "";
+    if(s.sim) sim = s.mode==="koko" ? `<div class="av-kvs">${s.a.map((p,i)=>`<span class="kv">${p} → ${s.sim.groups[i]} h</span>`).join("")}</div>`
+      : `<div class="av-kvs">${s.sim.groups.map((g2,d)=>`<span class="kv" style="border-color:${SCOL[d%SCOL.length]}"><span class="sw" style="background:${SCOL[d%SCOL.length]}"></span>day ${d+1}: ${g2.join(" ")} <b>(${g2.reduce((p,q)=>p+q,0)})</b></span>`).join("")}</div>`;
+    return `<svg class="av-svg av-ba" viewBox="0 0 ${W} 108" style="max-width:520px" role="img" aria-label="Candidate answers from ${s.L0} to ${s.H0}; the answer is in [${s.lo}, ${s.hi}]">${g}</svg>
+      <p class="av-aux av-key"><span><i class="ba-n"></i>known to fail</span><span><i class="done"></i>known to work</span></p>
+      ${s.sim ? `<div class="av-h mono" style="margin-top:8px">simulation with ${s.mode==="koko"?"speed":"capacity"} ${s.mid}: ${s.sim.used} ${s.mode==="koko"?"hours":"days"} ${s.ok ? "≤" : ">"} ${s.D} ${s.ok ? "✓" : "✗"}</div>${sim}` : ""}`; } });
+
+/* ---- minimum spanning tree ---- */
+const MST_E = "A-B 4, A-C 2, B-C 1, B-D 5, C-D 8, C-E 10, D-E 2, D-F 6, E-F 3";
+def({ id:"mst", group:"Graphs", title:"Minimum spanning tree: Kruskal and Prim", concepts:["mst","graphsalgo","unionfind","greedydc"],
+  text:v=>v.mode==="prim" ? "Prim grows one tree from a start node. A min-heap holds the edges that leave the tree; take the lightest, and if its far end is new, add that node and push its edges. An edge whose ends are both in the tree already is stale and skipped. O(E log V). Both algorithms are correct because of the cut property: the lightest edge across any split of the nodes is safe to take."
+    : "Kruskal looks at the edges from lightest to heaviest and keeps an edge unless its two ends are already connected, which union–find answers in almost O(1). A kept edge joins two separate trees; a rejected one would close a cycle. It stops after n − 1 edges. O(E log E) for the sort. The lightest edge joining two different trees is always safe (the cut property).",
+  inputs:[{k:"mode", label:"Algorithm", def:"kruskal", opts:[{v:"kruskal", label:"Kruskal (sort edges + union–find)"},{v:"prim", label:"Prim (grow from a node + heap)"}]},
+    {k:"e", label:"Edges (A-B weight)", def:MST_E},{k:"src", label:"Start node", def:"A", w:4, when:v=>v.mode==="prim"}],
+  random:()=>({e:MST_E.replace(/\d+/g, ()=>rint(1,12))}), counters:["cmp","w"], clabel:{cmp:"edges checked"},
+  code:v=>v.mode==="prim" ? ["tree = {start}; heap = edges of start","while heap is not empty and the tree misses nodes:","  (w, u, v) = heap.pop_min()","  if v is already in the tree: skip it   (stale)","  add v and the edge (u, v) to the tree","  push every edge from v to a node not in the tree","done: the tree spans every node it can reach"]
+    : ["sort the edges by weight","for each edge (u, v, w), lightest first:","  if find(u) == find(v): skip   (it would close a cycle)","  union(u, v); keep the edge","  stop when n - 1 edges are kept","done: the kept edges form a minimum spanning tree"],
+  run(v, R){ const {E, ids} = parseEdges(v.e, false), mode = v.mode==="prim" ? "prim" : "kruskal", keep = [], rej = [];
+    const S = o => Object.assign({E, ids, mode, keep:keep.slice(), rej:rej.slice()}, o);
+    if(mode==="kruskal"){ const order = E.map((e,k)=>k).sort((x,y)=>E[x].w - E[y].w || x - y), par = {}; ids.forEach(i=>par[i] = i);
+      const find = x => { while(par[x]!==x) x = par[x]; return x; };
+      const T = o => S(Object.assign({order, par:Object.assign({}, par)}, o));
+      R.step(0, `Sort the ${E.length} edges by weight: ${order.map(k=>`${E[k].a}${E[k].b} ${E[k].w}`).join(", ")}. Each node starts as its own tree.`, T({}));
+      for(const k of order){ const e = E[k], ra = find(e.a), rb = find(e.b); R.inc("cmp");
+        if(ra===rb){ rej.push(k); R.step(2, `${e.a}–${e.b} (${e.w}): ${e.a} and ${e.b} are already in the same tree (root ${ra}). Keeping it would close a cycle: skip.`, T({ek:k, no:true})); continue; }
+        par[rb] = ra; keep.push(k); R.inc("w", e.w);
+        R.step(3, `${e.a}–${e.b} (${e.w}): ${e.a} is in tree ${ra} and ${e.b} in tree ${rb}, so keep it and join the trees. It is the lightest edge between them, so it is safe.`, T({ek:k}));
+        if(keep.length === ids.length - 1){ R.step(4, `${keep.length} edges for ${ids.length} nodes: the tree is complete. The heavier edges are not needed.`, T({})); break; } }
+      R.step(5, keep.length===ids.length-1 ? `Minimum spanning tree: ${keep.map(k=>E[k].a+E[k].b).join(", ")}, total weight ${R.c.w}.` : `The graph is not connected: this is a minimum spanning forest of weight ${R.c.w}.`, T({end:true})); return; }
+    const src = String(v.src||"").trim(); if(!ids.includes(src)) throw new Error(`The start node "${src}" is not in the graph.`);
+    const inT = [src]; let heap = [];
+    const pushFrom = u => E.forEach((e,k)=>{ if(e.a===u && !inT.includes(e.b)) heap.push([e.w, u, e.b, k]); else if(e.b===u && !inT.includes(e.a)) heap.push([e.w, u, e.a, k]); });
+    const T = o => S(Object.assign({inT:inT.slice(), heap:heap.slice().sort((x,y)=>x[0]-y[0])}, o));
+    pushFrom(src); R.step(0, `Start the tree at ${src}. Push its ${heap.length} edges into the heap.`, T({u:src}));
+    while(heap.length && inT.length < ids.length){ heap.sort((x,y)=>x[0]-y[0] || x[3]-y[3]); const [w, u, x, k] = heap.shift(); R.inc("cmp");
+      if(inT.includes(x)){ rej.push(k); R.step(3, `Pop ${u}–${x} (${w}): ${x} is already in the tree, so this edge is stale. Skip it.`, T({ek:k, no:true})); continue; }
+      inT.push(x); keep.push(k); R.inc("w", w);
+      R.step(4, `Pop ${u}–${x} (${w}), the lightest edge leaving the tree. Add ${x} to the tree.`, T({ek:k, u:x}));
+      const before = heap.length; pushFrom(x);
+      if(heap.length > before) R.step(5, `Push the ${heap.length - before} edge${heap.length-before===1?"":"s"} from ${x} to nodes outside the tree.`, T({u:x})); }
+    R.step(6, inT.length===ids.length ? `Every node is in the tree: ${keep.map(k=>E[k].a+E[k].b).join(", ")}, total weight ${R.c.w}.` : `The heap is empty but ${ids.filter(i=>!inT.includes(i)).join(", ")} cannot be reached: the graph is not connected.`, T({end:true})); },
+  draw(s){ const pos = s.ids.every(i=>DPOS[i]) ? DPOS : circlePos(s.ids, 250, 135, 105), kp = new Set(s.keep), rj = new Set(s.rej);
+    const inT = s.inT ? new Set(s.inT) : null;
+    const nodes = s.ids.map(i=>({id:i, x:pos[i][0], y:pos[i][1], cls:(i===s.u?"cur ":"") + (inT ? (inT.has(i)?"done":"") : ""), sub:s.par ? (s.par[i]===i ? "root" : "→" + s.par[i]) : undefined}));
+    const edges = s.E.map((e,k)=>({a:e.a, b:e.b, w:e.w, cls:k===s.ek ? (s.no ? "try" : "hot") : kp.has(k) ? "tree" : rj.has(k) ? "gone" : ""}));
+    let side;
+    if(s.order) side = `<div class="av-h mono" style="margin-top:6px">edges, lightest first</div><div class="av-kvs">${s.order.map(k=>`<span class="kv${k===s.ek?(s.no?" miss":" cmp"):kp.has(k)?" done":rj.has(k)?" gone":""}">${esc(s.E[k].a+s.E[k].b)} ${s.E[k].w}${kp.has(k)?" ✓":rj.has(k)?" ✗":""}</span>`).join("")}</div><p class="av-aux">Small text under each node: its parent in union–find ("root" = the name of its tree).</p>`;
+    else side = `<div class="av-h mono" style="margin-top:6px">heap of edges leaving the tree (lightest first)</div><div class="av-kvs">${s.heap.map(h=>`<span class="kv${inT.has(h[2])?" gone":""}">${esc(h[1]+h[2])} ${h[0]}</span>`).join("") || '<span class="nil mono">empty</span>'}</div>`;
+    return graphSVG(nodes, edges, {label:"Weighted graph"}) + side + `<p class="av-aux mono">tree edges: ${esc(s.keep.map(k=>s.E[k].a+s.E[k].b).join(", ") || "none yet")}</p>`; } });
+
+const GROUPS = ["Sorting","Searching","Arrays & strings","Recursion & trees","Graphs","Data structures","Probabilistic & distributed","Dynamic programming"];
 const NOTE = {Sorting:"Bars are values. Orange: being compared. Purple: just moved. Faded: outside the part being worked on. Green: in final place."};
 
 /* ---------------- player ---------------- */
@@ -963,17 +1638,27 @@ function flipPlay(stage, old){
     const dx = (o[0] - r.left - r.width/2)/k, dy = (o[1] - r.top - r.height/2)/k; if(Math.abs(dx) < .5 && Math.abs(dy) < .5) return;
     el.animate([{transform:`translate(${dx}px,${dy}px)`}, {transform:"translate(0px,0px)"}], {duration:dur, easing:"cubic-bezier(.3,.7,.3,1)"}); });
 }
+/* a wide drawing scrolls inside its .av-scroll frame; the element marked data-focus (the current node) is kept in view */
+function keepInView(el){
+  const box = el.closest(".av-scroll"); if(!box || box.scrollWidth <= box.clientWidth + 1) return;
+  const r = el.getBoundingClientRect(), b = box.getBoundingClientRect();
+  if(r.left < b.left + 12 || r.right > b.right - 12) box.scrollLeft += (r.left + r.width/2) - (b.left + b.width/2);
+}
 function showFrame(){
   const v = byId(P.id), f = P.frames[P.k], stage = $("av-stage"); if(!v || !stage) return;
   if(!f){ stage.innerHTML = ""; return; }
   const old = P.k===P.shown+1 && !reducedMotion() ? flipGrab(stage) : null;
+  const scr = Array.from(stage.querySelectorAll(".av-scroll")).map(x=>x.scrollLeft);   // wide drawings keep their scroll position from step to step
   stage.innerHTML = v.draw(f.s, P.vals, f); P.shown = P.k;
+  stage.querySelectorAll(".av-scroll").forEach((x,i)=>{ if(scr[i]) x.scrollLeft = scr[i]; });
   if(old) flipPlay(stage, old);
+  if(v.after) v.after(stage, f.s);
+  else { const c = stage.querySelector(".av-scroll [data-focus]"); if(c) keepInView(c); }
   if(v.liveState) Object.entries(v.liveState(f.s)).forEach(([id,o])=>{ const b = document.querySelector(`[data-alive="${id}"]`); if(!b) return;
     if(o.label!==undefined && b.textContent!==o.label) b.textContent = o.label; b.disabled = !!o.disabled; });
   $("av-msg").textContent = f.msg;
   $("av-k").textContent = `step ${P.k+1} of ${P.frames.length}`;
-  $("av-count").innerHTML = (v.counters||[]).map(k=>`<span><b>${f.c[k]||0}</b> ${(v.clabel&&v.clabel[k])||COUNT[k]||k}</span>`).join("");
+  $("av-count").innerHTML = (fv(v,"counters")||[]).map(k=>`<span><b>${f.c[k]||0}</b> ${(v.clabel&&v.clabel[k])||COUNT[k]||k}</span>`).join("");
   document.querySelectorAll("#av-code li").forEach((li,i)=>{ li.classList.toggle("on", i===f.line); if(i===f.line) li.setAttribute("aria-current","step"); else li.removeAttribute("aria-current"); });
   const back = document.querySelector('[data-aact="back"]'), next = document.querySelector('[data-aact="next"]');
   if(back) back.disabled = P.k===0; if(next) next.disabled = P.k>=P.frames.length-1;
@@ -989,11 +1674,19 @@ function liveHTML(v){
   const btns = (L.buttons||[]).map(b=>typeof b==="string" ? `<span class="av-lab">${esc(b)}</span>` : `<button type="button" class="btn${b.primary?" primary":""}" data-alive="${b.id}">${esc(b.label)}</button>`).join("");
   return `<div class="av-live" role="group" aria-label="${esc(L.title)}"><div class="av-h mono">${esc(L.title)}</div><div class="av-livein">${fields}<div class="btnrow">${btns}</div></div>${L.note?`<p class="av-aux">${esc(L.note)}</p>`:""}</div>`;
 }
+/* an input is a text box, or a choice when it has opts: [{v, label, set:{other inputs to fill when it is picked}}];
+   when(vals) hides an input that the current choice does not use */
+const fv = (v, k) => typeof v[k]==="function" ? v[k](P.vals) : v[k];
+function inputHTML(i){
+  const val = P.vals[i.k]===undefined ? i.def : P.vals[i.k];
+  if(i.opts) return `<label class="av-f short"><span>${esc(i.label)}</span><select data-ain="${i.k}">${i.opts.map(o=>`<option value="${esc(o.v)}"${String(o.v)===String(val)?" selected":""}>${esc(o.label)}</option>`).join("")}</select></label>`;
+  return `<label class="av-f${i.w?" short":""}"><span>${esc(typeof i.label==="function"?i.label(P.vals):i.label)}</span><input type="text" data-ain="${i.k}" value="${esc(val)}" spellcheck="false" autocomplete="off"${i.w?` style="width:${i.w+3}ch"`:""}></label>`;
+}
 function vizHTML(v){
-  const ins = (v.inputs||[]).map(i=>`<label class="av-f${i.w?" short":""}"><span>${esc(i.label)}</span><input type="text" data-ain="${i.k}" value="${esc(P.vals[i.k]===undefined?i.def:P.vals[i.k])}" spellcheck="false" autocomplete="off"${i.w?` style="width:${i.w+3}ch"`:""}></label>`).join("");
+  const ins = (v.inputs||[]).filter(i=>!i.when || i.when(P.vals)).map(inputHTML).join("");
   const pres = (v.presets||[]).map((p,i)=>`<button type="button" class="btn" data-apreset="${i}">${esc(p.name)}</button>`).join("");
   return `<div class="av" data-viz="${v.id}">
-    <h2 class="vh">${esc(v.title)}</h2><p class="vsub">${esc(v.text)}</p>${chipsHTML(v.concepts)}
+    <h2 class="vh">${esc(v.title)}</h2><p class="vsub">${esc(fv(v,"text"))}</p>${chipsHTML(v.concepts)}
     <div class="av-in">${ins}<div class="btnrow">${ins?`<button type="button" class="btn primary" data-aact="apply">Run with this input</button>`:""}${pres}${v.random?`<button type="button" class="btn" data-aact="random">Random input</button>`:""}</div></div>
     ${P.err?`<p class="av-err" role="alert">${esc(P.err)}</p>`:""}
     <div class="av-body">
@@ -1006,7 +1699,7 @@ function vizHTML(v){
         ${liveHTML(v)}
         ${NOTE[v.group]?`<p class="av-aux">${esc(NOTE[v.group])}</p>`:""}
       </div>
-      <div class="av-side"><div class="av-h mono">Pseudocode</div><ol class="av-code" id="av-code">${v.code.map(l=>`<li><code>${esc(l)}</code></li>`).join("")}</ol></div>
+      <div class="av-side"><div class="av-h mono">Pseudocode</div><ol class="av-code" id="av-code">${fv(v,"code").map(l=>`<li><code>${esc(l)}</code></li>`).join("")}</ol></div>
     </div></div>`;
 }
 
@@ -1186,7 +1879,7 @@ function bind(el){
       if(d.areveal){ PR.shown[d.areveal] = !PR.shown[d.areveal]; const box = $("pr-"+d.areveal); if(box) box.hidden = !PR.shown[d.areveal]; b.textContent = (PR.shown[d.areveal]?"Hide ":"Show ") + b.textContent.replace(/^(Hide|Show) /,""); b.setAttribute("aria-expanded", String(!!PR.shown[d.areveal])); return; }
       const act = d.aact; if(!act) return;
       if(act==="apply") return rerun(readInputs());
-      if(act==="random"){ const v = byId(P.id); return rerun(Object.assign({}, P.vals, v.random())); }
+      if(act==="random"){ const v = byId(P.id); return rerun(Object.assign({}, P.vals, v.random(P.vals))); }
       if(act==="play") return P.t ? stop() : play();
       if(act==="back"){ stop(); P.k = Math.max(0, P.k-1); return showFrame(); }
       if(act==="next"){ stop(); P.k = Math.min(P.frames.length-1, P.k+1); return showFrame(); }
@@ -1203,6 +1896,12 @@ function bind(el){
       if(act==="starter"){ if(ta.value!==p.starter && !confirm("Replace your code with the starter code?")) return; ta.value = p.starter; await savePractice(p.id, {code:p.starter}); $("pr-saved").textContent = "saved"; return; }
       if(act==="togglesolved"){ const on = !solved(p.id); await savePractice(p.id, {solved:on}); app().toast(on?"Marked as solved":"Marked as not solved"); return render(el, st); }
     } catch(err){ app().toast("Something went wrong: " + err.message); }
+  });
+  el.addEventListener("change", e=>{
+    const s = e.target; if(!s.matches || !s.matches("select[data-ain]")) return;
+    const v = byId(P.id), inp = (v.inputs||[]).find(i=>i.k===s.dataset.ain), o = inp && (inp.opts||[]).find(x=>String(x.v)===s.value);
+    stop(); rerun(Object.assign(readInputs(), o && o.set || {}, {[s.dataset.ain]:s.value}));
+    const again = EL.querySelector(`select[data-ain="${s.dataset.ain}"]`); if(again) again.focus();
   });
   el.addEventListener("input", e=>{
     if(e.target.id==="av-speed"){ P.speed = +e.target.value; if(P.t) play(); return; }

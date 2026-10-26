@@ -1,0 +1,713 @@
+@@ mobile-chat
+title: Design a chat mobile app
+category: Mobile
+level: Senior / Staff
+concepts: mobilearch, websocket, realtime, crdt, retries, idgen, objectstore, apidesign
+summary: We build the phone app and the service behind it for a one-to-one and group chat product, like WhatsApp, Telegram or Messenger. A user types a message, sees it at once, and the other side sees it a moment later, even if one phone is in a tunnel, asleep, or switched off for a day. The server side is a standard problem of fan-out and storage. What makes the mobile case hard is the client: the radio is slow and unreliable, the operating system kills background processes, the battery is limited, and users expect the app to open instantly with the full history, offline. Our design treats the local database as the source of truth for the screen, uses one long-lived WebSocket for live traffic, uses push notifications as the wake-up path, and makes every write safe to retry.
+requirements: Functional requirements. One-to-one chats and groups of up to 1,000 members. Text messages, images, short videos and voice notes (media up to 100 MB). Delivery states: sent, delivered, read. Typing indicator and online presence. Reactions, replies and edits. Full history on a new device, and several devices per user (one phone, one tablet, one web client). Push notification when the app is not running. Search in local history.
+Non-functional requirements. Latency: a message between two online users arrives in under 300 ms at p50 and under 1 second at p99. The send button must feel instant: the message appears in the list in under 50 ms, before any network call. Delivery: every message is delivered at least once and shown exactly once, in the same order for all members of a conversation. Offline: the app opens and scrolls the full local history with no network. Battery: the app must not wake the radio more than needed; background use under 2 percent of the battery per day. Availability: 99.99 percent for message send. Security: transport encryption is a must; end-to-end encryption is out of scope here and only mentioned where it changes the design.
+Assumptions. 100 million daily active users. Each user sends 40 messages per day on average. 30 percent of users are connected at the busiest moment. Average text message is 200 bytes of body and about 1 KB with metadata and indexes. One in ten messages carries media of about 200 KB after client-side compression. Average group has 20 members; one in five messages goes to a group.
+estimates: Message rate. 100 million users times 40 messages is 4 billion messages per day. 4 billion divided by 86,400 seconds is about 46,000 messages per second on average. The peak is about 3 times the average: about 140,000 messages per second.
+Fan-out. Four in five messages go to one person; one in five goes to a group of 20. Average recipients per message: 0.8 times 1 plus 0.2 times 20 = 4.8. So 140,000 times 4.8 is about 670,000 deliveries per second at peak. Each delivery is a small frame of about 300 bytes on the wire: 670,000 times 300 bytes is about 200 MB per second, or 1.6 Gbit per second, spread over the gateway fleet.
+Connections. 30 percent of 100 million is 30 million concurrent WebSockets. A tuned gateway process holds 100,000 idle connections, but TLS state, buffers and per-connection objects take memory: about 30 KB each, so 100,000 connections need 3 GB. We plan 50,000 connections per node for headroom: 30 million divided by 50,000 is 600 gateway nodes. Add 30 percent for zone loss: about 800 nodes.
+Heartbeats. A ping every 60 seconds from 30 million clients is 500,000 pings per second. This is more than the message rate itself, so the heartbeat interval matters. On mobile networks, carrier NAT devices often drop idle connections after 30 seconds to 5 minutes, so the client adapts the interval to what it observes.
+Storage. 4 billion messages times 1 KB is 4 TB per day, about 1.5 PB per year. With 3 replicas this is about 4.4 PB per year. Media: 400 million media messages per day times 200 KB is 80 TB per day, or 29 PB per year. Media dominates by 20 times, so it goes to object storage and never touches the message database.
+api: The wire protocol is a WebSocket carrying small binary or JSON frames. The REST API handles everything that is not a live stream. Both follow the same message schema.
+WebSocket frame send: {"t":"send","cid":"01JC...","conv":"c_91","body":"hi","reply_to":null,"media":[]}. The client message id cid is a ULID made on the phone. The server answers with {"t":"ack","cid":"01JC...","msg_id":"m_5521","seq":1842,"ts":1761400000123}.
+WebSocket frame deliver (server to client): {"t":"msg","conv":"c_91","seq":1843,"msg_id":"m_5522","from":"u_7","cid":"...","body":"...","ts":...}. The client replies {"t":"ack_seq","conv":"c_91","seq":1843} in batches, which is the "delivered" signal.
+GET /v1/sync?cursor={opaque}&limit=500 returns changes since the cursor across all conversations: new messages, edits, reactions, read marks, membership changes. The result includes a new cursor and a has_more flag. This one call serves cold start, reconnect and a new device.
+GET /v1/conversations/{id}/messages?before_seq=1800&limit=50 returns older history, used when the user scrolls above what is stored locally.
+POST /v1/media/uploads with {conv, size, mime, sha256} returns an upload id and a list of presigned part URLs. The client uploads the parts straight to object storage and then calls POST /v1/media/uploads/{id}/complete. The send frame carries the resulting media id.
+POST /v1/devices registers a push token: {platform, token, app_version}. Tokens rotate, so the client re-registers on every launch if the token changed.
+datamodel: Server side. Messages are partitioned by conversation, because the reads are "latest N in this conversation" and the ordering is per conversation.
+```sql
+CREATE TABLE messages (
+  conv_id    bigint,
+  seq        bigint,          -- gapless counter per conversation
+  msg_id     bigint,          -- global 64-bit id (Snowflake style)
+  sender_id  bigint,
+  client_id  char(26),        -- ULID from the phone, for dedupe
+  body       blob,
+  media_ids  list<bigint>,
+  created_at timestamp,
+  PRIMARY KEY ((conv_id), seq)
+) WITH CLUSTERING ORDER BY (seq DESC);
+```
+A second table maps (conv_id, sender_id, client_id) to seq, with a TTL of 7 days. It is the dedupe table. A per-user inbox table holds the list of conversations with last_seq, last_read_seq and a per-user change counter that the sync cursor is built from. Presence and typing state are not stored; they live in memory with a TTL of a few seconds.
+Client side. A local SQLite database is the single source of truth for the UI.
+```sql
+CREATE TABLE message (
+  conv_id INTEGER, seq INTEGER NULL, client_id TEXT PRIMARY KEY,
+  sender INTEGER, body TEXT,
+  state INTEGER,   -- 0 pending, 1 sent, 2 failed
+  created_at INTEGER, server_ts INTEGER
+);
+CREATE INDEX msg_conv ON message(conv_id, seq);
+CREATE TABLE outbox (
+  client_id TEXT PRIMARY KEY, attempt INTEGER, next_try INTEGER);
+CREATE TABLE sync_state (key TEXT PRIMARY KEY, value TEXT);
+```
+A pending message has no seq yet, so it sorts after the last known seq by created_at. When the ack arrives, the row is updated with the real seq and the order becomes final. Full-text search uses an FTS5 virtual table on body.
+design: Client architecture. The app has four layers. The UI layer (SwiftUI or Jetpack Compose) only observes the database and never calls the network. The domain layer holds use cases such as "send message" and "mark read". The data layer has a repository that writes to SQLite and an outbox worker that talks to the network. The transport layer holds the WebSocket connection, the REST client and the push receiver. This is the usual shape of mobile app architecture, and the key rule is a one-way flow: network events change the database, the database drives the UI. A message therefore looks the same whether it came from a typed send, a socket frame, a push payload or a sync call.
+Sending. The user taps send. In one database transaction the app inserts the message with state "pending" and a new client id, and adds a row to the outbox. The UI shows the message at once with a small clock icon. The outbox worker sends the frame over the WebSocket. When the server answers with an ack, the worker updates the row (seq, server time, state "sent") and deletes the outbox row. If the socket is down, the row stays in the outbox. The worker is also scheduled with the OS job scheduler (WorkManager on Android, BGTaskScheduler or a background URLSession on iOS), so pending messages go out when the network returns even if the user closed the app.
+Server path. A gateway node receives the frame and checks the session. The send path then asks the conversation shard for the next seq. One shard owns each conversation at a time (chosen by consistent hashing of the conv id), so the seq counter is a local increment, with the new value stored together with the message. The shard checks the dedupe table for (conv, sender, client id); if the pair exists it returns the old ack and does nothing else. This makes retries safe. After the write is durable on a quorum, the shard sends the ack to the sender and puts a delivery job on a queue for each member.
+Delivery. For each member device, the delivery service looks in a routing table (user id to gateway node, kept in a fast in-memory store with a short TTL) and pushes the frame to that gateway, which writes it to the socket. If the device has no live socket, the service sends a push notification instead: an APNs or FCM message with a small payload (both limit it to about 4 KB). The push does not need to contain the message. It is a wake-up: the app starts, opens a socket or calls /v1/sync with its cursor, and gets the real data. This keeps the content path single and avoids duplicates.
+Ordering. Each conversation has one seq counter, so all members see the same order. Clients show messages sorted by seq. A message that arrives with a gap (the client has 1840 and 1842) holds the new row back and calls the history endpoint to fill 1841. The server clock is never used for ordering, only for display.
+Reconnect and sync. When the socket opens, the client sends its sync cursor. The server first replays what it has not yet acked, then continues live. If the client has been away for days, the replay would be large, so the client uses /v1/sync in pages of 500 and the server may answer "cursor too old, re-sync conversation list", after which the client fetches only the latest page of each active conversation and loads older history on demand.
+Media. The user picks a photo. The client compresses it (for example to a long side of 1,600 px, about 200 KB), makes a small blurred thumbnail of about 2 KB, and starts an upload to object storage with presigned URLs. Big files are split into 5 to 8 MB parts so a lost connection only repeats one part. The message with the media id is sent only after the upload completes, but the UI shows the message at once with a progress ring. The receiver gets the thumbnail inside the message and downloads the full file on view or by its auto-download setting (for example on Wi-Fi only).
+diagram:
+  PHONE                                         SERVER
+  +----------------------+
+  | UI (Compose/SwiftUI) |
+  +----------+-----------+
+             | observes
+  +----------v-----------+                +----------------------+
+  | SQLite (truth)       |                |  gateways (WebSocket)|
+  | message, outbox,     |                |  ~800 nodes, 50k each|
+  | sync_state, FTS      |                +-----+-----------+----+
+  +----------+-----------+                      |           |
+             | writes/reads                     v           |
+  +----------v-----------+   frames    +--------+------+    |
+  | outbox + sync worker |<==========> | chat shards   |    |
+  | (WorkManager / BGT)  |  WebSocket  | seq, dedupe   |    |
+  +----------+-----------+             +--------+------+    |
+             |  REST (sync, history)            |           |
+             +--------------------------------->| delivery  |
+             |  presigned upload                v queue      |
+             +-----------------------> +--------+------+    |
+                                       | object store  |    |
+  APNs / FCM  --- wake-up push ------- | + CDN (media) |<---+
+                                       +---------------+  push svc
+animation:
+== The user taps send. The app writes a pending row and an outbox row.
+  phone: [hi  (clock)]  outbox=1      server: seq=1841
+  phone ---------------------------->  server
+== The outbox worker sends the frame over the open WebSocket.
+  phone: [hi  (clock)]  outbox=1      server: seq=1841
+  phone --send cid=01JC-------------->  server
+== The shard assigns seq 1842, stores it, and acks.
+  phone: [hi  (clock)]  outbox=1      server: seq=1842 stored
+  phone <--ack seq=1842--------------  server
+== The app updates the row to sent and clears the outbox.
+  phone: [hi  (tick)]   outbox=0      server: seq=1842 stored
+  phone                                server -> delivery queue
+== Bob has no socket. The server sends a wake-up push.
+  alice: [hi  (tick)]                 push: APNs/FCM -> bob
+  server ------ push (4 KB max) ----->  bob (asleep)
+== Bob's app wakes up and calls sync with its cursor.
+  alice: [hi  (tick)]                 bob: GET /v1/sync?cursor=1841
+  server <-------- sync ------------  bob
+== Bob gets the message and acks the seq. Alice sees two ticks.
+  alice: [hi  (2 ticks)]              bob: [hi]  ack_seq=1842
+  alice <-- delivered seq=1842 ------  server <-- ack_seq -- bob
+deepdive: Idempotent send and unique ids. A phone may send a message, lose the connection before the ack, and send again. Without protection the other side sees the text twice. The fix is a client-generated id. We use a ULID (a 128-bit id with a 48-bit millisecond time prefix and 80 random bits, written as 26 characters), made once when the user taps send and saved in the outbox. It is the primary key of the local row, so the row never changes identity. The server stores (conv, sender, client id) and returns the old result for a repeated send. This is the main use of unique ID generation on the client side. The server also gives each stored message a 64-bit Snowflake-style id (41 bits of time, 10 bits of node, 12 bits of counter) for cross-conversation references such as replies. The per-conversation seq is a different thing: a gapless counter that gives order, while the global id is only a name. We could use the seq alone for names too, but a reply, a reaction and a forward all need a stable id that is the same in every conversation shard and in every cache.
+Retries on a bad network. The outbox worker uses exponential backoff with jitter: wait 1 s, 2 s, 4 s, up to about 60 s, with a random factor, so that a restart of a gateway does not make 30 million phones reconnect at the same second. This is the standard retry with backoff and jitter. Two refinements matter on mobile. First, the worker does not count attempts while the OS reports no network; it waits for a connectivity callback instead, since a failed attempt on a dead radio only costs battery. Second, the app separates "not sent" from "failed": after 24 hours or after a permanent error (the user was blocked, the group no longer exists) the message state becomes "failed" and the UI shows a retry button.
+WebSocket on a phone. The socket must survive a change from Wi-Fi to cellular, which changes the IP address. TCP cannot survive that, so the client detects the change, closes the socket, and reconnects with its last seq per conversation. The gateway adds session resumption: a short-lived token lets the client skip full authentication. Heartbeats: the client sends a ping when it has been idle for the interval, and doubles the interval up to 5 minutes while no connection drops happen, then halves it after a drop. Every second saved in the radio's high-power state is battery saved. When the app goes to the background, iOS suspends it within seconds and the socket dies, and Android may do the same under Doze. Therefore the socket is only for the foreground; in the background we rely on push, which the OS delivers through its own shared connection. This is the main reason a mobile chat needs two paths for real-time updates.
+Where a CRDT fits, and where it does not. Message order is decided by the server seq, so we do not need a CRDT for the message list. A CRDT is useful for state that several devices change at the same time without a central order. Examples: reactions are an add-wins set of (user, emoji) pairs; group membership edits can use an observed-remove set; the last-read position is a max-register (the larger seq wins); a drafted message synced across devices is a last-writer-wins register by a hybrid timestamp. These types merge in any order, so offline edits on two devices converge. A message edit is a last-writer-wins on the edit version. If the product later adds a shared document or a collaborative note inside the chat, a sequence CRDT would be the right tool for that content. We keep it narrow, since a CRDT carries metadata (tombstones, version vectors) that must be cleaned up.
+Read receipts and typing, at low cost. Read state is a single number per user per conversation (last_read_seq), sent at most once per 2 seconds and merged on the server as a max. In a group of 1,000, we do not send every read mark to everyone. We keep counts and send per-member details only on demand. Typing indicators are not stored: the client sends "typing" at most once per 3 seconds, the server forwards it only to online members of small groups and drops it otherwise. Presence is sent as a lease: "online until T", renewed by the heartbeat, which avoids a flood of on/off events. Subscribing to presence is limited to the people visible on the screen.
+Large groups and the fan-out choice. For a group of 20 we write the message once in the conversation partition and deliver a pointer to each member. For a group of 1,000 or a broadcast channel, the cost of 1,000 socket writes per message matters, so the delivery service groups members by gateway and sends one internal message per gateway with the member list, and the gateway writes to its local sockets. The conversation is still stored once. Each user has a cursor into it, so storage does not grow with the group size.
+tradeoffs: WebSocket versus long polling versus push only. Choose a WebSocket when the app is in the foreground and you need sub-second delivery, typing and presence, since one connection costs about 30 KB of server memory and almost no radio traffic while idle. Choose long polling or Server-Sent Events when you must pass strict proxies, or when you only need server-to-client events and want simple load balancing. Choose push only, with a sync call on wake-up, for the background, as the OS gives no other way. You give up about 100 to 300 ms of freshness on the push path and some control, because push delivery is best effort and may be delayed for minutes.
+Keep history on the server or only until delivery. Choose permanent server history (Telegram, Messenger style) when you need a fast new-device setup, search across devices and moderation. It costs about 1.5 PB per year at our scale. Choose delivery-only storage (the early WhatsApp style) when privacy and cost matter more and you accept that a lost phone loses history without a backup. The choice also changes the sync design: delivery-only needs no cursor history, only a per-device queue.
+failures: Gateway node dies. 50,000 sockets drop. Clients reconnect with jittered backoff to other nodes, and each sends its last seq. The shard replays anything un-acked. No message is lost, because the ack to the sender comes only after the quorum write, and the delivery is replayed from the log, not from gateway memory.
+Chat shard fails. The conversation shard that owned the seq counters is replaced by a replica after a lease expires, in a few seconds. The new owner reads the highest stored seq and continues from there. Writers in flight see timeouts and retry with the same client id, so the dedupe table prevents duplicates. A lease with a fencing token makes sure the old owner cannot write after it lost the lease.
+Push provider is slow or down. Messages stay in the log. Clients sync when they next open the app. The server also marks a device "stale" after several failed pushes and stops spending money on it. When APNs or FCM returns "token invalid", the token is deleted.
+Thundering herd after a regional outage. 30 million clients reconnect at once. Jittered backoff spreads this over a minute, the gateway has an admission limit (for example 5,000 new connections per second per node), and /v1/sync is rate limited per user. The client treats HTTP 429 and 503 as a signal to back off and honors Retry-After.
+evolution: At 1,000 users, one server and one database table with an auto-increment id are enough, and a 25-second long poll replaces the WebSocket. At 1 million users, add a WebSocket gateway tier, a push worker, and move media to object storage with a CDN. At 100 million users, shard messages by conversation, add the routing table, the delivery queue, per-device cursors, and the sync endpoint. At 1 billion users, run cells: independent copies of the whole stack for a slice of users (for example 20 million each), so a bug or an overload hits one cell only. Cross-cell chats are handled by a thin router. Add end-to-end encryption with per-device keys, backup to the user's cloud, and tiered storage that moves messages older than 90 days to cheaper disks.
+followups: Why not use HTTP polling every few seconds instead of a WebSocket? || Polling at 5 seconds from 30 million users is 6 million requests per second, each with TLS and headers, and the average delay is still 2.5 seconds. A WebSocket sends nothing while idle and delivers in tens of milliseconds. Polling also keeps the radio awake, which drains the battery.
+How do you avoid showing a message twice if the ack is lost? || The client makes a ULID before the first send and stores it in the outbox. The server keeps a dedupe record for (conversation, sender, client id) and returns the original ack for a repeat. The local row has the client id as primary key, so a delivered copy from the server merges with the pending row.
+What happens when the user is offline for two weeks? || The sync cursor may be too old. The server answers that a full re-sync is needed. The client fetches the conversation list and the latest page of each active chat, then loads older pages on scroll. Push notifications are collapsed so the user gets one summary and not thousands.
+How do you keep message order the same on all devices? || One shard owns each conversation and assigns a gapless seq on write. Clients sort by seq, and hold messages that arrive with a gap while they fetch the missing range. Server time is for display only.
+Where would you use a CRDT in a chat app? || For multi-writer state without a central order: reactions (add-wins set), group membership (observed-remove set), last-read marker (max register), and synced drafts (last-writer-wins). Not for message order, which the server seq already settles.
+ref: spec | RFC 6455: The WebSocket Protocol | Fette and Melnikov, 2011 | https://www.rfc-editor.org/rfc/rfc6455
+ref: paper | Conflict-free Replicated Data Types | Shapiro, Preguica, Baquero and Zawirski, 2011 |
+ref: docs | Build an offline-first app | Android Developers |
+ref: docs | Sending notification requests to APNs | Apple Developer Documentation |
+ref: book | Designing Data-Intensive Applications | Martin Kleppmann, 2017 |
+
+@@ mobile-trading
+title: Design a stock trading mobile app
+category: Mobile
+level: Senior / Staff
+concepts: mobilearch, websocket, realtime, idempotence, authn, apidesign, retries, cachelayer
+summary: We design the phone app and the backend for a retail brokerage, in the style of Robinhood, Zerodha Kite or Fidelity: live prices on a watchlist, charts, a portfolio, and buy and sell orders. Two things make it hard. First, prices change many times per second, but a phone screen, a radio and a battery can only handle a small part of that, so the system must choose what to send. Second, an order moves real money. If the phone sends a buy order, the network drops, and the user taps again, the user must not own two positions. Every state shown on the screen must be either correct or clearly marked as stale. We separate the two paths: a high-volume, loss-tolerant market data path, and a low-volume, exactly-once-in-effect order path.
+requirements: Functional requirements. Sign up and log in with biometrics. Watchlists with live quotes. Stock detail with a day chart and history (1D, 1W, 1M, 1Y, 5Y). Portfolio with positions, cash and profit and loss. Place, view and cancel orders: market, limit and stop. Order status updates. Push alerts for fills and price alerts. Order history and statements.
+Non-functional requirements. Quote latency from exchange feed to phone: under 500 ms at p99 while the app is in the foreground. Order latency from tap to broker acknowledgement: under 300 ms at p99, excluding the exchange. Correctness: an order is placed at most once in effect, even with retries; the buying power check never lets a user spend money twice. Availability: 99.95 percent during market hours, and the app must still open and show the last known portfolio when the network is bad. Security: a lost phone must not become a lost account. Compliance: every action is logged for the audit trail and kept for years.
+Assumptions. 10 million monthly users and 3 million daily users. At the market open (the first 30 minutes of the session) 1 million are connected at the same time. Each user has a watchlist of 10 symbols and a screen that shows 8 of them. About 6,000 symbols are actively watched, but the top 500 cover most of the interest. One order per daily user on average, and 40 percent of them are placed in the first 30 minutes.
+estimates: Market data in. A busy stock can produce thousands of quote changes per second in the consolidated feed. The whole US equity feed can reach hundreds of thousands of messages per second at the open. We do not send this to phones.
+Conflation. We keep the latest quote per symbol and send it at most every 500 ms, that is 2 updates per second per symbol per stream. For 6,000 symbols this is 12,000 conflated updates per second inside the fan-out layer. One update is about 40 bytes (symbol id, bid, ask, last, size, time as small numbers).
+Fan-out to phones. 1 million connected users, each with 8 visible symbols, each updated up to 2 times per second: 1,000,000 times 8 times 2 = 16 million symbol updates per second. We pack all changes of one tick into one frame per phone: 2 frames per second per phone, each about 8 times 40 = 320 bytes plus 30 bytes of framing. That is 2 million frames per second and 2,000,000 times 350 bytes = 700 MB per second, about 5.6 Gbit per second. On the phone this is 700 bytes per second, which is nothing for the radio but it keeps the radio awake. Most quotes do not change in every tick, so in practice we send about half of that.
+Connections. A fan-out gateway node holds 50,000 WebSockets and sends about 100,000 frames per second. 1 million connections need 20 nodes. We run 30 for zone loss.
+Orders. 3 million daily users times 1 order is 3 million orders per day. 40 percent in 1,800 seconds is 1,200,000 divided by 1,800, about 670 orders per second at the open, with a short peak of 3 times that: 2,000 per second. This is small for a database, but each order needs a buying power check, a risk check, a write to the audit log and a call to the exchange or a market maker.
+Charts. A day chart with 1-minute candles has 390 points; each candle is 5 numbers of 8 bytes. That is 390 times 40 = 15.6 KB raw, about 5 KB compressed. If 3 million users open 5 charts a day, that is 15 million chart reads per day, about 175 per second on average and about 1,500 per second at the open. Since the same 6,000 charts are asked again and again, a cache absorbs over 99 percent of them.
+api: The REST API is the contract for everything that changes state. The WebSocket carries only market data and order events.
+POST /v1/orders with header Idempotency-Key: 6f1c... and body {account_id, symbol, side, type, qty, limit_price, time_in_force, client_order_id}. Returns 201 {order_id, status:"pending_new"} the first time, and the same body with the same order_id on every repeat.
+GET /v1/orders/{order_id} returns the current state. GET /v1/orders?client_order_id=6f1c... looks up an order by the id the phone created; this is how the phone checks after a timeout. DELETE /v1/orders/{order_id} requests a cancel and returns 202, since the cancel may race with a fill.
+GET /v1/portfolio returns positions, cash, buying power and an "as_of" time. Prices are not part of it: the phone multiplies quantity by the live price itself.
+GET /v1/instruments/{symbol}/candles?interval=1m&range=1D returns arrays of [t, o, h, l, c, v]. The response carries Cache-Control and an ETag.
+POST /v1/auth/token with a refresh token and a device signature returns a short-lived access token (5 to 15 minutes). POST /v1/auth/step-up returns a one-time proof after a biometric or PIN check, needed for withdrawals and for new payees.
+WebSocket: the client sends {"op":"sub","symbols":["AAPL","MSFT"]} and {"op":"unsub","symbols":[...]}. The server sends {"t":"q","seq":8812,"u":[["AAPL",1,19231,19233,19232,100]...]}, using small integer ids and prices in minor units. It also sends {"t":"order","order_id":...,"status":"filled","filled_qty":10,"avg_px":192.31,"v":4}.
+datamodel: The order service owns the ledger of intent and state, in a relational database with strong transactions.
+```sql
+CREATE TABLE orders (
+  order_id      uuid PRIMARY KEY,
+  account_id    bigint NOT NULL,
+  client_order_id uuid NOT NULL,
+  symbol        text NOT NULL,
+  side          text NOT NULL,        -- buy / sell
+  qty           numeric(18,6) NOT NULL,
+  limit_price   numeric(18,6),
+  status        text NOT NULL,        -- see state machine
+  version       int NOT NULL DEFAULT 0,
+  created_at    timestamptz NOT NULL,
+  UNIQUE (account_id, client_order_id)
+);
+CREATE TABLE order_events (
+  order_id uuid, ver int, type text, payload jsonb, at timestamptz,
+  PRIMARY KEY (order_id, ver)
+);
+```
+The unique key on (account_id, client_order_id) is the idempotency guard: a second insert with the same pair fails, and the service returns the first row. order_events is append-only, which gives an audit trail and lets the phone resync by version. Cash and buying power are rows per account with a version column, updated in the same transaction as the order insert. Money uses fixed-point decimals, never floating point.
+The state machine is: pending_new, accepted, partially_filled, filled, cancel_requested, cancelled, rejected, expired. Only forward moves are allowed, checked in the update (WHERE status IN (...)).
+On the phone: a SQLite or Core Data store holds the last portfolio, the watchlist, order history and the last candle series per symbol. Live prices are never saved to disk; they live in memory in a store keyed by symbol.
+design: Client architecture. The mobile architecture has two data flows that must not mix. The first is a stream of quotes: a WebSocket client feeds an in-memory price store (a map from symbol to last quote), and each screen observes the symbols it shows. The second is request and response state: a repository over the REST API and the local database for portfolio, orders and charts. A screen such as the portfolio combines both: it takes quantity and cost from the database and the price from the stream, and computes value and profit and loss on the device, so a price tick never needs a server call.
+Subscriptions follow the screen. When the watchlist is visible the app subscribes to the 8 visible symbols. When the user scrolls, it unsubscribes from the rows that left and subscribes to the new ones. On the detail page it subscribes to one symbol, possibly at a faster rate, such as 250 ms. When the app goes to the background the socket is closed, because iOS and Android will not keep it alive and a streaming radio is a battery cost. On return to the foreground the app first shows the last known quotes with a "delayed" mark, then reconnects, then asks for a snapshot.
+Quote path on the server. Exchange feeds go to a feed handler, which normalizes quotes into one format. A quote engine keeps the latest quote per symbol in memory. A fan-out service holds a table from symbol to the list of connections that subscribed. Every 500 ms it takes the symbols that changed, and for each connection it builds one frame with the changed symbols of that connection. This is a real-time update system that favors the newest value over all values. If a phone is slow, its frame buffer fills; the gateway then drops older frames and sends only the latest quote per symbol. No client ever receives a queue of old prices.
+Market data entitlements. Real-time exchange data is licensed per user class, and often billed per user. The gateway checks entitlements when a client subscribes and sends delayed quotes (15 minutes is common) to users who lack the right. Each frame says whether it is real-time or delayed, and the UI shows the label. We cannot ignore this: the license terms apply to us.
+Order path. The user taps Buy. The phone makes a client_order_id (a UUID v4) and saves the order intent in the local database as "submitting". It sends POST /v1/orders with the Idempotency-Key. The API gateway validates the access token, and the order service checks the key in the orders table. If it is new, one database transaction does three things: it checks that buying power is at least qty times price plus a margin for market orders, reduces buying power by that amount (a hold), and inserts the order as pending_new. The commit returns the response. A separate worker reads new orders from an outbox table, sends them to the exchange gateway or the market maker over FIX, and moves the status to accepted when the exchange confirms. Fills arrive on the same FIX session and update the order, the position and the cash in one transaction. Each change writes an order event, and the event service pushes it to the phone over the WebSocket and, if the app is closed, as a push notification.
+Unknown outcome. The worst moment is when the phone sent the order and the connection broke before the response. The phone does not know if the server has the order. Because the phone owns the client_order_id, it can ask GET /v1/orders?client_order_id=... or just repeat the POST with the same key. Both give the same answer. The UI shows "checking order status" and never lets the user submit a second identical order from that screen until it knows.
+Authentication. Login uses a password or a passkey, then a device is registered with a key pair made in the secure hardware of the phone (Secure Enclave on iOS, Keystore/StrongBox on Android). The server stores the public key. Access tokens are short, refresh tokens are bound to the device key, and the app reads the token only after a biometric check for sensitive actions. This is the main part of authentication on mobile: we assume the phone can be stolen, so a stolen refresh token alone is not enough without the device key.
+diagram:
+  PHONE                                      BACKEND
+  +--------------------+     REST (orders, portfolio, charts)
+  | UI screens         |-------------+
+  +---+------------+---+             v
+      |            |          +-------------+    +--------------+
+  +---v----+  +----v-----+    | API gateway |--->| order svc    |
+  | price  |  | repo +   |    | + authn     |    | (SQL tx)     |
+  | store  |  | SQLite   |    +-------------+    +------+-------+
+  +---^----+  +----------+                              | outbox
+      |                                          +------v-------+
+      | WebSocket: quotes + order events         | exchange gw  |
+      |                                          |  (FIX)       |
+  +---+-------------+   +--------------+         +------+-------+
+  | fan-out gateways|<--| quote engine |<-- feed handler
+  | conflate 500 ms |   | latest/symbol|    (exchanges, SIP)
+  +---+-------------+   +--------------+
+      ^
+      +-- order events <-- event svc <-- fills from exchange gw
+
+  charts: phone -> CDN -> cache -> candle store
+animation:
+== The user taps Buy. The phone makes client id 6f1c and saves it.
+  phone : order 6f1c   submitting
+  server: (no order 6f1c)
+  wire  : -
+== The phone sends POST /v1/orders with Idempotency-Key 6f1c.
+  phone : order 6f1c   submitting
+  server: (no order 6f1c)
+  wire  : POST key=6f1c ------------------>
+== The server commits the order and a cash hold. The reply is lost.
+  phone : order 6f1c   submitting
+  server: order 6f1c   pending_new, hold 1923
+  wire  : <------ 201 ---X (link broken)
+== The phone times out, shows "checking", retries with the same key.
+  phone : order 6f1c   checking...
+  server: order 6f1c   pending_new, hold 1923
+  wire  : POST key=6f1c (retry) ---------->
+== The server finds the key, creates nothing, returns the first order.
+  phone : order 6f1c   checking...
+  server: order 6f1c   pending_new, hold 1923
+  wire  : <------ 200 order_id=o_77 --------
+== The exchange fills the order. The event reaches the phone.
+  phone : order o_77   FILLED 10 @ 192.31
+  server: order o_77   filled, v=4
+  wire  : <------ ws: order filled v=4 -----
+deepdive: Conflation and slow clients. A phone on a bad network cannot read 2 frames per second. If the server writes to a socket whose buffer is full, memory grows without limit. The gateway therefore keeps, per connection, a small map from symbol to the latest quote, not a queue. A write loop flushes the map when the socket is writable. If the phone is slow, it simply gets fewer, newer updates. The map has at most as many entries as the phone's subscriptions (8 to 50), so memory per connection is bounded. This is backpressure by overwriting. Each frame carries a sequence number so the phone can detect a gap; for quotes a gap does not matter, since the next value replaces the old one. Order events are different: they have a version per order, and the phone must apply them in order or refetch.
+Idempotency in detail. The idempotency key is made on the phone, once per user intent, and stored before the first send. The server enforces it with the unique index, not with a cache, because a cache entry may expire or be lost while the order still exists. If the repeat arrives while the first request is still running, the unique insert blocks on the first transaction's lock and then sees the committed row, so both requests return one order. If the repeat has the same key but a different body (the user changed the quantity), the server returns 422 and never creates anything: a key belongs to one exact intent. We keep the key as long as the order exists; there is no TTL. Cancel is idempotent by nature, since cancelling a cancelled order returns the cancelled order. Retries with backoff and jitter apply only to calls that are safe: GETs, and POSTs that carry a key. A POST without a key is never retried automatically.
+Buying power and double spending. Two orders from two devices at the same moment could both pass a check that reads "cash = 1,000" and then both write. We prevent this by making the check and the hold one atomic statement: UPDATE accounts SET buying_power = buying_power - :hold, version = version + 1 WHERE account_id = :a AND buying_power >= :hold. If zero rows were updated, the order is rejected with "insufficient buying power". A hold is released when the order is cancelled or filled at a lower price. Risk limits (pattern day trader rules, margin, restricted symbols) are checked before this update in the same service.
+Charts and caching. The candle API is read-heavy and the data is the same for all users. A closed candle never changes, so past data for 1W, 1M, 1Y, 5Y charts is cacheable for a day at the CDN with a long Cache-Control and a content-addressed URL. The current day changes every minute, so it is cached for 5 to 10 seconds in the cache layer and the CDN, which already cuts 1,500 reads per second at the open to a few per symbol. The phone keeps the last response in its database and shows it at once, then updates it with the live ticks from the stream: the last candle on the chart is built on the phone from the quotes it receives. The client sends If-None-Match with the ETag to save bytes.
+tradeoffs: Streaming quotes versus polling. Choose a WebSocket stream when the screen shows prices that users act on and you need updates under a second; the cost is a connection per user and a fan-out layer. Choose polling every 5 to 15 seconds for a portfolio summary or for a low-priority tab, where it saves 20 gateways and the user cannot see the difference. Many apps use both: streaming for the symbols on screen, polling for the rest.
+Conflation interval. Choose 250 ms for the detail screen of one symbol and for active traders who pay for it; the cost is four updates per second, more battery and double the egress. Choose 1 second for watchlists on cellular or low battery, which cuts the traffic in half again. Choose full tick-by-tick (every trade) only for a professional product with Level 2 depth, a separate entitlement, and desktop-class clients; on a phone it is wasted, since a screen draws at 60 frames per second and a person cannot read it.
+Strong consistency in the order service versus eventual consistency. Choose a relational database with a transaction for the order and the cash hold, since the rules are about money and the volume is only about 2,000 orders per second. Choose eventual consistency, queues and read replicas for things that can lag: the order history list, statements, notifications. You give up some write scale in the first (a single primary, with sharding by account as the exit) and accept short staleness in the second.
+Idempotency key versus a server-generated order id first. Choose a client-generated key when the network can lose the response, which is always true on mobile. Choose a two-step flow (create a draft order, get an id, then confirm) when you need a review screen and the risk checks to run before the user commits; it adds a round trip of 100 to 200 ms but also prevents wrong orders. Some apps use both: the draft returns a server id which serves as the key.
+failures: Fan-out gateway fails. 50,000 phones lose their sockets. They reconnect to other gateways with jittered backoff, send their subscription list, and receive a snapshot of the latest quotes first. Nothing is lost because quotes have no history to replay. Order events are replayed by version from the order service.
+Feed handler or exchange feed stops. The quote engine marks each symbol stale after 2 seconds with no update (or a different limit for illiquid symbols) and the frames carry a stale flag. The UI greys the price and disables market orders for that symbol. A stale price must never look like a live price.
+Order service primary fails. A replica is promoted in about 30 seconds. Writes during that time fail. Phones retry with the same keys, so no duplicates appear. Orders that were committed but not yet sent to the exchange are in the outbox table; the worker picks them up after failover. Orders already sent to the exchange have a unique exchange client id (the order id), so a resend after a crash is rejected as a duplicate by the exchange, not executed twice.
+Exchange connection drops mid-order. The order stays "accepted" or "pending_new" in our system until the FIX session is back and we run a state request for open orders. We do not guess. The phone shows the last known state with a "status delayed" note.
+evolution: At 10,000 users, one server, polling every 10 seconds, and a delayed data feed are enough; the order flow with an idempotency key is still needed on day one. At 1 million users, add the WebSocket tier, the quote engine, a CDN for candles and a separate order service with its own database. At 10 million daily users, shard the order database by account, run quote fan-out on tens of nodes with per-symbol sharding, and add per-region gateways. For global markets, add one feed pipeline per exchange and a currency service. Add options and crypto as new instrument types with their own rules, and keep the order state machine generic so the API stays the same.
+followups: The user taps Buy twice quickly. How do you avoid two orders? || The first tap creates a client order id and disables the button. If the user manages a second request with the same id, the unique index on (account, client_order_id) returns the first order. If the app makes a new id for each tap, the product must decide whether two taps are two intents; most apps lock the screen until the first result.
+A POST times out. What does the app do? || It does not assume failure. It shows "checking", then retries the same request with the same key or looks up the order by client_order_id. The server returns the one order. Only after a definite answer does the UI show success or an error.
+How do you make 1 million phones see prices in under a second without sending every tick? || Conflate on the server: keep the latest quote per symbol and send changes every 250 to 500 ms, packed into one frame per phone. Subscribe only to the symbols on screen. Overwrite old values for slow clients.
+How do you prevent the same cash being spent by two orders? || Make the check and the hold one atomic conditional update in the same transaction as the order insert. Rows with insufficient buying power are not updated, and the order is rejected. Holds are released on cancel or fill.
+How do you secure a financial app on a lost phone? || Short-lived access tokens, refresh tokens bound to a hardware-backed device key, biometric gate for the app and step-up for money movement, remote device revoke, certificate pinning, and no secrets on disk in clear text.
+ref: spec | RFC 6455: The WebSocket Protocol | Fette and Melnikov, 2011 | https://www.rfc-editor.org/rfc/rfc6455
+ref: blog | Designing robust and predictable APIs with idempotency | Brandur Leach, Stripe, 2017 |
+ref: spec | FIX Trading Community: FIX protocol specifications | FIX Trading Community |
+ref: docs | Android Keystore system | Android Developers |
+ref: book | Designing Data-Intensive Applications | Martin Kleppmann, 2017 |
+
+@@ pagination-library
+title: Design a pagination library
+category: Mobile
+level: Senior / Staff
+concepts: apidesign, mobilearch, cachelayer, eviction, retries, idempotence, queuesbuf, httpcaching
+summary: We design a client library that turns a paged server API into an endless, smooth list on a phone: a feed, an inbox, a product grid. It has two halves. The server contract says how a list is cut into pages and how a client asks for the next one. The client library decides when to load, how much to keep in memory, what to do on errors, and how to keep the list stable when the data changes underneath. Android Paging 3 and the iOS libraries built on diffable data sources are real examples of this problem. It is hard because the list is a moving target: new items arrive at the top while the user reads, requests fail on the train, the user flings the list at 15 rows per second, and memory is small. The library must hide this and still never show duplicates, gaps or a frozen scroll.
+requirements: Functional requirements. Load a first page quickly. Load more when the user nears the end (append) and, for bidirectional lists such as chat, near the start (prepend). Pull to refresh. Show loading, empty, end-of-list and error states per direction. Retry a failed page without losing the rest. Optionally keep a local database as the source of truth, so the list works offline. Support placeholders (a fixed-size scrollbar before all items are loaded) as an option. Work with any backend that follows the contract and with a local database as a source.
+Non-functional requirements. Smoothness: the UI thread never waits for the network or the disk; scrolling stays at 60 frames per second. Latency: when the user scrolls, the next page is already there, so the user sees a spinner in under 1 percent of scrolls. Memory: a bounded window of loaded items, no matter how far the user scrolls. Correctness: no duplicate and no missing items across pages even if the data changes. Efficiency: no more than one request in flight for the same page; no useless prefetching on a metered network. Testability: the library has no dependency on a UI framework, so its core can be tested with a fake clock and a fake source.
+Assumptions. A product with 5 million daily users on cellular networks, with a median round trip of 80 ms and a p95 of 600 ms. Each item is about 1 KB of JSON, 250 bytes after gzip. The list is sorted by time, newest first, and can hold up to 10 million items on the server for the largest users, but a typical user scrolls 100 items.
+estimates: Page size. A request costs mostly latency, not bytes. A page of 20 items is 20 times 250 bytes = 5 KB after compression. At 5 Mbit per second, 5 KB takes 8 ms to transfer, against a round trip of 80 ms. A page of 50 items is 12.5 KB and takes 20 ms. So moving from 20 to 50 items per page adds only 12 ms but cuts the number of requests by 2.5 times. Pages above about 100 items start to hurt: the first screen waits for data it does not show, and the server query is slower. We choose a page size of 30 and an initial load of 3 pages (90 items), so the first request already covers about 10 screens at 8 rows per screen.
+Prefetch distance. A quick fling moves about 15 rows per second. The p95 round trip is 600 ms, plus 100 ms for parsing and writing to the database: 700 ms. In 700 ms the user moves 15 times 0.7 = 10.5 rows. So the next page must be requested when the user is at least 11 rows from the edge. We add a safety factor of 2 and set the prefetch distance to 20 rows, about two thirds of a page.
+Memory window. We keep at most 300 items in memory. Each parsed item is about 2 KB of objects (strings, a few nested objects). 300 times 2 KB = 600 KB. Images are separate and handled by the image cache. Without a limit, a user who scrolls 5,000 items would hold 10 MB of list objects and would trigger garbage collection pauses.
+Offset cost. With offset paging, the query OFFSET 100000 LIMIT 30 makes the database find and drop 100,000 rows: about 100,000 index entries read for 30 returned. With a keyset condition the database seeks to the position in the index and reads 31 rows. This is 3,000 times less work for a user deep in the list.
+api: The contract with the server uses an opaque cursor, not an offset.
+GET /v1/feed?limit=30 returns {items:[...], next:"c_8f2a", prev:"c_91b0", has_more:true}. The first call has no cursor.
+GET /v1/feed?limit=30&after=c_8f2a returns the page that follows the cursor in the sort order. GET /v1/feed?limit=30&before=c_91b0 returns the page that comes before it (used to load newer items at the top or to prepend in a chat).
+The cursor is opaque to the client: a signed, base64 string that holds the sort key and the id of the last item, for example (created_at, id). The server may change its format. The client never builds or parses it.
+Optional: GET /v1/feed?around=item_77&limit=30 returns a page centred on one item, for deep links such as "open this message". GET /v1/feed/count returns an approximate total, used only for placeholders and a scrollbar, never for the paging logic.
+Errors: 400 with code "cursor_invalid" or "cursor_expired" means the client must refresh from the start. 429 and 503 carry Retry-After. Responses carry Cache-Control: private, max-age=30 and an ETag on the first page; later pages carry a longer max-age if their items are old and cannot change.
+Library API (Kotlin-like): a Pager is built from a PagingConfig(pageSize=30, prefetchDistance=20, initialLoadSize=90, maxItems=300, placeholders=false) and a PageSource. A PageSource has one method, load(params) where params hold the key, the direction (REFRESH, APPEND, PREPEND) and the load size, and the result is Page(items, prevKey, nextKey) or Error(cause). A Pager exposes a stream of snapshots and a loadState stream per direction. The list adapter calls itemAt(index), which also reports "the user is looking at this index" to the library, and the library decides if a load is needed.
+datamodel: In memory, the library keeps a window of pages in a double-ended queue ordered by position, a deque. Each page object holds its items, its own cursor, the cursors of its neighbours, and a timestamp. The pages in the window are contiguous. Loading an appended page pushes it on the tail; a prepended page goes on the head. When the window is over the size limit, pages are dropped from the end that is farthest from the viewport. The window therefore behaves like a bounded queue with two active ends.
+The loader keeps one small state machine per direction: Idle, Loading(key), Error(cause, attempt, retry_at) and Done (no more data). The in-flight map is {key: Deferred}, so a second request for the same key joins the first.
+With a database (the remote mediator pattern), the schema is:
+```sql
+CREATE TABLE item (
+  id        TEXT PRIMARY KEY,
+  sort_key  INTEGER NOT NULL,      -- created_at in ms
+  payload   BLOB NOT NULL,
+  fetched_at INTEGER NOT NULL
+);
+CREATE INDEX item_order ON item(sort_key DESC, id DESC);
+CREATE TABLE remote_key (
+  feed TEXT PRIMARY KEY,
+  next_cursor TEXT, prev_cursor TEXT, refreshed_at INTEGER
+);
+```
+The UI reads from item with a keyset query: SELECT payload FROM item WHERE (sort_key, id) < (?, ?) ORDER BY sort_key DESC, id DESC LIMIT 30. The network writes into item inside one transaction together with the new remote_key row. The remote_key table is the cursor that the library saves between app launches, so paging continues from the right place after a restart. Refresh clears both tables for the feed in the same transaction as the new first page is inserted, so the list never goes blank.
+design: Layers. The library has four parts. The PageSource knows how to load one page from the network or the database. The PageStore is the in-memory window described above. The Loader decides when to ask the source, merges results and runs the state machines. The Presenter turns the window into immutable snapshots that the UI thread can diff and draw. This follows the usual mobile app architecture: the UI observes, the data layer works on background threads, and the only thing that crosses the thread boundary is an immutable snapshot.
+Scroll to load. The adapter calls itemAt(i) when it binds row i. The Presenter tells the Loader the index. If the distance from i to the end of the window is less than the prefetch distance (20) and the append state is Idle, the Loader starts an append load with the tail cursor. The same rule at the head triggers a prepend. Because every bind is a trigger, the user never needs a scroll listener and the library never loads while nobody looks. The Loader also loads at most one page per direction at a time: a flood of binds during a fling gives one request, not twenty.
+Merging. A result arrives on a background thread. The Loader drops duplicates by item id (the same item can appear in two pages if an insert shifted the order), appends the page to the deque, drops pages from the far end if the window is above 300 items, and posts a new snapshot. This is an eviction policy based on distance from the viewport, not recency: in a list, the page the user left most recently is the one the user is most likely to scroll back to, and a least recently used rule can evict it if it was touched earlier than a far page. When pages are dropped, the cursor of the dropped side is kept, so a scroll back reloads that page. A dropped page is not lost; it is reloaded from the HTTP cache or the database in a few milliseconds.
+Refresh. Pull to refresh or an invalidation event (the user posted a new item, the server pushed a signal) starts a REFRESH load: fetch the first page, and when it arrives replace the whole window with it in one snapshot. The old window stays visible until the new one is ready, so the screen does not flash. The presenter diffs the old and new snapshots by item id and animates only the changes. A refresh cancels the loads in flight, because their cursors belong to the old list.
+Errors and retries. A failed load puts that direction in Error and the list shows a footer row "Could not load. Retry." The rest of the list stays usable. The Loader retries automatically only when the failure is transient (timeout, 5xx, 429) and idempotent, which a GET is. It waits 1 second, then 2, then 4 with random jitter, honors Retry-After when the server sends it, and stops after 3 attempts; then the state stays Error and the user decides. If the device is offline, the Loader does not burn attempts: it waits for a connectivity signal and then tries once. A 400 "cursor_expired" is not retried; it triggers a refresh. A 401 goes to the auth layer and the load is repeated once with the new token.
+diagram:
+  UI thread                     background threads
+  +-----------+  itemAt(i)   +------------------------------------+
+  | list view |------------->| Presenter                          |
+  | (adapter) |<-- snapshot -|  immutable snapshot + diff         |
+  +-----------+              +----------+-------------------------+
+                                        | index, direction
+                             +----------v-------------------------+
+                             | Loader                             |
+                             |  state per direction: Idle/Loading/|
+                             |  Error/Done; in-flight map; backoff|
+                             +---+------------------------+-------+
+                    read/trim    |                        | load(key)
+                  +--------------v----+         +---------v---------+
+                  | PageStore (deque) |         | PageSource        |
+                  | head <-pages-> tail|        | net or DB         |
+                  | max 300 items      |        +----+---------+----+
+                  +-------------------+              |         |
+                                             +-------v--+  +---v-------+
+                                             | HTTP     |  | SQLite    |
+                                             | + cache  |  | item,     |
+                                             | ETag     |  | remote_key|
+                                             +----------+  +-----------+
+animation:
+== The window holds pages P2 P3 P4. The user looks at row 62 of 90.
+  window : [P2][P3][P4]   tail cursor c_4
+  view   :        ^row 62      distance to end = 28
+  loader : append Idle
+== The user scrolls to row 75. Distance to end is 15, below 20.
+  window : [P2][P3][P4]   tail cursor c_4
+  view   :              ^row 75   distance = 15
+  loader : append Idle -> Loading(c_4)
+== A fling fires more binds. They join the request already in flight.
+  window : [P2][P3][P4]   tail cursor c_4
+  view   :               ^row 80
+  loader : append Loading(c_4)   (1 request, 14 binds joined)
+== The response arrives with P5. The loader drops no duplicates.
+  window : [P2][P3][P4][P5]  tail cursor c_5
+  view   :                ^row 84
+  loader : append Idle
+== The window is above 300 items. The far page P2 is dropped.
+  window : [P3][P4][P5]      head cursor c_2 kept
+  view   :              ^row 60 (indexes shifted by 30)
+  loader : append Idle
+== The user scrolls back up. P2 is reloaded from the cache.
+  window : [P2][P3][P4]      tail cursor c_4 kept
+  view   : ^row 8
+  loader : prepend Loading(c_2) -> Idle
+deepdive: Why not offset. Offset paging (?page=7&size=30) is simple but breaks in two ways. Cost: the database reads and discards all rows before the offset, so deep pages get slower in proportion to the offset. Correctness: if one new item is inserted at the top while the user reads page 6, then page 7 starts one item later and the last item of page 6 appears again as the first item of page 7. A deletion causes a gap. Keyset (cursor) paging says "give me 30 items after this exact position". The position is a value of the sort key, so inserts above it do not move it. The query uses a tie-breaker, for example (created_at, id), because many rows can share a timestamp, and the index must cover the same order. The server fetches limit + 1 rows: if it gets 31, it knows there is a next page and returns 30 without another query.
+Cursors in detail. A cursor encodes the last seen (sort key, id) and maybe the filter and the sort name, then is signed with HMAC so a client cannot forge one to read another user's data or cause a slow query. It has an expiry only if the underlying data is purged (for example, a search snapshot kept for 10 minutes). Where a sort key is not stable (sort by "score" that changes), a plain keyset breaks. The solutions are to freeze the order by a snapshot id returned in the first response, to sort by a stable key and let the client re-rank, or to accept that some items are repeated and let the merge step drop duplicates by id.
+Stable lists and invalidation. The window assumes the pages are a consistent view. They rarely are, over minutes. The library defines the rule: a list is a snapshot from the first page. New items at the top are not inserted into the visible list; the library shows a "12 new items" pill, and a tap refreshes. This is better than inserting rows above the viewport, which makes the content jump. When an item changes (liked, edited), a separate event updates it in place by id, without paging. When the source says "my data changed" (a database invalidation callback), the Loader reloads the current window around the first visible item, keeping the scroll position by anchoring to that item's id and its offset from the top of the screen.
+HTTP caching and idempotence. A GET of a page is idempotent and safe: asking twice does the same as asking once. That is why the library may retry it, join duplicate requests, and prefetch without a risk. We use a cache layer at each level: the page window in memory, the database, the HTTP cache and the CDN. The first page has an ETag; on refresh the client sends If-None-Match, and a 304 answer costs about 300 bytes and no parsing. Pages that are far in the past (older than an hour, sorted by time) cannot change, so the server marks them Cache-Control: private, max-age=3600 (public if they are not personal, so the CDN can share them). Because a cursor is part of the URL, the cache key is exact. For a personal feed, Vary: Authorization must not be forgotten, or a shared cache could mix users. A mutation such as "mark as read" is not a GET; it needs its own idempotency key so a retried request is not applied twice.
+The request queue. All loads pass through one bounded queue per feed, in the style of a ring buffer or a small priority queue: foreground loads (the user is waiting) go before prefetches, and at most 2 requests run at the same time, so the library does not take all connections of the HTTP/2 pool needed by image downloads. When the queue is full, the oldest prefetch is dropped. The queue state is also what we show in debug overlays and metrics.
+tradeoffs: Offset versus cursor paging. Choose offset or page numbers when the data is small (under about 10,000 rows), static, and the user needs to jump to page 17, such as an admin table on a web screen. Choose cursors for feeds, chats and anything that is large or changes while read; the price is that you cannot jump to an arbitrary page and a cursor needs a deterministic sort order with a tie-breaker. Mixed designs exist: a cursor for scrolling, and a search or filter instead of "go to page".
+Network source versus database as source of truth. Choose the network-only source for a short, low-value list (search suggestions) where offline use does not matter and every write to disk is waste. Choose the database as the source when the list is the main screen, when users read offline, and when you want restoring state after process death for free. You pay with schema work, migrations, pruning, and the care needed so that the cursor and the rows are written together.
+Page size and prefetch distance. Choose small pages (10 to 20) when items are large (more than 5 KB), when the connection is slow, or when the first paint matters more than the request count. Choose larger pages (50 to 100) when items are small, the network is good and the server query is cheap; larger pages reduce the request count and battery use. The deciding number is the p95 round trip times the scroll speed, which tells you how far ahead to request. Do not tune from a desk: measure the real p95 and the stall rate.
+Eviction by distance versus LRU, and window size. Choose distance-based dropping and a window of a few hundred items for a vertical list read in one direction. Choose a larger window (1,000 or more) or LRU when users jump back and forth between sections, as in a grid with tabs, and memory is not tight. The price of a small window is reloads when the user scrolls back; the price of a large one is memory and slower diffing. With database storage, a small window costs very little because a reload is a local read.
+failures: Network drops during a fling. The append load fails. The footer shows a spinner for the 1 second wait, then retries. If the radio is off, the Loader waits for connectivity and retries once. The user sees items already loaded and a small error row at the end.
+Duplicate or missing items after server changes. The merge step drops items already in the window by id, and the cursor design avoids shifting. If a deletion removes the item that a cursor points to, the keyset query still works, since it uses the key value and not the row. A cursor to a purged snapshot returns "cursor_expired", and the library refreshes and keeps the scroll anchor if the anchor item still exists.
+Server slow or overloaded. The client gets 503 or timeouts. Backoff with jitter and Retry-After stop all clients from retrying at once. The Loader limits itself to 2 concurrent requests per feed and 1 per direction. The server side may shed prefetch requests first if the client marks them with a header such as X-Priority: prefetch.
+evolution: At 1,000 users and 100 items per list, the server returns everything in one response and the client needs no library; this is the right answer for short lists. At 100,000 users, add limit and cursor to the API and a simple append-only loader with a footer spinner. At 5 million users, add the window, eviction, the request queue, the database source and ETags, because the cost of one wasted request now shows in the server bill and the cost of one jank in the review scores. For a platform with many teams, move the library into a shared module with a stable API, a test suite using a fake source and fake clock, and metrics (time to first page, stall rate, retries per load, memory of the window) that every feed reports in the same way. Later add features such as bidirectional anchor loading, grouping with section headers, and server-driven refresh signals.
+followups: Why do cursors beat offsets for a social feed? || New items are inserted at the top all the time. With offsets, every insert shifts later pages and the user sees repeats or gaps. A cursor names a position by sort key, so inserts above it change nothing. It also costs less in the database since it seeks the index instead of skipping rows.
+How do you decide the prefetch distance? || Multiply the p95 round trip (plus parse time) by the fast scroll speed in rows per second, then add a safety factor of about 2. For 700 ms and 15 rows per second this gives 10.5, so 20 rows. Then check it with the real stall rate, and lower it on metered or low-battery devices.
+What if the same page is requested twice? || A map of in-flight requests keyed by cursor joins the second call to the first. The merge step also drops items already present by id. A GET is idempotent, so a duplicate does no harm, but we avoid the wasted bytes.
+How do you keep the scroll position when new items arrive at the top? || Do not insert them into the visible window. Show a "new items" indicator and refresh on tap. When data must change under the viewport, anchor to the id and pixel offset of the first visible row, and restore it after the new snapshot is applied.
+Which pages do you evict and why not LRU? || The pages farthest from the viewport, because in a linear list the user will most likely come back to the nearest pages. An LRU rule looks at when a page was last touched, which can keep a far page that was bound a moment ago and evict a near one. Keep the cursors of the dropped ends so they can be reloaded.
+ref: docs | Paging library overview | Android Developers | https://developer.android.com/topic/libraries/architecture/paging/v3-overview
+ref: docs | Page from network and database | Android Developers | https://developer.android.com/topic/libraries/architecture/paging/v3-network-db
+ref: spec | RFC 9111: HTTP Caching | Fielding, Nottingham and Reschke, 2022 | https://www.rfc-editor.org/rfc/rfc9111
+ref: blog | Pagination done the right way (keyset) | Markus Winand, Use The Index, Luke |
+ref: book | Designing Data-Intensive Applications | Martin Kleppmann, 2017 |
+
+@@ mobile-hotel-booking
+title: Design a hotel booking mobile app
+category: Mobile
+level: Senior / Staff
+concepts: mobilearch, apidesign, idempotence, retries, cachelayer, authn, httpcaching, occ
+summary: We design the app and backend of an online hotel marketplace, like Booking.com, Airbnb or Expedia: search a city and dates, see hotels with prices and photos, open one, choose a room, pay, and get a confirmation that works offline at the hotel desk. Reads are huge and can be a little stale; the booking itself is rare but must be exact. The hard parts are the gap between the two. Search shows prices from caches that are minutes old, while the last room can be taken by someone else while you type your card number. A payment can succeed while the confirmation fails, or the other way round. A phone on a hotel Wi-Fi may drop the answer after we charged the card. The design makes search fast and cheap, then makes the last step a careful, repeatable transaction.
+requirements: Functional requirements. Search by destination, dates, guests and filters (price, stars, free cancellation), with a list and a map. Hotel page with photos, amenities, reviews and room types with rates. Account with login, guest checkout, saved guests and payment methods. Book a room with card or wallet payment. Booking list with confirmation, change and cancellation under the rate rules. Push and email for confirmation and reminders. Deep links from emails and ads to a hotel or a booking.
+Non-functional requirements. Search results in under 800 ms at p95 on 4G, the first screen in under 2 seconds on a cold start. Hotel page in under 500 ms. Price accuracy: the price on the final screen must be honored; a price change between the list and checkout is shown to the user and never silently applied. Booking correctness: a room-night is never sold beyond its capacity (with an allowed overbooking buffer per hotel policy); a payment is charged at most once for one booking; the user gets exactly one confirmation. Availability: search 99.9 percent, booking 99.95 percent. Offline: the user can open confirmed bookings, with address, dates, confirmation number and a map tile, with no network. Security: card numbers never touch our servers.
+Assumptions. 20 million monthly users, 5 million daily users. A daily user runs 8 searches and opens 3 hotel pages. 2 percent of daily users book. The catalog has 1 million properties, with 8 room types on average and a calendar of 365 days ahead. Hotels are connected directly or through supplier systems that confirm bookings in 1 to 5 seconds.
+estimates: Search load. 5 million times 8 searches is 40 million per day. 40 million divided by 86,400 is about 460 per second on average; travel traffic peaks in the evening and at weekends, so use 5 times: 2,300 per second at peak. If 60 percent of searches hit a cache, the search index sees about 900 per second.
+Hotel page load. 5 million times 3 pages = 15 million per day, 175 per second on average and about 870 at peak. Each needs live room rates for the selected dates.
+Booking load. 2 percent of 5 million = 100,000 bookings per day. That is 1.2 per second on average and about 6 per second at peak. Add payment retries and failures (30 percent more): 8 payment attempts per second. This is tiny next to search, which means we can afford a transaction on the booking path and we should spend our effort on correctness, not on raw speed.
+Inventory size. 1 million properties times 8 room types times 365 days = 2.9 billion room-night rows. At about 50 bytes per row (ids, date, total, booked, version, price) that is 146 GB. It fits in a sharded relational database; we shard by property id, so all nights of one hotel are on one shard. At 6 bookings per second, with 3 nights each, one shard sees a few writes per second, so there is no write scale problem, only a contention problem on popular hotels.
+Images. A result screen shows 10 thumbnails of about 25 KB each: 250 KB per screen. 40 million result screens per day times 250 KB = 10 TB per day, about 0.93 Gbit per second on average and 5 Gbit per second at peak. All of it goes through a CDN.
+api: Search: GET /v1/search?dest=paris&checkin=2026-12-10&checkout=2026-12-13&guests=2&sort=popularity&limit=20&cursor=... returns {results:[{property_id, name, thumb_url, from_price:{amount,currency,per_night}, rating, distance_m}], next, snapshot_id}. Prices here are "from" prices and marked indicative.
+Hotel: GET /v1/properties/{id} returns static content (name, photos, amenities, policies) with a long cache life. GET /v1/properties/{id}/offers?checkin=...&checkout=...&guests=2 returns live offers: [{offer_id, room_type, rate_plan, price_total, taxes, cancellation, refundable_until, quote_id, quote_expires_at}]. This one is not cacheable by clients.
+Book: POST /v1/bookings with the header Idempotency-Key and the body {quote_id, guests:[...], contact, payment:{token}, price_total_seen}. It returns 202 {booking_id, status:"pending"} or 201 {booking_id, status:"confirmed", confirmation_code}. If the price changed, it returns 409 {code:"price_changed", new_quote_id, new_price_total}. If the room is gone, 409 {code:"sold_out", alternatives:[...]}.
+GET /v1/bookings/{booking_id} returns the status; the app polls it with backoff, or waits for a push. GET /v1/bookings?status=upcoming lists the bookings. POST /v1/bookings/{id}/cancel is idempotent and returns the refund amount.
+Auth: POST /v1/auth/login, /v1/auth/refresh, and POST /v1/auth/guest to start a guest session tied to an email that is verified by a one-time code.
+Payment tokenization happens between the phone and the payment provider, not our API: the provider SDK returns a single-use token for the card or wallet, and we send only the token.
+datamodel: Inventory and bookings are in a relational database sharded by property_id.
+```sql
+CREATE TABLE room_night (
+  property_id bigint, room_type int, day date,
+  total smallint, booked smallint, held smallint,
+  price_cents int, version int,
+  PRIMARY KEY (property_id, room_type, day)
+);
+CREATE TABLE booking (
+  booking_id uuid PRIMARY KEY, user_id bigint,
+  property_id bigint, room_type int,
+  checkin date, checkout date, total_cents int,
+  status text,      -- held, paid, confirmed, failed, cancelled
+  idem_key text, hold_expires_at timestamptz,
+  psp_ref text, supplier_ref text, version int,
+  UNIQUE (user_id, idem_key)
+);
+```
+The room_night row has capacity (total), confirmed sales (booked) and unconfirmed holds (held). Available = total - booked - held. The booking table has a unique index on (user_id, idem_key) so a repeated request finds the first booking. The booking row carries payment and supplier references so each step can be repeated safely.
+Search uses a separate read-optimized index (a search engine or a columnar store) that holds one document per property, with a compact per-day price and availability summary refreshed every few minutes from the inventory. It is not the source of truth; it can be wrong by minutes.
+On the phone: a SQLite database with tables for bookings (full detail, kept for offline use), recent searches, viewed hotels and a key-value table for user settings. Auth tokens go to the secure store (Keychain or Keystore).
+design: Client architecture. The app follows the layered shape from mobile app architecture: screens observe view models; view models call use cases; a repository decides between the memory cache, the database and the network. Search and hotel data are cache-first, with the server as truth. Bookings are database-first, so "My trips" opens with no network. Navigation uses deep links from the start, since many sessions begin from an email or an ad: a link opens the hotel page with the dates, or the booking by id after the login step. The image loader asks the CDN for the size that fits the view (for example width=400, WebP or AVIF where supported), decodes off the main thread, and keeps a memory cache and a disk cache. A blurred low-quality placeholder from the API fills the card while the image loads.
+Search path. The app sends the search. The API gateway checks a search result cache in the cache layer, keyed by (destination, dates, guests, filters, currency, sort). A hit returns in about 20 ms. A miss goes to the search index, which ranks properties using the indexed price and availability summary, then the service enriches the page with thumbnails and ratings and stores it in the cache for 5 minutes. Pagination uses a cursor tied to a snapshot id so that page 2 continues the same ranking.
+Hotel page and quote. When the user opens a hotel, the app fetches static content (cached on the CDN and the device) and the live offers. The offers service asks the inventory for the real availability of every night and applies the rate rules. It creates a quote: a signed, short-lived record (15 minutes) holding the exact room, nights and total price. The price in the list was "from"; the price in the quote is a promise. The app displays "price confirmed" with the expiry, and counts down if the user waits.
+Booking path. The user fills in guest details and pays. The payment SDK makes a token. The app makes an idempotency key (a UUID) when the user opens the checkout screen, saves it with the draft, and sends POST /v1/bookings. The booking service runs a saga of steps. Step 1: check the quote is still valid and the price matches. Step 2: hold the inventory for all nights in one transaction (see the deep dive), writing the booking as "held" with a hold expiry of 10 minutes. Step 3: authorize the payment with the payment provider, passing our booking id as the provider's own idempotency key. Step 4: confirm with the hotel or supplier (a call that may take seconds). Step 5: mark the inventory as booked, capture the payment, set the booking to "confirmed" and publish an event. The event drives the email, the push notification and the loyalty points. If a step fails, the saga runs compensations: release the hold, void the authorization.
+Reconnecting after loss of answer. If the app does not get a response, it does not assume failure. It keeps the draft with the same key and calls GET /v1/bookings?idem_key=... or repeats the POST. The server returns the same booking in its current state. The screen shows "Confirming your booking" and a spinner with a hard limit of about 60 seconds, after which it says "We are still working on it; we will send you an email and a push" and lets the user leave. Nothing in this flow tells the user to try again with a new card, which is how double charges are made.
+Authentication. Browsing needs no login. Checkout needs an identity, but asking for registration before payment loses customers, so the app offers guest checkout with email verified by a one-time code, and offers to create an account afterwards. Sessions use a short access token and a rotating refresh token in the secure store, biometric unlock for saved cards, and a step-up check for changes to the account email. Card payments in Europe and India need strong customer authentication (3-D Secure); the payment SDK opens a bank page in a web view and returns to the app with a result, so the app must handle being killed during that step and recover from the booking state on the server.
+Offline and trips. When a booking is confirmed the app stores the full record, a QR code for the confirmation, the hotel address, check-in instructions, phone number and a static map image. The trip screen reads only from the database. Push messages for reminders ("check-in tomorrow") and changes carry an id; the app then fetches the details when opened.
+diagram:
+  PHONE                                          BACKEND
+  +-------------------+  search/offers   +-------------+
+  | screens + VMs     |----------------->| API gateway |
+  | repo: mem/SQLite  |<-----------------| authn, rate |
+  | image loader      |  JSON (ETag)     +------+------+
+  +----+-----------+--+                          |
+       |           | images (CDN, width=400)     |
+       |           +--------> CDN <--- origin    |
+       |  POST /bookings + Idempotency-Key       |
+       +-----------------------------------------+
+                                                 v
+        +------------+   miss   +----------------+--+
+        | cache layer|<---------| search svc        |--> search index
+        | (5 min)    |  hit     +-------------------+    (price summary)
+        +------------+          | offers svc: quote |
+                                +-------------------+
+                                | booking svc (saga)|
+                                +--+-------+------+-+
+                                   |       |      |
+                       +-----------v-+ +---v----+ +v--------------+
+                       | inventory DB| | payment| | hotel/supplier|
+                       | room_night  | | provider| | confirm      |
+                       | (OCC, shard)| +--------+ +---------------+
+                       +-------------+
+animation:
+== The user taps Pay. Last room: total=1, booked=0, held=0, version=7.
+  app    : checkout key=K1  state=draft
+  room   : total=1 booked=0 held=0 v7
+  booking: -
+== The server holds the room: held becomes 1 only if capacity allows.
+  app    : checkout key=K1  state=sending
+  room   : total=1 booked=0 held=1 v8
+  booking: B1 held (expires in 10 min)
+== A second buyer tries to hold the same night. The condition fails.
+  app    : (other app) 409 sold_out
+  room   : total=1 booked=0 held=1 v8
+  booking: B1 held
+== The payment is authorized with the provider using key B1.
+  app    : checkout key=K1  state=sending
+  room   : total=1 booked=0 held=1 v8
+  booking: B1 paid-authorized
+== The supplier confirms. The reply to the phone is lost.
+  app    : checkout key=K1  state=waiting...
+  room   : total=1 booked=1 held=0 v9
+  booking: B1 confirmed
+== The app retries with K1. The server returns B1 confirmed. One charge.
+  app    : booking B1 CONFIRMED, code HX42
+  room   : total=1 booked=1 held=0 v9
+  booking: B1 confirmed
+deepdive: Selling the last room: OCC. Many users look at the same popular hotel on the same weekend, and two of them tap Pay in the same second. A plain read-then-write is wrong: both read booked=0, both write booked=1, and the room is sold twice. The simple fix is a conditional update, which is the core of optimistic concurrency control: UPDATE room_night SET held = held + 1, version = version + 1 WHERE property_id = ? AND room_type = ? AND day = ? AND total - booked - held >= 1. The database checks the condition and applies the change in one atomic step, so exactly one of the two updates changes a row. The other sees "0 rows updated" and the service answers sold_out. For a stay of 3 nights the service runs three such updates in one transaction, in a fixed order (by date) so that two bookings cannot lock rows in opposite orders and deadlock. If one night fails, the whole transaction rolls back and no night is held. We add the version column for flows that read first, such as a rate plan with a minimum-stay rule: the service reads the rows with their versions, decides, and updates with WHERE version = ?. If the version has moved, it retries the whole decision up to 3 times. A lock-based design (SELECT ... FOR UPDATE) also works at 6 bookings per second, and its cost is the lock wait on a hot row. OCC wins when conflicts are rare; for a single hot room, conflicts are the common case, but each conflict ends in an immediate, honest "sold out", which is the correct business result.
+Idempotent booking. The unique index on (user_id, idem_key) is the guard. The first request inserts the booking and does the work. A repeat that arrives while the first is still running waits on the unique index and then gets the stored row. A repeat that arrives later gets the stored row as well. If the same key arrives with a different body, the service returns 422. The key is also used downstream: the booking id is the idempotency key for the payment provider call and for the supplier call, so a retry of our own saga step, after a crash, cannot charge twice or book twice at the hotel. Each step writes its result (psp_ref, supplier_ref) before the next starts, and a recovery worker scans bookings stuck in "held" or "paid" for more than 2 minutes and drives them forward or backward.
+Retries. Our service retries calls to the payment provider and the supplier with exponential backoff and jitter, but only inside a time budget: the user is waiting. The supplier call has a 5 second timeout and 2 retries; after that the booking goes to "pending supplier" and the user is told it will be confirmed within minutes. On the phone, the app retries GET requests (search, offers) up to 2 times with backoff, and never retries a POST without its key. Because the retry storms of a travel app come from bad hotel Wi-Fi and elevators, the client shows its own state ("trying again") instead of a silent hang.
+Price integrity and the stale cache. Search shows indicative prices from a cache and an index that are up to 5 to 15 minutes old. Offers recompute the price from the source of truth, and the quote locks it. If the quote price is higher than the list price, the app shows "price changed from 142 to 151" before the user enters details, not at the end. The booking request carries price_total_seen; the server compares it with the quote and refuses a mismatch with 409, so a stale screen can never charge more than shown. The cost of this honesty is a few lost clicks; the cost of the alternative is chargebacks and trust.
+HTTP caching. Static hotel content changes rarely, so the CDN and the phone hold it: Cache-Control: public, max-age=86400, stale-while-revalidate=604800 and an ETag; a revalidation answers 304 in 40 ms. Photos are immutable files with a content hash in the URL and max-age of one year. Search results are private and short: Cache-Control: private, max-age=60 and Vary: Accept-Language, Accept-Currency, so a page for euros is never served to a user who wants rupees. Offers and bookings use Cache-Control: no-store. The mistake to avoid is caching a personalized price in a shared cache.
+Payments and the double-charge window. The dangerous gap is between "money authorized" and "booking confirmed". We use authorize first, capture on confirmation, and void on failure. That means a supplier failure costs the user only a temporary hold on the card, not a charge and a refund. The recovery worker checks every authorization older than 15 minutes against the booking state and voids the ones with no confirmed booking. A reconciliation job each night compares our payments with the provider's report and our bookings with the supplier's list.
+tradeoffs: Hold the inventory first or take the payment first. Choose hold then authorize then confirm for rooms, since stock is scarce and a failed payment is cheap to undo; the hold costs 10 minutes of inventory per attempt, and at 6 bookings per second that is only 6 times 600 = 3,600 holds in flight. Choose payment first only if the supplier confirms in a single call and cannot reserve; then you pay for refunds when the room is gone. Whichever order you take, make every step repeatable and put compensation in the plan.
+OCC versus locks versus a queue. Choose a conditional update (OCC) for a counter with a simple rule like available >= 1; it needs no lock waits and is easy to reason about. Choose pessimistic locks (SELECT FOR UPDATE) when the decision reads many rows and conflicts are frequent. Choose a per-hotel serial queue when a supplier call must be strictly ordered, at the price of added latency. At 6 bookings per second the database can take any of the three; pick the simplest that is correct.
+Cached search versus live search. Choose cached results (5 minutes) with indicative prices for the list, because 2,300 searches per second against live inventory would cost 10 times more and give a slower first screen. Choose live availability for the hotel page and checkout, since this is where the promise is made. The price is the surprise "price changed" screen for 3 to 8 percent of users in busy dates; reduce it by refreshing the index more often for hotels that are nearly full.
+Guest checkout versus forced login. Choose guest checkout with email verification when conversion matters, which it does, and when a one-time code is enough proof for the booking list. Choose forced login for loyalty-heavy brands, where points and saved cards are the product. In both cases the booking service sees a verified identity before it creates a booking.
+failures: Response lost after a successful booking. The app retries with the same key and gets the existing booking. No second charge, no second room.
+Payment provider times out. The booking stays "held". The recovery worker asks the provider for the status using our reference. If authorized, it continues; if unknown after 15 minutes, it voids and releases the hold, and the user receives a message to try again.
+Supplier confirms after our timeout. The booking is "pending supplier". A callback or a poll later moves it to "confirmed" and sends the push. If the supplier rejects, the worker voids the payment, releases the hold and tells the user, offering alternatives.
+evolution: At 10,000 users, one database and a single service are enough; use a unique key and a conditional update from day one, because the double-booking bug does not wait for scale. At 1 million users, add the search index, the CDN for photos and the cache layer for results. At 20 million monthly users, shard the inventory by property, add the saga and the recovery workers, and split search and booking into separate services with their own capacity. At global scale, run regional search stacks near users, keep inventory in the region of the property, and add dynamic pricing, price alerts, and a ranking model fed by clicks and bookings.
+followups: Two users tap Pay for the last room at the same moment. What happens? || Both requests run a conditional update that reserves the room only if capacity remains. The database applies them one after the other, so one changes a row and the other changes none. The second user gets a sold_out response with alternatives. No lock is held across the payment step, since the hold row is the reservation.
+The phone loses the connection after the server charged the card. How do you avoid a second charge? || The app made an idempotency key before the first send and keeps it. A retry returns the existing booking. The booking id is also the idempotency key at the payment provider, so even our own retries cannot charge twice.
+Why is the list price different from the checkout price, and how do you handle it? || The list comes from a cache that is minutes old. The quote is computed from live inventory and locks the price for 15 minutes. The booking request carries the price the user saw, and the server rejects a mismatch with 409. The app shows the change before the user enters details.
+How would you cache hotel pages? || Static content with a long max-age, stale-while-revalidate and an ETag at the CDN; photos as immutable hashed URLs; search results private for 60 seconds with Vary on language and currency; offers and bookings no-store.
+What if the OS kills the app during 3-D Secure? || The booking state lives on the server. When the app restarts, it reads the draft and the idempotency key from disk and asks for the booking status. A pending authentication is resumed or the booking is cancelled by the sweeper after the hold expires.
+ref: blog | Designing robust and predictable APIs with idempotency | Brandur Leach, Stripe, 2017 |
+ref: docs | Idempotent requests | Stripe API documentation |
+ref: spec | RFC 9111: HTTP Caching | Fielding, Nottingham and Reschke, 2022 | https://www.rfc-editor.org/rfc/rfc9111
+ref: paper | Sagas | Hector Garcia-Molina and Kenneth Salem, 1987 |
+ref: book | Designing Data-Intensive Applications | Martin Kleppmann, 2017 |
+
+@@ mobile-drive
+title: Design a cloud drive mobile app
+category: Mobile
+level: Senior / Staff
+concepts: mobilearch, objectstore, stringmatch, crdt, retries, hmac, cachelayer, apidesign
+summary: We design the phone app and backend of a cloud drive, like Dropbox, Google Drive or iCloud Drive: browse folders, open and preview files, upload photos in the background, share links, and keep chosen files available offline. On a desktop the whole folder is mirrored. On a phone it cannot be: storage is small, uploads run on a weak uplink, the OS freezes background work, and the battery is precious. So the phone app is a smart cache and an upload queue in front of a file store that holds petabytes. The hard parts are resumable and cheap uploads, finding what changed on the server without scanning, conflicts when two devices edit the same file offline, and doing all of it without draining the battery or the data plan.
+requirements: Functional requirements. Browse folders and search by name. Preview images, video, PDF and office documents. Upload files from the share sheet and automatic camera upload. Download for offline use ("pin" a file or folder). Rename, move, delete and restore (with versions for 30 days). Share by link or by invitation, with view or edit permission. Comments and simple collaborative editing of documents are optional. Notifications when a shared folder changes.
+Non-functional requirements. Durability: a file that was reported as uploaded is never lost (target 11 nines per year). Upload: resumable after any interruption, and no byte is sent twice. Freshness: a change on one device appears on another within about 5 seconds when the app is open, and when the app is opened otherwise. Latency: folder listing from the local cache in under 100 ms, from the network in under 500 ms; first thumbnail visible in under 300 ms. Battery: camera upload runs only on Wi-Fi and charging by default. Storage on the phone: the cache stays within a user-set limit (default 2 GB or 10 percent of free space). Security: files are encrypted in transit and at rest; links can expire and carry a password.
+Assumptions. 50 million users, 15 million daily active. A daily user adds 4 files per day (mostly photos of 3 MB, some documents of 0.5 MB), average 2.5 MB. Each user has 3,000 files and about 4 GB in total. A file is split in blocks of at most 4 MB, as Dropbox documents for its own sync engine.
+estimates: Ingest. 15 million users times 4 files = 60 million files per day. 60 million times 2.5 MB = 150 TB per day of raw uploads. Deduplication of identical blocks (same photo uploaded by several people, copies of the same file) saves about 20 percent: 120 TB per day stored. 150 TB divided by 86,400 s = 1.7 GB per second on average, or 14 Gbit per second; peak at 3 times is 42 Gbit per second.
+Yearly storage. 120 TB per day times 365 = 44 PB of new logical data per year. Object storage with erasure coding (for example 10 data + 4 parity pieces, a factor of 1.4) needs about 61 PB of raw disk per year. Total stored: 50 million users times 4 GB = 200 PB logical, about 160 PB after dedup, 225 PB raw. At 20 TB per disk this is about 11,000 disks, before growth.
+Block requests. Most files are one block. 60 million files per day is 700 block uploads per second, and 2,100 at peak. Each is a presigned PUT straight to the object store.
+Metadata. A file entry (path, block list, size, modified time, revision, owner) is about 300 bytes. 50 million users times 3,000 files = 150 billion entries times 300 bytes = 45 TB. It is sharded by namespace (a user's root or a shared folder). Commits: 60 million per day, 700 per second, 2,100 at peak. This is easy for sharded SQL; the metadata is a lot of rows but little traffic.
+Upload time on a phone. A 3 MB photo on a 10 Mbit per second uplink takes 2.4 seconds. A 1 GB video takes 800 seconds, over 13 minutes. During that time a train enters a tunnel, so upload must be split in parts with a resume point.
+Delta sync. A 100 MB document with 10 bytes inserted at the front. With fixed 4 MB blocks every block shifts, so all 25 blocks change and 100 MB is sent. With content-defined chunks of about 1 MB average, only the first chunk changes: about 1 MB is sent, 100 times less.
+api: The API is REST over HTTPS. Content bytes do not pass through it.
+GET /v1/folders/{id}/entries?cursor=...&limit=200 lists a folder. GET /v1/changes?cursor=... returns all changes in a namespace since a cursor: [{op:"upsert|delete|move", path, file_id, rev, size, blocklist_hash}] plus a new cursor. GET /v1/changes/wait?cursor=...&timeout=30 is a long poll that returns early when something changed. The first call without a cursor returns a full listing and a cursor.
+POST /v1/files/commit with {namespace, path, parent_rev, size, blocks:[sha256,...], client_mtime} and the header Idempotency-Key. It returns 200 {file_id, rev} when all blocks are present, or 409 {need_blocks:[sha256,...]} listing the missing ones.
+POST /v1/blocks/upload-urls with {blocks:[{sha256,size}]} returns presigned PUT URLs for the missing blocks. The URL is signed with an HMAC and expires in 15 minutes. For files over 100 MB the client sends the blocks in parts of 8 MB and uses multipart upload.
+GET /v1/files/{id}/content with a Range header downloads a part of a file. It answers 302 to a signed CDN URL. GET /v1/files/{id}/thumbnail?w=256 returns a small image with a long Cache-Control and an ETag.
+POST /v1/shares with {file_id, access, expires_at, password} returns a link whose token is random and unguessable. DELETE /v1/files/{id} moves a file to trash; POST /v1/files/{id}/restore?rev=... brings back a version.
+datamodel: Content and metadata are separate. Content is in an object store as immutable blocks named by their hash. Metadata is in a sharded SQL database.
+```sql
+CREATE TABLE file_journal (            -- append-only, per namespace
+  namespace_id bigint, journal_id bigint,
+  file_id bigint, op text, path text, rev bigint,
+  blocklist_hash bytea, size bigint, at timestamptz,
+  PRIMARY KEY (namespace_id, journal_id)
+);
+CREATE TABLE blocklist (
+  blocklist_hash bytea PRIMARY KEY,
+  block_hashes   bytea[]            -- ordered list of sha256
+);
+CREATE TABLE block (
+  hash bytea PRIMARY KEY, size int, refcount bigint, store_key text
+);
+```
+The journal_id is the sync cursor: a client that says "I have everything up to 8,114" gets the rows above it. A file is the ordered list of its block hashes. The block table maps a hash to the object key; the refcount counts how many blocklists use it, and a garbage collector removes blocks with refcount 0 after a grace period of 7 days. The same design lets "Restore version" be a pointer change, not a copy.
+On the phone, SQLite holds the tree of what the user has seen: entries(file_id, parent_id, name, rev, size, state, pinned, last_access), the listing cursor per folder, an upload_queue(local_asset_id, state, blocks_done, next_try) and a block cache index. Files themselves are in the app's cache directory, with a size cap and an eviction rule.
+design: Client architecture. The phone app has a tree browser on top of a local database. The UI shows folders from SQLite at once and refreshes from the network in the background, the pattern from mobile app architecture: the database drives the screen. A sync engine on a background queue talks to /changes and updates the database; an upload manager owns the queue of local files to send; a download manager owns pinned files and previews; a cache manager enforces the size limit. The phone does not mirror the account. It keeps metadata of the folders the user has opened and content only for files that are pinned or recently opened.
+Upload path. The upload manager reads a file (a photo from the library, a document from the share sheet), splits it into blocks of up to 4 MB, and hashes each block with SHA-256 while reading. It sends POST /files/commit with the block list. If the server already has all blocks (the same file was uploaded before, or one block of an edit is unchanged) it answers 200 and nothing else is sent. Otherwise it answers 409 with the missing hashes. The client requests presigned URLs for those blocks and uploads each with a PUT, directly to the object store, in parallel (2 or 3 at a time on cellular, 4 to 6 on Wi-Fi). Then it commits again and gets the revision. The file becomes visible only at this second commit, so a half-uploaded file never appears. This is the same shape as the public description of Dropbox's sync: commit, "need blocks", upload blocks, commit again.
+Resumable by design. A block is named by its hash. Uploading the same block twice is harmless: the object is the same, so the PUT is idempotent by nature and a retry needs no special protocol. If the network drops after 6 of 10 blocks, the client asks again for URLs; the server reports 6 as present and the client sends 4. For single objects larger than a block, the multipart protocol of the object store gives the same effect: part numbers, an ETag per part, a final "complete" call. The client keeps blocks_done in the queue table, so it also resumes after the app is killed.
+Background work on the phone. On iOS, the upload runs in a background URLSession, which the system continues even when the app is not running and wakes the app when it finishes. On Android, a WorkManager job with constraints (unmetered network, charging, battery not low) runs the camera upload; long transfers use a foreground service with a notification when the user starts them. Both systems may delay work, so the app never promises "instant" for automatic upload. The camera upload watches the photo library: iOS gives a change token; Android a media store observer plus a periodic scan. Each new asset gets a row in the queue with a fingerprint (the asset id and the modified date) so it is not uploaded twice after a reinstall.
+Change detection. Open clients must learn quickly of server changes. A desktop client holds a long poll. A phone cannot hold a connection in the background, so the server sends a silent push (APNs or FCM) to registered devices when a namespace the user cares about changes; the app wakes, calls /changes with its cursor, and updates the database. When the app is in the foreground it uses the long poll, which gives about a 1 to 2 second delay. If push is delayed, the app still syncs on open. The cursor is the only state, so there is nothing to scan: the server returns only the rows after it.
+Downloads and cache. Opening a file first checks the block cache index. If the file is pinned or was opened recently, it is local. If not, the app downloads it with Range requests and streams it to the viewer (for video, the player requests ranges of the file). Thumbnails are the biggest traffic, so they come from a CDN and a server-side cache layer that stores generated sizes (64, 256, 1024 pixels), and the phone keeps them in a separate, small, LRU-evicted cache. The files cache has a limit; the cache manager evicts the least recently opened unpinned files when the limit is reached, and never evicts a file that has unsynced local edits.
+diagram:
+  PHONE                                       BACKEND
+  +-------------------------+
+  | UI: tree, grid, viewer  |
+  +------------+------------+     REST: /changes, /commit, /shares
+  | SQLite: entries, queue  |----------------------+
+  | block cache index      |                       v
+  +------+--------+---------+                +-----------+
+         |        |                           | API gw    |
+  +------v---+ +--v---------+                 | authn,    |
+  | sync     | | upload mgr |                 | limits    |
+  | engine   | | split 4 MB |                 +-----+-----+
+  | (cursor) | | sha-256    |                       |
+  +----------+ +--+---------+              +--------v---------+
+                  |                        | metadata svc     |
+                  | presigned PUT (HMAC)   | journal, blocklist
+                  v                        | (sharded SQL) +  |
+        +---------------------+            | cache layer      |
+        |  object store       |<-----------+------------------+
+        |  blocks by hash     |   refcount, GC       |
+        +----------+----------+                      | change event
+                   |                         +-------v--------+
+                  CDN ---> thumbnails/ranges | notify svc:     |
+                   ^                         | long poll, push |
+        APNs/FCM <-+-------------------------+----------------+
+animation:
+== A 9 MB photo is split into blocks B1 (4 MB), B2 (4 MB), B3 (1 MB).
+  phone : file IMG_1 -> [B1][B2][B3]  hashes h1 h2 h3
+  server: has h2 (another user's copy)
+  wire  : -
+== The phone commits the block list. The server needs h1 and h3.
+  phone : commit [h1 h2 h3]
+  server: has h2 only
+  wire  : ---commit--->  <---409 need h1,h3---
+== The phone gets presigned URLs and uploads B1. The link drops at B3.
+  phone : B1 sent, B3 half sent
+  server: has h1, h2
+  wire  : ---PUT h1 ok--->  ---PUT h3 ---X
+== The app retries later. Only the missing block h3 is requested.
+  phone : B3 resent, retry 1 after 2 s
+  server: has h1, h2, h3
+  wire  : ---PUT h3 ok--->
+== The second commit succeeds. The file gets revision 12 in the journal.
+  phone : commit [h1 h2 h3]
+  server: journal 8115: upsert IMG_1 rev 12
+  wire  : ---commit--->  <---200 rev 12---
+== A silent push wakes the tablet, which calls /changes and sees IMG_1.
+  tablet: cursor 8114 -> 8115, new IMG_1
+  server: notify -> push to tablet
+  wire  : <--push--  ---GET /changes?cursor=8114--->
+deepdive: Chunking and the rolling hash. Fixed blocks are simple and good for photos and videos, which are written once. But edits to a document change the byte positions. If a few bytes are inserted at the start, every fixed block after it is different, so nothing deduplicates. Content-defined chunking fixes this using string matching with a rolling hash. We slide a window (for example 48 bytes) over the file and update a hash by removing the byte that left and adding the byte that entered, which costs a few operations per byte whatever the window size. When the low 20 bits of the hash are zero, we cut a chunk boundary there. The chance of this at any position is 1 in 2 to the 20th, about one in a million, so chunks are about 1 MiB on average; minimum and maximum sizes (for example 256 KB and 4 MB) bound the spread. Because the cut depends on the local content, an insert only moves the boundaries near it, and later chunks keep their hashes. The same idea is behind the rsync algorithm, which uses a weak rolling checksum to find candidate matches at any offset and a strong hash to confirm them. On a phone, hashing 100 MB with a rolling hash takes in the order of a second or less, a real battery cost, so we apply it only to editable types (documents, notes, archives under about 200 MB), and use fixed 4 MB blocks for media.
+Deduplication and privacy. If the server already has a block with this hash, we skip the upload: this saves a lot, 20 percent in our estimate, and makes the same photo from a share link instant. But a naive "do you have hash X?" answer leaks information: an attacker who has a file can learn if anyone stored it. To limit this, the server only accepts a "have it" shortcut after the client proves it owns the content, for example by hashing a random range of bytes chosen by the server, or only dedupes inside one account or organization. Encrypted content per user (client-side keys) disables cross-user dedup; that is the price for zero-knowledge storage.
+Conflicts and merging. Two devices edit report.docx offline from revision 10. Each commit carries parent_rev. The first commit with parent_rev=10 wins and creates revision 11. The second commit sees that the head is 11, not 10, and the server answers 409 conflict. The client then uploads its version under a new name, "report (conflicted copy from Anna's phone).docx", and both exist. This is predictable and loses nothing, but it leaves the merge to the user. For structured data, we can do better with conflict-free replicated data types: tags on a file are an add-wins set; a "starred" flag is a last-writer-wins register; the order of items in a shared checklist is a sequence CRDT; comments are an append-only set. These merge without asking. For a shared text document, character edits are merged by a sequence CRDT or by operational transformation, which needs a live session with a server relay. For a binary file such as a photo, no merge is possible, so the copy is the right answer.
+Tree operations. The folder tree needs care: move folder A into B on one device and B into A on another would create a cycle. The journal gives a total order, so the server applies the first move and rejects the second as invalid with a clear error. Rename and move are atomic operations on a file_id, not delete plus create, so sharing and comments follow the file. A delete is a tombstone in the journal that other clients apply; the file stays in the trash with its versions for 30 days.
+Signed URLs and HMAC. The object store is private. For every upload and download, the metadata service gives a URL that includes the object key, the HTTP method, an expiry and a signature, for example HMAC-SHA256 of "PUT|blocks/ab12...|expires=1761400900|content-length=4194304" with a secret known to the service and the store. The store recomputes the HMAC and compares it in constant time. Without the secret nobody can make a valid URL, a URL cannot be changed to point to another object, and it stops working after 15 minutes. The same pattern signs the CDN links for downloads and the callbacks that the store sends to us when a block lands.
+Retries. The client wraps each network step in a retry with exponential backoff and jitter: 1 s, 2 s, 4 s up to 5 minutes for a block PUT, resetting on success. It distinguishes errors: 5xx and timeouts are retried; 403 on a presigned URL means the URL expired, so it asks for a new one; 409 need_blocks is part of the normal flow; a 413 or 400 means a bug and is not retried. All steps are idempotent: block PUTs by content address, commit by Idempotency-Key and parent_rev. The upload queue prevents a storm: at most 3 files at the same time, and a global pause when the OS reports a metered or low-power state.
+tradeoffs: Fixed blocks versus content-defined chunks. Choose fixed 4 MB blocks for media and for apps where files are written once; they are cheap to compute (about 400 MB per second hashing on a modern phone core) and make range reads simple. Choose content-defined chunking for editable files, backups and archives, where small edits are common and a 100 times saving in upload is worth a second of CPU. You give up some extra metadata (about 100 chunks per 100 MB instead of 25) and simple offsets.
+Full mirror versus online-first with a cache. Choose the mirror on desktops, with space and power. Choose online-first on the phone, with metadata cached and content pulled on demand or pinned. The mirror gives instant opening and full offline use but is impossible with a 128 GB phone and a 200 GB account. Online-first needs a network for unpinned files, and the app must say so clearly.
+Conflict copies versus automatic merge. Choose conflicted copies for opaque files and for the first version of a product: safe, simple, and understandable. Choose a CRDT or operational transformation for live documents and structured data where users expect to see each other typing. The price of merging is complexity (tombstones, garbage collection of history, a server relay) and the risk of merging two edits into something nobody wanted.
+failures: Upload interrupted. The block-level protocol and the queue table resume it. Uploaded blocks stay in the store; if the file is never committed, a lifecycle rule deletes unreferenced blocks and incomplete multipart uploads after 7 days.
+Metadata shard down. Folders on it cannot be listed or committed to. Apps show the cached tree and a banner; uploads stay in the queue and retry with backoff. A replica takes over in seconds, and the journal order is kept because the commit is a single-row append with a transaction.
+evolution: At 1,000 users, store files in a single bucket with the file path as the key and keep metadata in one SQL table; use presigned URLs from day one so the app server never touches content bytes. At 1 million users, add block-level dedup, the journal and cursor sync, a thumbnail service and a CDN. At 50 million users, shard metadata by namespace, add the cache layer for permissions and listings, notification services and the garbage collector with refcounts. At a billion users, run storage in cells by region, tier cold blocks to cheaper media after 90 days, add content-defined chunking for editable types, and build real-time collaboration on top of the same file model with a CRDT or operational transformation service.
+followups: How do you upload a 2 GB video on a flaky mobile network? || Split it into blocks or multipart parts of 4 to 8 MB, hash each, ask for presigned URLs only for missing blocks, keep progress in a local queue table, and use the OS background transfer service. A drop loses at most one part. A final commit makes the file visible.
+Why name blocks by their hash? || Identical content gets the same name, so dedup is free, PUT is idempotent, and integrity is checkable by anyone. It also means blocks are immutable, which makes caching and replication simple. The cost is garbage collection by reference counts.
+How does a second device learn about a change without scanning the whole drive? || The server keeps an append-only journal per namespace and each client stores a cursor. It asks for rows after the cursor. A long poll or a silent push tells it when to ask. Nothing is scanned on either side.
+Two people edit the same file offline. What happens? || Both commits carry the parent revision. The first wins; the second gets a conflict, and the client saves its version as a conflicted copy. For text documents with live editing, a CRDT or OT merge avoids the copy.
+How would you add delta sync for large documents? || Use content-defined chunking with a rolling hash so that an insert changes only nearby chunks. Upload only chunks the server does not have. Keep chunk sizes bounded, and use it for editable types only because of the CPU cost.
+How do presigned URLs work and why HMAC? || The URL carries the key, method, expiry and an HMAC signature computed with a secret. The store recomputes it, so a client can neither forge a URL nor reuse it for another object or after the expiry. This keeps file bytes off our API servers.
+ref: blog | Streaming File Synchronization | Dropbox Tech Blog, 2014 | https://dropbox.tech/infrastructure/streaming-file-synchronization
+ref: paper | The rsync algorithm | Andrew Tridgell and Paul Mackerras, 1996 |
+ref: paper | FastCDC: a fast and efficient content-defined chunking approach | Xia et al., USENIX ATC 2016 |
+ref: docs | Authenticating requests (AWS Signature Version 4) | Amazon S3 documentation |
+ref: paper | Conflict-free Replicated Data Types | Shapiro, Preguica, Baquero and Zawirski, 2011 |
+
+@@ mobile-video
+title: Design a video mobile app
+category: Mobile
+level: Senior / Staff
+concepts: mobilearch, abr, hlsdash, cdn, cachelayer, httpcaching, codecs, apidesign
+summary: We design the phone app and delivery system for an on-demand video service, in the style of Netflix, YouTube or Disney+: browse a catalog, tap a title, and see the first frame in about 2 seconds, then watch without stalls while the user walks from Wi-Fi to a 4G network. The hard part is not storing video; it is the last mile. A phone has a variable network, a small battery, a hardware decoder that supports only some codecs, and a DRM system that must approve every play. So the system prepares many versions of each title, lets the player pick the version second by second, and puts the bytes on a CDN near the user. We cover the content pipeline, the client player, the playback API, offline downloads and the numbers that size the system.
+requirements: Functional requirements. Browse home rows and search. Title page with trailer, episodes, subtitles and audio tracks. Play video with seek, resume from the last position on any device, subtitles, multiple audio languages, picture-in-picture and casting. Download titles for offline viewing with a time limit. Parental controls and profiles. Background audio for some content. Live events are out of scope.
+Non-functional requirements. Startup time (tap to first frame): under 2 seconds at p50 and under 4 seconds at p95. Rebuffering: under 0.3 percent of play time stalled, and fewer than 1 stall per 10 hours. Video quality: the best version the network and the screen can use; no switching back and forth every few seconds. Play failure rate: under 0.5 percent. Battery: one hour of playback on a modern phone uses no more than about 8 to 10 percent of the battery at default brightness, which depends on the decoder and screen. Data: a data saver mode and a default cap on cellular. Security: content is protected by DRM; the app is not a way to copy it.
+Assumptions. 50 million daily users on phones and tablets. Each watches 40 minutes per day, with an average delivered bitrate of 1.5 Mbit per second. The catalog has 100,000 hours of video. We serve through two or three CDNs plus our own cache in large networks.
+estimates: Egress volume. Per user per day: 40 minutes = 2,400 seconds times 1.5 Mbit = 3,600 Mbit = 450 MB. For 50 million users: 450 MB times 50 million = 22.5 PB per day. Divided by 86,400 seconds, that is 260 GB per second, or 2.1 Tbit per second on average.
+Concurrency and peak. Average concurrent viewers: 50 million times 2,400 / 86,400 = 1.4 million. Video traffic peaks in the evening at about 3 times the average: 4.2 million viewers and 4.2 million times 1.5 Mbit = 6.3 Tbit per second. No origin can serve this; a CDN must. With a 95 percent edge hit ratio, the origin side sees 5 percent: 315 Gbit per second, which the origin shield layer and object storage handle.
+Request rate. With 6-second segments (the target duration in Apple's HLS authoring specification), each viewer fetches one video segment per 6 seconds and one audio segment per 6 seconds: 4.2 million times 2 / 6 = 1.4 million segment requests per second at peak. This is why HTTP/2 or HTTP/3 with connection reuse matters on the CDN.
+Storage. A mobile ladder with 7 renditions, from 145 kbit/s to 4.5 Mbit/s, sums to about 12 Mbit per second. One hour is 12 Mbit times 3,600 = 43.2 Gbit = 5.4 GB per codec. 100,000 hours times 5.4 GB = 540 TB for H.264. A second set in AV1 or HEVC uses fewer bits for the same quality, perhaps 60 to 70 percent: about 350 TB. Together about 0.9 PB, plus audio and subtitles. Small for object storage.
+API traffic. 50 million users times 30 calls per day (home, rows, title, playback start, progress) = 1.5 billion calls per day, 17,000 per second on average and about 52,000 at peak. Progress reports are the big part: one report every 60 seconds from 4.2 million viewers = 70,000 per second. We batch progress, and send one at pause, seek and exit.
+Startup budget. API call for playback info 200 ms. Manifest fetch 100 ms. DRM license 200 ms (in parallel with the first segment). First segment of the starting rendition: at 730 kbit/s a 6-second segment is 0.55 MB, which takes about 0.9 seconds on a 5 Mbit/s link. Decoder start 100 ms. Total about 1.5 seconds. Without the parallel steps it would be 2.2 seconds.
+Offline. A 45-minute episode at 2 Mbit per second is 2 times 2,700 / 8 = 675 MB. A phone with 20 GB set aside holds about 29 such episodes.
+api: Home: GET /v1/home?profile=p1 returns rows [{title:"Continue watching", items:[{title_id, poster_url, progress_pct}]}, ...] with a cursor for more rows. Rows are personalized and cached for the user for a short time.
+Title: GET /v1/titles/{id} returns metadata, seasons, audio and subtitle tracks, maturity rating, and a content version used for cache keys. It carries an ETag.
+Playback start: POST /v1/playback with {title_id, device:{codecs:["avc1","hvc1","av01"], hdr:["hdr10"], drm:["fairplay"], max_res:"1080p", network:"cellular"}} returns {manifest_url, license_url, license_token, start_position_ms, cdn_hints, expires_at}. The manifest URL is signed and short-lived.
+Progress: POST /v1/playback/{session}/events with a batch [{t:"pos",ms:312000},{t:"stall",ms:1800},{t:"bitrate",kbps:2000}] sent every 60 seconds and on pause, seek, error and exit. The same events feed quality metrics.
+Downloads: POST /v1/downloads {title_id, quality:"720p"} returns the manifest, the offline license rules (for example 30 days to start, 48 hours to finish after the first play) and the track list. DELETE /v1/downloads/{id} releases the device slot. In our rules a user can keep titles on at most 5 devices.
+Manifests: GET {cdn}/t/9912/v7/master.m3u8 (HLS) or manifest.mpd (DASH). The master playlist lists the renditions; each media playlist lists the 6-second segments; the segments are fMP4 files, fetched with plain HTTP GET (and Range).
+datamodel: Catalog and playback data are separate from the media files. The title service stores titles, seasons, episodes and the encoded asset versions in a document or relational store, read mostly, with a cache in front. The viewing history is a key-value table keyed by (profile_id, title_id) holding position, updated_at and completion. It has a write per progress batch, so about 70,000 writes per second at peak, which a partitioned key-value store handles; we keep only the latest position per title and a separate append-only event stream for analytics.
+```sql
+-- title service (read-mostly)
+CREATE TABLE asset_version (
+  title_id bigint, version int, codec text, ladder_id int,
+  manifest_path text, drm_scheme text, ready_at timestamptz,
+  PRIMARY KEY (title_id, version, codec)
+);
+-- viewing state (key-value)
+-- key: (profile_id, title_id)  value: {pos_ms, dur_ms, updated_at}
+```
+Media storage layout: /t/{title}/{version}/{codec}/{rendition}/seg_00001.m4s with an init segment and one media playlist per rendition. The path includes the version so that a re-encode creates new URLs and old cached copies never need purging: segments are immutable and can be cached forever.
+On the phone: SQLite or a key-value store for the watch list, downloads (title, state, bytes, license expiry, file paths) and cached catalog JSON. Downloaded media is in the app's protected storage, encrypted with the DRM keys.
+design: Content pipeline. A master file is ingested and checked. The encoder makes a ladder of renditions: for example 234p at 145 kbit/s, 360p at 365, 432p at 730 and 1,100, 540p at 2,000, and 720p at 3,000 and 4,500 (tablets add 1080p). These values follow the example ladder in Apple's HLS authoring specification, which also says the 2,000 kbit/s variant should be the default and that cellular playlists must contain a variant with peak bandwidth of 192 kbit/s or less. Good services tune the ladder per title (per-title encoding), because a cartoon looks good at a much lower bitrate than a sports match. Each rendition is cut into 6-second segments that start with a keyframe, so a player can switch at any boundary. The segments are packaged once as CMAF (fragmented MP4) and described by both an HLS playlist and a DASH manifest, so one set of files serves iPhone and Android. The segments are encrypted with common encryption in the cbcs mode, which FairPlay, Widevine and PlayReady can all decrypt, so the DRM adds three license servers but not three copies of the video.
+Codecs. Every phone decodes H.264 in hardware, so it is the baseline. HEVC and AV1 use fewer bits for the same quality, which saves delivery cost and cellular data, but the phone must have a hardware decoder or it falls back to software, which can use much more power. The playback API receives the device's codec list and returns a manifest that contains only what the device can decode efficiently. A newer phone gets AV1 or HEVC, an older one H.264. The encoder pays for it: AV1 encoding costs many times the CPU of H.264, so it is used for popular titles first, where the saving on delivery repays it quickly.
+CDN delivery. The player requests segments from a CDN edge. If the edge has it, it answers in 10 to 30 ms. If not, it asks a regional shield cache, and only then the origin. Popular titles are warm everywhere; the long tail is fetched once per region. The playback API gives the player a prioritized list of CDN hosts, and the player moves to the next host on repeated errors. Segments are immutable, so the edge cache rules are simple: Cache-Control: public, max-age=31536000, immutable. Manifests of finished titles are immutable too. Signed URLs or tokens limit who can fetch.
+Client architecture. The app follows layered mobile app architecture. The UI has screens for browse, title and the player. The player is a separate module that wraps the platform player (AVPlayer on iOS, Media3 ExoPlayer on Android), since these use the hardware decoders, the DRM and the audio pipeline correctly. Our code adds the ABR tuning, analytics, prefetch and offline logic around it. A repository serves catalog data from the cache layer on the phone (memory and disk), refreshed with HTTP caching rules; the home page shows the cached version at once and updates the rows when the network answers.
+Start of playback. When the user opens a title page, the app can already warm the connection to the CDN host (DNS, TCP and TLS), which saves 100 to 300 ms later. On tap, the app calls the playback API, gets the manifest URL and starts the player. The player loads the master playlist, picks a starting rendition, and requests the license and the first segment in parallel. It starts when it has 2 to 3 seconds in the buffer. For a series, when the user is in the last minutes of an episode, the app prefetches the first segment and the license of the next episode.
+Adaptive bitrate. The player measures the download speed of each segment and keeps the buffer level. The ABR logic picks the rendition for the next segment. At startup it uses a conservative throughput estimate and a low rendition, since a fast first frame matters more than quality. In steady state it combines throughput and buffer. For example, the last five segments were downloaded at 4.2, 3.1, 5.0, 2.0 and 3.5 Mbit per second. The harmonic mean is 5 / (1/4.2 + 1/3.1 + 1/5.0 + 1/2.0 + 1/3.5) = 5 / 1.546 = 3.23 Mbit per second, which is less affected by one fast sample than the plain average (3.56). With a safety factor of 0.8 we may use 2.6 Mbit per second, so the player picks the 2,000 kbit/s rendition. It switches up only when the buffer is above 20 seconds, and down at once when the buffer falls below 8 seconds. It also never selects a rendition larger than the screen can show (a 6-inch phone gains little from 1080p) and honors a cellular cap and data saver.
+Offline downloads. The download manager gets the manifest, picks one rendition set (for example 720p, one audio, selected subtitles), downloads segments with a background transfer service, and asks the license server for an offline license that has a rental window. The files are stored encrypted. Playback uses the local files and the stored license, with no network. When the rule expires, the app deletes the files and the license.
+diagram:
+  +------------------------ PIPELINE ------------------------+
+  | master -> encode ladder -> 6 s segments -> package CMAF   |
+  |            (H.264, AV1)     keyframe-aligned   HLS + DASH |
+  |                     -> encrypt (cbcs) -> object store     |
+  +------------------------------+----------------------------+
+                                 | origin
+                          +------v------+   shield   +-------+
+                          | CDN edges   |<---------->| origin|
+                          +------^------+            +-------+
+                                 | segments (GET, Range)
+  PHONE                          |
+  +------------------------------+--------+     +----------------+
+  | Player (AVPlayer/Media3)               |     | Playback API   |
+  |  ABR: throughput + buffer              |---->|  caps -> URLs  |
+  |  buffer 20-50 s ahead                  |     |  license token |
+  +-------+-----------------------+--------+     +-------+--------+
+          | DRM                   | events               |
+  +-------v--------+      +-------v--------+     +-------v--------+
+  | license server |      | metrics stream |     | catalog + cache|
+  +----------------+      +----------------+     +----------------+
+  App: UI -> repository -> SQLite / HTTP cache; download manager
+animation:
+== Startup. The player picks the 730 kbit/s rendition and fetches seg 1.
+  buffer: [..........]  0 s     rendition: 730k
+  net   : 5 Mbit/s              state: starting
+== Seg 1 arrives in 0.9 s. Playback starts at once.
+  buffer: [##........]  6 s     rendition: 730k
+  net   : 5 Mbit/s              state: playing
+== The buffer grows. Throughput is steady. The player stays on 730k.
+  buffer: [#####.....] 12 s     rendition: 730k
+  net   : 5 Mbit/s              state: playing
+== The buffer passes 20 s and the estimate is 3.2 Mbit/s. Up-switch.
+  buffer: [########..] 21 s     rendition: 2000k
+  net   : 5 Mbit/s              state: playing
+== The user walks into a lift. Throughput falls to 0.6 Mbit/s.
+  buffer: [#####.....] 14 s     rendition: 2000k
+  net   : 0.6 Mbit/s            state: playing
+== Buffer is below 8 s. The player drops to 365k and keeps playing.
+  buffer: [##........]  7 s     rendition: 365k
+  net   : 0.6 Mbit/s            state: playing, no stall
+deepdive: Choosing the next rendition. There are two families of ABR rules. Throughput-based rules estimate the network speed and pick the highest rendition below it. They react quickly, but on mobile networks the estimate is noisy, and they cause oscillation. Buffer-based rules ignore the throughput and use the buffer level as the signal: a nearly empty buffer means choose the lowest rendition, a full buffer means the highest, and in between a rate map increases with the buffer. A well known study of a large streaming service (Huang and others, SIGCOMM 2014) showed that a buffer-based algorithm cut rebuffering by 10 to 20 percent compared with the service's own throughput-based player. Practical players mix them: throughput at startup, when the buffer says nothing yet, and buffer in steady state, plus hysteresis (do not switch twice within 10 seconds) so the picture does not flap. The cost of a bad switch is visible, but the cost of a stall is far worse, so rules favor going down fast and up slowly.
+Segment length and latency. A 6-second segment is a good balance for VOD: few requests, efficient encoding because the keyframe interval is long enough. Shorter segments (2 seconds) let the player adapt faster and start sooner, but triple the requests and add overhead of about 5 to 10 percent in bits. For the first segment of a play we may use a lower rendition to keep the first download small. HTTP/3 over QUIC helps mobile because a lost packet does not block the other streams and a connection survives a change from Wi-Fi to cellular, which would break a TCP connection and cost a new handshake.
+Caching at three levels. At the CDN, segments and finished manifests are immutable and cached for a year. At the API, the title page is cached with an ETag and max-age of 60 seconds with stale-while-revalidate, and personalized rows are private, short and keyed by profile. On the phone, an HTTP cache and our own cache layer keep catalog JSON and posters, so the home screen paints from disk in under 100 ms and refreshes in the background. The playback API response is never cached, since it holds signed URLs and a license token. The biggest mistake is a Vary or a cookie in a segment response, which splits the CDN cache by user and destroys the hit ratio.
+DRM and licenses. Every play needs a license. The app sends the player's challenge to the license server together with the token from the playback API. The server checks the account, the plan, the device security level, the concurrent streams limit and the region, and returns a license with rules (resolution limits by security level, an expiry). Weaker devices get only up to 540p; hardware-secured ones can get HD. License calls are on the startup path, so the license server is replicated and close to users, and the app fetches the license in parallel with the first segment. For downloads the license is persistent with its own clock.
+tradeoffs: HLS versus DASH. Choose HLS when iOS native playback matters, which it always does for a consumer app: AVPlayer plays HLS and some DRM paths need it. Choose DASH when you need its features on Android and smart TVs, such as flexible multi-period content and wide DRM tooling. With CMAF the segments are shared, so the real cost is only two manifests. Do both if your audience spans both worlds, and do not store two copies.
+H.264 versus HEVC versus AV1. Choose H.264 as the baseline that plays everywhere. Add HEVC for the iOS and Android devices with hardware decoders, saving roughly 30 to 50 percent of bits at equal quality. Add AV1 for popular titles and for newer phones with an AV1 hardware decoder, saving a further 20 to 30 percent, accepting very high encoding cost and the risk that a device falls back to software decoding. Check what the device reports, not what it claims, and measure power.
+Throughput-based versus buffer-based ABR. Choose throughput logic for startup and for short clips, because you have no buffer yet. Choose buffer logic for steady state on long videos, because it is stable. Choose a hybrid for production. A pure buffer approach is slow to use a fast network at the start; a pure throughput approach flaps.
+Own player versus platform player. Choose the platform player (AVPlayer, Media3) in nearly every case, because it integrates hardware decoding, DRM, casting, picture-in-picture, background audio and accessibility. Write your own only when you need control over the ABR and the network stack that the platform cannot give, and accept years of device bugs. Media3 lets you customise the load control and track selection while keeping the platform decoders.
+failures: A CDN has an outage or a slow region. The player counts errors and timeouts per host; after 3 failures in a row it moves to the next host in the list for the next segments, with no restart. The playback API can also steer new sessions away from a sick CDN using real-time quality data from the events stream.
+Network drops. The player keeps playing from the buffer for up to 20 to 50 seconds, retries the segment with exponential backoff and jitter, and lowers the rendition. If the buffer empties, it shows a spinner and resumes when it has a few seconds again. After 30 seconds of failures it shows an error with a retry, not an endless spinner.
+License server is slow or down. If the license call fails, the player retries once. Cached licenses, if the policy allows, let a recently played title resume. The license server is deployed in several regions; the playback API checks its health before it hands out a token.
+Release at peak time. A popular title launches at 9 pm. The origin sees a cold cache for 4 million simultaneous viewers. We pre-position the first minutes of expected hits on the edges before release, and the shield layer collapses duplicate requests, so the origin sees one request per segment per region.
+Device falls back to software decoding. Frame drops and heat rise. The player monitors dropped frames and thermal state, and when they rise it switches to H.264 or a lower resolution for the session, and reports the device model so that the playback API stops sending AV1 to it.
+evolution: At 1,000 users, upload MP4 files, serve them from object storage with a CDN in front using progressive download and Range requests; one rendition is enough. At 1 million users, add the ladder, HLS with H.264, ABR in the player, a playback API, and signed URLs. At 50 million users, add DASH and CMAF with a single set of segments, DRM, per-title encoding, HEVC and AV1, an origin shield, multiple CDNs with steering, and a real-time quality pipeline. At a billion users, build your own edge caches inside carrier networks, encode with machine-learned ladders, add live and low-latency delivery, and pre-push popular titles to devices overnight on Wi-Fi.
+followups: Why does the app use adaptive bitrate instead of one fixed quality? || A phone network changes by a factor of 10 within seconds. A single bitrate either stalls when the network is poor or wastes quality when it is good. With many renditions in 6-second segments the player can change quality at each boundary, keeping the buffer non-empty.
+How do you get the first frame in under 2 seconds? || Warm the connection early, call the playback API, fetch the manifest, then get the license and the first segment in parallel. Start with a low rendition and about 2 seconds of buffer. Use HTTP/3, a nearby edge cache, and a manifest that is small. Prefetch the next episode.
+How does a throughput estimate lead to a bad decision, and what do you do? || One fast segment, for example from a cache hit or a burst, overstates the speed and causes a high rendition followed by a stall. Use a harmonic mean or a low percentile of several samples, a safety factor of about 0.8, and let the buffer level veto an up-switch.
+Why package once as CMAF instead of separate files for HLS and DASH? || The segments are the same fragmented MP4 files; only the manifest differs. This halves storage and CDN cache footprint, which raises the hit ratio. With cbcs encryption one set of encrypted files works for FairPlay, Widevine and PlayReady.
+How do you decide which codec to send? || The device reports decoders and whether they are hardware; the server returns H.264 for old devices and HEVC or AV1 only where hardware decode exists. Check dropped frames and power in the field, and blacklist models that struggle.
+How do offline downloads work with DRM? || The app downloads encrypted segments and requests a persistent license with a rental policy, for example 30 days to start and 48 hours after first play. Playback checks the local license and the clock rules. Expired titles are deleted.
+ref: spec | HLS Authoring Specification for Apple Devices | Apple, current edition | https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices
+ref: paper | A Buffer-Based Approach to Rate Adaptation: Evidence from a Large Video Streaming Service | Huang, Johari, McKeown, Trunnell and Watson, SIGCOMM 2014 |
+ref: spec | ISO/IEC 23000-19 Common Media Application Format (CMAF) | ISO/IEC |
+ref: blog | Per-Title Encode Optimization | Netflix Technology Blog, 2015 |
+ref: docs | Media3 ExoPlayer: adaptive streaming | Android Developers |
+

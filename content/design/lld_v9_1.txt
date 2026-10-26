@@ -1,0 +1,1341 @@
+# Object-oriented design problems, batch lld_v9_1 (list lines 1-7)
+
+@@ connect-four
+title: Connect Four
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, automata, boolalg, gametheory, dp, fuzzing, locks
+summary: Connect Four is a two-player game on a vertical board of 7 columns and 6 rows. Players take turns to drop a disc into a column, and it falls to the lowest free cell. The first player to connect four discs in a row, column or diagonal wins. If the board is full and nobody has won, the game is a draw. The rules fit on a card, so the interview is not about the game. It is about object-oriented programming: where does the drop rule live, who knows that the game is over, how do you plug in a human, a bot or a network player without editing the game, and what happens when two clients move at the same moment? A good answer uses **small classes with one job each**: a Board that knows cells, a Game that knows turns and status, and Strategy objects for the parts that change. It also shows a small finite state machine and an Observer for the user interface.
+requirements: Functional requirements. Two players take turns, and the first player is chosen at the start. A move names a column (0 to 6). The disc lands in the lowest empty cell. The game rejects a move when the column is full, the column is out of range, the game is over, or it is not that player's turn. After each move the game checks for a win (4 connected discs) and for a draw (all 42 cells full). It reports the winner and the winning cells, or the draw. It keeps the move list, so we can replay or undo. A player can resign.
+Non-functional requirements. Extensibility: board size and winning length are parameters, so 9 by 7 with length 5 runs on the same code. A new kind of player, such as a search bot, must not change Game. Testability: no user interface, network or real randomness inside the core. Thread safety: two network threads may call the same Game, so a move must be atomic. Readability: the "is this a win?" rule lives in one place.
+Assumptions. Two players. One game lives in memory in one process. A server may hold many independent games. Persistence, matchmaking and the user interface are out of scope; I only leave hooks for them.
+estimates: Scale hardly matters here, and it is good to say so. A board has 42 cells, so a Game is below 1 KB and 100,000 live games take about 100 MB. A move does constant work: one drop and four lines through one cell, at most 4 axes x 6 neighbours = 24 reads. Contention is two threads per game at most. Cost grows only for a bot that searches ahead: the standard board has 4,531,985,219,092 legal positions (counted by John Tromp), so a bot must prune. The effort goes into clear responsibilities, not throughput.
+api: The caller creates a Game, calls play with a player and a column, and reads the result. Listeners get events.
+```java
+public enum Disc { RED, YELLOW }
+public record Move(Disc disc, int col, int row, int number) {}
+
+public sealed interface Outcome {
+  record Win(Disc winner, List<Cell> line) implements Outcome {}
+  record Draw() implements Outcome {}
+  record Resigned(Disc loser) implements Outcome {}
+}
+
+public interface GameListener {
+  void onMove(Move move);
+  void onFinished(Outcome outcome);
+}
+
+public interface WinRule {
+  Optional<List<Cell>> winningLine(Board b, int row, int col);
+}
+
+public interface MoveSource {
+  int chooseColumn(BoardView view, Disc me);   // human, bot, network
+}
+
+public final class Game {
+  public Game(Board board, WinRule rule, Disc first);
+  public Move play(Disc by, int col);     // atomic; throws on bad move
+  public void undo();
+  public void resign(Disc by);
+  public GameStatus status();
+  public Optional<Outcome> outcome();
+  public void addListener(GameListener l);
+}
+```
+Errors are exceptions: InvalidMoveException is the base class, with ColumnFullException, OutOfTurnException and GameOverException below it. A caller that draws the board gets a read-only BoardView, never the internal array.
+datamodel: Disc is an enum with two values. Cell is a pair (row, col). Board owns a two-dimensional array of Disc (null means empty) and an array `heights[col]` with the next free row of each column. The heights array makes a drop O(1), with no scan down the column. Move is an immutable record: who, column, the row where it landed, and the sequence number. Game owns the Board, the list of Moves, the turn, the status and the outcome. Game has one WinRule and many GameListeners. A MoveSource is not owned by Game. It belongs to the code that drives the game, so Game stays passive: it never waits for a player, it only answers calls. That is what makes it easy to test and to serve from a thread pool.
+The game is a small finite automaton (see Finite automata). WON, DRAWN and RESIGNED are final states: nothing leaves them.
+```text
+ WAITING ----start------------------> IN_PROGRESS
+ IN_PROGRESS --move, no result------> IN_PROGRESS (turn flips)
+ IN_PROGRESS --move, four in a line-> WON
+ IN_PROGRESS --move, board full-----> DRAWN
+ IN_PROGRESS --resign---------------> RESIGNED
+ IN_PROGRESS --undo-----------------> IN_PROGRESS (turn flips back)
+ WON, DRAWN, RESIGNED: no move, no undo
+```
+Every transition has a guard (a condition) and an action (change the board, flip the turn, tell listeners). Writing the table first shows the missing cases, such as "what does undo do after a win?". Answer: it is rejected.
+design: Classes. Board stores cells and answers "drop a disc in this column" and "what is at row r, column c". It knows nothing about players. WinRule is a Strategy: given the board and the cell just filled, it returns the winning line or nothing. LineWinRule counts matching discs in both directions on four axes. Game is the coordinator: it holds turn and status, calls Board, asks WinRule and tells listeners. MoveSource is a second Strategy that hides where a column number comes from. A GameRunner loops: ask the current player's MoveSource for a column, call game.play, repeat until the game finishes.
+Flow of play(by, col). Step 1: take the game lock. Step 2: if the status is not IN_PROGRESS, throw GameOverException. Step 3: if `by` is not the current turn, throw OutOfTurnException. Step 4: board.drop(col, by) validates the column and returns the row. Step 5: record a Move. Step 6: ask the WinRule. A line means WON. Otherwise a full board means DRAWN. Otherwise flip the turn. Step 7: notify listeners. We change state first and notify last, so a listener never sees a half-updated game.
+Patterns and why. Strategy for WinRule and MoveSource, because those two things vary: "five in a row" or "no diagonals" is a new WinRule, and human, random and minimax bots are new MoveSources. Game stays closed for change. State for the status: with five states and two behaviours an enum is enough, but a State object per state removes repeated checks if play, undo and resign differ a lot. Observer for GameListener: the console view, a web socket and a statistics collector all want moves, and Game should know none of them. Command for Move, since a move that records column, row and disc can be replayed or reversed. Factory to build games from a config like "7x6, length 4". No Singleton: a global Board would make tests share state.
+The core of the design is below.
+```java
+public final class Board {
+  private static final int[][] AXES = {{0,1},{1,0},{1,1},{1,-1}};
+  private final int rows, cols;
+  private final Disc[][] cells;      // [row][col], row 0 is the bottom
+  private final int[] heights;       // next free row per column
+
+  public Board(int rows, int cols) {
+    this.rows = rows; this.cols = cols;
+    cells = new Disc[rows][cols];
+    heights = new int[cols];
+  }
+
+  public int drop(int col, Disc d) {
+    if (col < 0 || col >= cols) throw new InvalidMoveException(col);
+    if (heights[col] == rows) throw new ColumnFullException(col);
+    int row = heights[col]++;
+    cells[row][col] = d;
+    return row;
+  }
+
+  public void removeTop(int col) { cells[--heights[col]][col] = null; }
+
+  public Disc at(int r, int c) {
+    boolean in = r >= 0 && r < rows && c >= 0 && c < cols;
+    return in ? cells[r][c] : null;
+  }
+
+  int run(int r, int c, int dr, int dc, Disc d) {
+    int n = 0;
+    while (at(r += dr, c += dc) == d) n++;
+    return n;
+  }
+
+  public int longestThrough(int r, int c, Disc d) {
+    int best = 1;
+    for (int[] a : AXES) {
+      int n = 1 + run(r, c, a[0], a[1], d) + run(r, c, -a[0], -a[1], d);
+      best = Math.max(best, n);
+    }
+    return best;
+  }
+}
+
+// inside Game
+public synchronized Move play(Disc by, int col) {
+  if (status != GameStatus.IN_PROGRESS) throw new GameOverException();
+  if (by != turn) throw new OutOfTurnException(by);
+  int row = board.drop(col, by);
+  Move m = new Move(by, col, row, moves.size() + 1);
+  moves.add(m);
+  if (rule.winningLine(board, row, col).isPresent()) status = WON;
+  else if (moves.size() == board.capacity()) status = DRAWN;
+  else turn = other(turn);
+  pending.add(m);                  // listeners are called after unlock
+  return m;
+}
+```
+Why check only through the last cell: the board had no win before this move, so any new win must contain the new disc. We read four axes through one cell, not 42 cells. Scanning everything is a fine first version, but it hides this idea.
+diagram:
+  +---------------------------+        +-------------------+
+  | GameRunner / Server       |------->| MoveSource  <<I>> |
+  | loop: ask, play, repeat   |        | chooseColumn()    |
+  +---------------------------+        +-------------------+
+        |                                 ^        ^      ^
+        | play(disc, col)             Human    RandomBot  Minimax
+        v
+  +---------------------------+  has   +-------------------+
+  | Game                      |------->| WinRule  <<I>>    |
+  |  status, turn, moves[]    |        | winningLine()     |
+  |  play() undo() resign()   |        +-------------------+
+  +---------------------------+              ^
+     |            |                      LineWinRule
+     | has        | notifies
+     v            v
+  +-----------+  +---------------------+
+  | Board     |  | GameListener <<I>>  |
+  | drop()    |  | onMove() onFinished |
+  | at() run()|  +---------------------+
+  +-----------+     ^           ^
+        | has 42    ConsoleView  WebSocketPusher
+        v
+  Disc (enum RED, YELLOW), Move (record)
+deepdive: Concurrency. The shared state is one Game: board, turn and status. Two threads can call play together, for example two socket handlers, or a handler and a timeout thread that calls resign. If both read the same `turn`, both drop a disc. The fix is one lock per game, here `synchronized`, or a ReentrantLock if you want tryLock with a timeout (see Locks and atomics). Games share nothing, so one lock per game is enough and a single lock cannot deadlock. A deadlock risk appears only if one call locks two games, for example when moving a game between servers; then lock in a fixed order, such as by game id.
+Keep the critical section short. Do not call listeners under the lock, because a slow web socket write would block the other player. Change state under the lock, copy the event, unlock, then send. A CopyOnWriteArrayList for listeners lets a view register during a notification. A client can also send the move number it expects ("I play column 3 as move 12"). The server compares it with moves.size() + 1 and rejects stale requests. A repeated request for an existing move returns the old result instead of dropping a second disc, so retries are safe.
+Bitboards for bots. A bot may check millions of positions per second, and object arrays are slow. A bitboard keeps each player's discs in one 64-bit long. We use 7 bits per column (6 cells plus one empty sentinel bit), so bit number = col x 7 + row. Four in a row is found with shifts and ANDs, which is Boolean algebra used as a data structure.
+```java
+static boolean hasFour(long b) {
+  for (int s : new int[] {1, 7, 6, 8}) {  // |, -, \, /
+    long m = b & (b >> s);                // pairs in a line
+    if ((m & (m >> (2 * s))) != 0) return true;  // two pairs = four
+  }
+  return false;
+}
+```
+The shift is 1 for a vertical line, 7 for horizontal, and 6 and 8 for the two diagonals. The sentinel bit stops a line from wrapping from the top of one column to the bottom of the next. This is a different Board and WinRule behind the same interfaces, so Game does not change.
+Bots. A MinimaxBot is a MoveSource. By Game theory it picks the move with the best worst case. Alpha-beta pruning skips branches that cannot change the answer. A transposition table caches the score of a position reached by different move orders; this is Dynamic programming (memoization) keyed by the two bitboards. The game is solved: with perfect play the first player wins by starting in the middle column (James Allen and Victor Allis, 1988). Search the middle columns first.
+Extensibility. A new win rule is a new WinRule. A new player is a MoveSource. A new view is a GameListener. None edits an existing class: this is the open-closed rule in Design patterns and SOLID. For PopOut (remove a bottom disc), add a PopMove and a `popBottom(col)` method; because Move is a Command, undo works for both.
+Testing. Keep Game free of I/O so tests are plain calls. Test Board alone: drops fill from the bottom, a full column throws, `at` outside the board gives null. Test WinRule on small boards written as text pictures: each of four axes, a line on the border, three in a row that must not win. Test Game with column lists: `[0,1,0,1,0,1,0]` gives RED a vertical win on move 7. Test a known full-board draw. Use a fake MoveSource with a fixed list. Use property tests (see Fuzzing and property-based testing) over random legal games: disc count equals move count, no disc floats above an empty cell, turns alternate, undo restores the board. One more property is the most useful: the bitboard check and the simple loop agree on every random position.
+tradeoffs: Enum status or State objects. Choose an enum and a switch when there are about five states and few behaviours differ, as here. Choose State classes when each state has its own rules for many operations (play, undo, resign, pause, spectate) or new states like PAUSED are coming. You pay with more classes; you gain that a new state cannot silently forget an operation.
+Full scan or last-move check. Choose the full scan for a first version or tiny boards: simplest and obviously correct. Choose the last-move check for constant time per move. Choose bitboards when a bot calls the check millions of times; you pay with hard-to-read code and a board of at most 64 cells. Keep the readable version as the reference in tests.
+Passive or active Game. Choose a passive Game that only answers play calls when many games share a thread pool. Choose an active Game that owns the loop only for a console program with two local players. The active style blocks a thread while it waits for a human, which does not scale on a server.
+One lock or an actor. Choose `synchronized` per game when moves are rare and the code must be obviously correct. Choose a single-thread queue per game (an actor) when timers, chat and spectators also send events to the same game. Choose lock-free atomics only if profiling shows contention; with two players it will not.
+Mutable or immutable Board. Choose a mutable Board with `removeTop` for speed and undo inside a bot search. Choose an immutable Board, where each move returns a new board, for easy history and safe sharing; copying 42 cells is cheap unless a bot makes it the hot loop.
+failures: Invalid input. A column below 0 or above 6 throws InvalidMoveException, and a full column throws ColumnFullException. A wrong or null disc fails the turn check. We validate before we mutate, so board, history and turn stay unchanged and the caller can ask again.
+Out-of-order and repeated requests. A move from the wrong player throws OutOfTurnException. A move after the end throws GameOverException. A client that retries after a lost reply sends the move number, and the server returns the existing move.
+Draw check order. The 42nd disc can complete a line, and that is a win, not a draw. Check for a win first. A test with a winning last move catches this bug.
+Undo. Allow undo only while IN_PROGRESS, so it never has to reset a final status. Undo on an empty history throws.
+Listener faults. A listener that throws must not break the game. Catch per listener, log, and continue. A slow listener must not hold the game lock.
+Disconnects. A timer thread calls resign for a silent player. It takes the same lock as a move, so a move and a timeout cannot both win; the second sees a non-IN_PROGRESS status and fails cleanly.
+evolution: Bigger boards and other lengths already work through Board(rows, cols) and WinRule. Only the bitboard needs a new layout above 64 cells (two longs).
+More players: replace Disc by a player id and `other(turn)` by a TurnOrder strategy; the win rule takes the player.
+Online play: add a GameService that maps game ids to Games, a repository for persistence and an event stream for spectators. Store the move list, not the board; replay rebuilds the board, and move numbers make writes idempotent.
+Time limits and ratings: a Clock strategy with a fake clock in tests; an Elo update as a listener on onFinished.
+Redo: keep two stacks of Moves. Undo applies the inverse of a Move and redo applies it again.
+followups: Why do you check only the last move for a win? || The position before the move had no win, so a new win must contain the new disc. Walk four axes through that cell in both directions and count matching discs: constant work. The assumption breaks if you load arbitrary positions; then validate once with a full scan.
+How would you add a bot without changing Game? || Define MoveSource.chooseColumn(view, me). The bot implements it and a runner calls it, then calls game.play. Give the bot a read-only view or a copy so it cannot corrupt state. A search bot can copy the board and use drop and removeTop.
+Two clients click at the same time. What happens? || play is atomic under one lock per game. The first caller changes the turn; the second sees the wrong turn and gets OutOfTurnException. A move number in the request detects stale clients and makes retries safe.
+When is the State pattern too much here? || With five states and two real behaviours, an enum with a guard at the top of each method is simpler. Use State objects when you repeat the same status check in many methods or add states such as PAUSED.
+How do you test the win rule well? || Build tiny boards from text. Cover the four axes, lines at the border, lines of three and a line longer than four. Add a property test that compares the fast and the simple implementation on random games, and turn every failure into a named test.
+How would you store and replay a game? || Store the move list with the game id, rule parameters and first player. Replay creates a new Game and plays the moves in order. The board is derived data and is never stored.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson and Vlissides, 1994 |
+ref: blog | State pattern | refactoring.guru | https://refactoring.guru/design-patterns/state
+ref: blog | Strategy pattern | refactoring.guru | https://refactoring.guru/design-patterns/strategy
+ref: blog | Solving Connect Four: how to build a perfect AI | Pascal Pons | http://blog.gamesolver.org/solving-connect-four/01-introduction/
+ref: blog | John's Connect Four Playground (position counts, results) | John Tromp | https://tromp.github.io/c4/c4.html
+
+@@ amazon-locker
+title: Amazon Locker / shipping locker
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, ccontrol, idgen, automata, locks, hashtables, idempotence, binpacking, ratelimit, dst
+summary: A locker station is a bank of metal compartments of different sizes with a touch screen. A delivery driver drops a package into a free compartment that fits it, and the customer gets a pickup code. The customer enters the code at the station, the door opens, and the compartment becomes free again. If nobody collects the package in a few days, staff remove it and the code stops working. It looks like a toy problem, but it contains the usual questions of object-oriented programming: how to model a compartment as a **state machine** with strict transitions, how to choose a compartment with a replaceable rule, how to hand out each compartment to exactly one driver when two arrive together, how to make a single-use code safe, and how to keep time-based rules testable. Hardware (doors, sensors) and messaging (SMS, email) must stay behind interfaces.
+requirements: Functional requirements. A carrier asks for a compartment for a package of a given size (small, medium or large). The station reserves one, opens its door, and the carrier confirms when the door is closed. The customer is notified with a pickup code and an expiry time. The customer enters the code; if it is valid, the door opens, and after the door is closed the compartment is free again. A code works once. After the hold period (assume 3 days) the package expires: the code is dead, the compartment is marked for staff, and the carrier or sender is told. A reservation that is not confirmed in 5 minutes is cancelled. If no compartment fits, the station says so and the carrier goes elsewhere. A compartment can be put out of order by staff or by a fault.
+Non-functional requirements. Correctness first: never give one compartment to two packages and never open a door for a wrong or used code. Thread safety: several carriers and customers use one station at once. Extensibility: a new size or allocation rule, a new notifier, a new code format must not change old classes. Testability: time and randomness come from injected objects. Repeated requests (a scanner retries on a weak network) must be safe.
+Assumptions. One station is one process with its own memory; a central service only keeps a registry and sends messages. Package size is already decided by the carrier scan. Payment, routing and returns are out of scope.
+estimates: Scale matters little per station, and that is the point to state. Assume 10,000 stations with 60 compartments each: 600,000 compartments in total, but each station is independent. A busy station sees about 100 deposits and 100 pickups a day, which is one event every 7 minutes on average. Contention is therefore low, and simple correct code beats clever code. One number matters for security: a 6-digit code has 1,000,000 values. A station has at most 60 live codes, so a random guess hits a live code with probability 60 / 1,000,000, about 1 in 16,700. That is why wrong attempts must be limited. Collisions when we create a code are rare (60 / 1,000,000 = 0.006%), so "generate and retry" is enough.
+api: The station is the facade for the carrier and the customer. All other parts are interfaces so tests can replace them.
+```java
+public enum Size { SMALL, MEDIUM, LARGE }
+public enum CState { FREE, RESERVED, OCCUPIED, EXPIRED, OUT_OF_ORDER }
+
+public interface LockerStation {
+  Reservation reserve(String packageId, Size size);  // carrier
+  void confirmDeposit(String packageId);   // door closed, package in
+  void cancel(String packageId);
+  Compartment pickup(String code);         // customer; opens door
+  void doorClosedEmpty(Compartment c);     // sensor event
+  int sweepExpired();                      // called by a scheduler
+  void staffCleared(String compartmentId); // EXPIRED -> FREE
+}
+
+public interface CompartmentAllocator {
+  Optional<Compartment> allocate(Size wanted);
+  void release(Compartment c);
+}
+
+public interface CodeGenerator {
+  String next();                           // e.g. 6 random digits
+  String key(String code);                 // lookup key (a hash)
+}
+
+public interface Door { void open(); boolean isClosed(); }
+public interface Notifier {
+  void ready(String packageId, String code, Instant until);
+  void expired(String packageId);
+}
+```
+Errors: NoSpaceException, InvalidCodeException, CodeExpiredException, TooManyAttemptsException and IllegalTransitionException. The station never returns the code to the carrier; it goes only to the customer through the Notifier.
+datamodel: Compartment: id, size, a state (atomic reference), and a Door. Reservation: package id, compartment, the code, and a reserve-until time. Hold: package id, compartment, and expires-at; this is what a live code points to. The station keeps four maps. `reservations` goes from package id to Reservation. `holds` goes from the code key to Hold. The allocator keeps one queue of free compartments per size. A min-heap or a delay queue ordered by expires-at finds expired holds without scanning all of them. Package id is a unique id from the carrier or from an ID generator such as a Snowflake or ULID (see Unique ID generation); we never invent it from the code.
+Compartment state machine (see Finite automata). Each arrow is a guarded transition, done with one compare-and-set so two threads cannot both win it.
+```text
+ FREE ------reserve---------> RESERVED
+ RESERVED --confirm----------> OCCUPIED
+ RESERVED --cancel / timeout-> FREE
+ OCCUPIED --pickup, door shut-> FREE
+ OCCUPIED --hold time over---> EXPIRED
+ EXPIRED --staff cleared-----> FREE
+ any state --fault-----------> OUT_OF_ORDER
+ OUT_OF_ORDER --repaired-----> FREE
+```
+The package has its own life cycle: IN_TRANSIT, DEPOSITED, PICKED_UP or EXPIRED. Keeping it separate from the compartment is intentional: a compartment can be free while the package is still on a truck. Any transition not in the table throws IllegalTransitionException, so a bug shows up in tests and not as a silent wrong state.
+design: Classes. LockerStation is the facade and owns the flows. Compartment holds its size, its state and its Door. CompartmentAllocator is a Strategy: the default BestFitAllocator takes the smallest free compartment that fits and, if none is free, the next larger size. A different allocator could spread use evenly or keep large ones for large packages only. CodeGenerator is a Strategy that returns random digits from a SecureRandom; a test passes a fixed list. Notifier is the Observer side: SMS, email and app push are listeners. Clock is the standard java.time.Clock, so tests can freeze and move time.
+Deposit flow. Step 1: the carrier scans the package and calls reserve(packageId, size). Step 2: the station uses computeIfAbsent on the packageId, so a repeated call returns the same Reservation. Step 3: the allocator removes a compartment from the free queue of the right size and moves it FREE to RESERVED. Step 4: the Door opens. Step 5: the carrier loads the package and closes the door; the sensor or the scanner calls confirmDeposit. Step 6: RESERVED to OCCUPIED, the code is added to `holds`, and the Notifier sends the code. Pickup flow. Step 1: the customer types the code. Step 2: the attempt limiter checks the station is not locked out. Step 3: the code key is looked up. Step 4: expiry is checked against the Clock. Step 5: `holds.remove(key, hold)` removes the code, and only one caller can succeed. Step 6: the Door opens. Step 7: when the sensor reports a closed, empty door, OCCUPIED goes to FREE and the compartment returns to its queue.
+Patterns and why (see Design patterns and SOLID). State for the compartment: five states with different legal operations; the table above becomes code that rejects the rest. Strategy for allocation, code generation and size rules, because these are policies that change by country or by product. Observer for notifications, so the station knows only the Notifier interface. Facade for LockerStation, so callers see five methods and not twelve classes. Factory to build a station from configuration (a list of compartments with sizes). Command is useful for door actions, if you want to log and retry them. Singleton is wrong for the station: a test and a production code path would share one global state.
+The central part is below: one atomic state, a pool that hands each compartment to one caller, and the two main flows.
+```java
+final class Compartment {
+  final String id; final Size size; final Door door;
+  private final AtomicReference<CState> state =
+      new AtomicReference<>(CState.FREE);
+  Compartment(String id, Size size, Door door) {
+    this.id = id; this.size = size; this.door = door;
+  }
+  boolean move(CState from, CState to) {
+    return state.compareAndSet(from, to);
+  }
+}
+
+final class BestFitAllocator implements CompartmentAllocator {
+  private final Map<Size, Queue<Compartment>> free =
+      new EnumMap<>(Size.class);
+
+  BestFitAllocator() {
+    for (Size s : Size.values())
+      free.put(s, new ConcurrentLinkedQueue<>());
+  }
+
+  public Optional<Compartment> allocate(Size wanted) {
+    for (Size s : Size.values()) {
+      if (s.compareTo(wanted) < 0) continue;     // too small
+      Compartment c;
+      while ((c = free.get(s).poll()) != null) {
+        if (c.move(CState.FREE, CState.RESERVED)) return Optional.of(c);
+      }                       // stale entry (out of order): skip it
+    }
+    return Optional.empty();
+  }
+  public void release(Compartment c) { free.get(c.size).add(c); }
+}
+
+public Reservation reserve(String packageId, Size size) {
+  return reservations.computeIfAbsent(packageId, id -> {
+    Compartment c = allocator.allocate(size)
+        .orElseThrow(() -> new NoSpaceException(size));
+    c.door.open();
+    Instant until = clock.instant().plus(RESERVE_TTL);
+    return new Reservation(id, c, codes.next(), until);
+  });
+}
+
+public Compartment pickup(String code) {
+  limiter.check();                         // throws if locked out
+  String key = codes.key(code);
+  Hold h = holds.get(key);
+  if (h == null) { limiter.fail(); throw new InvalidCodeException(); }
+  if (!clock.instant().isBefore(h.expiresAt()))
+    throw new CodeExpiredException();
+  if (!holds.remove(key, h)) throw new InvalidCodeException();
+  h.compartment().door.open();             // single use: code is gone
+  return h.compartment();
+}
+```
+diagram:
+  Carrier app          Customer at screen        Scheduler
+      |                       |                       |
+      v                       v                       v
+  +------------------------------------------------------------+
+  | LockerStation  (facade)                                    |
+  | reserve() confirmDeposit() pickup() sweepExpired()         |
+  +------------------------------------------------------------+
+     | uses            | uses            | uses          | uses
+     v                 v                 v               v
+  +-----------------+ +----------------+ +-------------+ +--------+
+  | Compartment-    | | CodeGenerator  | | Notifier    | | Clock  |
+  | Allocator <<I>> | | <<I>>          | | <<I>>       | | (inj.) |
+  +-----------------+ +----------------+ +-------------+ +--------+
+     ^                    ^                 ^      ^
+  BestFit / Spread    SecureRandom      Sms    Email
+     |
+     | free queue per size
+     v
+  +--------------------------+  has   +----------------+
+  | Compartment              |------->| Door <<I>>     |
+  |  id, size, state (CAS)   |        | open() closed? |
+  +--------------------------+        +----------------+
+  FREE -> RESERVED -> OCCUPIED -> FREE | EXPIRED | OUT_OF_ORDER
+deepdive: Concurrency. What is shared? The free queues, the compartment states and the two maps. Two carriers may ask for a medium compartment at the same moment. A plain "find a free one, then mark it" has a check-then-act race: both find the same compartment. Two fixes work. The first is one ReentrantLock per station around allocate and release; it is simple and fast enough here (see Locks and atomics). The second, shown above, makes the handout atomic: `poll()` on a concurrent queue gives each compartment to exactly one thread, and the compare-and-set on the state is a second guard. This is optimistic concurrency control: do the work, and let the CAS tell you if you lost (see Concurrency control (2PL, OCC)). We use no lock at all on the hot path, so nothing can deadlock. If you need an operation across two maps, for example "move a hold to expired and notify", lock in one fixed order or do the steps so that each map change is atomic and the order is safe.
+Idempotence. Scanners and apps retry. reserve uses computeIfAbsent, so the second call returns the first Reservation and does not take a second compartment (see Idempotence). confirmDeposit checks the CAS: if the compartment is already OCCUPIED for this package, return success without sending a second SMS. cancel on an unknown package is a no-op. The key is the package id, never a time or a counter. Single-use codes are the opposite case: we want the second use to fail, and `holds.remove(key, hold)` gives that, because only one caller removes it.
+Code safety. The code is a lookup key in a hash map (see Hashing and hash tables). Store `key(code)` as an HMAC or SHA-256 of the digits plus a station secret, so a memory dump does not show live codes. Generate with SecureRandom, not with `Random`. Codes are unique within a station among live holds: generate, check `holds.containsKey`, retry. Brute force is limited by an attempt limiter with a token bucket (see Rate limiting): for example 5 wrong tries, then a lockout that doubles each time. At 60 live codes in a 6-digit space, 5 tries per lockout window is the main defence, so also log every failed attempt and send it to the central service.
+Expiry. A sweeper runs every minute. It takes entries from a min-heap ordered by expires-at while the head is in the past. For each: `holds.remove(key, hold)`, then move OCCUPIED to EXPIRED, then call the Notifier. EXPIRED compartments are not returned to the free queue until staff call staffCleared. The sweeper and a customer can race at the boundary: both call `holds.remove(key, hold)` and only one succeeds, so the package is either picked up or expired, never both. Pickup also compares expiry with the same Clock, so the two sides use one definition of "now".
+Extensibility. A new size (EXTRA_LARGE) is a new enum value, plus a queue; BestFitAllocator already walks sizes in order. A new allocation rule is a new CompartmentAllocator. A new notifier is a new Notifier added to a composite. A code that is a QR code instead of digits is a new CodeGenerator. Packing several small parcels in a large compartment is a different problem (see Bin packing); keep it out of this model unless asked.
+Testing. Inject a fixed Clock and a CodeGenerator with a list of codes, plus a fake Door and a fake Notifier that records calls. Unit tests: best fit picks the smallest size; a larger size is used when the small ones are full; NoSpaceException when all are full; each illegal transition throws. Time tests (see Deterministic simulation testing for the idea): reserve at 10:00, move the clock to 10:06 and run the sweeper, assert the reservation is cancelled and the compartment is free; confirm at 10:00, move to day 3 plus 1 minute, assert the code fails. Concurrency test: 100 threads reserve a station with 60 mediums; exactly 60 succeed, 40 get NoSpaceException, and no compartment appears twice. Repeat the test many times, with a latch to start all threads together.
+tradeoffs: Lock or lock-free handout. Choose one ReentrantLock per station when you also need to change several structures together (a compartment, a map, a heap) and you want code a new engineer can verify in minutes. Choose the queue plus compare-and-set when you want no blocking and the invariant is simple: one compartment, one owner. With one event every few minutes either is fast enough, so pick the easier one to prove.
+Best fit or first fit. Choose best fit (smallest compartment that fits) when large compartments are rare and the mix of packages is not known, because it keeps big ones free for big packages. Choose first fit or an even-spread rule when door wear matters or when sizes are plentiful. Choose a look-ahead rule only if you know tomorrow's packages; it needs bin-packing logic and a central planner.
+Enum state or State classes. Choose an enum with a transition table (as above) when states differ only in what is allowed next. Choose State classes when each state has real behaviour, for example OUT_OF_ORDER showing a message and calling maintenance. The enum is smaller and easier to test; State classes scale better once the rules grow.
+Random code or compartment-bound code. Choose a random code unique within the station when the same code format must work on any compartment and you can limit attempts. Choose a code that contains the compartment number when you want quicker lookup and accept that it shows which door opens. Choose a QR code scanned at the station when the customer has a phone; it removes guessing but needs a camera.
+In-memory or persisted state. Choose in-memory state when a station restart can be recovered by staff and the central service is the record. Choose a local database or a write-ahead log when a power cut must not lose live codes. A cheap middle path is to persist holds on each change and rebuild the maps at start.
+failures: Invalid input. A null or unknown package id, a size that is not in the enum, or a code with letters is rejected at the edge of the facade. No state changes happen before validation.
+No space. reserve throws NoSpaceException with the size. The carrier app shows the next station. No compartment is left half-reserved, because the exception happens before any state change.
+Carrier never confirms. A timer cancels the reservation after 5 minutes: RESERVED to FREE and the compartment goes back to its queue. If the carrier later confirms, the CAS fails and the call returns a clear error.
+Door fault. If `open()` throws in reserve, the lambda exits with an exception, so no Reservation is stored; the compartment moves to OUT_OF_ORDER and a maintenance event is sent. If `open()` throws during pickup, put the Hold back (`holds.putIfAbsent`) so the customer can try again, and raise the fault.
+Wrong, used or expired code. The first two give InvalidCodeException, the third CodeExpiredException. Show one neutral message on screen so an attacker learns nothing about which case it was. Count the attempt.
+Power loss. With in-memory state, live codes vanish. We reload them from the persisted log, or from the central service, before the screen accepts input. Without this, customers see "invalid code" for packages inside the lockers.
+evolution: Returns and sending a parcel: add a flow where the customer is the depositor and the carrier picks up. The compartment state machine and the allocator are reused; only a new facade method and a new code owner are added.
+Multiple stations and reroute: a central service chooses a station; each station keeps its own state. Cross-station operations become messages with idempotent ids.
+Dynamic hold times and reminders: a HoldPolicy strategy per carrier, and a reminder step in the sweeper at 24 hours.
+followups: How do you make sure two drivers never get the same compartment? || Hand out compartments through a concurrent queue, where poll gives each item to one thread, and also guard the state with compare-and-set from FREE to RESERVED. Alternatively use one lock around allocation. The invariant is one owner per compartment, and the test is a many-thread reservation test.
+Why is the compartment a state machine and not a boolean? || There are more than two situations: reserved but empty, occupied, expired and waiting for staff, broken. Each allows different actions. A table of transitions makes illegal ones impossible and easy to test.
+How do you handle a scanner that retries the same reserve call? || Use the package id as an idempotency key. computeIfAbsent returns the existing Reservation, so no second compartment is taken. The same holds for confirm and cancel.
+How would you stop code guessing? || Limit wrong attempts per station with a token bucket and growing lockouts, use random codes from SecureRandom, keep the live set small, store only hashes, and alert on repeated failures. A longer code or a QR code removes the problem if the product allows it.
+How do you test expiry without waiting 3 days? || Inject a Clock. The test sets a fixed clock, calls the code, moves the clock and calls the sweeper. Never call Instant.now() inside the domain classes.
+What changes if the station must survive a restart? || Persist each hold and reservation on change, in a local log or database, and rebuild maps and queues at start. Compartment states can be rebuilt from holds plus sensor readings. Recovery runs before the screen accepts input.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson and Vlissides, 1994 |
+ref: blog | State pattern | refactoring.guru | https://refactoring.guru/design-patterns/state
+ref: blog | Strategy pattern | refactoring.guru | https://refactoring.guru/design-patterns/strategy
+ref: blog | Observer pattern | refactoring.guru | https://refactoring.guru/design-patterns/observer
+ref: book | Java Concurrency in Practice | Goetz et al., 2006 |
+
+@@ elevator
+title: Elevator system
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, automata, scheduling, trees, eventloop, queuesbuf, locks, dst
+summary: Design the control software of a building with several elevators. People press a hall button (up or down) on a floor, then a floor button inside the car. The system must decide which car answers a hall call, in which order a car visits its stops, when doors open and close, and what to do when a car is overloaded or broken. The interview is not about hardware. It is an exercise in object-oriented programming. It tests whether you can model **a car as a state machine**, separate the "which car" decision from the "which stop next" decision with two Strategy objects, and keep the control logic deterministic and testable. It is also a small scheduling problem: the order of stops is the same idea as disk-arm or CPU scheduling, with the same risks of waste and starvation.
+requirements: Functional requirements. A building has F floors and N cars. A hall call has a floor and a direction. A car call has a car and a target floor. The system assigns each hall call to one car. A car moves one floor per time step, stops at floors it should serve, opens the doors for a fixed time, closes them and continues. It serves stops in the current direction first, then reverses (the LOOK rule). An idle car waits where it is. A car can be set out of service (fault, fire recall, maintenance). An overloaded car keeps its doors open. Invalid floors are rejected. Repeated presses of the same button do nothing new.
+Non-functional requirements. Fairness: no call waits for ever. Extensibility: a new dispatch rule or a new stop-order rule must not change the Elevator class. Testability: the whole system runs on a discrete clock, so a test calls tick() and checks floors and states, with no sleeps. Thread safety: buttons are pressed from many threads while the control loop runs. Safety: a car never moves with its doors open.
+Assumptions. One bank of cars with one controller. Equal speed for all cars. A passenger model is not needed; we only see button events and sensors (door closed, overload).
+estimates: Load is tiny, so the design must be about correctness. Take a 40-floor tower with 4,000 people and 6 cars. In the morning peak assume 15% of people arrive in 5 minutes: 600 people in 300 seconds, about 2 passengers per second, so about 4 button events per second (a hall call and a car call each). One control thread handles thousands of events per second. Each car keeps at most 40 pending stops, so a car is a few hundred bytes. If a floor takes about 2 seconds to travel and doors need about 6 seconds per stop, a full trip with 8 stops takes about 2 minutes, which is why the choice of car and the order of stops matter more than speed of code.
+api: One facade accepts events and one method advances time. Policies are interfaces.
+```java
+public enum Dir { UP, DOWN, NONE }
+public enum EState { IDLE, MOVING, DOORS_OPEN, OUT_OF_SERVICE }
+public record HallCall(int floor, Dir dir) {}
+
+public interface ElevatorSystem {
+  void hallCall(int floor, Dir dir);      // button in the corridor
+  void carCall(int carId, int floor);     // button inside the car
+  void setOutOfService(int carId, boolean out);
+  void setOverloaded(int carId, boolean on);
+  void tick();                            // advance one time step
+  List<CarStatus> status();               // immutable snapshots
+}
+
+public interface DispatchStrategy {       // which car takes a hall call
+  Optional<Elevator> choose(List<Elevator> cars, HallCall call);
+}
+
+public interface ElevatorListener {       // displays, logs, metrics
+  void onArrived(int carId, int floor);
+  void onDoors(int carId, boolean open);
+}
+```
+Errors: IllegalArgumentException for a floor that does not exist, IllegalStateException for a call to a car that is out of service. A hall call with no car available is kept pending and tried again at the next tick.
+datamodel: Elevator: id, current floor, direction, state, a door timer, an overload flag, and three sorted sets of floors: car calls, hall calls going up, hall calls going down. Sorted sets let us ask "what is the next stop above floor 12?" in O(log n). HallCall is an immutable value (floor, direction) and works as a key in a set, so a second press is a no-op. The Controller owns the cars, the pending hall calls with their assigned car, the inbound event queue and the strategy.
+The car is a finite automaton (see Finite automata); direction is separate data.
+```text
+ IDLE --has a stop----------------> MOVING
+ IDLE --call at this floor--------> DOORS_OPEN
+ MOVING --arrived at a stop-------> DOORS_OPEN
+ DOORS_OPEN --timer ends, work----> MOVING
+ DOORS_OPEN --timer ends, no work-> IDLE
+ DOORS_OPEN --overloaded----------> DOORS_OPEN (timer held)
+ any --fault / fire---------------> OUT_OF_SERVICE
+ OUT_OF_SERVICE --reset-----------> IDLE
+```
+design: Responsibilities. Elevator knows its own state and its own stop list; it moves one step per tick(). It does not know about other cars. Controller receives events, keeps pending hall calls, asks the DispatchStrategy for a car, and calls tick() on every car. DispatchStrategy answers one question only: which car. NearestCarStrategy is the default; it scores each car with an estimated time to reach the call. The stop-order rule (LOOK) lives inside Elevator because it depends on private data; if you want to swap it, extract a StopPolicy interface with chooseDirection and shouldStop. Listeners observe arrivals and door events.
+Hall call flow. Step 1: a button thread calls hallCall(floor, dir). Step 2: the Controller puts a HallCallEvent in the inbox queue and returns. Step 3: in the next tick the control loop drains the inbox. Step 4: if the call is already pending, drop it. Step 5: ask the strategy for a car. Step 6: call car.addHallCall(floor, dir) and record the assignment. Step 7: every tick moves the car; when it stops at the floor, the call is removed and the controller forgets the assignment. If the strategy returns nothing, the call stays pending and is retried.
+Scoring. For an idle car the cost is the distance in floors. For a car moving towards the call in the same direction it is the distance plus a penalty per stop in between (door time). For any other car it is the distance to its last stop in the current direction plus the way back. Out-of-service cars cost infinity. The lowest cost wins; ties go to the lower car id so tests are stable.
+Patterns and why (see Design patterns and SOLID). Strategy for dispatch (and optionally stop order): rules change by building, and morning and evening traffic want different rules. State for the car: an enum with a switch in tick() is enough for four states, and State classes are the next step if each state gets rich behaviour. Observer for displays and logs. Command for events in the inbox: HallCallEvent, CarCallEvent and FaultEvent are small objects that can be queued, logged and replayed. Facade for ElevatorSystem. Factory for building a bank from a config. No Singleton: tests need many independent systems.
+The Elevator class is the core of the design.
+```java
+final class Elevator {
+  static final int DOOR_TICKS = 3;
+  final int id, bottom, top;
+  private final NavigableSet<Integer> car = new TreeSet<>();
+  private final NavigableSet<Integer> hallUp = new TreeSet<>();
+  private final NavigableSet<Integer> hallDown = new TreeSet<>();
+  private int floor, doorLeft;
+  private Dir dir = Dir.NONE;
+  private EState state = EState.IDLE;
+  private boolean overloaded;
+
+  void addCarCall(int f) { accept(car, f); }
+  void addHallCall(int f, Dir d) {
+    accept(d == Dir.UP ? hallUp : hallDown, f);
+  }
+
+  private void accept(Set<Integer> set, int f) {
+    if (state == EState.OUT_OF_SERVICE)
+      throw new IllegalStateException("out of service");
+    if (f < bottom || f > top)
+      throw new IllegalArgumentException("no floor " + f);
+    if (f == floor && state == EState.DOORS_OPEN) doorLeft = DOOR_TICKS;
+    else if (f == floor && state == EState.IDLE) openDoors();
+    else set.add(f);
+  }
+
+  /** One time step: move one floor or count down the door timer. */
+  void tick() {
+    switch (state) {
+      case IDLE -> startIfWork();
+      case MOVING -> {
+        floor += (dir == Dir.UP) ? 1 : -1;
+        if (serveHere()) openDoors();
+      }
+      case DOORS_OPEN -> {
+        if (!overloaded && --doorLeft <= 0) startIfWork();
+      }
+      case OUT_OF_SERVICE -> { }
+    }
+  }
+
+  private void startIfWork() {
+    dir = chooseDirection();
+    if (dir == Dir.NONE) { state = EState.IDLE; return; }
+    if (serveHere()) openDoors(); else state = EState.MOVING;
+  }
+
+  private Dir chooseDirection() {          // the LOOK rule
+    Integer up = above(floor), down = below(floor);
+    if (up == null && down == null) return Dir.NONE;
+    if (dir == Dir.UP && up != null) return Dir.UP;
+    if (dir == Dir.DOWN && down != null) return Dir.DOWN;
+    if (up != null && down != null)        // nearest stop first
+      return up - floor <= floor - down ? Dir.UP : Dir.DOWN;
+    return up != null ? Dir.UP : Dir.DOWN;
+  }
+
+  private boolean serveHere() {            // remove the calls we serve
+    Integer ahead = (dir == Dir.UP) ? above(floor) : below(floor);
+    boolean last = ahead == null;
+    var same = (dir == Dir.DOWN) ? hallDown : hallUp;
+    var other = (dir == Dir.DOWN) ? hallUp : hallDown;
+    boolean hit = car.remove(floor) | same.remove(floor);
+    if (last) hit |= other.remove(floor);  // turn-around stop
+    return hit;
+  }
+
+  private void openDoors() {
+    state = EState.DOORS_OPEN;
+    doorLeft = DOOR_TICKS;
+  }
+  void setOverloaded(boolean on) { overloaded = on; }
+  void setOutOfService(boolean out) {
+    state = out ? EState.OUT_OF_SERVICE : EState.IDLE;
+  }
+  private Integer above(int f) {
+    return Stream.of(car, hallUp, hallDown).map(s -> s.higher(f))
+        .filter(Objects::nonNull).min(Integer::compare).orElse(null);
+  }
+  private Integer below(int f) {
+    return Stream.of(car, hallUp, hallDown).map(s -> s.lower(f))
+        .filter(Objects::nonNull).max(Integer::compare).orElse(null);
+  }
+}
+```
+Why the turn-around stop matters. A car going up serves "up" hall calls on the way, but not "down" calls: a person who wants to go down would ride up. The "down" call at floor 8 is served only when floor 8 is the last stop in the up direction, or later on the way down. In the demo scenario a car at floor 0 has car calls 8 and 2 and hall calls (5, down) and (3, up). It stops at 2, then 3, then 8, turns, and serves floor 5 on the way down.
+diagram:
+  button threads                      scheduler / test
+       |  hallCall() carCall()               |  tick()
+       v                                     v
+  +-------------------------------------------------------+
+  | Controller  (one control thread)                      |
+  |   inbox: BlockingQueue<Event>   pending hall calls    |
+  +-------------------------------------------------------+
+       | asks                           | tick() each car
+       v                                v
+  +--------------------+     +-------------------------------+
+  | DispatchStrategy   |     | Elevator  (x N)               |
+  |   choose(cars,call)|     |  state: IDLE MOVING DOORS_OPEN|
+  +--------------------+     |         OUT_OF_SERVICE        |
+     ^           ^           |  car{}  hallUp{}  hallDown{}  |
+  Nearest   LeastBusy        |  (TreeSet each, sorted floors)|
+                             +-------------------------------+
+                                        | notifies
+                                        v
+                              +---------------------+
+                              | ElevatorListener    |
+                              +---------------------+
+                              display / log / metrics
+deepdive: Concurrency. The shared data is every car's state and the pending-call table. Many threads press buttons, and one loop moves cars. The simplest safe design has no shared mutable state: button threads only add an event to a BlockingQueue (many producers, one consumer), and the control loop is the only thread that touches cars. This is the Event loop pattern. A queue is the right structure (see Queues, skip lists & ring buffers). There are no locks around cars, so no deadlock. The loop publishes an immutable list of CarStatus snapshots through a volatile field for displays.
+The lock-based alternative gives each Elevator a lock. A dispatcher that reads all cars to compute costs would have to lock all of them. Always lock in the order of car id, or read a snapshot without locks and accept a slightly stale cost (see Locks and atomics). Stale costs are fine: a bad choice costs seconds, not safety. The safety rule "never move with doors open" is local to one car's tick(), so it needs no cross-car lock.
+Scheduling. The order of stops is a scheduling problem like the disk arm. FCFS (serve calls in arrival order) makes the car zigzag. SSTF (always go to the nearest stop) is fast but can starve far floors if new near calls keep coming. SCAN and LOOK sweep in one direction and reverse, so every call waits at most about two sweeps. That is the same fairness argument as in CPU scheduling: bounded waiting costs a little average speed. Our LOOK reverses at the last stop and not at the building end, which saves empty travel. The sorted sets (TreeSet, see Trees, heaps & tries) give higher() and lower() in O(log n). With 40 floors a boolean array would also be fine.
+Reassignment. When a car goes out of service, the Controller finds its assigned hall calls and runs them through dispatch again. The car's own car calls are lost: passengers inside get the nearest floor and doors open. This is why the Controller, not the car, owns the list of pending hall calls.
+Extensibility. A new dispatch rule is a new class. Destination dispatch (the passenger enters the target floor in the lobby) adds a new event type and a strategy that groups passengers by target; Elevator gets a new method addPassenger(from, to). Zoning (cars A to C serve floors 1 to 20, D to F serve 21 to 40) is a strategy that filters cars. A freight car is a subclass with another capacity, or better, a flag in the config; prefer composition.
+Testing. Everything runs on tick(), so there is no real clock. Write scenario tests: given a car at 0 and these calls, assert the floor and state at each tick (as in the trace above). Test invariants after every tick with a helper: floor within bounds; state MOVING means the doors are closed; a MOVING car has a stop in its direction; no call is lost. Use a seeded random generator to create passenger streams, run 100,000 ticks and check that every call is served within a bound. A seed that fails is printed, so the run can be replayed exactly (the idea of Deterministic simulation testing). Fake the listeners with a recording list and assert the order of events.
+tradeoffs: LOOK, SSTF or FCFS. Choose LOOK when fairness matters and traffic is mixed, which is almost always. Choose SSTF only for a quiet building with few floors, where starvation cannot happen in practice. Choose FCFS only for a teaching example. You give up some average speed with LOOK to bound the worst wait.
+Central dispatch or each car decides. Choose a central controller when you want a good global assignment, easy testing and one place to apply rules (zones, priority). Choose independent cars that bid for calls when the cars are far apart or controllers are separate, and you accept duplicate work and harder tests. A hybrid is common: the controller proposes, the car may refuse.
+Event loop or locks. Choose the single control thread with a queue when state is complex and events are far below 100,000 per second, as here. Choose per-car locks when cars must run on separate threads for real-time reasons, and then fix a lock order. The loop is easier to reason about and to replay.
+Enum state or State classes. Choose the enum plus switch with four states. Choose State classes when each state needs its own events and timers, for example separate behaviour for fire mode, inspection mode and independent service. You pay with more classes, and gain isolated tests per state.
+Normal or destination dispatch. Choose normal up/down buttons for small buildings and simple use. Choose destination dispatch for tall buildings with heavy peaks: grouping people with the same target cuts the stops per trip, at the cost of a keypad system, more complex scheduling and users who must learn it.
+failures: Invalid input. A floor outside the range, a car id that does not exist, or direction NONE in a hall call throws IllegalArgumentException before any state changes. A top-floor hall call with direction UP is rejected the same way.
+Duplicate and repeated presses. HallCall is a value in a set, and car calls are in a set, so a second press changes nothing. A call for the current floor while the doors are open only extends the door timer; for an idle car it opens the doors.
+Car out of service. The car stops accepting calls (IllegalStateException). The controller re-dispatches its hall calls. If it was moving, a safe design finishes the move to the next floor, opens the doors and then switches state.
+Overload. While overloaded the door timer is held and the car does not move. A listener raises an alarm. When the load drops the timer runs again.
+Fire recall. A FireEvent sets all cars to a special mode: clear all calls, go to the ground floor, open doors, stay out of service. It is the highest priority event and is handled first in the inbox.
+No car available. Hall calls stay pending and are retried each tick. A metric counts ticks with pending calls and no car, so operators see the problem.
+Power loss. State in memory is lost. On restart every car is IDLE at its sensor floor, pending calls are empty and people press again. Persistence is not worth the complexity here.
+evolution: Destination dispatch: a new DestinationCall event and a grouping DispatchStrategy.
+Energy saving and parking: when idle for 60 seconds, send a car to the lobby in the morning and to the middle floors in the evening, using a ParkingPolicy strategy.
+Multiple banks and sky lobbies: a Building owns several Controllers; a trip across banks becomes two linked calls.
+VIP and freight priority: a priority field on events and a dispatch rule that respects it, with a cap so normal users do not starve.
+followups: Why not make Elevator and its states a class hierarchy (MovingElevator, IdleElevator)? || An object cannot change its class at run time, so the car would need to be replaced on each transition. A state field (enum or State objects) held inside one Elevator keeps identity, data and listeners stable.
+How do you make sure a down-call is not served by a car going up? || Keep hall calls by direction in separate sets. A car stops for a call in its own direction on the way. It serves the opposite direction only at the turn-around stop, when there is nothing further in its direction.
+How do you avoid starvation? || Use LOOK or SCAN. The car sweeps in one direction and reverses, so any floor is reached within about two sweeps. SSTF can starve far floors. If you add priority rules, add aging or a cap.
+How do you handle many threads pressing buttons? || Make button handlers only enqueue events, and let a single control loop apply them. No shared mutable car state, no locks. If you need locks, use one per car and lock in id order.
+How would you test the system without a real clock? || Drive time with tick(). Write scenario tests with expected floor and state per tick, and invariant checks after every tick. Add seeded random traffic and print the seed on failure, so any failure can be replayed.
+What changes for destination dispatch? || Add an event with from and to floors, and a strategy that assigns a passenger group to a car, then adds the pickup and drop-off stops. Elevator mostly stays the same; the buttons inside the car disappear.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson and Vlissides, 1994 |
+ref: blog | State pattern | refactoring.guru | https://refactoring.guru/design-patterns/state
+ref: blog | Strategy pattern | refactoring.guru | https://refactoring.guru/design-patterns/strategy
+ref: book | Operating System Concepts (disk scheduling: SCAN, C-SCAN, LOOK) | Silberschatz, Galvin and Gagne |
+
+@@ parking-lot
+title: Parking lot
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, locks, hashtables, idgen, occ, binpacking, trees, idempotence, dst
+summary: A parking lot has several floors, each with many spots of different sizes. A car arrives at an entry gate and gets a ticket and a spot. When it leaves, the driver pays at a machine or at the exit gate, the gate opens, and the spot becomes free. This is the classic interview problem for object-oriented programming because the nouns are obvious (lot, floor, spot, vehicle, ticket, gate) and the hard part is to give each noun the right job. The interesting questions are: how does a vehicle "fit" a spot, how do you choose the spot with a rule you can change, how do you compute a fee with rules that stack (hourly rate, daily cap, discounts), and how do you stop two cars from getting the same spot. Good answers use **Strategy for the rules, a small state machine for spots and tickets, and one atomic claim for every spot**.
+requirements: Functional requirements. The lot has floors, and each floor has spots of size SMALL (motorcycle), MEDIUM (car) and LARGE (van, truck). Some spots have features: an electric vehicle charger or an accessible-parking sign. A vehicle fits a spot when the spot is at least as large as the vehicle and has the features the vehicle needs. At entry the system finds a free spot (by default the nearest to the entrance), issues a ticket and records the entry time. A display board shows free spots per size. At exit the driver pays the fee that depends on time and rules, the system accepts payment, and the exit gate opens within a grace time of 15 minutes. The spot becomes free. A lost ticket is handled by the plate number with a flat fee. Staff can mark a spot out of service. The same plate cannot be inside twice.
+Non-functional requirements. Correctness: one spot, one car; one payment per ticket even when the request is repeated. Extensibility: a new pricing rule, a new spot choice rule or a new vehicle type must not change old classes. Thread safety: several entry and exit gates work at once. Testability: the clock, the id generator and the payment gateway are injected. Money is stored as integer cents.
+Assumptions. One lot in one process; persistence is out of scope but the design must not block it.
+estimates: Take a garage with 5 floors and 2,000 spots. In a normal peak, 600 cars per hour enter: one every 6 seconds. After an event, 2,000 cars may leave in 30 minutes: about 1 per second over 4 exit lanes. Memory is small: a Spot is about 100 bytes, so spots take 200 KB, and 2,000 live tickets take about 400 KB. Contention is low: one claim per few seconds. The place where cost matters is "find the nearest free spot that fits": with a sorted set it is O(log n) for the first match, and a list scan over 2,000 spots would also be fast enough. So we choose clear code, and we choose concurrency tools for correctness, not speed.
+api: The ParkingLot facade serves the gates. Everything that can change is behind an interface.
+```java
+public enum Size { SMALL, MEDIUM, LARGE }
+public enum Feature { EV, ACCESSIBLE }
+public record Vehicle(String plate, Size size, Set<Feature> needs) {}
+
+public interface SpotAllocator {
+  Optional<Spot> allocate(Vehicle v);   // claims the spot atomically
+  void release(Spot s);
+}
+
+public interface PricingPolicy {
+  Money fee(Ticket t, Instant exitTime);
+}
+
+public interface PaymentGateway {
+  Payment charge(String idempotencyKey, Money fee, PaymentMethod m);
+}
+
+public interface DisplayListener {
+  void onAvailability(Size size, int free);
+}
+
+public final class ParkingLot {
+  public Ticket enter(Vehicle v);                 // entry gate
+  public Money quote(String ticketId);           // fee right now
+  public Payment pay(String ticketId, PaymentMethod m);
+  public void exit(String ticketId);              // exit gate
+  public Ticket reissueLost(String plate);        // lost ticket
+  public void setOutOfService(String spotId, boolean out);
+}
+```
+Errors: LotFullException(size), AlreadyInsideException(plate), NotPaidException, UnknownTicketException. They are checked before any state changes.
+datamodel: Spot: id, floor, distance from the entrance, size, a set of features, and a state held in an atomic reference: FREE, OCCUPIED or OUT_OF_SERVICE. Vehicle: plate, size, needed features. Ticket: id, plate, the Spot, entry time. The ticket id comes from an ID generator such as a ULID or a Snowflake id (see Unique ID generation); it is not the plate and not a counter that can be guessed. Payment: id, amount, time. The lot keeps three maps: ticket id to Ticket, plate to ticket id (to forbid duplicates and to find a lost ticket), and ticket id to Payment. The allocator keeps one sorted set of free spots per size.
+State machines (see Finite automata). A spot is FREE, then OCCUPIED when a car takes it, and FREE again on release. OUT_OF_SERVICE can be entered from any state and left only by staff. A ticket is ACTIVE after entry, PAID after a payment, and EXITED when the gate opens. We derive it: PAID means a Payment exists, EXITED means the ticket left the map. Fewer stored flags mean fewer ways to be inconsistent.
+design: Classes. Spot owns its state and the CAS that changes it. SpotAllocator is a Strategy for choosing a spot; NearestAllocator is the default, and others could fill one floor at a time or keep EV spots for EVs. PricingPolicy is a Strategy for fees, built as a chain of Decorators: HourlyPricing is the base, DailyCapPricing wraps it and limits the amount per 24 hours, ValidationDiscount wraps that and subtracts a stamp from a shop. Each wrapper calls the inner one and changes the answer, so rules stack without a class for every combination. ParkingLot is a Facade: it coordinates allocation, tickets, pricing and payment, and holds no rules itself. DisplayListener is the Observer for the board.
+Entry flow. Step 1: generate a ticket id. Step 2: claim the plate with putIfAbsent, so the same plate cannot enter twice. Step 3: ask the allocator for a spot; it removes the spot from the free set and flips FREE to OCCUPIED. Step 4: if no spot exists, undo the plate claim and throw LotFullException. Step 5: create and store the Ticket. Step 6: tell the display listeners and open the gate. Exit flow. Step 1: look up the ticket. Step 2: check that a Payment exists and is not older than the grace time. Step 3: remove the ticket from the map; only one caller wins. Step 4: remove the plate entry. Step 5: release the spot, which flips OCCUPIED to FREE and puts it back in the sorted set. Step 6: open the gate. Payment flow. Compute the fee with the policy, call the gateway with the ticket id as idempotency key, and store the first Payment.
+Pricing example. Rate 4.00 per started hour, daily cap 30.00. A stay of 3 hours 20 minutes is 4 started hours, so 16.00. A stay of 9 hours is 36.00, capped to 30.00. Rounding up per started hour is a business rule to confirm. Money is a long in cents, never a double.
+Patterns and why (see Design patterns and SOLID). Strategy for spot choice and pricing: rules change by site and by season. Decorator for pricing: rules combine freely. Facade for the lot. Observer for the display board and metrics. State for spots (and optionally tickets): invalid transitions are rejected. Factory to build floors and spots from configuration. Singleton is the usual answer and I avoid it: one lot per site is a fact of deployment, not of the class, and a global makes tests share state.
+The core of the design is below: the spot, the allocator, and the three gate operations.
+```java
+enum Size { SMALL, MEDIUM, LARGE }
+enum Feature { EV, ACCESSIBLE }
+enum SpotState { FREE, OCCUPIED, OUT_OF_SERVICE }
+record Vehicle(String plate, Size size, Set<Feature> needs) {}
+record Ticket(String id, String plate, Spot spot, Instant entry) {}
+final class Spot {
+  final String id; final int floor, distance; final Size size;
+  final Set<Feature> features;
+  private final AtomicReference<SpotState> state =
+      new AtomicReference<>(SpotState.FREE);
+
+  Spot(String id, int floor, int dist, Size size, Set<Feature> f) {
+    this.id = id; this.floor = floor; this.distance = dist;
+    this.size = size; this.features = f;
+  }
+  boolean matches(Vehicle v, boolean exact) {
+    if (size.compareTo(v.size()) < 0) return false;
+    return exact ? features.equals(v.needs())
+                 : features.containsAll(v.needs());
+  }
+  boolean take() {
+    return state.compareAndSet(SpotState.FREE, SpotState.OCCUPIED);
+  }
+  boolean free() {
+    return state.compareAndSet(SpotState.OCCUPIED, SpotState.FREE);
+  }
+}
+
+final class NearestAllocator implements SpotAllocator {
+  private static final Comparator<Spot> NEAREST =
+      Comparator.comparingInt((Spot s) -> s.floor)
+          .thenComparingInt(s -> s.distance).thenComparing(s -> s.id);
+  private final Map<Size, ConcurrentSkipListSet<Spot>> free =
+      new EnumMap<>(Size.class);
+
+  NearestAllocator(Collection<Spot> spots) {
+    for (Size z : Size.values())
+      free.put(z, new ConcurrentSkipListSet<>(NEAREST));
+    for (Spot s : spots) free.get(s.size).add(s);
+  }
+  public Optional<Spot> allocate(Vehicle v) {
+    for (boolean exact : new boolean[] {true, false})
+      for (Size z : Size.values()) {
+        if (z.compareTo(v.size()) < 0) continue;
+        for (Spot s : free.get(z)) {
+          if (!s.matches(v, exact)) continue;
+          if (free.get(z).remove(s) && s.take()) return Optional.of(s);
+        }
+      }
+    return Optional.empty();
+  }
+  public void release(Spot s) {
+    if (s.free()) free.get(s.size).add(s);
+  }
+}
+
+public Ticket enter(Vehicle v) {
+  String id = ids.next();
+  if (byPlate.putIfAbsent(v.plate(), id) != null)
+    throw new AlreadyInsideException(v.plate());
+  Optional<Spot> spot = allocator.allocate(v);
+  if (spot.isEmpty()) {
+    byPlate.remove(v.plate(), id);
+    throw new LotFullException(v.size());
+  }
+  Ticket t = new Ticket(id, v.plate(), spot.get(), clock.instant());
+  tickets.put(id, t);
+  return t;
+}
+
+public Payment pay(String ticketId, PaymentMethod m) {
+  Ticket t = find(ticketId);
+  Payment prior = paid.get(ticketId);
+  if (prior != null) return prior;
+  Money fee = pricing.fee(t, clock.instant());
+  Payment p = gateway.charge(ticketId, fee, m);  // key = ticket id
+  Payment won = paid.putIfAbsent(ticketId, p);
+  return won != null ? won : p;
+}
+
+public void exit(String ticketId) {
+  Ticket t = find(ticketId);
+  Payment p = paid.get(ticketId);
+  if (p == null || p.at().plus(GRACE).isBefore(clock.instant()))
+    throw new NotPaidException(ticketId);
+  if (!tickets.remove(ticketId, t)) return;      // already left
+  byPlate.remove(t.plate(), ticketId);
+  allocator.release(t.spot());
+}
+```
+Why `remove` is the claim. Two gates can see the same spot at the same time in a concurrent sorted set, because iteration does not lock. Only one call to `remove(s)` returns true, so only that gate owns the spot. The CAS on the state is a second guard that also catches a spot marked out of service in between.
+diagram:
+  Entry gate         Exit gate / pay machine       Staff console
+      |                       |                         |
+      | enter(vehicle)        | pay() exit()            | setOutOfSvc
+      v                       v                         v
+  +------------------------------------------------------------+
+  | ParkingLot  (facade)                                       |
+  |   tickets{id->Ticket}  byPlate{plate->id}  paid{id->Pay}   |
+  +------------------------------------------------------------+
+     | allocate/release   | fee()            | charge()   | notify
+     v                    v                  v            v
+  +---------------+  +----------------+  +---------+  +-----------+
+  | SpotAllocator |  | PricingPolicy  |  | Payment |  | Display-  |
+  | <<I>>         |  | <<I>>          |  | Gateway |  | Listener  |
+  +---------------+  +----------------+  +---------+  +-----------+
+     ^                    ^
+  NearestAllocator    Hourly <- DailyCap <- Validation (decorators)
+     |
+     | free sets by size (sorted by floor, distance)
+     v
+  +--------------------------------------------+
+  | Spot: id, floor, distance, size, features  |
+  | state: FREE <-> OCCUPIED, OUT_OF_SERVICE   |
+  +--------------------------------------------+
+deepdive: Concurrency. What is shared? The free sets, each spot's state, and the three maps. A "find a free spot, then mark it" sequence has a check-then-act race: two gates both find spot 12 and both give it away. Our fix is to make the claim one atomic step. The free sets are ConcurrentSkipListSet objects, a lock-free sorted structure (see Trees, heaps & tries for the sorted-set idea). `remove(s)` succeeds for one thread only. The CAS on the state is the second guard. This is optimistic concurrency control (see Concurrency control (2PL, OCC)): we do the work, and a failed CAS means someone else won, so we move on to the next spot. There is no lock to order, so no deadlock.
+The alternative is one lock for the whole lot, or one per floor. A single ReentrantLock around allocate and release is the simplest correct code and is fast enough at one claim per few seconds (see Locks and atomics). Use per-floor locks only if you see contention, and then never hold two floor locks together, or lock in floor order. The maps are ConcurrentHashMap objects (see Hashing and hash tables). `putIfAbsent` on the plate map is the "same plate twice" guard.
+Idempotence. A payment machine can time out and retry pay(ticketId). The gateway call carries the ticket id as the idempotency key, so two requests that race produce one charge; the lot then uses `putIfAbsent` to keep the first Payment and returns it to both callers (see Idempotence). We do not use `computeIfAbsent` around the charge, because it would hold a bin lock of the map during a slow network call. exit is idempotent too: the second call finds no ticket in the map and returns.
+Bin packing. Choosing a spot is a small bin-packing problem (see Bin packing & cluster scheduling). Best fit (smallest spot that fits) keeps large spots for large vehicles. The first pass asks for an exact match of features, so a plain car does not take an EV spot unless nothing else is free; the second pass accepts a superset. Perfect packing is impossible because arrivals are online.
+Testing. Inject a fake Clock, a counting ID generator and a gateway that records calls. Test the fit rules (a van fits only LARGE; an EV car skips a plain spot) and the allocator (nearest first; a larger spot when smaller ones are full). Test pricing with a table of (duration, fee) cases at the edges: 0, 59, 60 and 61 minutes, exactly the cap, a stay over midnight. Concurrency test: 200 threads enter a lot with 100 spots; exactly 100 tickets, 100 LotFullException, and no spot twice. Run it many times. Time-based rules use a movable clock (the idea behind Deterministic simulation testing): enter at 10:00, pay at 13:20, exit at 13:40, which is inside the grace.
+tradeoffs: Lock or lock-free claim. Choose one lock around the allocator when the code must be easy to audit and claims are rare, as in most single-site lots. Choose the concurrent sorted set plus CAS when many gates contend, or when you plan to move the claim into a database as a conditional update. You give up a bit of simplicity in exchange for no blocking and no lock order to get wrong.
+Sorted set or list scan. Choose a sorted set (nearest first) when you have thousands of spots and several rules over the order. Choose a plain list scan when the lot has fewer than a few hundred spots; it is shorter and simple to test. Choose one set per size (as here) when sizes are few and fixed; choose one set with a predicate when rules are many.
+Inheritance or composition for vehicles and spots. Choose an enum and a size field when types differ only in data (size, features). Choose subclasses (Motorcycle, Car, Truck) only when types have different behaviour, for example a truck that needs two adjacent spots. The usual class tree (Vehicle with three children, Spot with five children) adds files and no behaviour, and it breaks when a spot is both EV and accessible.
+Decorator or rule list for pricing. Choose decorators when rules wrap and change one running fee (cap, discount). Choose a list of independent rules summed or applied in a fixed order when rules do not depend on one another, such as fixed fees and taxes. Choose a table of price bands loaded from configuration when product managers change prices weekly and you do not want a deploy.
+failures: Lot full. enter throws LotFullException for that size. No plate claim stays behind, because we remove it before the throw. The display already shows zero free spots, and the gate shows "full".
+Same plate twice. putIfAbsent fails and AlreadyInsideException is thrown. This can also mean a plate was misread: staff can clear the old ticket.
+Lost ticket. The driver gives the plate. The lot finds the ticket id through the plate map, and charges the flat lost-ticket fee or the normal fee, whichever is higher, with the same idempotency rules.
+Payment failure. A declined card leaves the ticket unpaid and the spot occupied. A gateway timeout is retried with the same key, so the driver is never charged twice.
+Exit without payment or after the grace time. exit throws NotPaidException. If the grace time has passed, the driver pays the difference: quote(ticketId) prices the time since the last payment.
+Spot out of service. A free spot is taken out of the sorted set by the failed take() on its next claim and is not offered again. An occupied spot is not released into the free set when the car leaves, because free() fails when the state is OUT_OF_SERVICE. Staff put it back with a repair call that adds it to the set.
+evolution: Reservations: add a RESERVED state and an expiry for each reservation; a booking holds a spot of a size for a time window. The allocator must skip reserved spots.
+Multiple lots and a search service: a LotRegistry maps ids to lots; each lot keeps its own state.
+Monthly passes and EV charging: more decorators (pass holders pay nothing) and a charging session object attached to the ticket with its own meter and fee line.
+Distributed deployment: the claim becomes a conditional update in a database (set state OCCUPIED where state is FREE), which is the same optimistic idea.
+followups: How do you stop two cars from getting the same spot? || Make the claim atomic. Remove the spot from a concurrent sorted set (only one remover wins) and flip its state with compare-and-set. Or use one lock around allocate and release. Test it with many threads and a small number of spots.
+Why do you avoid Singleton for the ParkingLot? || A global instance hides dependencies, makes tests share state, and blocks having two lots. Create one instance in the composition root and pass it to the gates.
+How do you add a new pricing rule, for example a night discount? || Write a new PricingPolicy decorator that wraps the current one and changes the amount. Compose it in the factory. No existing class changes, and tests cover it alone.
+What if the payment call times out? || Retry with the same idempotency key. The gateway makes one charge. The lot keeps the first Payment with putIfAbsent and returns it to both callers. Do not hold a map lock while calling the gateway.
+How do you test fee rules and the grace period? || Inject a Clock and a gateway fake. Use a table of durations and expected fees, including edges at 59, 60 and 61 minutes, the cap and midnight. Move the clock to test the grace time.
+How does the design change if tickets move to a database? || The ticket and payment maps become tables with a unique key on plate and on ticket id. The spot claim becomes a conditional update. Idempotency keys become unique constraints. The classes and interfaces stay the same.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson and Vlissides, 1994 |
+ref: blog | Strategy pattern | refactoring.guru | https://refactoring.guru/design-patterns/strategy
+ref: blog | Decorator pattern | refactoring.guru | https://refactoring.guru/design-patterns/decorator
+ref: docs | ConcurrentSkipListSet (Java SE 21) | Oracle | https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ConcurrentSkipListSet.html
+
+@@ file-system
+title: In-memory file system / Unix file search
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, trees, filesystems, hashtables, locks, deadlock, graphsalgo, invindex, fuzzing
+summary: Build the core of a file system that lives in memory: directories that contain files and other directories, paths such as /var/log/app.log, and the commands a user knows from Unix: mkdir, write, read, ls, rm, mv, cp, and find with filters like name, size and age. This is object-oriented programming on a tree, so it is the standard test of the **Composite pattern**: a directory and a file are both nodes, and code that walks the tree should not care which is which. The second half is a design question about search: how do you express "all files named *.log larger than 1 MB" so that new filters need no change to the tree classes? Then come the quiet traps: paths with "." and "..", moving a directory into itself, two threads renaming in opposite directions, and a tree of a million nodes.
+requirements: Functional requirements. Paths are absolute and use "/" as separator; "." and ".." are understood. Operations: create a directory (optionally with all parents), create a file, write and append bytes, read bytes, list a directory in name order, remove a file or a directory (recursive only on request), move or rename, copy, stat (type, size, modified time), and find under a starting directory with a filter. A directory size is the sum of its files. Names are non-empty, contain no "/" and are at most 255 characters; the whole path is at most 4,096 characters (the limits of Linux). Creating a name that exists fails.
+Non-functional requirements. Extensibility: new filters (owner, extension, modified before) and new node types (symbolic link) without editing old code. Thread safety: many readers and some writers at once; no corrupt tree; no deadlock. Testability: the clock is injected, and every operation works without disk. Performance: path lookup is proportional to the path depth; find visits each node once.
+Assumptions. Everything fits in memory. No users and permissions in version one (they are an extension). No symbolic links in version one (the evolution section adds them, with loop protection).
+estimates: Take a tree with 1 million nodes. A node costs roughly 200 bytes for the object, its name, its map entry and its timestamp, so the tree takes about 200 MB plus the file contents. A path with 10 parts costs 10 map lookups; with a sorted map of 100 children that is about 7 string comparisons each, so a lookup takes a few microseconds. A full walk for find touches every node once, with pointer chasing at roughly 50 to 100 ns per node, so about 50 to 100 ms for 1 million nodes. That is fine for one query, and too slow for thousands of queries per second. Concurrency is modest, so one read-write lock is a good first design.
+api: The facade is the only class most callers see. Filters are small factory functions that build predicates.
+```java
+public interface FileSystem {
+  void mkdir(String path, boolean parents);
+  void createFile(String path);
+  void write(String path, byte[] data);
+  void append(String path, byte[] data);
+  byte[] read(String path);
+  List<Entry> ls(String path);            // sorted by name
+  void rm(String path, boolean recursive);
+  void mv(String from, String to);
+  void cp(String from, String to);
+  Stat stat(String path);
+  List<String> find(String start, Predicate<Node> spec);
+}
+
+public record Entry(String name, boolean directory, long size,
+                    Instant modified) {}
+public record Stat(boolean directory, long size, Instant modified) {}
+
+final class Filters {
+  static Predicate<Node> name(String glob) {
+    PathMatcher m = FileSystems.getDefault()
+        .getPathMatcher("glob:" + glob);
+    return n -> m.matches(Path.of(n.name));
+  }
+  static Predicate<Node> minSize(long b) { return n -> n.size() >= b; }
+  static Predicate<Node> isFile() { return n -> n instanceof FileNode; }
+}
+```
+Errors are unchecked exceptions with a common base FsException: NoSuchFileException, AlreadyExistsException, NotADirectoryException, IsADirectoryException, DirectoryNotEmptyException, InvalidPathException. This mirrors the errno values of Unix (ENOENT, EEXIST, ENOTDIR, EISDIR, ENOTEMPTY).
+datamodel: Node is the abstract base: name, a parent reference, and a modified time. FileNode adds the content as a byte array. DirectoryNode adds a map from name to child. The parent reference makes `path()` and the ".." step easy, and the map makes lookup by name fast. A directory is the only owner of its children, and each node has at most one parent, so the structure is a tree and not a general graph. That one rule is what you must protect in mv.
+The map type is a choice. TreeMap keeps names sorted, so `ls` needs no sort, and lookup is O(log k) for k children. HashMap gives O(1) lookup (see Hashing & hash tables) but `ls` must sort. We use TreeMap because listing in order is a first-class operation and directories rarely have more than a few thousand entries.
+There is no state machine here: the only state is the tree, and its invariants are: each node has one parent (except the root), names in a directory are unique, and no node is its own ancestor. Real file systems (see File systems) split the name from the file: a directory entry maps a name to an inode number, and the inode holds size, times, permissions and the data blocks. We merge them for simplicity. This is why we cannot have hard links yet.
+design: Classes. Node, FileNode and DirectoryNode form the Composite: the tree is built from one interface, `walk` and `size` work on a file or on a whole subtree with the same call. InMemoryFileSystem is the Facade: it parses paths, finds nodes, takes locks, checks rules and calls the nodes. Filters is a set of Specifications: small predicates that can be combined with and, or and negate. `find` accepts any Predicate<Node>, so adding "owner is alice" means writing one new factory method and no change to Node or to find.
+Resolve flow. Step 1: reject a path that does not start with "/". Step 2: start at the root. Step 3: split by "/" and skip empty parts and ".". Step 4: for "..", go to the parent, and stay at the root if there is none (as Unix does). Step 5: for a name, the current node must be a directory, or we throw NotADirectoryException; look up the child, or throw NoSuchFileException. This is the same walk a real kernel does for each path, one directory at a time. Create flow for mkdir -p. Resolve the parent; if a part is missing and `parents` is true, create a DirectoryNode and add it; if a part exists and is a file, fail.
+Move flow. Step 1: resolve the source and the destination parent. Step 2: check that the destination parent is not the source or inside the source: walk up from the destination parent through the parent references; if you meet the source, throw. Without this check, `mv /a /a/b/c` would cut the tree in two and lose the subtree. Step 3: check that the target name is free. Step 4: remove from the old parent, rename, add to the new parent, all under the write lock. Copy is a deep copy: walk the source subtree and rebuild it; copying into itself needs the same ancestor check.
+Patterns and why (see Design patterns and SOLID). Composite, because files and folders form a part-whole tree and clients should treat both the same. Specification (a Strategy for matching), because filters are many and combine with and/or/not. Facade for the file system API. Iterator or Visitor for traversal: we use a `walk` callback; a lazy Iterator is better when results are huge, and a Visitor is better when many different operations (size, delete, chmod, print) must be added without touching the node classes. Command for undo of rm (move to a trash directory instead of deleting) is a possible extension. Singleton is not used: tests create a fresh file system each time.
+The core is below: the Composite classes, the path walk and `find`.
+```java
+abstract class Node {
+  String name;
+  DirectoryNode parent;
+  Instant modified;
+
+  Node(String name, Instant now) {
+    this.name = name;
+    this.modified = now;
+  }
+  abstract long size();
+  abstract void walk(Consumer<Node> visit);       // pre-order
+
+  String path() {
+    if (parent == null) return "/";
+    String up = parent.path();
+    return (up.equals("/") ? "" : up) + "/" + name;
+  }
+}
+
+final class FileNode extends Node {
+  private byte[] data = new byte[0];
+  FileNode(String name, Instant now) { super(name, now); }
+  long size() { return data.length; }
+  void walk(Consumer<Node> visit) { visit.accept(this); }
+  byte[] read() { return data.clone(); }
+  void write(byte[] bytes, Instant now) {
+    data = bytes.clone();
+    modified = now;
+  }
+}
+
+final class DirectoryNode extends Node {
+  private final Map<String, Node> kids = new TreeMap<>();
+  DirectoryNode(String name, Instant now) { super(name, now); }
+  long size() {
+    return kids.values().stream().mapToLong(Node::size).sum();
+  }
+  Node child(String n) { return kids.get(n); }
+  Collection<Node> children() { return List.copyOf(kids.values()); }
+
+  void add(Node n, Instant now) {
+    if (kids.putIfAbsent(n.name, n) != null)
+      throw new AlreadyExistsException(n.name);
+    n.parent = this;
+    modified = now;
+  }
+  Node remove(String n, Instant now) {
+    Node x = kids.remove(n);
+    if (x == null) throw new NoSuchFileException(n);
+    x.parent = null;
+    modified = now;
+    return x;
+  }
+  void walk(Consumer<Node> visit) {
+    visit.accept(this);
+    for (Node k : kids.values()) k.walk(visit);
+  }
+}
+
+// inside InMemoryFileSystem
+Node resolve(String path) {
+  if (!path.startsWith("/")) throw new InvalidPathException(path);
+  Node cur = root;
+  for (String part : path.split("/")) {
+    if (part.isEmpty() || part.equals(".")) continue;
+    if (!(cur instanceof DirectoryNode d))
+      throw new NotADirectoryException(cur.path());
+    if (part.equals("..")) {
+      cur = d.parent == null ? d : d.parent;
+      continue;
+    }
+    cur = d.child(part);
+    if (cur == null) throw new NoSuchFileException(path);
+  }
+  return cur;
+}
+
+public List<String> find(String start, Predicate<Node> spec) {
+  lock.readLock().lock();
+  try {
+    List<String> hits = new ArrayList<>();
+    resolve(start).walk(n -> { if (spec.test(n)) hits.add(n.path()); });
+    return hits;
+  } finally { lock.readLock().unlock(); }
+}
+```
+Notice that `children()` returns a copy, so a caller can iterate while another thread changes the directory only if the copy was taken under the lock. The locks are in the facade, not in the nodes, so the nodes stay simple.
+diagram:
+  +--------------------------------------------------------+
+  | InMemoryFileSystem  (facade)                           |
+  |  root: DirectoryNode   lock: ReadWriteLock             |
+  |  mkdir write read ls rm mv cp stat find                |
+  +--------------------------------------------------------+
+        | resolve(path)                  | find(start, spec)
+        v                                v
+  +---------------------------+   +------------------------------+
+  | Node  (abstract)          |   | Filters  -> Predicate<Node>  |
+  |  name, parent, modified   |   |  name("*.log")               |
+  |  size()  walk()  path()   |   |  minSize(n)  isFile()        |
+  +---------------------------+   |  .and() .or() .negate()      |
+        ^                 ^       +------------------------------+
+        | is-a            | is-a
+  +-----------+     +--------------------+
+  | FileNode  |     | DirectoryNode      |
+  |  byte[]   |     |  kids: name->Node  |-----+ has many
+  +-----------+     +--------------------+     |
+                          ^                    |
+                          +--------------------+
+  /  -> var -> log -> app.log      (a tree: one parent per node)
+deepdive: Concurrency. The shared state is the whole tree. The simplest correct design is one ReentrantReadWriteLock in the facade (see Locks & atomics). `ls`, `read`, `stat` and `find` take the read lock, so many run together. `mkdir`, `write`, `rm`, `mv` and `cp` take the write lock, so they run alone. Because there is only one lock, deadlock is impossible. The cost is that one long `find` over a million nodes blocks all writers for 50 to 100 ms, and one writer blocks all readers.
+Finer locks pay off when the tree is large and busy. The usual scheme is a lock per directory with lock coupling: lock the parent, find the child, lock the child, release the parent, and so on down the path. Two operations on different branches then run in parallel. The danger is deadlock (see Deadlock): `mv /x/a /y/` takes the locks of x and y, while `mv /y/b /x/` takes y then x. Each waits for the other. Two standard fixes: always lock directories in the order of a unique id, or take one global rename lock for any move across directories. Linux does the second: it has a per-file-system rename mutex for cross-directory renames. The ancestor check in mv needs a stable view of the parent links, which is a second reason for the global rename lock.
+A third design avoids read locks. Make directories immutable and copy the path from the changed node up to the root on each write (copy on write). Readers take the root pointer once and walk a frozen snapshot. A `find` then never blocks writers and sees a consistent tree. The cost is O(depth) allocations per write and more garbage.
+Search. `find` is a depth-first walk (see Graph algorithms; a tree is a graph without cycles). Depth-first with the callback needs memory proportional to the depth and finds results in path order. Breadth-first finds shallow results first, which suits "find the nearest match" and `-maxdepth`, at the cost of memory proportional to the widest level. A walk callback is recursive; a tree 100,000 levels deep would overflow the stack, so a production walk uses an explicit stack. Pruning (the `-prune` of Unix find) skips a subtree when a directory matches a stop rule, so a search can avoid `/proc` or `node_modules`.
+When one tree answers many name searches, walking is wasteful. Keep an index: a hash map from file name to the set of nodes with that name makes `find -name exact` O(1), and a trigram inverted index (see Inverted index; the plocate tool uses this idea) answers substring and glob queries by intersecting posting lists. The index is updated by the same write paths, under the write lock, which is the price: every mkdir, rm and mv does extra work.
+Extensibility. A new filter is a new factory method. A new node type, SymlinkNode, stores a target path; `resolve` follows it with a counter that stops after 40 links (the Linux limit, error ELOOP). A new operation over the tree is a new function that uses `walk`, or a Visitor if you expect many.
+Testing. Use a fake clock for modified times. Unit tests: resolve with ".", "..", "//" and trailing slash; ".." at the root stays at the root; mkdir -p twice; rm of a non-empty directory without the recursive flag fails; mv into its own child fails; mv keeps content and size; ls is sorted; find combines filters; size of a directory equals the sum of its files after writes and deletes. Property-based tests (see Fuzzing & property-based testing) are the best fit: generate a random sequence of operations, run it on the file system and on a trivial model (a map from path to content), and compare ls and read after each step. Also check the invariants after every step: parent links match children, no cycles, sizes add up. A concurrency test runs writers and readers together and checks that no exception other than the expected NoSuchFile appears.
+tradeoffs: Composite classes or one class with a type flag. Choose the Composite (FileNode, DirectoryNode) when files and directories have different data and behaviour, which is always true here: a file has bytes and a directory has children. Choose a single Node with a flag only for a tiny teaching version. The Composite costs a few instanceof checks at the edges, such as `resolve`, and gives you code that cannot ask a file for its children.
+Visitor or methods on the nodes. Choose methods on the nodes (`size()`, `walk()`) when the set of operations is small and stable, and you expect new node types such as symbolic links. Choose a Visitor when you expect many new operations over a stable set of node types (du, chmod -R, export, checksum), because each operation lives in one class. This is the expression problem: you can make one of the two directions easy, not both.
+Global read-write lock, per-directory locks or copy on write. Choose one read-write lock when the tree is small or traffic is low: it is almost impossible to get wrong. Choose per-directory locks with a global rename lock when many writers work in different branches and profiling shows contention. Choose copy on write when readers are many, long scans must not block writers, and you accept more allocation.
+TreeMap or HashMap for children. Choose TreeMap when ls in name order is common and directories are modest. Choose HashMap when directories can hold millions of entries and lookup speed matters more than order; sort only in ls. Real file systems use hashed or tree-based directory indexes for large directories.
+failures: Bad paths. Relative paths, empty names, names with "/" or the names "." and ".." as a new file name, names over 255 characters and paths over 4,096 characters are rejected with InvalidPathException before any change.
+Missing and wrong types. A missing parent gives NoSuchFileException unless `parents` is true. Using a file as a directory gives NotADirectoryException. Writing to a directory or reading a directory gives IsADirectoryException. A name that exists gives AlreadyExistsException. rm of a non-empty directory without `recursive` gives DirectoryNotEmptyException. All checks happen before the first change, so a failed operation leaves the tree as it was.
+Dangerous moves. rm "/" is rejected. mv or cp of a directory into itself or its descendant is rejected by the ancestor check. mv onto an existing name fails (or replaces a file atomically if you choose the Unix rule, but never a directory with content).
+Concurrent changes during find. With the read lock held for the whole walk, the tree cannot change. With copy on write the walk sees one consistent snapshot, which may be a little old. With per-directory locks you must say that find is not a snapshot.
+evolution: Symbolic links and hard links: split Node into a name entry and an inode, add a link count, and add SymlinkNode with the ELOOP limit.
+Permissions: add owner, group and mode bits to the inode, check the execute bit on each directory during `resolve` and the read/write bit on the final node. A User object is passed to every call.
+File handles: open returns a handle with an offset, read and write advance it, and close releases it. The handle is a small state machine (OPEN, CLOSED).
+Watchers: an Observer interface like inotify, called after each change, used for caches and the search index.
+followups: Why is Composite the right pattern here? || Files and directories form a part-whole hierarchy, and many operations (size, walk, find) should work on both through the same call. The directory delegates to its children, the file is the leaf. Clients do not need instanceof checks except at the few places that really need a directory.
+How do you add a new find filter, for example owner or modified before a date? || Write one new Predicate factory and combine it with and/or/negate. Neither Node nor find changes. If filters need to be parsed from a command line, add a small parser that builds the predicate tree.
+How can mv cause a deadlock, and how do you prevent it? || Two moves in opposite directions can lock two directories in opposite order. Fix it with a global lock order (by unique directory id) or one rename lock for cross-directory moves, as Linux does. With one global read-write lock the problem does not exist.
+How would you support symbolic links without infinite loops? || Add a SymlinkNode with a target path. During resolve, follow links and count them; stop with an error after 40 (the Linux limit). For a walk that follows links, also keep a visited set of node ids.
+How do you make repeated name searches fast? || Keep an index updated on every write: a hash map from name to nodes for exact names, and a trigram inverted index for substring and glob queries. It trades slower writes and more memory for fast reads; decide if it may be stale.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson and Vlissides, 1994 |
+ref: blog | Composite pattern | refactoring.guru | https://refactoring.guru/design-patterns/composite
+ref: blog | Visitor pattern | refactoring.guru | https://refactoring.guru/design-patterns/visitor
+ref: book | Operating Systems: Three Easy Pieces (file system implementation chapters) | Arpaci-Dusseau and Arpaci-Dusseau | https://pages.cs.wisc.edu/~remzi/OSTEP/
+
+@@ movie-booking
+title: Movie ticket booking
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, locks, occ, ccontrol, automata, idempotence, isolation, retries, hashtables
+summary: Design the booking core of a cinema chain: users search for shows, look at a seat map, choose seats, pay, and receive tickets. The domain is easy to model with objects (theatre, screen, seat, movie, show, booking, payment), so it tests object-oriented programming in the plain sense. The hard part is the **seat**: two users must never buy the same seat of the same show, yet a seat that someone is thinking about must be held for a few minutes and then released if they do not pay. That makes it a problem of temporary reservation, expiry, all-or-nothing updates over several seats, and payments that can fail or repeat. A strong answer separates the static model (a physical seat) from the per-show state (this seat, this show), uses a small state machine for the booking, and shows exactly where the concurrency control sits.
+requirements: Functional requirements. Search shows by city, movie and date. Show the seat map of a show with the state of each seat (available, held, booked) and its price. A user selects 1 to 6 seats and holds them for 10 minutes. The user pays within the hold time; on success the booking is confirmed and tickets with a QR code are sent. If the hold expires, the payment fails for good, or the user cancels, the seats become available. A confirmed booking can be cancelled up to 2 hours before the show with a refund by a policy. Prices depend on seat type (regular, premium, recliner), time of day and weekday. Coupons reduce the price.
+Non-functional requirements. Correctness: no seat is sold twice, and a user is never charged without getting seats (or a refund). Thread safety under high contention on one popular show. Extensibility: new pricing rules, refund policies, payment methods and notification channels without editing old classes. Testability: injected clock, injected payment gateway. Retry safety: every call that changes money or seats can be repeated.
+Assumptions. One service owns the seat state of a show. Search and the catalog (movies, theatres, shows) are read-mostly. Payment happens at an external gateway that supports an idempotency key. Seat selection is by seat id (no automatic "best available") in version one.
+estimates: A city multiplex has 10 screens with 250 seats and 5 shows a day: 12,500 seats a day. A seat state is a small object, so a show costs about 250 x 50 bytes = 12 KB, and 1,000 shows in memory cost 12 MB. Load is spiky, not large. A big release goes on sale at 10:00, and 5,000 users may open the same show within a minute for 250 seats. That is 20 requests per seat, mostly fighting for the best 50 seats. So the numbers to remember are not queries per second but contention: many threads, few hot objects. Only 20 to 30 percent of holds end in a payment, so about 70 percent of holds expire, and the system must release them cheaply.
+api: One facade for the user flow. Policies and external systems are interfaces.
+```java
+public interface BookingService {
+  List<ShowInfo> search(String city, String movieId, LocalDate day);
+  SeatMap seatMap(String showId);
+  Booking hold(String userId, String showId, List<String> seatIds);
+  Booking pay(String bookingId, PaymentDetails details); // idempotent
+  void cancel(String bookingId);
+  Optional<Booking> get(String bookingId);
+}
+
+public interface PricingStrategy {
+  Money price(Show show, Seat seat);
+}
+
+public interface RefundPolicy {
+  Money refund(Booking b, Instant now);   // zero after the cutoff
+}
+
+public interface PaymentGateway {
+  PaymentResult charge(String idempotencyKey, Money amount,
+                       PaymentDetails d);
+  void refund(String idempotencyKey, Money amount);
+}
+
+public interface BookingListener {
+  void onConfirmed(Booking b);
+  void onExpired(Booking b);
+  void onCancelled(Booking b);
+}
+```
+Errors: SeatUnavailableException (carries the seat ids that failed), HoldExpiredException, TooManySeatsException, ShowStartedException, PaymentFailedException. A failed hold changes nothing.
+datamodel: Static model: Theatre has Screens; a Screen has Seats (row, number, SeatType). Movie (title, duration). Show: id, movie, screen, start time, base price tier. The catalog keeps indexes from city to theatres and from (movie, day) to shows in hash maps (see Hashing & hash tables), because search is a lookup, not a scan.
+Per-show state: ShowSeat is the pair (show, seat) with a state. This is the key modelling step. A Seat is a physical chair and is shared by every show on that screen, so its availability cannot live on the Seat. We keep a map from seat id to a state cell for each show. The state is an immutable value: kind (AVAILABLE, HELD, BOOKED), the booking id that owns it, and the hold expiry time. Immutable values make compare-and-set safe.
+Booking: id, user id, show id, seat ids, price lines and total, status, created time, hold-until time, payment reference. Ticket: booking id, seat, QR code.
+The booking is a finite automaton (see Finite automata).
+```text
+ PENDING --pay()-----------> PAYING
+ PENDING --hold ran out----> EXPIRED
+ PENDING --user cancels----> CANCELLED
+ PAYING  --charge ok, seats confirmed--> CONFIRMED
+ PAYING  --charge declined-> PENDING   (user may retry)
+ PAYING  --seats lost-----> EXPIRED    (refund the charge)
+ CONFIRMED --cancel before cutoff----> CANCELLED (refund)
+ EXPIRED, CANCELLED: final.   CONFIRMED: final after the show.
+```
+The seat cell has its own tiny machine: AVAILABLE to HELD to BOOKED, with HELD back to AVAILABLE on release or expiry, and BOOKED back to AVAILABLE only on cancellation.
+design: Classes. BookingService is the Facade. SeatInventory (one ShowSeats per show) owns the seat cells and offers hold, confirm and release as all-or-nothing operations. Booking owns its status and checks transitions. PricingStrategy computes a price per seat; real pricing is a chain of Decorators around a base price (weekend surcharge, premium seat, coupon discount), so rules combine without a class for each combination. RefundPolicy is a Strategy, for example "full refund until 2 hours before the show, nothing after". PaymentGateway is an Adapter over the external API. BookingListener is the Observer for e-mail, SMS and analytics. A Clock is injected everywhere.
+Hold flow. Step 1: validate the request (1 to 6 seats, show not started). Step 2: create a Booking in PENDING with a new id and holdUntil = now + 10 minutes. Step 3: call `hold` on the show's seat inventory with all seat ids. It either takes every seat or none. Step 4: if it fails, throw SeatUnavailableException with the failed ids and discard the booking. Step 5: otherwise store the booking and return it with the price and the deadline. Pay flow. Step 1: load the booking; if it is already CONFIRMED, return it (this makes a repeated call safe). Step 2: if less than 2 minutes remain on the hold, refuse and ask the user to select again, so the hold cannot run out while the gateway works. Step 3: move to PAYING. Step 4: call the gateway with the booking id as idempotency key. Step 5: on success call `confirm` on the seats; if it succeeds, move to CONFIRMED and notify. Step 6: if confirm fails, refund by the same key and move to EXPIRED. Step 7: if the gateway declines, move back to PENDING.
+Patterns and why (see Design patterns and SOLID). State for the booking, because each status allows only some actions. Strategy for pricing and refunds: marketing changes these every month. Decorator for price rules and coupons. Observer for notifications. Adapter for the payment gateway, so the domain never sees vendor types. Facade for the service. Factory to create bookings and tickets. Singleton for the service is avoided: wire one instance in the composition root. Keep money in a Money value class (long minor units plus currency), never a double.
+The core of the design is the seat inventory of one show.
+```java
+enum Kind { AVAILABLE, HELD, BOOKED }
+
+record SeatState(Kind kind, String bookingId, Instant until) {
+  static final SeatState FREE =
+      new SeatState(Kind.AVAILABLE, null, null);
+
+  static SeatState held(String bookingId, Instant until) {
+    return new SeatState(Kind.HELD, bookingId, until);
+  }
+  boolean claimable(Instant now) {      // free, or a hold that ran out
+    return kind == Kind.AVAILABLE
+        || (kind == Kind.HELD && !until.isAfter(now));
+  }
+  boolean heldBy(String id, Instant now) {
+    return kind == Kind.HELD && bookingId.equals(id)
+        && until.isAfter(now);
+  }
+}
+
+final class ShowSeats {
+  private final Map<String, AtomicReference<SeatState>> seats =
+      new HashMap<>();                  // fixed after construction
+
+  ShowSeats(Collection<String> seatIds) {
+    for (String id : seatIds)
+      seats.put(id, new AtomicReference<>(SeatState.FREE));
+  }
+
+  /** All-or-nothing hold. Seats are tried in sorted order. */
+  boolean hold(Collection<String> ids, String bookingId,
+               Instant now, Duration ttl) {
+    SeatState mine = SeatState.held(bookingId, now.plus(ttl));
+    List<AtomicReference<SeatState>> got = new ArrayList<>();
+    for (String id : new TreeSet<>(ids)) {
+      AtomicReference<SeatState> ref = ref(id);
+      SeatState cur = ref.get();
+      if (cur.claimable(now) && ref.compareAndSet(cur, mine)) {
+        got.add(ref);
+      } else {
+        for (var r : got) r.compareAndSet(mine, SeatState.FREE);
+        return false;                   // somebody else has a seat
+      }
+    }
+    return true;
+  }
+
+  /** After payment: turn our holds into bookings, all or nothing. */
+  boolean confirm(Collection<String> ids, String bookingId,
+                  Instant now) {
+    SeatState booked = new SeatState(Kind.BOOKED, bookingId, null);
+    List<AtomicReference<SeatState>> done = new ArrayList<>();
+    for (String id : new TreeSet<>(ids)) {
+      AtomicReference<SeatState> r = ref(id);
+      SeatState cur = r.get();
+      if (cur.heldBy(bookingId, now) && r.compareAndSet(cur, booked)) {
+        done.add(r);
+      } else {                          // hold ran out: undo, refund
+        for (var d : done) d.compareAndSet(booked, SeatState.FREE);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void release(Collection<String> ids, String bookingId) {
+    for (String id : ids) {
+      AtomicReference<SeatState> r = ref(id);
+      SeatState cur = r.get();
+      if (cur.bookingId() != null && cur.bookingId().equals(bookingId))
+        r.compareAndSet(cur, SeatState.FREE);
+    }
+  }
+
+  private AtomicReference<SeatState> ref(String id) {
+    AtomicReference<SeatState> r = seats.get(id);
+    if (r == null) throw new NoSuchSeatException(id);
+    return r;
+  }
+}
+```
+Seat ids are tried in sorted order, and the cells are compared by reference. If two users want {A1, A2} and {A2, A3}, both go for A2 after their first seat, and exactly one wins. Without the sort, each could take its first seat and then fail on the second, and both would roll back although one could have succeeded.
+diagram:
+  +----------------------------------------------------------+
+  | BookingService  (facade)                                 |
+  |  search() seatMap() hold() pay() cancel()                |
+  +----------------------------------------------------------+
+     |           |              |               |            |
+     v           v              v               v            v
+  +--------+ +-----------+ +-------------+ +---------+ +----------+
+  |Catalog | | Seat      | | Pricing-    | | Payment | | Booking- |
+  |(index) | | Inventory | | Strategy    | | Gateway | | Listener |
+  |movie,  | | per show  | | <<I>>       | | <<I>>   | | <<I>>    |
+  |show    | |           | | (decorators)| |(adapter)| | (observer)|
+  +--------+ +-----------+ +-------------+ +---------+ +----------+
+                  |
+                  | seatId -> AtomicReference<SeatState>
+                  v
+  +-------------------------------------------------+
+  | SeatState (immutable): AVAILABLE | HELD | BOOKED |
+  |   bookingId, holdUntil                          |
+  +-------------------------------------------------+
+  Booking: PENDING -> PAYING -> CONFIRMED | EXPIRED | CANCELLED
+  Sweeper (every 30 s): expired PENDING bookings -> release seats
+deepdive: Concurrency. What is shared? The seat cells of a show. Many users touch few cells, so contention is the problem, not volume. There are three standard answers (see Locks & atomics and Concurrency control (2PL, OCC)). Pessimistic: take a lock on the show (or on each seat in sorted order), check, change, unlock. It is simple and correct, and under a rush all users queue behind one lock for the whole check-and-update. Optimistic: read the cell, decide, and change it with compare-and-set; if someone else changed it first, the CAS fails and you give up that seat at once (see Optimistic concurrency). Nobody waits, and a loser learns about it immediately, which is what a user wants to hear. We use the optimistic way, per seat. Database: let the store enforce the rule, as described below.
+Why the all-or-nothing hold works without a lock. Each CAS is atomic for one seat. A multi-seat hold is a sequence of CAS calls plus a rollback of the ones that succeeded. Taking seats in sorted order means two overlapping requests collide on their first shared seat, so one proceeds and one fails fast. No thread ever waits for another, so there is no deadlock. A seat map read in the middle of a hold may show a partial result for a few microseconds; that is fine for display and never used for decisions.
+Expiry without timers. A hold carries its own expiry time, and `claimable(now)` treats an expired hold as free. So correctness does not depend on a background job: the next user simply takes the seat. A sweeper still runs every 30 seconds to move expired bookings to EXPIRED, notify listeners and keep the seat map accurate for display. Keep pending bookings in a priority queue by holdUntil so the sweeper only looks at the head.
+Database version. In a real system seat state is in a database shared by many service instances. The strongest rule is a unique constraint: a table booked_seat with primary key (show_id, seat_id) can hold one row per seat, so a second insert fails whatever the code does. Holds use a conditional update: set state to HELD, owner and expiry where the seat is available or its hold has expired, and check that the number of changed rows equals the number of requested seats; otherwise roll back the transaction. This works at READ COMMITTED isolation because the condition is inside the statement (see Isolation levels); SERIALIZABLE would also work but aborts more and needs retries. Do not read first and write later in separate statements.
+Payments and repeats. The gateway call is slow and can time out. The booking id is the idempotency key, so a retry of charge produces one charge (see Idempotence). Retry with exponential backoff and jitter on timeouts, and never retry a decline (see Retries, backoff & jitter). The gateway can also call back (webhook) twice; the handler loads the booking, finds it CONFIRMED and returns. If the money is taken but `confirm` fails because the hold ran out, we compensate: refund with the same key and tell the user. This is a saga in miniature: charge, confirm, and a refund as the undo step.
+Extensibility. A new price rule is a new decorator. A new refund policy is a new class chosen per theatre. A new notification channel is a new listener. "Best available" seating is a new SeatSelector Strategy that turns a seat count into seat ids and then calls the same `hold`.
+Testing. Inject a fake clock and a fake gateway that can succeed, decline, time out or succeed twice. Test the seat cell rules: hold, a second hold fails, an expired hold can be taken, confirm after expiry fails, release by the wrong booking does nothing. Test the booking machine: every legal transition and every illegal one. Concurrency test: 100 threads each hold a random pair from 20 seats; assert that no seat belongs to two bookings, and that the number of successful holds times two is at most 20. Run it many times with a start barrier. Test the compensation path: the gateway succeeds, then the clock jumps past the hold.
+tradeoffs: Pessimistic lock, optimistic CAS or database constraint. Choose a per-show lock when the service is one process and the code must be easy to prove; you give up parallelism on a hot show. Choose per-seat CAS when contention is high and users should get an immediate "taken" answer; you give up simple code and must write rollback. Choose the database constraint plus conditional update when several instances run or when state must survive restart; you pay a database round trip per hold. Many systems combine them: CAS in memory for speed, a unique constraint as the final guard.
+Hold first or pay first. Choose hold-then-pay (as here) when users should be sure that their seats are theirs while they type a card number. The cost is that seats are blocked by users who leave. Choose pay-then-allocate only for general admission tickets, where no specific seat is promised. Choose a short hold (5 minutes) for a busy show, a longer one (10 to 15) when payment needs a bank app.
+Lazy or eager expiry. Choose lazy expiry (an expired hold counts as free when someone claims it) as the correctness mechanism, always. Choose to add an eager sweeper for accurate seat maps, notifications and metrics. A timer per hold is the weakest choice: it needs memory, it is lost on restart, and it does not make the answer more correct.
+failures: Invalid input. Unknown show or seat id, a duplicate seat id in one request, zero seats, more than 6 seats, a show that already started: all rejected before any state changes.
+Seat taken. hold returns false; the service throws SeatUnavailableException with the failed ids. Rollback has freed everything we took. The client refreshes the seat map.
+Hold expires while the user pays. The pay step refuses when fewer than 2 minutes remain. If expiry still happens, `confirm` fails, we refund, move to EXPIRED and tell the user. The user sees "your seats were released and you were not charged".
+Gateway failure. A timeout is retried with the same key. A decline moves the booking back to PENDING so the user can try another card within the hold time. An unknown result (timeout after the last retry) keeps the booking in PAYING and a reconciliation job asks the gateway for the status by key.
+Duplicate requests. A double click on Pay or a repeated webhook finds the booking already CONFIRMED and returns the same booking. Creating a booking twice for the same seats is blocked by the seat cells, and a client-sent request id can make hold itself idempotent.
+Crash. If the process dies after the charge and before the confirm, the reconciliation job finds bookings in PAYING with a successful charge, and confirms or refunds them. State of holds is lost on restart; confirmed bookings are reloaded.
+evolution: Best-available seating: a SeatSelector strategy that scores seat groups by row and distance from the centre.
+Waiting room for big on-sale events: a queue in front of the service lets in a fixed number of users per second, so the hot show sees steady load.
+Multiple theatres and services: the catalog service and the booking service are split; the show id is the boundary, and each show is owned by one node (partitioned by show id).
+followups: Why is availability not a field on Seat? || A Seat is the physical chair and exists in every show on that screen. Availability is per show, so the state belongs to the pair (show, seat). Putting it on Seat would mark the chair taken for 8 p.m. and 10 p.m. alike.
+How do you stop two users from buying the same seat? || Make the claim atomic. In memory use compare-and-set per seat, or a lock per show. In a database use a conditional update and a unique key on (show, seat). Test it with many threads on few seats.
+How do you hold several seats all or nothing? || Try them in sorted order, remember the ones you took, and on the first failure release them and return false. Sorted order makes overlapping requests collide on the same seat first, so one of them wins. Nobody waits, so there is no deadlock.
+What happens to a hold that nobody pays for? || It carries an expiry time. A new claim treats an expired hold as free, so correctness needs no timer. A sweeper moves the booking to EXPIRED and notifies listeners.
+A payment succeeds but the seats are gone. What now? || Compensate: refund with the same idempotency key, mark the booking EXPIRED and tell the user. Reduce the chance by refusing to start a payment when little hold time remains. A reconciliation job covers crashes between charge and confirm.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson and Vlissides, 1994 |
+ref: blog | State pattern | refactoring.guru | https://refactoring.guru/design-patterns/state
+ref: blog | Decorator pattern | refactoring.guru | https://refactoring.guru/design-patterns/decorator
+ref: book | Designing Data-Intensive Applications (transactions and weak isolation chapters) | Martin Kleppmann, 2017 |
+
+@@ logging-service
+title: Logging service
+category: Object-oriented design
+level: Mid / Senior
+concepts: oop, designpatterns, semaphores, queuesbuf, backpressure, batching, locks, thread, wal, retries, circuitbreaker
+summary: Design a logging library like Log4j or SLF4J with Logback: application code calls `logger.info("...")`, and the line goes to the console, a rolling file or a remote collector, in a chosen format, only if its level is enabled. This is a favourite problem for object-oriented programming because it needs several patterns at once (Strategy for formats and policies, Observer for destinations, Decorator for async and buffering, a Factory with a registry for loggers) and because it has hard operational rules. Logging sits on the hot path of every request, so it must be cheap when a level is off, must never throw into business code, and must never block the application for long when the disk or network is slow. The core of a strong answer is the **bounded queue between callers and the writer**, with a clear policy for what happens when it is full.
+requirements: Functional requirements. Levels TRACE, DEBUG, INFO, WARN, ERROR. Loggers have names in a hierarchy ("com.acme.billing" inherits from "com.acme") and an optional level; a logger without a level uses its nearest parent's level. A logger sends events to appenders: console, rolling file, and a network sink. Each appender has a formatter (plain text or JSON) and optional filters. Events carry time, level, logger name, thread name, message, optional exception and a context map (request id, user id). Files roll by size (100 MB) or by day, and old files are removed after a retention time. Levels can change at run time. On shutdown, pending events are written.
+Non-functional requirements. Overhead: a disabled call costs a level comparison and nothing else (no string building). Safety: logging never throws to the caller and never grows memory without bound. Throughput: tens of thousands of events per second per process. Thread safety: many application threads log at once; one event is never torn into pieces in a file. Extensibility: a new appender, formatter or filter needs no change to Logger. Testability: clock and sinks are injected; async behaviour can be made deterministic.
+Assumptions. One process, JVM-like threads. Delivery is best effort: after a crash we may lose the events still in memory, which is a stated trade-off and not a bug. Central log storage, search and dashboards are out of scope.
+estimates: Take a service with 5,000 events per second on average, 50,000 in a burst, 300 bytes per event. Average output is 1.5 MB per second, about 130 GB a day uncompressed; a burst is 15 MB per second. A file or local disk handles that when writes are batched, but a single synchronous write with a flush costs 20 to 100 microseconds, so 50,000 of them need most of a core and stall the caller. Enqueueing an event into an in-memory queue costs roughly 100 to 300 nanoseconds. A queue of 8,192 events holds about 2.5 MB. If the sink stalls for 5 seconds at 5,000 events per second, 25,000 events arrive, three times the queue size. So the design must decide what to do when full: that is a requirement, not an edge case.
+api: Application code sees Logger and LoggerFactory. The pipeline behind them is interfaces.
+```java
+public enum Level { TRACE, DEBUG, INFO, WARN, ERROR }
+public enum OverflowPolicy {
+  BLOCK, DROP_NEWEST, DROP_OLDEST, KEEP_ERRORS
+}
+
+public record LogEvent(Instant time, Level level, String logger,
+    String thread, String message, Throwable error,
+    Map<String, String> context) {}
+
+public final class Logger {
+  public boolean isEnabled(Level level);
+  public void log(Level level, String msg);
+  public void log(Level level, Supplier<String> msg);   // lazy
+  public void error(String msg, Throwable t);
+  public void addAppender(Appender a);
+  public void setLevel(Level level);                    // or null
+}
+
+public final class LoggerFactory {
+  public static Logger get(String name);
+  public static void configure(LogConfig config);
+}
+
+public interface Appender extends AutoCloseable {
+  void append(LogEvent e) throws IOException;
+  default void appendAll(List<LogEvent> es) throws IOException {
+    for (LogEvent e : es) append(e);
+  }
+  default void appendAllQuietly(List<LogEvent> es) { /* catch all */ }
+  default void flush() throws IOException {}
+}
+
+public interface Formatter { String format(LogEvent e); }
+public interface LogFilter { boolean accept(LogEvent e); }
+public interface CircuitBreaker {
+  boolean allowRequest(); void onSuccess(); void onFailure();
+}
+```
+Rules for the contract: `Logger.log` never throws; `Appender.append` may throw IOException and the wrapper decides what to do; `close()` flushes.
+datamodel: LogEvent is an immutable record created once per call. It is immutable because it crosses threads: the caller thread creates it and the writer thread formats it. The context map is copied at creation, because the thread-local map of the caller will change before the writer runs. The thread name is also captured at creation, for the same reason.
+Logger: name, an optional level, a parent reference or a name-prefix lookup, and a list of appenders. LoggerFactory keeps a ConcurrentHashMap from name to Logger (see Hashing & hash tables), and computeIfAbsent creates a logger once per name. The effective level of a logger is its own level or its parent's; it is cached in a volatile field and recomputed for the subtree when a level changes, so the hot path reads one integer.
+The appender has a life cycle. NEW, then STARTED, then STOPPING while it drains the queue, then STOPPED. After STOPPED, append is a silent no-op. The circuit breaker has three states: CLOSED (normal), OPEN (the sink is failing; skip it for 30 seconds and use the fallback), and HALF_OPEN (let one batch through; success closes it, failure opens it again). These are two small state machines; keep them as enums with a transition method each.
+design: Classes and their jobs. Logger decides if a call is enabled, builds the LogEvent and hands it to its appenders. It does not format, write or filter by content. Appender is the destination. AbstractAppender is a Template Method: filter, then format, then write, with the write step left to subclasses (ConsoleAppender, RollingFileAppender, HttpAppender). Formatter is a Strategy: PatternFormatter and JsonFormatter. LogFilter is a Strategy chain: LevelFilter, RegexFilter, SamplingFilter, RedactionFilter. AsyncAppender is a Decorator: it wraps any Appender, implements the same interface, and adds a queue and a writer thread. RollingFileAppender uses a RotationPolicy Strategy (by size, by time) and a RetentionPolicy.
+Call flow. Step 1: application calls `logger.info(supplier)`. Step 2: the logger compares the level with its cached effective level; if disabled, return without calling the supplier. Step 3: build the LogEvent: now, thread name, the message from the supplier, and a copy of the context. Step 4: for each appender, call `append`. Step 5: for an AsyncAppender, `append` calls `queue.offer` and returns. Step 6: the writer thread takes a batch from the queue, applies filters and the formatter, and writes the batch to the sink in one call. Step 7: if the write fails, it retries with backoff, then falls back to stderr or a local file and opens the circuit breaker.
+Patterns and why (see Design patterns and SOLID). Strategy for formatter, filter, rotation and overflow policy: these vary by deployment. Observer, because a logger notifies a list of appenders and does not know their types. Decorator for async, buffering and sampling wrappers: each adds one behaviour and they stack. Template Method for common appender steps. Factory and registry for LoggerFactory.get(name). Builder for configuration. Chain of Responsibility for filters, where each filter may accept, deny or pass on. Singleton: the LoggerFactory registry is one of the few honest uses, because loggers are looked up by name from anywhere; still hide it behind a static method and allow a test to reset it.
+The core of the design is the async appender: a bounded queue, a policy for overflow, batching, retry, a breaker and a clean stop.
+```java
+public final class AsyncAppender implements Appender {
+  private static final LogEvent STOP = LogEvent.poison();
+  private final BlockingQueue<LogEvent> queue;
+  private final Appender sink, fallback;
+  private final CircuitBreaker breaker;
+  private final OverflowPolicy policy;
+  private final int batchSize, maxRetries;
+  private final LongAdder dropped = new LongAdder();
+  private final Thread worker;
+
+  public AsyncAppender(Appender sink, Appender fallback,
+      CircuitBreaker breaker, OverflowPolicy policy,
+      int capacity, int batchSize, int maxRetries) {
+    this.sink = sink; this.fallback = fallback; this.breaker = breaker;
+    this.policy = policy; this.batchSize = batchSize;
+    this.maxRetries = maxRetries;
+    this.queue = new ArrayBlockingQueue<>(capacity);
+    this.worker = new Thread(this::drainLoop, "log-writer");
+    worker.setDaemon(true);
+    worker.start();
+  }
+
+  @Override public void append(LogEvent e) {      // never throws
+    if (queue.offer(e)) return;                   // fast path
+    switch (policy) {
+      case DROP_NEWEST -> dropped.increment();
+      case DROP_OLDEST -> {
+        queue.poll();                             // make room
+        if (!queue.offer(e)) dropped.increment();
+      }
+      case KEEP_ERRORS -> {
+        if (e.level().compareTo(Level.ERROR) >= 0) putQuietly(e);
+        else dropped.increment();
+      }
+      case BLOCK -> putQuietly(e);
+    }
+  }
+
+  private void putQuietly(LogEvent e) {
+    try { queue.put(e); }
+    catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+      dropped.increment();
+    }
+  }
+
+  private void drainLoop() {
+    List<LogEvent> batch = new ArrayList<>(batchSize);
+    boolean stop = false;
+    while (!stop) {
+      try {
+        batch.add(queue.take());                  // wait for work
+        queue.drainTo(batch, batchSize - 1);      // group the rest
+      } catch (InterruptedException ie) { stop = true; }
+      stop |= batch.removeIf(ev -> ev == STOP);
+      if (!batch.isEmpty()) write(batch);
+      batch.clear();
+    }
+    try { sink.flush(); } catch (IOException ignored) { }
+  }
+
+  private void write(List<LogEvent> batch) {
+    for (int attempt = 0; breaker.allowRequest(); attempt++) {
+      try { sink.appendAll(batch); breaker.onSuccess(); return; }
+      catch (IOException ex) {
+        breaker.onFailure();
+        if (attempt >= maxRetries) break;
+        sleepQuietly(Backoff.delayMs(attempt));   // with jitter
+      }
+    }
+    fallback.appendAllQuietly(batch);             // stderr or file
+  }
+
+  private static void sleepQuietly(long ms) {
+    try { Thread.sleep(ms); }
+    catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
+  public long droppedCount() { return dropped.sum(); }
+
+  @Override public void close() throws InterruptedException {
+    queue.offer(STOP, 1, TimeUnit.SECONDS);       // after the rest
+    worker.join(5_000);
+  }
+}
+```
+The queue is a bounded buffer. A bounded buffer is what you build with two semaphores, one counting free slots and one counting filled slots (see Semaphores & bounded buffers); ArrayBlockingQueue does the same with one lock and two conditions. `offer` is the non-blocking try, `put` is the blocking wait.
+diagram:
+  app thread 1   app thread 2   app thread N
+       |              |              |
+       v              v              v
+  +-----------------------------------------------+
+  | Logger "com.acme.billing"                     |
+  |  isEnabled(level)? -> build LogEvent          |
+  +-----------------------------------------------+
+       | for each appender (Observer)
+       v
+  +---------------------------+
+  | AsyncAppender (Decorator) |      bounded queue (e.g. 8,192)
+  |  offer(event) ----------> |  [e][e][e][ ][ ][ ][ ][ ]
+  |  overflow policy          |              |
+  +---------------------------+              v take + drainTo(batch)
+                                      +--------------+
+                                      | writer thread|
+                                      +--------------+
+                                              | filter -> format
+                                              v
+                        +-----------------------------------+
+                        | CircuitBreaker + retry (backoff)  |
+                        +-----------------------------------+
+                           | ok                     | open/fail
+                           v                        v
+              +-------------------------+    +--------------+
+              | RollingFile / Http /    |    | Fallback     |
+              | Console  Appender       |    | stderr, file |
+              +-------------------------+    +--------------+
+deepdive: Concurrency. Many application threads produce events and one writer thread consumes them. This many-producers, one-consumer shape is the classic use of a bounded queue (see Queues, skip lists & ring buffers). Each producer holds the queue lock only for the instant of `offer`, so a caller pays about the cost of one lock and one array write. The writer owns the sink alone, so the file or socket needs no lock, and events are written in the order they were accepted. Per-thread order is preserved; the order between threads is whatever the queue decided, and that is all a log can promise. A lock-free ring buffer (the LMAX Disruptor, used by Log4j 2 async loggers) lowers the cost under heavy contention. Start with the standard queue and measure.
+Backpressure. If the queue is full, the system must choose (see Backpressure). BLOCK slows the application to the speed of the sink: no loss, but a stuck disk now stalls request threads, which is dangerous. DROP_NEWEST is the cheapest and keeps the oldest events, which often explain the cause of an incident. DROP_OLDEST keeps the latest events, which show the current state. KEEP_ERRORS drops DEBUG and INFO first and blocks (or waits briefly) only for WARN and ERROR, which is the most common production choice. In all non-blocking cases count the drops, and write a single "N events dropped" line when the sink recovers. A drop without a counter is a silent bug.
+Batching. The writer takes one event with `take`, then `drainTo` grabs up to batchSize − 1 more without waiting. It formats the batch into one buffer and does one write call and one flush. Under load, batches grow by themselves and the cost per event falls; under light load, a batch has one event (see Batching). For a file, the cost that batching saves is the system call and, if you ask for durability, the fsync. A log file is an append-only log (see Log / write-ahead log): it has the same questions about when to flush to the OS and when to fsync to disk. A common setting is: flush each batch to the OS and fsync every second. One fsync per event is unaffordable, since each can cost milliseconds.
+Failure handling. A sink can fail: disk full, a collector down, a network timeout. The writer retries a batch up to maxRetries times with exponential backoff and jitter (see Retries, backoff & jitter), then writes the batch to the fallback. Each failure also counts in the circuit breaker (see Timeouts & circuit breakers). After five failures it opens: for 30 seconds the writer sends everything straight to the fallback without waiting for timeouts, so the queue keeps draining. After 30 seconds one probe batch tests the sink. Without the breaker, a dead collector with 5-second timeouts would make the writer process 1 batch per 15 seconds and the queue would overflow at once.
+Threads and shutdown. The writer is a daemon thread, so it never keeps the JVM alive. Shutdown puts a STOP marker after the last event: the writer finishes everything before it, flushes and ends. `close()` waits for at most 5 seconds, so a hung sink cannot hang the exit. Call it from a JVM shutdown hook. Events in memory at SIGKILL are lost; document this.
+Extensibility. A new destination is a new Appender class with no change to Logger. A Kafka appender is an Appender that sends batches to a topic. Sampling, redaction of card numbers and rate limits are Filters. A per-request override ("trace this user") is a filter on the context map. Dynamic levels come from an endpoint that calls setLevel; the effective-level cache is recomputed.
+Testing. Use a recording Appender in tests and assert events, not text. Make async deterministic: give AsyncAppender a test mode where `flushAndWait()` blocks until the queue is empty, or inject an executor. Overflow tests: capacity 2, a sink blocked by a CountDownLatch, send 10 events, assert the counters for each policy (DROP_NEWEST keeps events 1–2; DROP_OLDEST keeps 9–10; KEEP_ERRORS keeps all ERRORs). Retry tests: a sink that fails twice and then works; assert 3 attempts. Breaker tests with a fake clock: five failures open it, 30 seconds later it half-opens. Shutdown test: 1,000 events, then close(), assert 1,000 written. Stress test: 8 producer threads, 100,000 events each, assert written + dropped = sent and that each producer's events appear in order.
+tradeoffs: Synchronous or asynchronous logging. Choose synchronous appenders for command-line tools, tests and for audit logs that must be on disk before the action continues. Choose asynchronous for services with latency goals, because the caller pays about 200 nanoseconds instead of a disk write. You give up exact ordering with other actions, you risk losing the last events at a crash, and you must handle overflow.
+Block or drop when the queue is full. Choose BLOCK only when losing events is worse than slowing the service, for example security audit events, and put a timeout on the wait. Choose DROP_NEWEST or DROP_OLDEST for general application logs. Choose KEEP_ERRORS when you want the important events to survive an overload. The deciding factor is what the on-call engineer needs most during an incident.
+Standard queue or ring buffer. Choose ArrayBlockingQueue until profiling shows lock contention on the queue, which is rare below about a million events per second. Choose a ring buffer such as the Disruptor for very high rates and for predictable latency, at the cost of a library, pre-sized memory and more careful shutdown logic.
+Write files and ship them, or send over the network from the process. Choose local files plus a shipper agent (Fluent Bit, Filebeat) when the collector is far away or unreliable, because the file is a durable buffer that survives the application. Choose a direct network appender for short-lived jobs and functions where no agent runs, and accept that a collector outage hits the application's fallback path.
+failures: Bad input and re-entrancy. A null message becomes "null". A log call never throws: the Logger wraps appender calls in try/catch. If an appender logs an error about itself, the event would re-enter the same queue and loop, so a thread-local flag sends internal errors to stderr.
+Huge events. A message of 5 MB or a stack trace with 10,000 frames can fill the queue and the disk. Truncate the message at 32 KB and the trace at a fixed number of frames; mark the event as truncated.
+Slow or dead sink. Retry with backoff, then fallback, then open the breaker. The queue keeps draining to the fallback, so callers are not blocked, and a counter shows the problem on a dashboard.
+Queue full. The overflow policy applies. Drops are counted, and a summary line is written when the pressure ends.
+Disk full or file removed. The RollingFileAppender catches the IOException, tries to roll and reopen once, and else reports to the breaker. Retention runs before writing when space is low.
+Log injection. A user-controlled string with a newline can forge a fake log line in a text format. The text formatter escapes CR and LF in the message; the JSON formatter escapes them by the format rules. Sensitive values (card numbers, passwords) are removed by a RedactionFilter before any appender sees them.
+evolution: Structured logging: replace the message string by a template and key-value fields (`"order {id} paid", id=17`), so the JSON output has real fields and the template can be used to group events.
+Sampling and rate limits: a filter with a token bucket per message template, so a loop that logs one error a million times produces 100 lines and a count.
+Central logging service: add an ingest API, a message queue, indexing and retention tiers; the in-process library becomes the first stage and the interfaces stay.
+followups: Why log through a queue and a writer thread? || It moves the slow part (formatting, disk, network) out of the request thread. The caller pays for an enqueue, and the writer can batch many events into one write. The price is possible loss at a crash and the need for an overflow policy.
+What should happen when the queue is full? || It depends on the data. Block for audit events, with a timeout. Drop for ordinary logs, preferably the low-level ones first and keep WARN and ERROR. Always count the drops and report them. Never let the application grow memory without bound.
+How do you make logging cheap when a level is disabled? || Check the effective level first, cached in a volatile field, and take the message as a Supplier or a template so no string is built. A disabled call is one comparison.
+How do you avoid losing the last logs at shutdown? || Use a STOP marker, drain the queue, flush the sink, and wait with a timeout in a shutdown hook. A crash or SIGKILL can still lose what is in memory; for stronger guarantees write to a local file synchronously for ERROR events.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson and Vlissides, 1994 |
+ref: docs | Apache Log4j 2: Asynchronous Loggers for low-latency logging | Apache Software Foundation | https://logging.apache.org/log4j/2.x/manual/async.html
+ref: blog | Chain of Responsibility pattern | refactoring.guru | https://refactoring.guru/design-patterns/chain-of-responsibility
+ref: docs | BlockingQueue (Java SE 21) | Oracle | https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/BlockingQueue.html
+
