@@ -6,6 +6,7 @@
 Usage: python3 tools/build.py [--check] [--no-html]
 Environment: DTS_CONTENT_DB=path   write the database somewhere else (tests use a temp file)
              DTS_PRACTICE_FIXTURE=1 also load tests/fixtures/problems_sample.json (UI tests)
+             (content/practice/templates.json is not a problem list: it holds the pattern templates, keyed by pattern name)
              DTS_ANIM_FIXTURE=1 also load tests/fixtures/anim_sample.json (animated scenes for tests)
              DTS_ANIM_DIR=path  read animated scenes from another folder instead of content/anim/
              DTS_FORMAT_FIXTURE=1 also load tests/fixtures/format_sample.txt and format_design.txt (rich-text browser test)
@@ -46,6 +47,8 @@ CREATE TABLE design_paragraphs (design_id TEXT NOT NULL REFERENCES designs(id), 
 CREATE TABLE design_sources (design_id TEXT NOT NULL REFERENCES designs(id), ord INTEGER NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, who TEXT NOT NULL, url TEXT NOT NULL, PRIMARY KEY (design_id, ord));
 -- practice problems: one JSON object per row (statement, tests, starter, solution, ...), in file order
 CREATE TABLE practice (id TEXT PRIMARY KEY, ord INTEGER NOT NULL, pattern TEXT NOT NULL, difficulty TEXT NOT NULL, body TEXT NOT NULL);
+-- pattern templates (content/practice/templates.json): one JSON object per pattern name, in file order
+CREATE TABLE templates (pattern TEXT PRIMARY KEY, ord INTEGER NOT NULL, body TEXT NOT NULL);
 -- animated scenes (content/anim/*.json, format in content/anim/README.md): one JSON object per row, in file order
 CREATE TABLE scenes (id TEXT PRIMARY KEY, concept TEXT NOT NULL REFERENCES nodes(id), ord INTEGER NOT NULL, title TEXT NOT NULL, steps INTEGER NOT NULL, body TEXT NOT NULL);
 CREATE INDEX scenes_concept ON scenes(concept, ord);
@@ -99,6 +102,8 @@ def write_db(data, path):
                                                            "\n".join(p for sec, ps in d["rd"].items() if sec not in ("diagram", "animation") for p in ps)))
     for i, p in enumerate(data["practice"]):
         db.execute("INSERT INTO practice VALUES (?,?,?,?,?)", (p["id"], i, p.get("pattern", ""), p.get("difficulty", ""), json.dumps(p, ensure_ascii=False)))
+    for i, (name, t) in enumerate(data.get("templates", {}).items()):
+        db.execute("INSERT INTO templates VALUES (?,?,?)", (name, i, json.dumps(t, ensure_ascii=False)))
     for i, s in enumerate(data.get("scenes", [])):
         db.execute("INSERT INTO scenes VALUES (?,?,?,?,?,?)", (s["id"], s["concept"], i, s.get("title", ""), len(s["steps"]), json.dumps(s, ensure_ascii=False)))
     db.execute("INSERT INTO search(search) VALUES ('optimize')")
@@ -142,7 +147,7 @@ FIXTURE = os.path.join(ROOT, "tests", "fixtures", "problems_sample.json")
 def load_practice():
     """All content/practice/*.json files (each a JSON list), concatenated in file order. When DTS_PRACTICE_FIXTURE is set,
     the sample problems in tests/fixtures/problems_sample.json are added too (for UI tests); content problems win on id clashes."""
-    files = sorted(glob.glob(os.path.join(ROOT, "content", "practice", "*.json")))
+    files = sorted(f for f in glob.glob(os.path.join(ROOT, "content", "practice", "*.json")) if os.path.basename(f) != "templates.json")
     if os.environ.get("DTS_PRACTICE_FIXTURE"): files.append(FIXTURE)
     out, seen, errs = [], set(), []
     for f in files:
@@ -155,6 +160,34 @@ def load_practice():
             if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(p["id"])): errs.append(f"{os.path.relpath(f, ROOT)}: bad problem id {p['id']!r}"); continue
             if p["id"] in seen: continue
             seen.add(p["id"]); out.append(p)
+    return out, errs
+
+TEMPLATES = os.path.join(ROOT, "content", "practice", "templates.json")
+TEMPLATE_LANGS = ("python", "javascript", "go", "cpp", "rust", "scala")
+
+def load_templates(patterns):
+    """content/practice/templates.json: {pattern name: {summary, signals, idea, example, code: {language: source}, complexity, bugs,
+    viz, viz_more}}. Returns (templates, errors); a bad entry is skipped with a message, a missing file means no templates.
+    patterns are the practice patterns: a template for a pattern no problem uses is reported, but kept (the cheat sheet shows it)."""
+    if not os.path.exists(TEMPLATES): return {}, []
+    try: raw = json.load(open(TEMPLATES, encoding="utf-8"))
+    except ValueError as e: return {}, [f"content/practice/templates.json: invalid JSON: {e}"]
+    if not isinstance(raw, dict): return {}, ["content/practice/templates.json: must be an object keyed by pattern name"]
+    out, errs = {}, []
+    for name, t in raw.items():
+        bad = [] if isinstance(t, dict) else ["not an object"]
+        if not bad:
+            if not (isinstance(t.get("signals"), list) and 1 <= len(t["signals"]) <= 6 and all(isinstance(x, str) and x for x in t["signals"])): bad.append("signals")
+            for k in ("summary", "idea", "complexity"):
+                if not isinstance(t.get(k), str) or not t[k].strip(): bad.append(k)
+            code = t.get("code")
+            if not isinstance(code, dict) or not code.get("python") or any(not isinstance(v, str) for v in code.values()) or set(code) - set(TEMPLATE_LANGS): bad.append("code")
+            if not isinstance(t.get("bugs", []), list): bad.append("bugs")
+            if t.get("viz") is not None and not isinstance(t.get("viz"), str): bad.append("viz")
+        if bad: errs.append(f"templates.json: {name!r} has a bad {', '.join(bad)}"); continue
+        if name not in patterns: errs.append(f"templates.json: no practice problem uses the pattern {name!r} (kept)")
+        out[name] = t
+    errs += [f"templates.json: no template for the pattern {p!r}" for p in sorted(patterns) if p not in out]
     return out, errs
 
 ANIM_FIXTURE = os.path.join(ROOT, "tests", "fixtures", "anim_sample.json")
@@ -196,6 +229,9 @@ def main():
     data["practice"], perrs = load_practice()
     for e in perrs: print("practice: skipped " + e, file=sys.stderr)
     data["stats"]["practice"] = len(data["practice"])
+    data["templates"], terrs = load_templates({p.get("pattern") for p in data["practice"] if p.get("pattern")})
+    for e in terrs: print("templates: " + e, file=sys.stderr)
+    data["stats"]["templates"] = len(data["templates"])
     data["scenes"], aerrs = load_scenes({n["id"] for n in data["nodes"]})
     if aerrs:
         print("ANIMATION ERRORS (fix them, or check one file with python3 tools/checkanim.py <file>):\n  " + "\n  ".join(aerrs), file=sys.stderr); sys.exit(1)
@@ -203,7 +239,7 @@ def main():
     st = data["stats"]
     print(f"content ok: {st['nodes']} concepts {st['per_layer']}, {st['edges']} links, {st['side']} side links, "
           f"{st['tours']} tours, {st['courses']} courses, {st['words']:,} words, {st['refs']} sources ({st['urls']} with direct links), {st['deep']} deep reads, "
-          f"{st['designs']} design questions, {st['practice']} practice problems, {st['scenes']} animated scenes")
+          f"{st['designs']} design questions, {st['practice']} practice problems, {st['templates']} pattern templates, {st['scenes']} animated scenes")
     if "--check" in args: return
     os.makedirs(os.path.join(ROOT, "data"), exist_ok=True); os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)
     db = os.environ.get("DTS_CONTENT_DB") or os.path.join(ROOT, "data", "content.db")

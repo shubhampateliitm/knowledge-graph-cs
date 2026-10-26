@@ -152,6 +152,22 @@ class API(unittest.TestCase):
         s, ex = self.get("/api/export"); self.assertEqual(ex["practice"][0]["problem_id"], "sample-valid-brackets")
         s, mine = self.req("DELETE", "/api/practice/sample-valid-brackets"); self.assertEqual(mine, {})
 
+    def test_templates(self):
+        """content/practice/templates.json is served in the graph and at /api/templates, keyed by pattern name, and is not read as problems"""
+        path = os.path.join(ROOT, "content", "practice", "templates.json")
+        if not os.path.exists(path): self.skipTest("no templates.json")
+        with open(path, encoding="utf-8") as f: content = json.load(f)
+        s, g = self.get("/api/graph"); self.assertEqual(s, 200)
+        self.assertEqual(list(g["templates"]), list(content))                         # same names, same order
+        s, t = self.get("/api/templates"); self.assertEqual((s, t), (200, g["templates"]))
+        self.assertNotIn("templates", {p["id"] for p in g["practice"]})
+        patterns = {p["pattern"] for p in g["practice"] if not p["id"].startswith("sample-")}
+        self.assertEqual(patterns - set(t), set())                                     # every real pattern has a template
+        for name, x in t.items():
+            self.assertTrue(2 <= len(x["signals"]) <= 4 and x["idea"] and x["complexity"] and x["bugs"], name)
+            self.assertEqual(set(x["code"]), {"python", "javascript", "go", "cpp", "rust", "scala"}, name)
+            self.assertTrue(x["viz"] is None or isinstance(x["viz"], str), name)
+
     def test_scenes(self):
         fixture = json.load(open(os.path.join(ROOT, "tests", "fixtures", "anim_sample.json"), encoding="utf-8"))
         s, g = self.get("/api/graph")

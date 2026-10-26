@@ -1005,6 +1005,7 @@ function route(initial){
   const msc = h.match(/^scene\/(.+)$/), scn = msc && SCENES.find(x=>x.id===msc[1]);
   if(scn){ if(R.open && curId()===scn.concept && R.cur.scene===scn.id) return; if(initial) render(true); exploreFrom(scn.concept); return openRead({type:"node", id:scn.concept, scene:scn.id}, {seq:null}); }
   if(h==="animations"){ if(R.open) closeRead(); state.view="algorithms"; state.algo.tab="anim"; render(true); return; }
+  if(h==="patterns"){ if(R.open) closeRead(); state.view="algorithms"; state.algo.tab="patterns"; render(true); return; }
   const md = h.match(/^design\/(.+)$/);
   if(md && DES[md[1]]){ if(R.open && R.cur.type==="design" && R.cur.id===md[1]) return; if(initial){ state.view="design"; render(true); } return openRead({type:"design", id:md[1]}, {seq:null}); }
   const ma = h.match(/^(algo|practice)\/(.+)$/);

@@ -18,6 +18,7 @@ Serves the web app from web/ and a JSON API:
   GET  /api/design/<id>                full system design question (summaries are in /api/graph -> designs)
   GET  /api/practice                   your saved code and solved marks per practice problem (problems are in /api/graph -> practice)
   PUT|DELETE /api/practice/<id>        body {"code": "...", "solved": true|false} (either or both)
+  GET  /api/templates                  pattern templates keyed by pattern name (also in /api/graph -> templates)
   GET  /api/export                     all your data as JSON
 
 Content lives in data/content.db (rebuilt by tools/build.py); your own data lives in data/user.db and survives rebuilds.
@@ -118,6 +119,8 @@ class Content:
                 design_list.append(dict(base, summary=(rd.get("summary") or [""])[0]))
         practice = [json.loads(r[0]) for r in db.execute("SELECT body FROM practice ORDER BY ord")] if "practice" in has else []
         self.practice_ids = {p["id"] for p in practice}
+        # pattern templates (content/practice/templates.json), keyed by the practice pattern name, in file order
+        self.templates = {r[0]: json.loads(r[1]) for r in db.execute("SELECT pattern, body FROM templates ORDER BY ord")} if "templates" in has else {}
         # animated scenes: full bodies in each concept's read, summaries in the graph
         self.scenes = [json.loads(r[0]) for r in db.execute("SELECT body FROM scenes ORDER BY ord")] if "scenes" in has else []
         by_concept = {}
@@ -126,7 +129,7 @@ class Content:
         scene_list = [dict(id=s_["id"], concept=s_["concept"], title=s_.get("title", ""), n=len(s_.get("steps", []))) for s_ in self.scenes]
         db.close()
         self.ids = set(self.reads)
-        self.graph = dict(nodes=nodes, edges=edges, side=side, tours=tours, layers=layers, curriculum=curriculum, designs=design_list, practice=practice, scenes=scene_list, stats=self.stats, built_at=self.built_at, mode="server")
+        self.graph = dict(nodes=nodes, edges=edges, side=side, tours=tours, layers=layers, curriculum=curriculum, designs=design_list, practice=practice, templates=self.templates, scenes=scene_list, stats=self.stats, built_at=self.built_at, mode="server")
         self.graph_json = json.dumps(self.graph, ensure_ascii=False, separators=(",", ":")).encode()
         self.graph_gz = gzip.compress(self.graph_json, 6)
         self.local = threading.local()
@@ -293,6 +296,7 @@ def make_handler(app, allowed_hosts):
                     if not d: return self.err(404, f"unknown design {m.group(1)!r}")
                     return self.send(200, d)
                 if p == "/api/practice": return self.send(200, app.user.practice())
+                if p == "/api/templates": return self.send(200, c.templates)
                 if p == "/api/scenes":
                     cid = (qs.get("concept") or [None])[0]
                     if cid is not None and not self.known(cid): return

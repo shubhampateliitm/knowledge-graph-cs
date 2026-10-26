@@ -19,7 +19,7 @@ Tabs:
 
 - **Tours**: complete descents; "What happens when…" journeys come first.
 - **Design**: system design interview questions (requirements, estimates, API, data model, design with diagram and animation, deep dives, trade-offs, failure modes, evolution, follow-ups). Each links to the concepts it uses (chips, a concept map by layer, and "Study these concepts" as a reading sequence); every concept lists the design questions that use it.
-- **Algorithms**: three parts. 25 step-by-step visualizers (sorting, binary search, two pointers, sliding window, BFS/DFS, Dijkstra, topological sort, union–find, heaps, hash tables, LRU, Bloom filter, consistent hashing, Raft, trie, B-tree, DP tables; the B-tree and Raft ones also take live actions: insert a key, crash a server) with pseudocode, narration, counters and your own input; and **Practice** problems grouped by pattern, with a code editor, tests run in a Web Worker (2-second limit), hint / approach / solution and follow-ups; and **Animations**, a gallery of every animated scene grouped by layer (`#animations`), each opening its concept's read at that scene (`#scene/<id>` links there directly).
+- **Algorithms**: four parts. 40 step-by-step visualizers (sorting, binary search and binary search on the answer, two pointers, fast and slow pointers, sliding windows with counts, monotonic stack, prefix sums and difference arrays, line sweep, KMP, the sieve, backtracking recursion trees with pruning, tree DFS with return values and the call stack, BFS/DFS, Dijkstra, topological sort, minimum spanning trees, union–find, heaps (top K, running median), segment trees with lazy adds, hash tables, LRU, Bloom filter, consistent hashing, Raft, trie with prefix counts, B-tree, and DP tables in 1-D and 2-D with a table / memo / plain-recursion switch; the B-tree and Raft ones also take live actions: insert a key, crash a server) with pseudocode, narration, counters and your own input (a Problem menu switches between the variants of a pattern); **Practice** problems grouped by pattern, with a code editor, tests run in a Web Worker (2-second limit), hint / approach / solution and follow-ups, plus a **pattern template** for every pattern (on each problem and under each pattern heading): when to use it, the idea, code in Python, JavaScript, Go, C++, Rust and Scala (your language choice is remembered), complexity, common bugs and the visualizer to watch; **Which pattern?** (`#patterns`), a cheat sheet from phrases in a problem to the pattern, with a filter and every template; and **Animations**, a gallery of every animated scene grouped by layer (`#animations`), each opening its concept's read at that scene (`#scene/<id>` links there directly).
 
 A **Courses** view maps the Stanford BS and MS curriculum (CS 103 to CS 336) onto the graph: pick a course and study its concepts in order.
 
@@ -45,6 +45,7 @@ content/reads/long/   *.txt                                   long reads: "@@ id
 content/curriculum/   *.txt                                   Stanford BS/MS programs and courses mapped to concepts
 content/design/       *.txt                                   system design questions ("@@ id", see content/NEW_CONTENT.md section 2)
 content/practice/     *.json                                  practice problems (JSON lists, concatenated; see NEW_CONTENT.md section 4)
+content/practice/     templates.json                          pattern templates keyed by the problems' pattern names (not a problem list)
 content/anim/         *.json                                  animated scenes (JSON lists; format in content/anim/README.md)
 tools/kg.py           parser + validator (every node has a read, every edge has a reason, every node reaches L5)
 tools/build.py        content -> data/content.db (SQLite + FTS5) and dist/down-the-stack.html (single shareable file)
@@ -67,6 +68,7 @@ data/                 content.db (rebuilt) and user.db (your progress, bookmarks
 | GET | `/api/search?q=` | full-text search over every read and design question (FTS5, BM25; phrase hits first; designs come back as `design/<id>`) |
 | GET | `/api/graph` → `designs`, `practice` | design summaries (id, title, category, level, concepts, minutes, summary) and all practice problems |
 | GET | `/api/design/<id>` | full system design question (sections, sources) |
+| GET | `/api/templates` | pattern templates keyed by pattern name (also in `/api/graph` → `templates`) |
 | GET | `/api/practice` | your saved code and solved marks |
 | PUT/DELETE | `/api/practice/<id>` | `{"code": "...", "solved": true|false}` (either or both; code up to 60,000 characters) |
 | GET | `/api/library` | every source, grouped by work, with the concepts that cite it |
@@ -82,7 +84,7 @@ The server binds to 127.0.0.1, rejects unexpected `Host` headers (DNS rebinding)
 
 ## Editing content
 
-Content formats for trade-offs, interview questions, animations, design questions, journeys and practice problems are in `content/NEW_CONTENT.md`. Check a design with `python3 tools/checkdesign.py <file>` and practice solutions with `node tools/check_practice.js`. Animated scenes follow `content/anim/README.md`; check one with `python3 tools/checkanim.py content/anim/<file>.json`. The build runs the same check on every scene file and stops on any error (a missing `content/anim/` folder just means no scenes).
+Content formats for trade-offs, interview questions, animations, design questions, journeys and practice problems are in `content/NEW_CONTENT.md`. Check a design with `python3 tools/checkdesign.py <file>` and practice solutions with `node tools/check_practice.js`. Pattern templates (`content/practice/templates.json`, one entry per pattern name used in the problems) are compile-checked in every language that is installed with `python3 tools/check_templates.py`. Animated scenes follow `content/anim/README.md`; check one with `python3 tools/checkanim.py content/anim/<file>.json`. The build runs the same check on every scene file and stops on any error (a missing `content/anim/` folder just means no scenes).
 
 Add a concept: a line in `content/graph/nodes_*.txt` under its layer, edges in `edges_*.txt` with a reason for each link, and a read in `content/reads/`. Then `python3 tools/build.py --check` tells you exactly what is missing (no read, no sources, no path down to L5, an edge pointing upward...).
 

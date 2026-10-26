@@ -727,33 +727,39 @@ function raftDraw(s){
   return `<div class="av-raft"><div class="rf-left">${ring}</div><div class="rf-right"><div class="av-h mono">Logs · solid = committed</div><div class="rf-logw">${logs}</div><p class="av-aux">Cells show the command and its term (colour = term). The green bar ends at each server's commit index (c); ▲ is where the leader will send next.</p></div></div>${legend}<p class="av-aux mono">time ${s.t} · ${lab}${s.part!==null?` · ${SN(s.part)} is cut off`:""}</p>`;
 }
 
-def({ id:"trie", group:"Data structures", title:"Trie: insert and search", concepts:["trees","fst","invindex"],
-  text:"A trie stores words letter by letter along paths from the root, so words with a common prefix share nodes. Insert and search cost O(length of the word), independent of how many words are stored, and \"all words starting with ca\" is one walk down. Autocomplete, routing tables (longest prefix match) and the term dictionaries in search engines build on it.",
-  inputs:[{k:"ops", label:"Operations", def:"insert car, insert cat, insert cart, insert care, insert dog, insert do, search cat, search ca, prefix ca, search cow"}],
+def({ id:"trie", group:"Data structures", title:"Trie: insert, search and prefix counts", concepts:["trees","fst","invindex"],
+  text:"A trie stores words letter by letter along paths from the root, so words with a common prefix share nodes. Insert and search cost O(length of the word), independent of how many words are stored. Each node also keeps a count of the words that pass through it, so \"how many words start with ca?\" is one walk down and one number. Autocomplete, routing tables (longest prefix match) and the term dictionaries in search engines build on it.",
+  inputs:[{k:"ops", label:"Operations (insert, search, prefix, count)", def:"insert car, insert cat, insert cart, insert care, insert dog, insert do, search cat, search ca, prefix ca, count ca, search cow"}],
+  random:()=>{ const w = ["car","cat","cart","care","cap","dog","do","dot","door","card"].sort(()=>Math.random()-.5).slice(0,6); return {ops:w.map(x=>"insert "+x).concat(["search "+w[0], "count "+w[1].slice(0,2), "prefix "+w[2].slice(0,1)]).join(", ")}; },
   counters:["steps"],
-  code:["insert(w): node = root","  for each letter c in w:","    if node has no child c: create it","    node = node.child[c]","  mark node as the end of a word","search(w): node = root; follow each letter","  a letter is missing: not found","  found only if the last node ends a word"],
-  run(v, R){ const T = {0:{c:"·", kids:{}, end:false}}; let nid = 1;
+  code:["insert(w): if w is already a word: stop","  node = root; for each letter c in w:","    if node has no child c: create it","    node = node.child[c]; node.count += 1","  mark node as the end of a word","search(w) / prefix(p): follow each letter from the root","  a letter is missing: not found","  search: found only if the last node ends a word","count(p): walk p, then read node.count"],
+  run(v, R){ const T = {0:{c:"·", kids:{}, end:false, n:0}}; let nid = 1;
     const S = o => Object.assign({T}, o);
-    R.step(0, "An empty trie: just the root.", S({}));
-    for(const [cmd, w] of ops(v.ops)){ if(!w || !["insert","search","prefix"].includes(cmd) || !/^[a-z]{1,10}$/.test(w)) throw new Error('Write "insert word", "search word" or "prefix ab" (lowercase letters, up to 10).');
+    const walk = w => { let node = 0; for(const c of w){ const nx = T[node].kids[c]; if(nx===undefined) return -1; node = nx; } return node; };
+    R.step(0, "An empty trie: just the root. The small number under a node is how many words pass through it.", S({}));
+    for(const [cmd, w] of ops(v.ops)){ if(!w || !["insert","search","prefix","count"].includes(cmd) || !/^[a-z]{1,10}$/.test(w)) throw new Error('Write "insert word", "search word", "prefix ab" or "count ab" (lowercase letters, up to 10).');
       if(nid > 40) throw new Error("The trie got too big to draw. Use fewer words.");
       let node = 0; const path = [0];
-      if(cmd==="insert"){ R.step(0, `insert "${w}": start at the root.`, S({path:path.slice()}));
-        for(const c of w){ R.inc("steps"); if(!T[node].kids[c]){ T[nid] = {c, kids:{}, end:false}; T[node].kids[c] = nid++; path.push(T[node].kids[c]); node = T[node].kids[c]; R.step(2, `No child '${c}': create it.`, S({path:path.slice(), cur:node, add:true})); }
-          else { node = T[node].kids[c]; path.push(node); R.step(3, `Follow the existing child '${c}'.`, S({path:path.slice(), cur:node})); } }
+      if(cmd==="insert"){ const at = walk(w);
+        if(at >= 0 && T[at].end){ R.step(0, `insert "${w}": it is already a word, so nothing changes (the counts stay right).`, S({path:[], cur:at, ok:true})); continue; }
+        R.step(1, `insert "${w}": start at the root.`, S({path:path.slice()}));
+        for(const c of w){ R.inc("steps"); let made = false; if(!T[node].kids[c]){ T[nid] = {c, kids:{}, end:false, n:0}; T[node].kids[c] = nid++; made = true; }
+          node = T[node].kids[c]; T[node].n++; path.push(node);
+          R.step(made ? 2 : 3, made ? `No child '${c}': create it. Its count is ${T[node].n}.` : `Follow the existing child '${c}'; its count goes up to ${T[node].n}.`, S({path:path.slice(), cur:node, add:made})); }
         T[node].end = true; R.step(4, `Mark the last node: "${w}" is a word.`, S({path:path.slice(), cur:node, ok:true})); continue; }
       R.step(5, `${cmd} "${w}": start at the root.`, S({path:path.slice()}));
       let lost = false;
-      for(const c of w){ R.inc("steps"); const nx = T[node].kids[c]; if(nx===undefined){ R.step(6, `No child '${c}': "${w}" is not ${cmd==="prefix"?"a prefix of any word":"in the trie"}.`, S({path:path.slice(), cur:node, miss:true})); lost = true; break; }
+      for(const c of w){ R.inc("steps"); const nx = T[node].kids[c]; if(nx===undefined){ R.step(6, cmd==="count" ? `No child '${c}': no word starts with "${w}", the count is 0.` : `No child '${c}': "${w}" is not ${cmd==="prefix"?"a prefix of any word":"in the trie"}.`, S({path:path.slice(), cur:node, miss:true})); lost = true; break; }
         node = nx; path.push(node); R.step(5, `Follow '${c}'.`, S({path:path.slice(), cur:node})); }
       if(lost) continue;
-      if(cmd==="prefix"){ const words = []; const walk = (n, pre) => { if(T[n].end) words.push(pre); Object.keys(T[n].kids).sort().forEach(c=>walk(T[n].kids[c], pre+c)); }; walk(node, w);
-        R.step(7, `Every word under this node starts with "${w}": ${words.join(", ")||"none"}.`, S({path:path.slice(), cur:node, ok:true})); }
+      if(cmd==="count") R.step(8, `The node for "${w}" has count ${T[node].n}: ${T[node].n} word${T[node].n===1?"":"s"} start${T[node].n===1?"s":""} with "${w}". No need to visit them.`, S({path:path.slice(), cur:node, ok:true}));
+      else if(cmd==="prefix"){ const words = []; const go = (n, pre) => { if(T[n].end) words.push(pre); Object.keys(T[n].kids).sort().forEach(c=>go(T[n].kids[c], pre+c)); }; go(node, w);
+        R.step(5, `Every word under this node starts with "${w}": ${words.join(", ")||"none"}.`, S({path:path.slice(), cur:node, ok:true})); }
       else R.step(7, T[node].end ? `The last node ends a word: "${w}" is found.` : `The path exists, but the last node does not end a word: "${w}" is only a prefix.`, S({path:path.slice(), cur:node, ok:T[node].end, miss:!T[node].end})); }
     R.step(4, "Done.", S({})); },
   draw(s){ const nodes = {}, on = new Set(s.path||[]);
-    Object.entries(s.T).forEach(([id,n])=>{ nodes[id] = {label:n.c, end:n.end, kids:Object.keys(n.kids).sort().map(c=>String(n.kids[c])), cls:(+id===s.cur?(s.miss?"miss":s.ok?"done":"cur"):on.has(+id)?"cmp":""), ecls:on.has(+id)?"hot":""}; });
-    return treeSVG(nodes, ["0"], {label:"Trie", ux:34, uy:50, r:14}) + `<p class="av-aux">A double circle marks the end of a word.</p>`; } });
+    Object.entries(s.T).forEach(([id,n])=>{ nodes[id] = {label:n.c, end:n.end, sub:+id ? n.n : undefined, kids:Object.keys(n.kids).sort().map(c=>String(n.kids[c])), cls:(+id===s.cur?(s.miss?"miss":s.ok?"done":"cur"):on.has(+id)?"cmp":""), ecls:on.has(+id)?"hot":""}; });
+    return treeSVG(nodes, ["0"], {label:"Trie", ux:34, uy:54, r:14}) + `<p class="av-aux">A double circle marks the end of a word. The number under a node counts the words that pass through it.</p>`; } });
 
 /* ---- B-tree ---- */
 const BT_OPS = "insert 10 20 5 6 12 30 7 17 3 4 25 28 15 1 9, search 17, search 13";
@@ -1192,9 +1198,9 @@ function binTreeSVG(N, o){
     n += `<g class="tn ${st}"${i===o.cur?" data-focus":""}><circle cx="${px(i)}" cy="${py(i)}" r="${R}"/><text x="${px(i)}" y="${py(i)+4}" text-anchor="middle">${esc(nd.v)}</text>${sub!==undefined&&sub!==""?`<text x="${px(i)}" y="${py(i)+R+13}" text-anchor="middle" class="sub ret">${esc(sub)}</text>`:""}${tag?`<text x="${px(i)+R+3}" y="${py(i)-R+2}" class="sub tag">${esc(tag)}</text>`:""}</g>`; });
   return wide(W, H, e + n, o.label || "Binary tree", .85);
 }
-const TD_MODES = [{v:"height", label:"Height (max depth)", set:{}},{v:"diameter", label:"Diameter (longest path)", set:{}},{v:"maxpath", label:"Maximum path sum", set:{tree:"-10, 9, 20, null, null, 15, 7, 3, -8"}},
-  {v:"pre", label:"Preorder: visit before the children", set:{}},{v:"in", label:"Inorder: visit between the children", set:{}},{v:"post", label:"Postorder: visit after the children", set:{}}];
 const TD_TREE = "1, 2, 3, 4, 5, null, 6, 7, null, null, 8";
+const TD_MODES = [{v:"height", label:"Height (max depth)", set:{tree:TD_TREE}},{v:"diameter", label:"Diameter (longest path)", set:{tree:TD_TREE}},{v:"maxpath", label:"Maximum path sum", set:{tree:"-10, 9, 20, null, null, 15, 7, 3, -8"}},
+  {v:"pre", label:"Preorder: visit before the children", set:{tree:TD_TREE}},{v:"in", label:"Inorder: visit between the children", set:{tree:TD_TREE}},{v:"post", label:"Postorder: visit after the children", set:{tree:TD_TREE}}];
 const TD_CODE = {
   height:["dfs(node):","  if node is null: return 0","  L = dfs(node.left)","  R = dfs(node.right)","  return 1 + max(L, R)   (my height, handed to my parent)"],
   diameter:["best = 0","dfs(node): if node is null: return 0","  L = dfs(node.left)","  R = dfs(node.right)","  best = max(best, L + R)   (longest path that bends here)","  return 1 + max(L, R)   (height, for the parent)"],
@@ -1598,6 +1604,220 @@ def({ id:"mst", group:"Graphs", title:"Minimum spanning tree: Kruskal and Prim",
     else side = `<div class="av-h mono" style="margin-top:6px">heap of edges leaving the tree (lightest first)</div><div class="av-kvs">${s.heap.map(h=>`<span class="kv${inT.has(h[2])?" gone":""}">${esc(h[1]+h[2])} ${h[0]}</span>`).join("") || '<span class="nil mono">empty</span>'}</div>`;
     return graphSVG(nodes, edges, {label:"Weighted graph"}) + side + `<p class="av-aux mono">tree edges: ${esc(s.keep.map(k=>s.E[k].a+s.E[k].b).join(", ") || "none yet")}</p>`; } });
 
+/* ---- line sweep ---- */
+function parseIntervals(str){
+  const out = String(str||"").split(/[,;\n]+/).map(x=>x.trim()).filter(Boolean).map(t=>{
+    const m = t.match(/^(\d+)\s*-\s*(\d+)(?:\s*[x×*]\s*(\d+))?$/); if(!m) throw new Error(`Write intervals like "5-10" (start-end), or "5-10 x3" with a weight. Could not read "${t}".`);
+    const s = +m[1], e = +m[2], w = m[3] ? +m[3] : 1; if(e <= s) throw new Error(`An interval must end after it starts: "${t}".`); if(e > 100) throw new Error("Use times from 0 to 100.");
+    if(w < 1 || w > 9) throw new Error("Weights go from 1 to 9."); return {s, e, w}; });
+  if(!out.length) throw new Error("Type some intervals."); if(out.length > 9) throw new Error("At most 9 intervals, so every row stays readable.");
+  return out;
+}
+def({ id:"sweep", group:"Arrays & strings", title:"Line sweep: the busiest moment", concepts:["compgeom","sorting","prefixsums"],
+  text:"Turn every interval into two events: +1 (or + its weight) when it starts and −1 when it ends. Sort the events by time and sweep a line across them, keeping a running total of what is active; its maximum is the number of meeting rooms you need (or the peak load of a car). When an end and a start share a time, the end goes first, because [start, end) intervals that only touch do not overlap. O(n log n) for the sort.",
+  inputs:[{k:"iv", label:"Intervals start-end (end not included), optional weight: 5-10 x3", def:"0-30, 5-10, 15-20, 12-25, 25-35, 31-40"},{k:"cap", label:"Capacity (0 = none)", def:"0", w:4}],
+  presets:[{name:"Meeting rooms", v:{iv:"0-30, 5-10, 15-20, 12-25, 25-35, 31-40", cap:"0"}},{name:"Car pooling (capacity 4)", v:{iv:"1-5 x2, 3-7 x3, 8-12 x2, 9-11 x1", cap:"4"}},{name:"Touching ends", v:{iv:"0-10, 10-20, 20-30", cap:"0"}}],
+  random:()=>{ const n = rint(4,7); return {iv:Array.from({length:n},()=>{ const s = rint(0,40); return `${s}-${s+rint(4,20)}`; }).join(", "), cap:"0"}; },
+  counters:["ev"],
+  code:["events = (start, +w) and (end, -w) for every interval","sort by time; at the same time, ends (-) go first","active = 0; best = 0","for each event (time, d) in order:","  active = active + d","  best = max(best, active)   (if capacity: active > capacity fails)","return best"],
+  run(v, R){ const iv = parseIntervals(v.iv), cap = nums(v.cap, 0, 99, 1)[0];
+    const ev = []; iv.forEach((x,i)=>{ ev.push({t:x.s, d:x.w, i}); ev.push({t:x.e, d:-x.w, i}); });
+    ev.sort((a,b)=>a.t-b.t || a.d-b.d);
+    let active = 0, best = 0, bt = null; const on = new Set(), done = new Set();
+    const S = o => Object.assign({iv, ev, cap, active, best, bt, on:[...on], done:[...done]}, o);
+    R.step(0, `${iv.length} intervals become ${ev.length} events: +${iv.some(x=>x.w>1)?"weight":"1"} at each start, − at each end.`, S({}));
+    R.step(1, `Sort the events by time: ${ev.map(e=>`${e.t}${e.d>0?"+":"−"}${Math.abs(e.d)}`).join(", ")}. At equal times an end comes before a start.`, S({}));
+    for(let k=0;k<ev.length;k++){ const e = ev[k]; active += e.d; R.inc("ev");
+      if(e.d>0) on.add(e.i); else { on.delete(e.i); done.add(e.i); }
+      const nb = active > best; if(nb){ best = active; bt = e.t; }
+      const what = e.d > 0 ? `interval ${e.i+1} (${iv[e.i].s}–${iv[e.i].e}) starts: +${e.d}` : `interval ${e.i+1} ends: −${-e.d}`;
+      const over = cap && active > cap;
+      R.step(nb ? 5 : 4, `At time ${e.t}, ${what}. Active: ${active}.${nb ? ` A new maximum: ${best}.` : ""}${over ? ` That is more than the capacity ${cap}: it does not fit.` : ""}`, S({k, t:e.t, over})); }
+    R.step(6, cap ? (best > cap ? `The load reaches ${best} at time ${bt}, more than the capacity ${cap}: the trips do not fit.` : `The load never goes above ${best}, within the capacity ${cap}: everything fits.`) : `The busiest moment has ${best} intervals at once (first at time ${bt}): you need ${best} room${best===1?"":"s"}. ${ev.length} events, sorted once: O(n log n).`, S({end:true})); },
+  draw(s){ const W = 360, X0 = 30, X1 = W - 12, T0 = Math.min(...s.iv.map(x=>x.s)), T1 = Math.max(...s.iv.map(x=>x.e)), x = t => X0 + (X1-X0)*(t-T0)/Math.max(1, T1-T0), RH = 22, top = 16;
+    const H = top + s.iv.length*RH + 34, on = new Set(s.on), done = new Set(s.done);
+    let g = "";
+    s.iv.forEach((iv,i)=>{ const y = top + i*RH, cls = on.has(i) ? (s.over ? "over" : "on") : done.has(i) ? "done" : "";
+      g += `<g class="sw-iv ${cls}"><text x="${X0-6}" y="${y+12}" text-anchor="end" class="sub">${i+1}</text><rect x="${x(iv.s)}" y="${y+2}" width="${Math.max(2, x(iv.e)-x(iv.s))}" height="${RH-7}" rx="4"/>${iv.w>1?`<text x="${x(iv.s)+4}" y="${y+13}" class="w">×${iv.w}</text>`:""}</g>`; });
+    const ay = top + s.iv.length*RH + 4;
+    g += `<line x1="${X0}" y1="${ay}" x2="${X1}" y2="${ay}" class="axis"/><text x="${X0}" y="${ay+14}" class="sub" text-anchor="middle">${T0}</text><text x="${X1}" y="${ay+14}" class="sub" text-anchor="middle">${T1}</text>`;
+    if(s.t!==undefined) g += `<line x1="${x(s.t)}" y1="${top-8}" x2="${x(s.t)}" y2="${ay+4}" class="sw-line"/><text x="${x(s.t)}" y="${ay+26}" text-anchor="middle" class="sw-t">t = ${s.t}</text>`;
+    const evs = s.ev.map((e,k)=>`<span class="kv${k===s.k?" cmp":k<(s.k===undefined?(s.end?s.ev.length:0):s.k)?" gone":""}">${e.t} ${e.d>0?"+":"−"}${Math.abs(e.d)}</span>`).join("");
+    return `<svg class="av-svg av-sw" viewBox="0 0 ${W} ${H}" style="max-width:560px" role="img" aria-label="${s.iv.length} intervals on a time line${s.t!==undefined?`; the sweep line is at ${s.t}`:""}">${g}</svg>
+      <div class="av-h mono" style="margin-top:6px">events in sweep order</div><div class="av-kvs">${evs}</div>
+      <p class="av-aux mono">active now: ${s.active} · maximum so far: ${s.best}${s.cap?` · capacity ${s.cap}`:""}</p>`; } });
+
+/* ---- KMP string matching ---- */
+def({ id:"kmp", group:"Arrays & strings", title:"KMP string matching", concepts:["stringmatch","bigo","amortized"],
+  text:"First build lps for the pattern: lps[i] is the length of the longest proper prefix of pattern[0..i] that is also a suffix of it. Then scan the text. On a mismatch after j matched letters, do not move back in the text: slide the pattern so that its first lps[j−1] letters line up with what was just matched, because they are known to be equal. The text pointer never goes back, so the search is O(n + m) instead of O(n·m).",
+  inputs:[{k:"t", label:"Text (up to 24 letters)", def:"abxabcabcabyabcaby"},{k:"p", label:"Pattern (up to 8 letters)", def:"abcaby", w:10}],
+  presets:[{name:"Many partial matches", v:{t:"aaaaaaaaab", p:"aaab"}},{name:"Overlapping matches", v:{t:"abababab", p:"abab"}}],
+  random:()=>{ const t = Array.from({length:rint(14,20)},()=>"ab"[rint(0,1)]).join(""); return {t, p:t.slice(rint(0,8)).slice(0,rint(3,5))}; },
+  counters:["cmp","shift"],
+  code:["build lps: k = 0","  for i from 1 to m-1: while k > 0 and p[i] != p[k]: k = lps[k-1]","    if p[i] == p[k]: k += 1;  lps[i] = k","search: j = 0   (letters of p matched)","for i from 0 to n-1:","  while j > 0 and t[i] != p[j]: j = lps[j-1]   (slide)","  if t[i] == p[j]: j += 1","  if j == m: found at i - m + 1; j = lps[j-1]"],
+  run(v, R){ const t = String(v.t||"").replace(/\s/g,""), p = String(v.p||"").replace(/\s/g,"");
+    if(!t || !p) throw new Error("Type a text and a pattern."); if(t.length > 24) throw new Error("At most 24 letters of text."); if(p.length > 8) throw new Error("At most 8 letters of pattern.");
+    const m = p.length, lps = Array(m).fill(null); lps[0] = 0; const found = [];
+    const S = o => Object.assign({t, p, lps:lps.slice(), found:found.slice()}, o);
+    R.step(0, `Build the lps table for "${p}". lps[0] = 0: one letter has no proper prefix.`, S({phase:"build", i:0, k:0}));
+    let k = 0;
+    for(let i=1;i<m;i++){
+      while(k > 0 && p[i] !== p[k]){ R.inc("cmp"); const nk = lps[k-1]; R.step(1, `p[${i}] = '${p[i]}' ≠ p[${k}] = '${p[k]}': fall back to the next shorter border, k = lps[${k-1}] = ${nk}.`, S({phase:"build", i, k, miss:true})); k = nk; }
+      R.inc("cmp");
+      if(p[i] === p[k]){ k++; lps[i] = k; R.step(2, `p[${i}] = '${p[i]}' matches p[${k-1}]: the border grows to ${k}. lps[${i}] = ${k} ("${p.slice(0,k)}" is both a prefix and a suffix of "${p.slice(0,i+1)}").`, S({phase:"build", i, k})); }
+      else { lps[i] = 0; R.step(2, `p[${i}] = '${p[i]}' ≠ p[0]: no border. lps[${i}] = 0.`, S({phase:"build", i, k:0, miss:true})); } }
+    R.step(3, `lps = [${lps.join(", ")}]. Now search the text; the text pointer i only moves forward.`, S({phase:"search", i:0, j:0}));
+    let j = 0;
+    for(let i=0;i<t.length;i++){
+      while(j > 0 && t[i] !== p[j]){ R.inc("cmp"); R.inc("shift"); const nj = lps[j-1];
+        R.step(5, `t[${i}] = '${t[i]}' ≠ p[${j}] = '${p[j]}'. Keep i and slide the pattern: the last ${nj} matched letters are already a prefix of p, so j = lps[${j-1}] = ${nj}.`, S({phase:"search", i, j, miss:true}));
+        j = nj; R.step(5, `The pattern now starts at ${i - j} in the text.`, S({phase:"search", i, j})); }
+      R.inc("cmp");
+      if(t[i] === p[j]){ j++; R.step(6, `t[${i}] = '${t[i]}' = p[${j-1}]: ${j} letter${j===1?"":"s"} matched.`, S({phase:"search", i, j, hit:true})); }
+      else R.step(6, `t[${i}] = '${t[i]}' ≠ p[0]: move on.`, S({phase:"search", i, j, miss:true}));
+      if(j === m){ found.push(i-m+1); R.step(7, `All ${m} letters match: "${p}" found at ${i-m+1}. Continue with j = lps[${m-1}] = ${lps[m-1]} to find overlapping matches.`, S({phase:"search", i, j, match:true})); j = lps[m-1]; } }
+    R.step(7, found.length ? `Done: "${p}" occurs at ${found.join(", ")}. ${R.c.cmp} letter comparisons for ${t.length} + ${m} letters.` : `Done: "${p}" does not occur. ${R.c.cmp} comparisons.`, S({phase:"search", end:true})); },
+  draw(s){ const m = s.p.length;
+    if(s.phase==="build"){ const k = s.k||0, matched = !s.miss && s.i>0, sufFrom = matched ? s.i-k+1 : s.i-k, sufTo = matched ? s.i : s.i-1;
+      const cells = s.p.split("").map((c,i)=>({v:c, cls:i===s.i ? (s.miss?"miss":"cur") : k>0 && i<k && i<sufFrom ? "done" : k>0 && i>=sufFrom && i<=sufTo ? "win" : ""}));
+      return rowsSVG([{label:"p", cells}, {label:"lps", cells:s.lps.map((x,i)=>({v:x===null?"":x, cls:i===s.i?"cur":x===null?"nil":""}))}], {lx:40, label:"Pattern and its lps table"}) + `<p class="av-aux">Green: the border (a prefix that is also a suffix). Blue: the same letters at the end. Orange: the letter being tested.</p>`; }
+    if(s.end || s.i===undefined) return rowsSVG([{label:"text", cells:s.t.split("").map((c,i)=>({v:c, cls:s.found.some(f=>i>=f && i<f+m) ? "done" : ""}))}], {lx:40, label:"Text"}) + `<p class="av-aux mono">found at: ${s.found.join(", ") || "none"}</p>`;
+    const hit = s.hit || s.match, start = hit ? s.i - s.j + 1 : s.i - s.j, at = hit ? s.j - 1 : s.j;   // where the pattern starts in the text; which pattern letter is at t[i]
+    const T = s.t.split("").map((c,i)=>({v:c, cls:i===s.i ? (s.miss ? "miss" : hit ? "done" : "cur") : i>=start && i<s.i ? "win" : "", focus:i===s.i}));
+    const P = s.p.split("").map((c,k)=>({v:c, cls:s.match ? "done" : k < at ? "win" : k === at ? (s.miss ? "miss" : hit ? "done" : "cur") : ""}));
+    return rowsSVG([{label:"text", cells:T}, {label:"p", cells:P, off:start}, {label:"lps", cells:s.lps.map(x=>({v:x})), off:start}], {lx:40, label:"Text with the pattern lined up under it"}) + `<p class="av-aux mono">pattern starts at ${start} · ${s.j} letter${s.j===1?"":"s"} matched · found at: ${s.found.join(", ") || "none yet"}</p>`; } });
+
+/* ---- heaps: top-K and the running median ---- */
+def({ id:"topk", group:"Data structures", title:"Heaps: top K and the running median", concepts:["trees","queuesbuf","bigo"],
+  text:v=>v.mode==="median" ? "Keep the smaller half of the numbers in a max-heap and the larger half in a min-heap, with sizes equal or the low half one bigger. Each new number goes to one side; if the sizes drift apart, move one top across. The median is then the top of the low half, or the average of both tops. Each number costs O(log n)." :
+    "To keep the K largest numbers of a stream, use a min-heap of size K: push each number, and when the heap has K + 1 items, pop the smallest. The heap then holds the K largest seen so far, and its top is the K-th largest. O(n log K) time and O(K) memory, instead of sorting everything.",
+  inputs:[{k:"mode", label:"Problem", def:"topk", opts:[{v:"topk", label:"K largest with a size-K min-heap", set:{a:"5, 1, 9, 3, 12, 7, 4, 15, 8", k:"3"}},{v:"median", label:"Running median with two heaps", set:{a:"5, 15, 1, 3, 8, 7, 9, 10"}}]},
+    {k:"a", label:"Stream of numbers (up to 12)", def:"5, 1, 9, 3, 12, 7, 4, 15, 8"},{k:"k", label:"K", def:"3", w:4, when:v=>v.mode!=="median"}],
+  random:()=>({a:randArr(rint(7,10), 1, 40)}), counters:["push","pop"],
+  code:v=>v.mode==="median" ? ["low = max-heap (smaller half); high = min-heap (larger half)","add(x): if low is empty or x <= low.top: low.push(x) else high.push(x)","  if len(low) > len(high) + 1: high.push(low.pop())","  if len(high) > len(low): low.push(high.pop())","median: odd count: low.top; even: (low.top + high.top) / 2"]
+    : ["heap = empty min-heap","for x in stream:","  heap.push(x)","  if len(heap) > K: heap.pop()   (drop the smallest)","heap holds the K largest; heap.top is the K-th largest"],
+  run(v, R){ const a = nums(v.a, -99, 99, 12), mode = v.mode==="median" ? "median" : "topk";
+    const up = (h, less) => { let i = h.length-1; while(i>0){ const p = (i-1)>>1; if(!less(h[i], h[p])) break; [h[i],h[p]] = [h[p],h[i]]; i = p; } };
+    const down = (h, less) => { let i = 0; for(;;){ const l = 2*i+1, r = l+1; let m = i; if(l<h.length && less(h[l],h[m])) m = l; if(r<h.length && less(h[r],h[m])) m = r; if(m===i) return; [h[i],h[m]] = [h[m],h[i]]; i = m; } };
+    const push = (h, x, less) => { h.push(x); up(h, less); R.inc("push"); }, pop = (h, less) => { const top = h[0], last = h.pop(); if(h.length){ h[0] = last; down(h, less); } R.inc("pop"); return top; };
+    const minL = (x,y)=>x<y, maxL = (x,y)=>x>y;
+    if(mode==="topk"){ const K = nums(v.k, 1, 8, 1)[0], h = []; const S = o => Object.assign({mode, h:h.slice(), K, a}, o);
+      R.step(0, `Keep the ${K} largest numbers of the stream in a min-heap of size ${K}. Its top is always the smallest of them.`, S({}));
+      a.forEach((x,i)=>{ push(h, x, minL); R.step(2, `Push ${x}. The heap has ${h.length} item${h.length===1?"":"s"}; its top (the smallest) is ${h[0]}.`, S({at:i, nw:x}));
+        if(h.length > K){ const y = pop(h, minL); R.step(3, `${K+1} items is one too many: pop the smallest, ${y}. It cannot be among the ${K} largest.`, S({at:i, out:y})); } });
+      R.step(4, `The ${K} largest are ${h.slice().sort((x,y)=>y-x).join(", ")}; the ${K===1?"1st":K===2?"2nd":K===3?"3rd":K+"th"} largest is the top, ${h[0]}. ${R.c.push} pushes and ${R.c.pop||0} pops, each O(log ${K}).`, S({end:true})); return; }
+    const lo = [], hi = [], meds = []; const S = o => Object.assign({mode, lo:lo.slice(), hi:hi.slice(), a, meds:meds.slice()}, o);
+    const med = () => lo.length > hi.length ? lo[0] : (lo[0] + hi[0]) / 2;
+    R.step(0, "Two heaps: low (a max-heap with the smaller half) and high (a min-heap with the larger half).", S({}));
+    a.forEach((x,i)=>{
+      if(!lo.length || x <= lo[0]){ push(lo, x, maxL); R.step(1, `${x} ${lo.length>1 ? `≤ ${lo[0]===x && lo.length>1 ? "the top of low" : "low's top " + lo[0]}` : "is the first number"}: push it into low.`, S({at:i, nw:x, side:"lo"})); }
+      else { push(hi, x, minL); R.step(1, `${x} > low's top ${lo[0]}: push it into high.`, S({at:i, nw:x, side:"hi"})); }
+      if(lo.length > hi.length + 1){ const y = pop(lo, maxL); push(hi, y, minL); R.step(2, `low has 2 more than high: move its top ${y} to high.`, S({at:i, nw:y, side:"hi"})); }
+      else if(hi.length > lo.length){ const y = pop(hi, minL); push(lo, y, maxL); R.step(3, `high is bigger than low: move its top ${y} to low.`, S({at:i, nw:y, side:"lo"})); }
+      meds.push(med());
+      R.step(4, `${i+1} number${i===0?"":"s"}: the median is ${lo.length > hi.length ? `low's top, ${lo[0]}` : `(${lo[0]} + ${hi[0]}) / 2 = ${med()}`}.`, S({at:i})); });
+    R.step(4, `Medians after each number: ${meds.join(", ")}. Each step is O(log n).`, S({end:true})); },
+  draw(s){ const tree = (h, label, cls) => { const nodes = {}; h.forEach((x,i)=>nodes[i] = {label:String(x), kids:[2*i+1,2*i+2].filter(k=>k<h.length), cls:(i===0?"cur":"")}); return `<div class="hp-side ${cls||""}"><div class="av-h mono">${esc(label)}</div>${treeSVG(nodes, h.length?["0"]:[], {label, empty:"empty", ux:38, uy:48, r:15})}</div>`; };
+    const stream = s.a.map((x,i)=>({v:x, cls:i===s.at ? "cur" : s.at!==undefined && i<s.at || s.end ? "dim" : ""}));
+    const head = rowsSVG([{label:"stream", cells:stream}], {lx:52, label:"The input stream", min:.85});
+    if(s.mode==="median") return head + `<div class="av-hp">${tree(s.lo, "low: max-heap (smaller half)", s.side==="lo"?"act":"")}${tree(s.hi, "high: min-heap (larger half)", s.side==="hi"?"act":"")}</div><p class="av-aux mono">medians: ${s.meds.join(", ") || "none yet"}</p>`;
+    return head + `<div class="av-hp">${tree(s.h, `min-heap of the ${s.K} largest so far`, "act")}</div>${s.out!==undefined?`<p class="av-aux">popped ${s.out}</p>`:""}<p class="av-aux mono">kept: ${s.h.slice().sort((x,y)=>y-x).join(", ") || "none"}</p>`; } });
+
+/* ---- sieve of Eratosthenes ---- */
+def({ id:"sieve", group:"Searching", title:"Sieve of Eratosthenes", concepts:["numbertheory","bigo"],
+  text:"List the numbers from 2 to N. The smallest number not crossed out is prime; cross out its multiples, starting at p × p (smaller multiples were already crossed out by smaller primes). Once p × p is bigger than N, every number left is prime. It costs O(N log log N), almost linear, and is the standard way to find all primes up to a few million.",
+  inputs:[{k:"n", label:"N (10 to 120)", def:"60", w:5}], random:()=>({n:String(rint(30,100))}), counters:["cross"],
+  code:["mark 2..N as maybe prime","for p from 2 while p * p <= N:","  if p is still marked: it is prime","    for m from p * p to N step p: cross out m","every number still marked is prime"],
+  run(v, R){ const N = nums(v.n, 10, 120, 1)[0], st = Array(N+1).fill(0);   // 0 unknown, 1 crossed, 2 prime
+    const S = o => Object.assign({N, st:st.slice()}, o);
+    R.step(0, `Numbers 2 to ${N}; none crossed out yet.`, S({}));
+    for(let p=2; p*p<=N; p++){
+      if(st[p]===1){ R.step(2, `${p} is crossed out (a multiple of a smaller prime): skip it.`, S({p})); continue; }
+      st[p] = 2; R.step(2, `${p} is not crossed out, so it is prime. Cross out its multiples from ${p} × ${p} = ${p*p}.`, S({p}));
+      const hit = [];
+      for(let m=p*p; m<=N; m+=p){ if(st[m]!==1){ st[m] = 1; R.inc("cross"); } hit.push(m); }
+      R.step(3, `Crossed out ${hit.join(", ")}.`, S({p, hit})); }
+    let c = 0; for(let i=2;i<=N;i++) if(st[i]!==1){ st[i] = 2; c++; }
+    R.step(4, `The next p has p × p > ${N}, so everything left is prime: ${c} primes up to ${N}. Only ${R.c.cross||0} cross-outs.`, S({end:true})); },
+  draw(s){ const hit = new Set(s.hit||[]);
+    let h = `<div class="av-sieve" role="img" aria-label="Numbers 2 to ${s.N}: primes and crossed-out numbers">`;
+    for(let i=2;i<=s.N;i++) h += `<span class="sv${s.st[i]===2?" pr":s.st[i]===1?" x":""}${i===s.p?" cur":""}${hit.has(i)?" hit":""}">${i}</span>`;
+    return h + `</div><p class="av-aux av-key"><span><i class="done"></i>prime</span><span><i class="cur"></i>current p</span><span><i class="swp"></i>just crossed out</span><span><i class="prn"></i>crossed out</span></p>`; } });
+
+/* ---- 2-D DP: grid DP and interval DP, as a table or as memoized recursion ---- */
+const D2_MODES = [{v:"minpath", label:"Grid: minimum path sum (right / down)", set:{g:"1 3 1 2; 1 5 1 3; 4 2 1 1; 2 6 3 1"}},{v:"paths", label:"Grid: count paths around obstacles", set:{g:"0 0 0 0; 0 1 0 0; 0 0 0 1; 1 0 0 0"}},
+  {v:"lps", label:"Interval: longest palindromic subsequence", set:{s:"bbabcbcab"}}];
+function d2Problem(v){
+  const mode = D2_MODES.some(m=>m.v===v.mode) ? v.mode : "minpath";
+  if(mode==="lps"){ const s = String(v.s||"").replace(/\s/g,""); if(!s || s.length > 9) throw new Error("Use a word of 1 to 9 letters.");
+    const n = s.length;
+    return {mode, n, R:n, C:n, s, valid:(i,j)=>j>=i, goal:[0, n-1], rows:s.split(""), cols:s.split(""),
+      what:"f(i, j) = the longest palindromic subsequence inside s[i..j]",
+      order:(()=>{ const o = []; for(let len=1;len<=n;len++) for(let i=0;i+len-1<n;i++) o.push([i, i+len-1]); return o; })(),
+      base:(i,j)=>i===j ? 1 : undefined, deps:(i,j)=>s[i]===s[j] ? (i+1<=j-1 ? [[i+1, j-1]] : []) : [[i+1, j],[i, j-1]],
+      calc:(i,j,g)=>s[i]===s[j] ? 2 + (i+1<=j-1 ? g(i+1, j-1) : 0) : Math.max(g(i+1, j), g(i, j-1)),
+      expl:(i,j,g,r)=>s[i]===s[j] ? `s[${i}] = s[${j}] = '${s[i]}': both ends join the palindrome inside, f(${i}, ${j}) = 2 + ${i+1<=j-1 ? `f(${i+1}, ${j-1}) = 2 + ${g(i+1, j-1)}` : "0"} = ${r}.` : `'${s[i]}' ≠ '${s[j]}': drop one end, f(${i}, ${j}) = max(f(${i+1}, ${j}) = ${g(i+1, j)}, f(${i}, ${j-1}) = ${g(i, j-1)}) = ${r}.`,
+      rec:"s[i] == s[j] ? 2 + f(i+1, j-1) : max(f(i+1, j), f(i, j-1))", baseStr:"f(i, i) = 1", fill:"by length: all ranges of length 1, then 2, ...", intro:`Find the longest palindromic subsequence of "${s}".`}; }
+  const rows = String(v.g||"").split(/[;\n]+/).map(r=>r.trim()).filter(Boolean).map(r=>r.split(/[\s,]+/).map(Number));
+  if(!rows.length || rows.some(r=>r.length!==rows[0].length || r.some(x=>!Number.isInteger(x)))) throw new Error('Write the grid row by row, rows separated by ";", like "1 3 1; 1 5 1".');
+  const R = rows.length, C = rows[0].length; if(R > 6 || C > 6) throw new Error("At most 6 × 6 cells.");
+  const G = rows, rl = Array.from({length:R},(x,i)=>i), cl = Array.from({length:C},(x,j)=>j);
+  if(mode==="paths"){ if(G.flat().some(x=>x!==0 && x!==1)) throw new Error("Use 0 for an open cell and 1 for an obstacle.");
+    return {mode, R, C, G, valid:()=>true, goal:[R-1, C-1], rows:rl, cols:cl, what:"f(i, j) = the number of paths from the top-left corner to cell (i, j)",
+      order:rl.flatMap(i=>cl.map(j=>[i,j])), base:(i,j)=>G[i][j]===1 ? 0 : i===0 && j===0 ? 1 : undefined,
+      deps:(i,j)=>[[i-1,j],[i,j-1]].filter(([a,b])=>a>=0&&b>=0), calc:(i,j,g)=>(i>0?g(i-1,j):0) + (j>0?g(i,j-1):0),
+      expl:(i,j,g,r)=>`Paths into (${i}, ${j}) come from above (${i>0?g(i-1,j):"none"}) or from the left (${j>0?g(i,j-1):"none"}): f = ${r}.`,
+      rec:"0 if blocked, else f(i-1, j) + f(i, j-1)", baseStr:"f(0, 0) = 1; an obstacle has 0 paths", fill:"row by row", intro:"Count the paths from the top-left to the bottom-right corner, moving right or down and avoiding obstacles (1)."}; }
+  if(G.flat().some(x=>x<0 || x>9)) throw new Error("Use costs from 0 to 9.");
+  return {mode, R, C, G, valid:()=>true, goal:[R-1, C-1], rows:rl, cols:cl, what:"f(i, j) = the cheapest path cost from the top-left corner to cell (i, j)",
+    order:rl.flatMap(i=>cl.map(j=>[i,j])), base:(i,j)=>i===0 && j===0 ? G[0][0] : undefined,
+    deps:(i,j)=>[[i-1,j],[i,j-1]].filter(([a,b])=>a>=0&&b>=0), calc:(i,j,g)=>G[i][j] + Math.min(i>0?g(i-1,j):INF, j>0?g(i,j-1):INF),
+    expl:(i,j,g,r)=>`f(${i}, ${j}) = cost ${G[i][j]} + the cheaper way in (${[i>0?`from above ${g(i-1,j)}`:"", j>0?`from the left ${g(i,j-1)}`:""].filter(Boolean).join(", ")}) = ${r}.`,
+    rec:"grid[i][j] + min(f(i-1, j), f(i, j-1))", baseStr:"f(0, 0) = grid[0][0]", fill:"row by row", intro:"Find the cheapest path from the top-left to the bottom-right corner, moving only right or down."};
+}
+def({ id:"dp2d", group:"Dynamic programming", title:"2-D DP: grid and interval tables, filled or memoized", concepts:["dp","callstack","bigo"],
+  text:"A 2-D state needs two numbers: a cell (i, j) of a grid, or a range s[i..j]. The table method fills the cells in an order where every cell it reads is already done: row by row for a grid, by increasing length for ranges. The memo method starts from the answer cell and asks for what it needs, storing each result; it fills the same cells in a different order and only the ones it actually needs. Both cost O(number of cells × work per cell).",
+  inputs:[{k:"mode", label:"Problem", def:"minpath", opts:D2_MODES},{k:"method", label:"Method", def:"table", opts:[{v:"table", label:"Bottom-up table", set:{}},{v:"memo", label:"Top-down recursion with a memo", set:{}}]},
+    {k:"g", label:v=>v.mode==="paths"?"Grid: 0 = open, 1 = obstacle; rows split by ;":"Grid of costs, rows split by ;", def:"1 3 1 2; 1 5 1 3; 4 2 1 1; 2 6 3 1", when:v=>v.mode!=="lps"},
+    {k:"s", label:"Word (up to 9 letters)", def:"bbabcbcab", w:12, when:v=>v.mode==="lps"}],
+  random:v=>v.mode==="lps" ? {s:Array.from({length:rint(6,9)},()=>"abc"[rint(0,2)]).join("")} : v.mode==="paths" ? {g:Array.from({length:4},(x,i)=>Array.from({length:4},(y,j)=>(i+j===0||i+j===6)?0:Math.random()<.2?1:0).join(" ")).join("; ")} : {g:Array.from({length:4},()=>randArr(4,1,9).replace(/,/g,"")).join("; ")},
+  counters:v=>v.method==="memo" ? ["calls","memo","cells"] : ["cells"],
+  code:v=>{ let p; try{ p = d2Problem(v); }catch(e){ p = d2Problem({mode:"minpath", g:"1 2; 3 4"}); }
+    return v.method==="memo" ? ["memo = {}", `f(i, j): base case: ${p.baseStr}`, "  if (i, j) is in memo: return it   (cache hit)", `  memo[i, j] = ${p.rec}`, "  return memo[i, j]"]
+      : [`${p.baseStr}   (base cases)`, `fill the other cells ${p.fill}:`, `  f(i, j) = ${p.rec}`, `return f(${p.mode==="lps" ? "0, n-1" : "R-1, C-1"})`]; },
+  run(v, R){ const p = d2Problem(v), method = v.method==="memo" ? "memo" : "table", f = Array.from({length:p.R},()=>Array(p.C).fill(null)), stack = [];
+    const S = o => Object.assign({p:{mode:p.mode, R:p.R, C:p.C, G:p.G, rows:p.rows, cols:p.cols, what:p.what, goal:p.goal, s:p.s}, method, f:f.map(r=>r.slice()), stack:stack.map(x=>x.slice())}, o);
+    const get = (i,j) => f[i][j];
+    if(method==="table"){
+      p.order.forEach(([i,j])=>{ const b = p.base(i,j); if(b!==undefined){ f[i][j] = b; R.inc("cells"); } });
+      R.step(0, `${p.intro} ${p.what}. Base cases first: ${p.baseStr}.`, S({}));
+      for(const [i,j] of p.order){ if(f[i][j]!==null) continue; const ds = p.deps(i,j), r = p.calc(i,j,get); f[i][j] = r; R.inc("cells");
+        R.step(2, p.expl(i,j,get,r), S({cur:[i,j], dep:ds})); }
+      const [gi, gj] = p.goal;
+      R.step(3, `The answer is f(${gi}, ${gj}) = ${f[gi][gj]}. ${R.c.cells} cells, each filled once.`, S({cur:[gi,gj], end:true})); return; }
+    R.step(0, `${p.intro} ${p.what}. Start with the call for the answer cell and let it ask for what it needs.`, S({}));
+    const call = (i, j, from) => { R.inc("calls"); stack.push([i, j]);
+      const b = p.base(i,j);
+      if(b!==undefined){ if(f[i][j]===null){ f[i][j] = b; R.inc("cells"); } R.step(1, `f(${i}, ${j}) is a base case: ${b}.`, S({cur:[i,j]})); stack.pop(); return b; }
+      if(f[i][j]!==null){ R.inc("memo"); R.step(2, `f(${i}, ${j}) is already in the memo: ${f[i][j]} (a cache hit).`, S({cur:[i,j], hit:true})); stack.pop(); return f[i][j]; }
+      const ds = p.deps(i,j);
+      R.step(3, `Call f(${i}, ${j})${from ? ` (asked by f(${from[0]}, ${from[1]}))` : ""}: it needs ${ds.length ? ds.map(([a,c])=>`f(${a}, ${c})`).join(" and ") : "nothing more"}.`, S({cur:[i,j], dep:ds}));
+      ds.forEach(([a,c])=>call(a, c, [i,j]));
+      const r = p.calc(i,j,get); f[i][j] = r; R.inc("cells");
+      R.step(4, p.expl(i,j,get,r) + " Store it in the memo.", S({cur:[i,j], dep:ds})); stack.pop(); return r; };
+    const [gi, gj] = p.goal, r = call(gi, gj);
+    const total = p.order.length, used = f.flat().filter(x=>x!==null).length;
+    R.step(4, `f(${gi}, ${gj}) = ${r}. ${R.c.calls} calls, ${R.c.memo||0} cache hits; ${used} of ${total} cells were needed${used<total?" (the table fills them all)":""}.`, S({cur:[gi,gj], end:true})); },
+  draw(s){ const P = s.p, dep = new Set((s.dep||[]).map(x=>x.join(","))), cur = s.cur ? s.cur.join(",") : "";
+    const head = [{v:""}].concat(P.cols.map(c=>({v:c})));
+    const rows = [head].concat(P.rows.map((rl,i)=>[{v:rl}].concat(P.cols.map((c,j)=>{ const k = i+","+j, x = s.f[i][j];
+      if(P.mode==="lps" && j<i) return {v:"", cls:"na"};
+      return {v:x===null?"":x, cls:k===cur ? (s.hit ? "done" : "cur") : dep.has(k) ? "cmp" : s.end && k===P.goal.join(",") ? "done" : ""}; }))));
+    let grid = "";
+    if(P.G) grid = `<div><div class="av-h mono">${P.mode==="paths" ? "grid (1 = obstacle)" : "grid of costs"}</div>${table([[{v:""}].concat(P.cols.map(c=>({v:c})))].concat(P.G.map((r,i)=>[{v:i}].concat(r.map((x,j)=>({v:x, cls:(i+","+j)===cur ? "cur" : P.mode==="paths" && x===1 ? "blk" : ""}))))), {head:true, side:true, cls:"dp"})}</div>`;
+    const st = s.method==="memo" ? stackHTML("call stack", s.stack.map((x,k)=>({t:`<b>f(${x[0]}, ${x[1]})</b>`, cls:k===s.stack.length-1 ? (s.hit ? "hit" : "cur") : ""})), "empty") : "";
+    return `<div class="av-bk">${grid}<div><div class="av-h mono">f table${P.mode==="lps" ? " (rows i, columns j)" : ""}</div><div class="av-dpwrap">${table(rows, {head:true, side:true, cls:"dp"})}</div></div>${st}</div><p class="av-aux">${esc(P.what)}. Orange: the cell being filled; purple: the cells it reads.</p>`; } });
+
 const GROUPS = ["Sorting","Searching","Arrays & strings","Recursion & trees","Graphs","Data structures","Probabilistic & distributed","Dynamic programming"];
 const NOTE = {Sorting:"Bars are values. Orange: being compared. Purple: just moved. Faded: outside the part being worked on. Green: in final place."};
 
@@ -1686,7 +1906,8 @@ function vizHTML(v){
   const ins = (v.inputs||[]).filter(i=>!i.when || i.when(P.vals)).map(inputHTML).join("");
   const pres = (v.presets||[]).map((p,i)=>`<button type="button" class="btn" data-apreset="${i}">${esc(p.name)}</button>`).join("");
   return `<div class="av" data-viz="${v.id}">
-    <h2 class="vh">${esc(v.title)}</h2><p class="vsub">${esc(fv(v,"text"))}</p>${chipsHTML(v.concepts)}
+    <h2 class="vh">${esc(v.title)}</h2><p class="vsub">${esc(fv(v,"text"))}</p>${chipsHTML(v.concepts)}${(()=>{ const T = templates(), ns = Object.keys(T).filter(n=>T[n].viz===v.id || (T[n].viz_more||[]).includes(v.id));
+      return ns.length ? `<p class="av-aux av-tpls">Pattern template${ns.length===1?"":"s"}: ${ns.map(n=>`<button type="button" class="linkish" data-aptjump="${esc(n)}">${esc(n)}</button>`).join(" · ")}</p>` : ""; })()}
     <div class="av-in">${ins}<div class="btnrow">${ins?`<button type="button" class="btn primary" data-aact="apply">Run with this input</button>`:""}${pres}${v.random?`<button type="button" class="btn" data-aact="random">Random input</button>`:""}</div></div>
     ${P.err?`<p class="av-err" role="alert">${esc(P.err)}</p>`:""}
     <div class="av-body">
@@ -1731,7 +1952,9 @@ function practiceListHTML(){
   const done = all.filter(p=>solved(p.id)).length;
   return `<h2 class="vh">Practice</h2><p class="vsub">${all.length} problems grouped by pattern; ${done} solved. Learn the pattern, not the problem: each one has a hint, the approach and why it works, and follow-up questions an interviewer would ask. Your code runs in your browser with a 2-second limit.</p>
     <div class="filters" role="group" aria-label="Difficulty">${DIFFS.map(d=>`<button type="button" data-adiff="${d}" aria-pressed="${PR.diff===d}">${d} <span class="mono" style="opacity:.7">${d==="All"?all.length:all.filter(p=>p.difficulty===d).length}</span></button>`).join("")}</div>
-    ${pats.map(pt=>{ const ps = list.filter(p=>p.pattern===pt); return `<h3 class="ysec pr-pat">${esc(pt)} <span class="mono">${ps.filter(p=>solved(p.id)).length}/${ps.length}</span></h3><div class="pr-list">${ps.map(p=>`<button type="button" class="pr-row" data-aprob="${esc(p.id)}"><span class="pr-t">${esc(p.title)}</span><span class="pr-d ${esc(String(p.difficulty).toLowerCase())}">${esc(p.difficulty)}</span><span class="pr-s" title="${solved(p.id)?"Solved":"Not solved yet"}">${solved(p.id)?"✓ solved":""}</span></button>`).join("")}</div>`; }).join("") || `<p class="empty">No ${esc(PR.diff)} problems.</p>`}`;
+    <p class="av-aux">Not sure which pattern a problem needs? <button type="button" class="linkish" data-atab="patterns">Open the "Which pattern?" cheat sheet</button>.</p>
+    ${pats.map(pt=>{ const ps = list.filter(p=>p.pattern===pt), [tn, tt] = tplFor(pt), open = PR.tplOpen && PR.tplOpen[pt];
+      return `<h3 class="ysec pr-pat" id="pat-${slug(pt)}">${esc(pt)} <span class="mono">${ps.filter(p=>solved(p.id)).length}/${ps.length}</span>${tt ? `<button type="button" class="btn tp-btn" data-atpl="${esc(pt)}" aria-expanded="${!!open}">${open ? "Hide" : "Show"} pattern template</button>` : ""}</h3>${tt && open ? `<div class="pr-tpl">${tplHTML(tn, tt)}</div>` : ""}<div class="pr-list">${ps.map(p=>`<button type="button" class="pr-row" data-aprob="${esc(p.id)}"><span class="pr-t">${esc(p.title)}</span><span class="pr-d ${esc(String(p.difficulty).toLowerCase())}">${esc(p.difficulty)}</span><span class="pr-s" title="${solved(p.id)?"Solved":"Not solved yet"}">${solved(p.id)?"✓ solved":""}</span></button>`).join("")}</div>`; }).join("") || `<p class="empty">No ${esc(PR.diff)} problems.</p>`}`;
 }
 function paras(t){ return String(t||"").split(/\n+/).filter(Boolean).map(x=>`<p>${esc(x)}</p>`).join(""); }
 function problemHTML(p){
@@ -1743,6 +1966,7 @@ function problemHTML(p){
     <p class="pr-meta"><span class="pr-d ${esc(String(p.difficulty).toLowerCase())}">${esc(p.difficulty)}</span> <span>${esc(p.pattern)}</span>${p.link?` · <a href="${esc(p.link)}" target="_blank" rel="noopener noreferrer">open the original ↗</a>`:""} <span class="pr-s" id="pr-solved">${solved(p.id)?"✓ solved":""}</span></p>
     ${p.concepts&&p.concepts.length?chipsHTML(p.concepts):""}
     <div class="pr-stmt">${paras(p.statement)}</div>
+    ${(([tn, tt]) => tt ? rev("template", "pattern template", `<p class="av-aux">The general shape of <b>${esc(tn)}</b> problems, not this problem's answer.</p>` + tplHTML(tn, tt)) : "")(tplFor(p.pattern))}
     <p class="av-aux">Write <code>${esc(p.fn)}(${esc((p.params||[]).join(", "))})</code> in JavaScript. Tab inserts two spaces; press Esc, then Tab, to leave the editor.</p>
     <label for="pr-code" class="sr">Your code</label>
     <textarea id="pr-code" class="pr-code" spellcheck="false" autocomplete="off" autocapitalize="off" data-aprob-id="${esc(p.id)}">${esc(code)}</textarea>
@@ -1805,9 +2029,71 @@ function resultsHTML(p, r){
   return `<div class="pr-res ${all?"good":"bad"}"><b>${pass} of ${p.tests.length} tests pass.</b> ${all?"Well done. Now read the approach and try the follow-ups.":r.timeout?"Stopped after 2 seconds: is there an infinite loop, or a slow algorithm?":"Look at the first failing test."}${r.nolimit?" (Ran without the time limit: workers are not available here.)":""}</div><ol class="pr-tests">${rows.join("")}</ol>`;
 }
 
+/* ---------------- pattern templates (content/practice/templates.json, keyed by practice pattern name) ---------------- */
+/* The language choice is shared by every code panel and kept in this browser. Lang is reusable: Lang.get(), Lang.set(id),
+   Lang.list(), Lang.selectHTML(current, available) renders buttons with data-codelang; a "dts:lang" event fires on window when it changes. */
+const LANGS = [{id:"python", label:"Python", rich:"python"},{id:"javascript", label:"JavaScript", rich:"js"},{id:"go", label:"Go", rich:"go"},
+  {id:"cpp", label:"C++", rich:"c"},{id:"rust", label:"Rust", rich:"rust"},{id:"scala", label:"Scala", rich:"scala"}];
+const LKEY = "dts:lang:v1";
+const Lang = {
+  get(){ let v = null; try{ v = localStorage.getItem(LKEY); }catch(e){} return LANGS.some(l=>l.id===v) ? v : "python"; },
+  set(v){ if(!LANGS.some(l=>l.id===v)) return; try{ localStorage.setItem(LKEY, v); }catch(e){} try{ window.dispatchEvent(new CustomEvent("dts:lang", {detail:v})); }catch(e){} },
+  list:() => LANGS.map(l=>({id:l.id, label:l.label})),
+  selectHTML(cur, avail){ const ok = avail ? LANGS.filter(l=>avail.includes(l.id)) : LANGS;
+    return `<div class="lang-sel" role="group" aria-label="Code language">${ok.map(l=>`<button type="button" data-codelang="${l.id}" aria-pressed="${l.id===cur}">${l.label}</button>`).join("")}</div>`; }
+};
+const templates = () => (app().DATA.templates || {});
+/* a template for a pattern name: the exact name, else the same name ignoring case and a "(...)" suffix */
+function tplFor(name){
+  const T = templates(); if(T[name]) return [name, T[name]];
+  const k = s => String(s||"").toLowerCase().replace(/\s*\(.*\)\s*$/, "").trim(), want = k(name), hit = Object.keys(T).find(x=>k(x)===want);
+  return hit ? [hit, T[hit]] : [null, null];
+}
+const slug = s => String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+function tplCodeHTML(t, lang){
+  const ids = LANGS.filter(l=>t.code && t.code[l.id]).map(l=>l.id), cur = ids.includes(lang) ? lang : ids[0], L = LANGS.find(l=>l.id===cur), src = t.code[cur];
+  const note = "lines marked CHANGE are the parts to adapt";
+  const block = window.DTSRich && window.DTSRich.codeBlock ? window.DTSRich.codeBlock(src, L.rich, note) : `<pre class="pr-sol"><code>${esc(src)}</code></pre>`;
+  return Lang.selectHTML(cur, ids) + block;
+}
+function tplHTML(name, t){
+  const vz = [t.viz].concat(t.viz_more||[]).filter(id=>id && byId(id));
+  const used = problems().filter(p=>p.pattern===name).length;
+  return `<section class="tp" data-tpl="${esc(name)}" aria-label="Pattern template: ${esc(name)}">
+    <p class="tp-sum">${esc(t.summary||"")}</p>
+    <div class="tp-grid"><div><div class="av-h mono">Use it when you see</div><ul class="tp-sig">${(t.signals||[]).map(x=>`<li>${esc(x)}</li>`).join("")}</ul></div>
+      <div><div class="av-h mono">The idea</div><p>${esc(t.idea||"")}</p>${t.example?`<p class="tp-ex"><b>Template problem:</b> ${esc(t.example)}</p>`:""}</div></div>
+    <div class="tp-code">${tplCodeHTML(t, Lang.get())}</div>
+    <p class="tp-cx"><b>Complexity:</b> ${esc(t.complexity||"")}</p>
+    ${(t.bugs||[]).length ? `<div class="av-h mono">Common bugs</div><ul class="tp-bugs">${t.bugs.map(x=>`<li>${esc(x)}</li>`).join("")}</ul>` : ""}
+    <div class="btnrow tp-links">${vz.map(id=>`<button type="button" class="btn" data-avizgo="${esc(id)}">Watch it step by step: ${esc(byId(id).title)}</button>`).join("")}${used ? `<button type="button" class="btn" data-apat="${esc(name)}">Practice it: ${used} problem${used===1?"":"s"}</button>` : ""}</div>
+  </section>`;
+}
+/* the "Which pattern?" cheat sheet: every signal from every template, filterable, then all the templates */
+const PT = { q:"", open:null };
+function patternsHTML(){
+  const T = templates(), names = Object.keys(T);
+  if(!names.length) return `<h2 class="vh">Which pattern?</h2><p class="vsub">No pattern templates yet. Add content/practice/templates.json and run python3 tools/build.py.</p>`;
+  const count = n => problems().filter(p=>p.pattern===n).length;
+  const rows = names.flatMap(n=>(T[n].signals||[]).map(sig=>`<tr data-ptrow><td>${esc(sig)}</td><td><button type="button" class="pt-go" data-aptjump="${esc(n)}">${esc(n)}</button></td><td class="pt-n mono">${count(n)||""}</td></tr>`));
+  return `<h2 class="vh">Which pattern?</h2><p class="vsub">Read the problem, find the phrase that matches it below, and open that pattern's template. Each template says when to use it, the idea, code in ${LANGS.length} languages, the complexity, the usual bugs, and a visualizer you can step through.</p>
+    <label class="av-f pt-filter"><span>Filter: type a word from the problem (sorted, k largest, intervals, all subsets, shortest path…)</span><input type="search" id="pt-q" value="${esc(PT.q)}" autocomplete="off" spellcheck="false"></label>
+    <p class="av-aux mono" id="pt-count" aria-live="polite"></p>
+    <div class="pt-wrap"><table class="pt-table"><thead><tr><th scope="col">If the problem says…</th><th scope="col">Pattern</th><th scope="col" class="pt-n">problems</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>
+    <h3 class="ysec">All ${names.length} templates</h3>
+    <div class="pt-all">${names.map(n=>`<details class="pt-d" id="tpl-${slug(n)}"${PT.open===n?" open":""}><summary><b>${esc(n)}</b> <span>${esc(T[n].summary||"")}</span></summary>${tplHTML(n, T[n])}</details>`).join("")}</div>`;
+}
+function ptFilter(){
+  const box = $("pt-q"); if(!box || !EL) return; const q = box.value.trim().toLowerCase(); PT.q = box.value;
+  let n = 0; EL.querySelectorAll("[data-ptrow]").forEach(tr=>{ const on = !q || tr.textContent.toLowerCase().includes(q); tr.hidden = !on; if(on) n++; });
+  const c = $("pt-count"); if(c) c.textContent = q ? `${n} matching signal${n===1?"":"s"}` : `${n} signals across ${Object.keys(templates()).length} patterns`;
+}
+function refreshCode(){ if(!EL) return; const lang = Lang.get();
+  EL.querySelectorAll(".tp[data-tpl]").forEach(box=>{ const t = templates()[box.dataset.tpl], c = box.querySelector(".tp-code"); if(t && c) c.innerHTML = tplCodeHTML(t, lang); }); }
+
 /* ---------------- view ---------------- */
 let EL = null;
-function hash(st){ return st.tab==="practice" ? "#practice/" + (st.prob || "list") : st.tab==="anim" ? "#animations" : "#algo/" + (byId(st.viz) ? st.viz : V[0].id); }
+function hash(st){ return st.tab==="practice" ? "#practice/" + (st.prob || "list") : st.tab==="anim" ? "#animations" : st.tab==="patterns" ? "#patterns" : "#algo/" + (byId(st.viz) ? st.viz : V[0].id); }
 /* ---------------- animations gallery ---------------- */
 const SC = { list:null, waiting:false, err:"" };
 function galleryHTML(){
@@ -1831,7 +2117,12 @@ function render(el, st){
   try{ if(!app().R.open) history.replaceState(null, "", hash(st)); }catch(e){}
   const nprob = problems().length;
   const nscn = (app().SCENES||[]).length;
-  const tabs = `<div class="filters alg-tabs" role="group" aria-label="Algorithms"><button type="button" data-atab="viz" aria-pressed="${st.tab!=="practice"&&st.tab!=="anim"}">Visualizers · ${V.length}</button><button type="button" data-atab="practice" aria-pressed="${st.tab==="practice"}">Practice · ${nprob}</button><button type="button" data-atab="anim" aria-pressed="${st.tab==="anim"}">Animations · ${nscn}</button></div>`;
+  const tabs = `<div class="filters alg-tabs" role="group" aria-label="Algorithms"><button type="button" data-atab="viz" aria-pressed="${!["practice","anim","patterns"].includes(st.tab)}">Visualizers · ${V.length}</button><button type="button" data-atab="practice" aria-pressed="${st.tab==="practice"}">Practice · ${nprob}</button><button type="button" data-atab="patterns" aria-pressed="${st.tab==="patterns"}">Which pattern?</button><button type="button" data-atab="anim" aria-pressed="${st.tab==="anim"}">Animations · ${nscn}</button></div>`;
+  if(st.tab==="patterns"){
+    el.innerHTML = tabs + `<div class="alg-pt">${patternsHTML()}</div>`; ptFilter();
+    if(PT.open){ const d = $("tpl-" + slug(PT.open)); PT.open = null; if(d){ d.open = true; d.scrollIntoView({block:"start"}); const s = d.querySelector("summary"); if(s) s.focus(); } }
+    return;
+  }
   if(st.tab==="anim"){
     if(!SC.list){ el.innerHTML = tabs + `<p class="empty">Loading the animations…</p>`;
       if(!SC.waiting){ SC.waiting = true; app().Store.scenes().then(l=>{ SC.list = l||[]; }).catch(e=>{ SC.list = []; SC.err = e.message; }).then(()=>{ SC.waiting = false; const a = app(); if(a.state.view==="algorithms" && a.state.algo.tab==="anim" && !a.R.open) render(el, a.state.algo); }); }
@@ -1861,7 +2152,13 @@ function bind(el){
     const b = e.target.closest("button"); if(!b || !el.contains(b)) return;
     const d = b.dataset, st = app().state.algo;
     try {
-      if(d.atab){ stop(); st.tab = d.atab; return render(el, st); }
+      if(d.atab){ stop(); st.tab = d.atab; render(el, st); if(d.atab==="patterns") el.scrollIntoView({block:"start"}); return; }
+      if(d.codelang){ const box = b.closest(".tp"), same = box && box.dataset.tpl; Lang.set(d.codelang); refreshCode();
+        const back = same ? Array.from(el.querySelectorAll(".tp[data-tpl]")).find(x=>x.dataset.tpl===same) : null, nb = back && back.querySelector(`[data-codelang="${d.codelang}"]`); if(nb) nb.focus(); return; }
+      if(d.avizgo){ stop(); st.tab = "viz"; st.viz = d.avizgo; P.err = ""; render(el, st); el.scrollIntoView({block:"start"}); return; }
+      if(d.aptjump){ stop(); st.tab = "patterns"; PT.open = d.aptjump; return render(el, st); }
+      if(d.atpl){ PR.tplOpen = PR.tplOpen || {}; PR.tplOpen[d.atpl] = !PR.tplOpen[d.atpl]; render(el, st); const h = $("pat-" + slug(d.atpl)), again = h && h.querySelector("[data-atpl]"); if(again) again.focus(); return; }
+      if(d.apat){ stop(); st.tab = "practice"; st.prob = null; PR.diff = "All"; render(el, st); const h = $("pat-" + slug(d.apat)); if(h) h.scrollIntoView({block:"start"}); return; }
       if(d.aviz){ stop(); st.viz = d.aviz; P.err = ""; render(el, st); const m = el.querySelector(".alg-main"); if(m && matchMedia("(max-width: 900px)").matches) m.scrollIntoView({block:"start"}); return; }
       if(d.acell!==undefined){ const v = byId(P.id); if(!v.click) return; const nv = v.click(P.vals, +d.acell); if(nv) rerun(Object.assign({}, P.vals, nv)); return; }
       if(d.alive){ const v = byId(P.id); if(!v.act) return; const fv = {};
@@ -1904,6 +2201,7 @@ function bind(el){
     const again = EL.querySelector(`select[data-ain="${s.dataset.ain}"]`); if(again) again.focus();
   });
   el.addEventListener("input", e=>{
+    if(e.target.id==="pt-q"){ ptFilter(); return; }
     if(e.target.id==="av-speed"){ P.speed = +e.target.value; if(P.t) play(); return; }
     if(e.target.id==="pr-code"){ const id = e.target.dataset.aprobId, ta = e.target; clearTimeout(PR.t); $("pr-saved").textContent = "…";
       PR.t = setTimeout(()=>{ savePractice(id, {code:ta.value}).then(()=>{ const s = $("pr-saved"); if(s) s.textContent = "saved"; }).catch(()=>{ const s = $("pr-saved"); if(s) s.textContent = "could not save"; }); }, 600); }
@@ -1921,6 +2219,6 @@ function bind(el){
   });
 }
 
-window.DTSAlgo = { render, hash, list:()=>V.map(v=>v.id), forConcept:id=>V.filter(v=>(v.concepts||[]).includes(id)).map(v=>({id:v.id, title:v.title})), _P:P, _V:V, _run:runViz, _init:initVals };
+window.DTSAlgo = { render, hash, lang:Lang, templateFor:tplFor, list:()=>V.map(v=>v.id), forConcept:id=>V.filter(v=>(v.concepts||[]).includes(id)).map(v=>({id:v.id, title:v.title})), _P:P, _V:V, _run:runViz, _init:initVals };
 if(window.__dts && window.__dts.algoReady) window.__dts.algoReady();
 })();
