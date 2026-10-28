@@ -1,0 +1,749 @@
+@@ coherence
+== Per-core counters to avoid line bouncing
+kind: sharding
+when: Many threads update one hot counter or statistic, and the updates must be cheap.
+how: With one shared counter, every increment needs the cache line in the Modified state on the writing core. Each write invalidates the copies on the other cores, so the line moves between cores. One move costs roughly 50 to 100 ns, so ten threads reach only a few million increments per second in total.
+The fix is to shard the counter. Each core or thread updates its own slot, and each slot sits in its own 64-byte line (padded), so no line is shared. Writes stay in the local cache. A reader sums all slots when it needs the total, and accepts a slightly stale value.
+Padding matters. If two slots share a line, this is false sharing: the cores still fight over the line even though they touch different bytes.
+used: Linux per-CPU counters (percpu_counter); Java LongAdder and Striped64; metrics libraries that keep per-thread counters.
+avoid: When the total must be exact at every instant, or when there are only one or two writers; a plain atomic is simpler.
+flow:
+  Thread on core 0 [client: updates slot 0] -> Slot 0 [cache: own line M state] : increment | The thread adds to its own slot. The line stays Modified in its own cache, so there is no traffic.
+  Thread on core 1 [client: updates slot 1] -> Slot 1 [cache: own line M state] : increment | Core 1 uses a different line, padded to 64 bytes. No invalidation is sent.
+  Thread on core 1 -x> Slot 0 : write same line | If both threads shared one line, each write would invalidate the other core's copy. This is false sharing.
+  Metrics reader [svc] -> Slot 0, Slot 1 : read all slots | The reader loads every slot and adds them. Each load moves a line once, but only when someone reads.
+  * Metrics reader: total, slightly stale | The sum may miss increments that happen during the read. That is fine for statistics.
+ref: docs | Linux kernel per-CPU variables | The Linux kernel documentation | https://docs.kernel.org/core-api/this_cpu_ops.html
+
+== Read-mostly data swapped by one pointer (RCU)
+kind: copy-on-write
+when: Many cores read shared data all the time, and a rare writer must update it without locking the readers.
+how: Readers only load the data, so every core keeps the line in the Shared state. No traffic is needed and reads scale with the number of cores. A lock would break this: each reader would write the lock word and the line would bounce.
+The writer builds a new copy of the structure off to the side. It then publishes it with one pointer store using release ordering. This causes one invalidation of the pointer line, and readers pick up the new copy on their next load.
+The old copy is freed only after a grace period, when every core has passed a point where it cannot hold the old pointer. Readers never block and never see a half-written object.
+used: Linux kernel RCU (routing tables, dentry lookups); userspace-RCU library; read-mostly config or routing tables in network software.
+avoid: When writes are frequent or the structure is large; copying it every time costs more than a lock.
+flow:
+  Reader cores [client: many cores] -> Config v1 [store: shared lines] : load pointer | Readers load the pointer and the data. All lines are in the Shared state, so no coherence traffic occurs.
+  Writer [svc] -> Config v2 [store: new copy] : build copy | The writer prepares a full new copy. Readers still see version 1 and are not disturbed.
+  Writer -> Config pointer [cache: one 8-byte word] : release store | One store swaps the pointer. Only this line is invalidated on the reader cores.
+  Reader cores -> Config v2 : load new pointer | On their next access, readers miss once, fetch the pointer line and then see version 2.
+  Writer ~> Config v1 : free after grace period | The old copy is freed only after all cores have moved on. Until then, late readers may still use it.
+ref: docs | What is RCU? | The Linux kernel documentation | https://docs.kernel.org/RCU/whatisRCU.html
+
+@@ digitallogic
+== Registers between logic stages set the clock
+kind: pipeline-stages
+when: A chip must run fast, and one long chain of gates between two registers would limit the clock.
+how: Combinational logic (gates with no memory) needs time for signals to settle. The clock period must be longer than the slowest path between two registers, plus the register's setup time. A path of 30 gate delays cannot run at the speed of a path of 10.
+Designers cut the long path into stages and put flip-flops between them. Each stage now has a shorter path, so the clock can run faster. All stages work on different data at the same time. A flip-flop captures its input on the clock edge and holds it for the next stage.
+The price is more registers, more power for the clock tree, and one extra cycle of latency per stage. Designers balance the stages so that none is much slower than the others. Static timing tools check every path before the chip is built.
+used: Every CPU, GPU and network switch chip; the multiplier and floating-point units inside them; FPGA designs that pipeline arithmetic.
+avoid: Control logic that feeds back to itself in one cycle, where extra stages would add latency or break correctness.
+flow:
+  Input register [store: flip-flops] -> Stage 1 logic [svc: 10 gate delays] : data | The first stage settles its output within one clock period after the register changes.
+  Stage 1 logic -> Mid register [store: flip-flops] : result | On the next clock edge the mid register captures the result and holds it steady.
+  Mid register -> Stage 2 logic [svc: 10 gate delays] : data | The second stage starts from stable inputs while stage 1 already works on new data.
+  Stage 2 logic -> Output register [store: flip-flops] : result | The output register captures the final value, so the unit gives one result per cycle.
+  Stage 2 logic -x> Output register : too slow for clock | If the path is slower than the period, the register captures a wrong value. Timing tools find these paths.
+ref: book | Computer Organization and Design | Patterson and Hennessy, Morgan Kaufmann | 
+
+== FPGA as a programmable offload for the network
+kind: offload-accelerator
+when: A fixed network or data task is too heavy for CPU cores, but needs to change more often than a custom chip allows.
+how: An FPGA is a grid of small lookup tables (LUTs, each a tiny memory that acts as any gate function), flip-flops and programmable wires. A bitstream sets the contents of the tables and the wiring, so the same chip becomes any digital circuit.
+A cloud provider puts the FPGA on the path between the NIC and the host. Packets flow through a hardware pipeline, which applies rules at line rate and with fixed latency. The host CPU only handles the first packet of a flow and the rest of the flow stays in hardware.
+New logic is deployed by loading a new bitstream. This takes seconds, but the design cycle is much longer than software. Compared with a CPU, the FPGA gives steady latency and low power per packet.
+used: Azure Accelerated Networking uses FPGA-based SmartNICs (the AccelNet paper, NSDI 2018); FPGAs for market-data and trading networks.
+avoid: When rules change daily or the logic is simple; use a normal NIC with a software data plane (DPDK, eBPF) or a fixed-function ASIC for stable high volume.
+flow:
+  Virtual machine [client] -> FPGA SmartNIC [svc: LUTs and flip-flops] : packet | A guest sends a packet. It goes to the FPGA on the NIC, not through the host CPU.
+  FPGA SmartNIC -> Flow table [cache: rules on chip] : lookup | The hardware looks up the flow in a table on chip. The lookup takes a fixed number of cycles.
+  FPGA SmartNIC -> Network [svc: wire] : rewritten packet | On a hit, the FPGA applies the rule (for example encapsulation) and sends the packet at line rate.
+  FPGA SmartNIC ~> Host agent [svc: software agent] : flow miss | On a miss, only the first packet goes to the host software. The host decides the rule.
+  Host agent ~> Flow table : install rule | The agent installs the rule, so the rest of the flow stays in hardware.
+ref: paper | Azure Accelerated Networking: SmartNICs in the Public Cloud | Firestone et al., NSDI 2018 |
+
+@@ display
+== Swap chain: double and triple buffering with vsync
+kind: producer-consumer
+when: A program draws frames while a display reads them at a fixed rate, and the picture must not tear.
+how: The display controller reads the front buffer line by line at the refresh rate, for example 60 times a second (16.7 ms per frame). If the program wrote into that same buffer, the screen would show half of the old frame and half of the new frame. This is tearing.
+With double buffering the program draws into a back buffer. When the frame is done, it asks to present. The swap happens during the vertical blanking interval (vsync), so scanout always reads one complete frame.
+The cost is latency and stalls. If drawing takes 17 ms, the program misses the swap and waits for the next vblank, so the frame rate drops to 30. Triple buffering adds a third buffer, so the program can start the next frame while one waits. This keeps the rate up but adds a frame of delay. The swap chain is a small bounded queue between a producer (the GPU) and a consumer (the display).
+used: Every GPU swap chain in Vulkan, Direct3D, Metal and OpenGL; Android SurfaceFlinger buffer queues; Wayland compositors.
+avoid: Games that value lowest latency over tear-free pictures; use adaptive sync (variable refresh rate) or allow tearing.
+flow:
+  Game loop [client: draws frames] -> Back buffer [store: frame N+1] : draw calls | The GPU renders the next frame into the back buffer, away from the screen.
+  Back buffer -> Swap queue [queue: present requests] : present | The finished frame is queued for the next vertical blank.
+  Display controller [svc: scanout] -> Front buffer [store: frame N] : read line by line | At 60 Hz the controller reads the front buffer from top to bottom in 16.7 ms.
+  Swap queue -> Display controller : swap at vblank | At the blanking interval the buffers swap. The controller starts the next scan from the new frame.
+  Back buffer -x> Display controller : frame late | A frame that is not ready at vblank is skipped. The old frame is shown again for another 16.7 ms.
+ref: docs | Vulkan WSI: presentation modes | Khronos Group | https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html
+
+== Compositor with hardware overlay planes
+kind: offload-accelerator, pipes-filters
+when: Several layers (video, app windows, cursor, status bar) must appear on one screen at low power.
+how: The simple way is to blend all layers into one framebuffer with the GPU on every frame. This reads and writes many megabytes per frame and uses power. At 4K and 60 Hz, one 32-bit framebuffer is about 33 MB, and it is read 60 times a second.
+Display controllers have several hardware planes. The compositor gives each plane a buffer, its position and its scale. The controller blends the planes during scanout, line by line, so the GPU does no work for those layers.
+The compositor checks if the hardware can handle the layer set. If it can, it does direct scanout. If not (too many layers or an unsupported format), it falls back to GPU composition for some layers. A video player on a phone often runs with no GPU work at all.
+used: Android Hardware Composer (HWC) and SurfaceFlinger; Linux DRM/KMS atomic modesetting with planes; Wayland compositors with direct scanout.
+avoid: Effects that need blending the display hardware cannot do; use the GPU for those layers.
+flow:
+  App windows [client: several layers] -> Compositor [svc: HWC or KMS] : buffers and geometry | Each app gives the compositor a finished buffer. The compositor knows the position of every layer.
+  Video decoder [svc: hardware decode] -> Compositor : decoded frames | The video frame stays in its own buffer and is never copied into a big framebuffer.
+  Compositor -> Display controller [svc: overlay planes] : atomic commit | The compositor sends one commit: which buffer on which plane, with position and scale.
+  Compositor ~> GPU [svc: fallback] : compose extra layers | If the planes cannot take all layers, the GPU blends the extra ones. This costs power.
+  Display controller -> Panel [client: pixels] : scanout | The controller blends planes line by line and drives the panel at the refresh rate.
+ref: docs | Linux DRM/KMS: planes | The Linux kernel documentation | https://docs.kernel.org/gpu/drm-kms.html
+
+@@ dma
+== NIC receive ring with DMA and interrupt coalescing
+kind: producer-consumer, batching
+when: A server must receive millions of packets per second without the CPU copying every byte or taking an interrupt per packet.
+how: At start-up the driver allocates a receive ring: an array of descriptors, each pointing to a pre-allocated buffer in RAM. It tells the NIC where the ring is. When a packet arrives, the NIC writes the bytes into the next buffer by DMA, writes the length into the descriptor and sets a done flag. The CPU is not involved in the copy.
+The NIC then raises an interrupt, but not for every packet. With interrupt coalescing it waits for a number of packets or a short time, for example 50 microseconds, and raises one interrupt for the batch. The driver handler wakes the network stack, which polls the ring and handles many packets in one pass.
+The driver refills the ring with fresh buffers and moves the tail pointer, a write to a device register called a doorbell. If the CPU is too slow and the ring is full, the NIC drops packets. Ring size is a trade: a bigger ring absorbs bursts but uses more memory and adds delay.
+used: Linux NIC drivers with NAPI (Intel ixgbe and ice, Mellanox mlx5); DPDK poll-mode drivers; the same ring idea in NVMe queues and virtio.
+avoid: Tiny low-rate devices where a simple programmed I/O register read is enough; or ultra low latency paths where coalescing delay is not acceptable (turn it off or poll).
+flow:
+  Wire [client: packets in] -> NIC [svc: DMA engine] : frame | A frame arrives at the card.
+  NIC -> RX ring [queue: 1024 descriptors] : write descriptor | The NIC takes the next descriptor, which holds the address of a free buffer.
+  NIC -> Packet buffers [store: RAM pages] : DMA write | The NIC copies the frame into RAM over PCIe. The CPU does not touch the bytes.
+  NIC ~> Driver [svc: IRQ handler] : one interrupt per batch | After 50 us or N frames, the NIC raises a single interrupt for many packets.
+  Driver -> Network stack [svc: polls ring] : batch of frames | The driver polls the ring and passes all finished frames up in one run.
+  Network stack -> RX ring : refill and doorbell | The driver gives back fresh buffers and writes the tail pointer, so the NIC can continue.
+ref: docs | Linux networking: NAPI | The Linux kernel documentation | https://docs.kernel.org/networking/napi.html
+
+== IOMMU-protected device DMA for passthrough
+kind: none
+when: A device or a guest VM is allowed to do DMA, but must not read or write memory that is not its own.
+how: Plain DMA uses physical addresses, so a buggy or hostile device could write anywhere in RAM. An IOMMU (Intel VT-d, AMD-Vi, Arm SMMU) sits between the device and memory. It translates each device address (an I/O virtual address) with page tables and blocks any access outside the mapping.
+The kernel maps only the buffers a device may use. For VM passthrough, the hypervisor maps the guest's memory for the device, so the guest driver programs real hardware directly while the host stays protected. Linux VFIO is the interface for this.
+Mappings cost something: each map and unmap changes page tables and may flush the IOMMU's translation cache (IOTLB). Drivers use large, long-lived mappings (for example huge pages) to keep this cost low. A faulting access raises an error to the host instead of corrupting memory.
+used: Linux VFIO with QEMU/KVM for GPU and NIC passthrough; SR-IOV virtual functions given to VMs; DPDK with vfio-pci; protection against DMA attacks on laptops.
+avoid: When the device is fully trusted and mapping cost matters more than isolation; or use bounce buffers if a device cannot use the IOMMU.
+flow:
+  Guest driver [svc: in the VM] -> Hypervisor [svc: KVM and VFIO] : map guest memory | The hypervisor registers guest pages for the device. The list of pages is the allowed window.
+  Hypervisor -> IOMMU [svc: page tables] : program mapping | The IOMMU gets an entry from device address to physical page.
+  Guest driver -> NIC VF [svc: SR-IOV function] : post descriptors | The guest writes descriptors straight to the device. The host kernel is not on the data path.
+  NIC VF -> IOMMU : DMA with device address | Each DMA request carries an I/O virtual address that the IOMMU must translate.
+  IOMMU -> Guest buffers [store: pinned pages] : translated write | Inside the window, the write goes to the guest's own memory.
+  NIC VF -x> IOMMU : address outside window | An address outside the mapping is blocked and the IOMMU reports a fault to the host.
+ref: docs | VFIO: Virtual Function I/O | The Linux kernel documentation | https://docs.kernel.org/driver-api/vfio.html
+
+@@ dram
+== HBM stacks beside a GPU on a silicon interposer
+kind: memory-tiering, offload-accelerator
+when: An accelerator needs memory bandwidth in the TB/s range, which ordinary DIMMs on a motherboard cannot give.
+how: A DIMM channel is 64 bits wide and gives tens of GB/s. HBM stacks several DRAM dies on top of each other, joined by through-silicon vias (TSVs), and each stack has a very wide interface of 1024 bits or more. The stacks sit next to the GPU die on a silicon interposer, so the wires are short and many.
+Several stacks together give multiple TB/s. A modern training GPU has several HBM stacks and tens to a couple of hundred GB of capacity. Capacity is the limit: weights, activations and the KV cache must all fit, or be split over many GPUs.
+HBM is the fast tier. Host DRAM is the larger, slower tier behind PCIe or NVLink-C2C, at far lower bandwidth. Software moves data across tiers on purpose (offload of optimizer state, KV cache spill). HBM is costly and hard to package, which is why supply, not just chips, limits GPU shipments.
+used: NVIDIA H100/H200 and Blackwell GPUs; AMD Instinct MI300 series; Google TPUs; also many AI accelerators.
+avoid: When capacity matters more than bandwidth; use DDR or LPDDR, or CXL-attached memory.
+flow:
+  GPU compute die [svc: SMs] -> HBM stack 0 [store: stacked DRAM dies] : wide reads | The compute die reads over a very wide bus on the interposer. Total bandwidth is in TB/s.
+  GPU compute die -> HBM stack 1 [store: stacked DRAM dies] : wide reads | Several stacks are read in parallel, which adds their bandwidths.
+  HBM stack 0 -> Interposer [note: short wires] : TSVs and microbumps | Dies are joined with vertical vias, and the stack connects to the interposer with microbumps.
+  GPU compute die ~> Host DRAM [store: DDR or LPDDR] : spill over PCIe or NVLink | Data that does not fit in HBM goes to host memory. This path is much slower.
+  GPU compute die -x> Host DRAM : out of HBM | When HBM is full the job fails or must offload. Capacity is the hard limit.
+ref: docs | High Bandwidth Memory (HBM) standards | JEDEC | https://www.jedec.org/
+
+== Channel and bank interleaving for parallel access
+kind: sharding, data-locality
+when: A memory controller must serve many requests, and one bank is too slow to keep up with the cores.
+how: A DRAM bank can serve only one row at a time. Opening a row (activate), reading, and closing it (precharge) takes tens of nanoseconds. One bank therefore cannot give high bandwidth. A system has several channels, each with ranks, bank groups and banks.
+The memory controller maps address bits so that consecutive cache lines go to different channels and banks. A streaming read then keeps all channels busy at once. The controller also reorders requests to hit an already open row, which is much cheaper than opening a new one.
+Software sees the effect. A stride that maps many accesses to one bank wastes bandwidth. Random accesses cost a row miss each time. Sequential scans, large pages and spreading threads across channels give much more bandwidth. Memory refresh also blocks banks for short times, so there are small latency spikes.
+used: Every server memory controller (Intel, AMD, Arm); STREAM benchmark tuning; filling all memory channels with DIMMs when sizing a database server.
+avoid: Do not tune for this on small working sets that fit in cache; look at cache behaviour first.
+flow:
+  CPU cores [client: many threads] -> Memory controller [svc: address mapping] : cache line requests | Many cores send 64-byte line requests. The controller splits them by address bits.
+  Memory controller -> Channel 0 [svc: banks] : line 0 | The first line goes to channel 0.
+  Memory controller -> Channel 1 [svc: banks] : line 1 | The next line goes to channel 1, so both work at the same time.
+  Channel 0 -> Open row [cache: row buffer] : row hit | A request for an open row is fast. The controller reorders requests to get more hits.
+  Channel 1 -x> Open row : row miss | A row miss needs precharge and activate first, so it costs many more cycles.
+ref: paper | What Every Programmer Should Know About Memory | Ulrich Drepper, 2007 | https://akkadia.org/drepper/cpumemory.pdf
+
+@@ floatingpoint
+== Reproducible parallel sums with tree reduction
+kind: map-reduce, fork-join
+when: A sum or average runs over many workers, and the result must be accurate and the same on every run.
+how: Floating-point addition is not associative: (a + b) + c can differ from a + (b + c) in the last bits. A parallel sum depends on the order of the additions. If threads finish in different orders, the same data gives slightly different results on each run. A large value can also swallow a small one completely.
+The fix is to fix the order. Split the data into chunks with a fixed layout. Each worker sums its chunk, using Kahan or pairwise summation to cut the rounding error. Then combine the partial sums in a fixed binary tree, always in the same order. The result is the same for the same input and the same chunking.
+Accumulating in a wider type helps too, for example FP32 or FP64 accumulators for FP16 data. Cost: a fixed order may be slightly slower than atomics that add in any order. If the number of workers changes, the tree changes and the bits can change.
+used: Reproducible reductions in HPC libraries (for example Intel oneMKL conditional numerical reproducibility); deterministic modes in deep learning frameworks; SQL engines that sum doubles across partitions.
+avoid: When bit-exact results are not needed; plain atomic adds are fine for rough metrics. For money, use integers.
+flow:
+  Input data [lake: 1 billion floats] -> Worker 1 [svc: fixed chunk], Worker 2 [svc: fixed chunk] : fixed chunks | Data is cut into chunks that do not change between runs.
+  Worker 1 -> Partial sum 1 [cache: Kahan sum] : compensated sum | Each worker keeps a running error term, so small values are not lost.
+  Worker 2 -> Partial sum 2 [cache: Kahan sum] : compensated sum | The second worker does the same on its own chunk.
+  Partial sum 1, Partial sum 2 -> Reducer [svc: fixed binary tree] : combine in order | The partial sums are always added in the same order, so the bits repeat.
+  Reducer -> Result [store: same bits every run] : total | The output is identical across runs if the chunking does not change.
+ref: paper | What Every Computer Scientist Should Know About Floating-Point Arithmetic | David Goldberg, ACM Computing Surveys, 1991 | https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html
+
+== Money as integer minor units, not floats
+kind: none
+when: A system stores or adds prices, bids or balances, and the totals must be exact.
+how: Binary floating point cannot store 0.1 exactly. In double precision, 0.1 + 0.2 gives 0.30000000000000004. One sum is harmless, but billions of small amounts add errors, and totals will not match across systems that add in different orders.
+The common design stores money as an integer count of the smallest unit: cents, or micros (millionths of a unit) when prices are very small, such as ad bids. All sums are integer sums, which are exact and give the same result in any order. A currency code is stored next to the amount. Conversion to a display string happens only at the edge.
+Rounding is a business rule, written once. For example, a CPM price of 2.5 dollars gives 0.0025 dollars per impression, which is 2500 micros. Division uses a stated rule, such as round half to even, and the remainder is not lost. Use 64-bit integers, since 32-bit micros overflow at about 2,147 units.
+used: Google Ads API reports cost in micros; Stripe uses integer minor units (cents) in its API; ad billing and ledger systems commonly use integers or fixed decimals.
+avoid: Scientific or ML values that are not money; floats are fine there.
+flow:
+  Bid request [client: price 2.50 USD] -> Pricing service [svc: parse decimal] : string 2.50 | The service reads the price as a decimal string, never as a float.
+  Pricing service -> Impression log [log: micros as int64] : 2500000 micros | It stores the exact integer, together with the currency code.
+  Impression log -> Billing job [svc: integer sums] : stream of ints | The job adds integers. The sum is exact and does not depend on the order.
+  Billing job -> Invoice DB [db: cents and currency] : rounded total | One stated rounding rule turns micros into cents at the very end.
+  Billing job -x> Invoice DB : float sum drifts | A float sum would drift by fractions of a cent and fail audit reconciliation.
+ref: docs | Google Ads API: cost micros | Google | 
+
+@@ ftl
+== Log-structured mapping with garbage collection
+kind: lsm-compaction, copy-on-write
+when: A device must hide that flash cannot overwrite in place, yet look like a normal block device to the host.
+how: NAND flash is written in pages (for example 16 KB) but erased only in whole blocks (megabytes). A host write to logical block 7 cannot just overwrite the old page. The FTL writes the new data to a fresh page in the current open block and updates a mapping table, from logical address to physical page. The old page is marked invalid.
+Over time blocks contain a mix of valid and invalid pages. Garbage collection picks a block with few valid pages, copies the valid ones to a new block, then erases it. These copies are extra writes: write amplification, the ratio of flash writes to host writes. A value of 2 to 4 is common for random writes, and it grows as the drive fills.
+The controller also spreads erases over all blocks (wear leveling), since each block survives only a limited number of program-erase cycles. The mapping table is large (about 4 bytes per 4 KB page, so roughly 1 GB per 1 TB), so it lives in controller DRAM and is protected by a log for power loss.
+used: Every SSD controller (firmware from Samsung, Kioxia, Micron, Phison and others); eMMC and UFS in phones; also the same log-structured idea in LSM trees.
+avoid: Hard to avoid inside a drive, but hosts can reduce its cost with TRIM, spare space and sequential writes. Zoned devices remove it.
+flow:
+  Host [client: write LBA 7] -> FTL controller [svc: mapping and GC] : write 4 KB | The host sends a normal block write for logical block 7.
+  FTL controller -> Mapping table [cache: LBA to page] : lookup and update | The FTL points LBA 7 at a new page and marks the old page invalid.
+  FTL controller -> Open block [store: NAND pages] : program next page | New data is appended to the open block. No in-place overwrite happens.
+  FTL controller ~> Full block [store: mixed valid pages] : garbage collect | In the background, the FTL picks a block with few valid pages and copies those pages out.
+  Full block -> Open block : copy valid pages | Valid pages move to the open block. These are extra writes that wear the flash.
+  FTL controller -> Full block : erase block | The emptied block is erased as a unit and becomes free again.
+ref: paper | Design Tradeoffs for SSD Performance | Agrawal et al., USENIX ATC 2008 | https://www.usenix.org/legacy/event/usenix08/tech/full_papers/agrawal/agrawal.pdf
+
+== Host-managed placement with zones to avoid device GC
+kind: data-locality, lsm-compaction
+when: A storage system writes data in large sequential chunks and wants low write amplification and steady latency.
+how: In a normal SSD the host cannot say which data will die together. Hot and cold data mix in one block, so garbage collection must copy a lot. Zoned Namespaces (ZNS) change the contract: the SSD is split into zones that must be written sequentially and are reset as a whole. There is no page-level mapping, so the drive needs little DRAM and no device GC.
+The host application takes over placement. A log-structured store, such as an LSM tree, writes each SSTable file into its own zone. When the file is deleted at compaction, the whole zone is reset. Data with the same lifetime sits together, so write amplification stays near 1.
+NVMe Flexible Data Placement (FDP) is a softer version: the host adds a placement hint to each write, but the drive keeps a normal interface. The cost is software work, because the application must manage zones or hints.
+used: RocksDB with the ZenFS plugin on ZNS drives; Linux zoned block device support (f2fs, btrfs zoned mode); FDP supported in recent enterprise NVMe SSDs.
+avoid: General workloads with random overwrites; use a normal conventional SSD.
+flow:
+  LSM engine [svc: flush and compact] -> Zone allocator [svc: host software] : need space for SSTable | The engine asks for space for a new immutable file.
+  Zone allocator -> Zone 3 [store: sequential write only] : append writes | The file is appended to one zone. Writes only move the write pointer forward.
+  Zone allocator -> Zone 4 [store: sequential write only] : append other lifetime | Data with a different expected lifetime goes to another zone.
+  LSM engine ~> Zone allocator : compaction deletes file | Compaction makes the old file dead, and all its data dies together.
+  Zone allocator -> Zone 3 : reset zone | The host resets the whole zone with one command. There is no copying of valid data.
+ref: docs | NVMe Zoned Namespace Command Set | NVM Express | https://nvmexpress.org/specifications/
+
+@@ hwclocks
+== Monotonic clock for durations, wall clock for stamps
+kind: timeout-deadline
+when: A program must measure how long something took, and also record when it happened, and the two must not be mixed up.
+how: A computer has two kinds of clock. The wall clock (CLOCK_REALTIME, System.currentTimeMillis) shows calendar time. NTP can step it forward or back, and leap seconds or a VM pause can jump it. The monotonic clock (CLOCK_MONOTONIC, System.nanoTime) only counts forward from some start point. It is never set by NTP, but it is only slewed in rate, by a small amount.
+Use the monotonic clock for timeouts, deadlines, retry timers and latency measurement. A timeout computed from the wall clock can fire at once or never when the clock is stepped. Use the wall clock for timestamps in logs and records that other machines read.
+A monotonic value has meaning only on one machine, and often only for one boot, so never send it over the network. Send a remaining time (a duration) or a wall-clock stamp instead. Each clock read costs about 20 to 50 ns through the vDSO, which reads the TSC without a system call.
+used: Linux clock_gettime and the vDSO; Go time package (monotonic reading inside time.Time); Java System.nanoTime; gRPC deadlines sent as remaining duration.
+avoid: Never compare monotonic values across machines or reboots; use synchronized wall clocks or logical clocks for ordering events across nodes.
+flow:
+  Request handler [svc: needs timeout] -> Monotonic clock [cache: TSC via vDSO] : read start | The handler reads the monotonic clock at the start. The value only has meaning locally.
+  Request handler -> Dependency [svc: remote call] : call with deadline 200 ms | The call carries a remaining duration, not a clock value.
+  NTP daemon [svc: chrony] -> Wall clock [cache: calendar time] : step by +2 s | NTP corrects the wall clock with a jump. This does not change the monotonic clock.
+  Request handler -> Monotonic clock : read end | Elapsed time is end minus start. The result is still right after the NTP step.
+  Request handler -> Log [log: wall-clock stamps] : event at wall time | For the record the handler writes the wall-clock time, which other machines can read.
+  Request handler -x> Wall clock : timeout from wall time | A timeout built on the wall clock would have fired two seconds early.
+ref: docs | clock_gettime(3) | Linux man-pages project | https://man7.org/linux/man-pages/man3/clock_gettime.3.html
+
+== Lease with a clock-drift margin
+kind: lease, fencing-token
+when: One node must act as the single owner (leader, lock holder) for a time, and a crashed owner must be replaced safely.
+how: The owner takes a lease for a fixed time, such as 10 seconds, from a lock service. It keeps the lease by renewing it before it ends. If it crashes, the lease runs out and another node can take over. No failure detector is needed for this.
+Every node counts time with its own oscillator, and each one drifts, for example by 50 parts per million, or about 4 seconds per day. The owner must stop acting before the service thinks the lease is over. So the holder uses a shorter local time than the grant, for example it stops at 8 of 10 seconds, and the service waits the full time plus a margin.
+Clocks are not the only danger. A GC pause or a stalled VM can make the owner continue after its lease has ended. So the protected resource also checks a fencing token, a number that grows with each lease, and rejects old ones.
+used: Chubby and ZooKeeper-style sessions; etcd leases; Kubernetes leader election with Lease objects; Google Spanner leader leases (based on TrueTime).
+avoid: When correctness must hold even with paused processes and no fencing check; use consensus on each write instead.
+flow:
+  Node A [svc: owner] -> Lock service [svc: etcd or ZooKeeper] : acquire lease 10 s | Node A asks for the lease. The service grants it with token 41.
+  Lock service -> Node A : granted token 41 | Node A starts its own local timer for 8 seconds, shorter than the grant.
+  Node A -> Storage [db: checks token] : write with token 41 | Each write carries the token. Storage remembers the highest token it has seen.
+  * Node A: paused 15 s | A long pause stops Node A. Its local timer cannot run while it sleeps.
+  Node B [svc: standby] -> Lock service : acquire after expiry | After 10 s plus a margin, the service grants the lease to Node B with token 42.
+  Node A -x> Storage : write with token 41 | Node A wakes up and writes with the old token. Storage rejects it as stale.
+ref: paper | The Chubby lock service for loosely-coupled distributed systems | Mike Burrows, OSDI 2006 | https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/
+
+@@ interrupts
+== NAPI: interrupt first, then poll under load
+kind: event-driven, batching
+when: A device produces events at a rate that changes a lot, and one interrupt per event would swamp the CPU at high load.
+how: At low rates, an interrupt per event is good: the CPU sleeps until work arrives and reacts fast. At high rates, each interrupt costs a context switch and cache disturbance, about a few microseconds. At a million packets per second the CPU can spend all its time in handlers and do no useful work. This is called receive livelock.
+Linux NAPI combines both modes. The first packet raises an interrupt. The handler masks that device interrupt and schedules a poll. The poll function runs in softirq context and takes up to a budget of packets, commonly 64, from the ring. If the ring is empty it re-enables the interrupt. If not, it polls again.
+So under load the system polls with interrupts off and handles large batches. Under light load it goes back to interrupts. This also keeps the handler short: the top half only acknowledges the device, and the real work is deferred to the bottom half.
+used: Linux network drivers (Intel, Mellanox, Broadcom); the same interrupt-then-poll idea in NVMe polling and io_uring; DPDK avoids interrupts entirely.
+avoid: Hard real-time paths where a worst-case latency bound matters more than throughput; use dedicated cores with pure polling or tuned interrupts.
+flow:
+  Device [client: NIC] -> Interrupt controller [svc: APIC] : IRQ line raised | The first packet makes the device raise an interrupt.
+  Interrupt controller -> Top half [svc: hard IRQ handler] : vector to handler | The CPU pauses its current task and runs a short handler.
+  Top half -> Device : mask device IRQ | The handler disables more interrupts from this device and schedules a poll.
+  Top half ~> Softirq poll [svc: NAPI poll loop] : schedule poll | The real work is deferred to a softirq that runs soon after.
+  Softirq poll -> Ring buffer [queue: 64 per round] : take up to budget | The poll loop takes up to 64 packets per round, with no new interrupts.
+  Softirq poll -> Device : ring empty then unmask | When the ring is empty, interrupts are enabled again, and the CPU can sleep.
+ref: docs | NAPI | The Linux kernel documentation | https://docs.kernel.org/networking/napi.html
+
+== IRQ affinity: one NIC queue per core
+kind: data-locality, sharding
+when: A busy network or storage device must scale across many cores and keep each core's caches warm.
+how: Modern NICs have many receive queues. Each queue has its own interrupt (an MSI-X vector). The NIC hashes each flow (source and destination address and port) to one queue, so all packets of one connection go to the same queue and the same core.
+The administrator or irqbalance sets IRQ affinity: queue 0 interrupts core 0, queue 1 interrupts core 1, and so on. The packet is handled on the core that took the interrupt, and the application thread for that socket can run on the same core (or at least the same NUMA node). Packet data, socket state and the stack code stay in that core's cache.
+Without this, one core handles every interrupt and becomes the limit at a few million packets per second, while other cores wait. With it, throughput scales nearly linear with the number of queues. Affinity must also respect NUMA: use cores on the socket where the NIC is attached.
+used: Linux RSS and RPS with /proc/irq/N/smp_affinity; high-rate load balancers and proxies tuned per queue; NVMe drivers that map one queue per CPU.
+avoid: Small servers with low traffic; leave the defaults and let irqbalance work.
+flow:
+  Incoming packets [client: many flows] -> NIC [svc: RSS hash] : frames | The NIC computes a hash over the flow tuple for each frame.
+  NIC -> Queue 0 [queue: MSI-X vector 0], Queue 1 [queue: MSI-X vector 1] : hash picks queue | All packets of one flow land in the same queue, so their order is kept.
+  Queue 0 -> Core 0 [svc: IRQ and stack] : interrupt | Queue 0 interrupts only core 0, set by smp_affinity.
+  Queue 1 -> Core 1 [svc: IRQ and stack] : interrupt | Queue 1 interrupts only core 1, so the two cores work in parallel.
+  Core 0 -> App thread 0 [svc: same core] : socket data | The application thread that owns the socket runs on the same core, with a warm cache.
+  Core 1 -x> Core 0 : cross-core handoff | Moving a flow to another core would cost cache misses and lock contention.
+ref: docs | Scaling in the Linux Networking Stack | The Linux kernel documentation | https://docs.kernel.org/networking/scaling.html
+
+@@ isa
+== Compile once to IR, emit code for each ISA
+kind: interpreter-compiler
+when: One program must run on several processor families, such as x86-64 and Arm64, without writing it twice.
+how: The instruction set architecture (ISA) is the contract between software and the chip. Machine code for x86-64 does not run on Arm64. A compiler front end parses source code and produces an intermediate representation (IR), which does not depend on a chip. Optimizations run on the IR.
+A back end then lowers the IR to one target ISA. It chooses instructions, assigns registers and applies the calling convention of that target. The same IR can go to x86-64, Arm64 or RISC-V by changing the back end. Cross compilation builds code for a different ISA from the one the build machine uses.
+Teams use this to ship one codebase to cloud servers on both architectures. Cloud providers offer Arm instances (AWS Graviton) next to x86 ones, often at lower cost for the same work. A container image can carry a manifest list with one image per architecture, and the runtime pulls the matching one.
+used: LLVM (Clang, Rust, Swift) with back ends for x86, AArch64 and RISC-V; GCC; Go cross compile with GOARCH; Docker buildx multi-platform images.
+avoid: Hand-written assembly or code that assumes one ISA (for example memory ordering or SIMD intrinsics); wrap it behind an interface with a portable fallback.
+flow:
+  Source code [lake: C, Rust or Swift] -> Front end [svc: parser] : AST | The front end checks the language rules and builds a tree.
+  Front end -> IR [store: LLVM IR] : lowered code | The program becomes an IR with unlimited virtual registers and no ISA details.
+  IR -> Optimizer [svc: IR passes] : inline and vectorize | Passes work on the IR once, and every target gets the benefit.
+  Optimizer -> x86-64 back end [svc: instruction selection], AArch64 back end [svc: instruction selection] : IR | Each back end picks real instructions and registers for its ISA.
+  x86-64 back end -> amd64 image [store: container layer] : machine code | Machine code for x86-64 goes to one image.
+  AArch64 back end -> arm64 image [store: container layer] : machine code | The Arm64 code goes to another image. A manifest list names both.
+ref: docs | The Architecture of Open Source Applications: LLVM | Chris Lattner, 2011 | https://aosabook.org/en/v1/llvm.html
+
+== Runtime dispatch on CPU features
+kind: none
+when: One binary must run on many CPUs, and must use the fastest instruction extension available on each one.
+how: Chips of one ISA differ. Two x86-64 servers may support AVX2 or AVX-512, and one Arm64 chip may have SVE and another may not. If you compile for the newest extension, the program crashes with an illegal instruction on older chips. If you compile for the oldest, you lose speed.
+The solution is to compile several versions of a hot function, for example a scalar, an AVX2 and an AVX-512 version. At start-up (or at first call) the program asks the CPU what it supports, with the CPUID instruction on x86 or hardware capability bits on Arm. It then stores a pointer to the best version and calls it from then on.
+The check happens once, so the cost per call is one indirect jump. Compilers and libraries automate this. The price is larger binaries and more testing, since each version must be checked and must give the same results.
+used: glibc IFUNC for memcpy and strlen; GCC function multiversioning; Highway and simdjson select kernels at runtime; ClickHouse picks vector kernels by CPU at run time.
+avoid: When you control the fleet and every machine has the same CPU; compile for that target and skip dispatch.
+flow:
+  Program start [client] -> CPU feature probe [svc: CPUID] : ask capabilities | At start-up the program asks which extensions this CPU supports.
+  CPU feature probe -> Dispatch table [cache: function pointers] : pick best kernel | The best version of each hot function is stored in a table.
+  Hot loop [svc: caller] -> Dispatch table : call through pointer | Each call costs one indirect jump, so the check does not repeat.
+  Dispatch table -> AVX2 kernel [svc: 256-bit vectors] : on AVX2 CPUs | A CPU with AVX2 runs the 256-bit version.
+  Dispatch table -> Scalar kernel [svc: portable fallback] : on old CPUs | An old CPU runs the portable version and gets the same answer more slowly.
+  Hot loop -x> AVX2 kernel : illegal instruction | If the binary were built only for AVX2, an old CPU would crash with this error.
+ref: docs | Function multiversioning | GCC documentation | https://gcc.gnu.org/onlinedocs/gcc/Function-Multiversioning.html
+
+@@ memhier
+== Multi-level caching from L1 to database
+kind: memory-tiering, cache-aside
+when: A service reads the same data many times, and each step down to the source is much slower and larger.
+how: The CPU hierarchy repeats at the system level. In round numbers, an L1 hit takes about 1 ns, DRAM about 100 ns, an SSD read about 100 microseconds, and a network call to a remote cache or database 0.5 to 10 ms. Each tier is bigger, slower and cheaper than the one before.
+A service mirrors this on purpose. It keeps hot objects in a small in-process cache (a hash map with an eviction policy). On a miss it asks a shared cache such as Redis or Memcached. On a second miss it reads the database and fills both caches on the way back.
+The average time is the sum of hit rate times cost at each level. A hit rate of 95% at 100 ns and 5% at 1 ms gives about 50 microseconds, so the slow tier still dominates. Keep the hot working set in the fastest tier. Beware of stale data: set a TTL or invalidate on write.
+used: Caffeine in-process cache in front of Redis in front of a database; CDN, then app cache, then origin; the same idea in CPUs, page cache and buffer pools.
+avoid: Data that is read once, or data that must always be fresh; read from the source and skip the cache.
+flow:
+  Request [client] -> Local cache [cache: in process 100 ns] : get key | The service first looks in its own memory. A hit costs about a hundred nanoseconds.
+  Local cache -> Redis [cache: shared 0.5 ms] : miss then get | On a miss the service asks the shared cache over the network.
+  Redis -> Database [db: source 5 ms] : miss then query | A second miss goes to the database, the slowest and largest tier.
+  Database -> Redis : row | The row returns, and Redis stores it with a TTL.
+  Redis -> Local cache : value | The local cache keeps a copy too, so the next call is fast.
+  * Local cache: hit rate 95 percent | After warm-up most reads end in the first tier, and the average time falls a lot.
+ref: book | Computer Architecture: A Quantitative Approach | Hennessy and Patterson, Morgan Kaufmann | 
+
+== Prefetch to hide memory latency in scans
+kind: memory-tiering, batching
+when: A loop walks a large data set that does not fit in cache, and each access waits for DRAM.
+how: A DRAM access takes about 80 to 100 ns, which is hundreds of CPU cycles. A loop that reads the next item only after the last one finished would wait for memory all the time. The CPU can have many cache misses in flight at once (about 10 per core), so the goal is to start loads early.
+For sequential or strided access, the hardware prefetcher detects the pattern and fetches lines ahead. Column scans in a database and array loops get this for free. For irregular access, such as hash table probes or pointer chasing, the hardware cannot guess. Software issues prefetch instructions for items a few steps ahead, or processes a batch of keys at once so their misses overlap.
+For example, a join probes 16 keys in a group: first it computes all 16 hashes and prefetches the 16 buckets, then it reads them. The misses overlap, so the time per key can fall several times. The tuning is delicate: prefetch too late and it has no effect, too early and the line is evicted before use.
+used: Columnar scans in ClickHouse, DuckDB and Velox; hash join with group prefetching in research and production engines; the Linux kernel prefetch macros in list walks.
+avoid: Data that fits in L2 or L3 cache, or when the code is bound by compute; measure cache misses before adding prefetch.
+flow:
+  Scan loop [svc: probes 16 keys] -> Hash step [svc: compute hashes] : batch of 16 keys | The loop computes all hashes for a group before reading any bucket.
+  Hash step -> Prefetcher [svc: prefetch instructions] : 16 bucket addresses | It issues a prefetch for every bucket address. No result is needed yet.
+  Prefetcher -> DRAM [store: hash table 8 GB] : 16 line requests | Sixteen cache misses are in flight at once, so their waits overlap.
+  DRAM -> L1 cache [cache: 32 KB] : lines arrive | The lines arrive in cache after about one memory latency, not sixteen.
+  Scan loop -> L1 cache : read buckets | The loop now reads the buckets and finds them in cache.
+  Scan loop -x> DRAM : one miss at a time | Without batching, each key waits about 100 ns for its own miss.
+ref: paper | Improving Hash Join Performance through Prefetching | Chen, Ailamaki, Gibbons, Mowry, ICDE 2004 |
+
+@@ memmodel
+== Publish with release, consume with acquire
+kind: producer-consumer
+when: One thread prepares data and another must read it after a flag or pointer says it is ready, without a lock.
+how: Modern CPUs and compilers reorder memory operations. A store buffer lets a core's later store become visible before an earlier one on weak models such as Arm. So a producer that writes data and then sets ready = 1 may show ready to other cores before the data. A consumer that sees ready = 1 can read old data.
+The memory model gives a rule. The producer writes the data, then does a release store to the flag. The consumer does an acquire load of the flag, then reads the data. If the acquire load sees the value from the release store, all writes before the release are visible after the acquire. This is a happens-before edge.
+On x86 the hardware already keeps stores in order, so the cost is small and only the compiler is restrained. On Arm the compiler emits special instructions (stlr and ldar). Using relaxed ordering is faster but breaks the pattern. This is the base of lock-free queues and of the safe publication of objects.
+used: C++ and Rust atomics (std::atomic with release and acquire); Java volatile fields and final fields; Linux kernel smp_store_release and smp_load_acquire; SPSC ring buffers such as the LMAX Disruptor.
+avoid: When a mutex is fast enough; locks give the ordering for free and are far easier to get right.
+flow:
+  Producer thread [svc: core 0] -> Data buffer [store: plain writes] : write payload | The producer fills the data with ordinary stores. They may still sit in a store buffer.
+  Producer thread -> Ready flag [cache: atomic] : store release 1 | The release store makes all earlier writes visible before the flag becomes visible.
+  Consumer thread [svc: core 1] -> Ready flag : load acquire | The consumer spins on the flag with an acquire load.
+  Consumer thread -> Data buffer : read payload | After it sees 1, the consumer is sure to read the new payload.
+  Producer thread -x> Ready flag : relaxed store | With a relaxed store, the flag may show up first. The consumer can then read old data.
+  * Consumer thread: sees stale data | This bug appears rarely, mostly on weakly ordered CPUs, and is hard to reproduce.
+ref: spec | Memory model | cppreference | https://en.cppreference.com/w/cpp/language/memory_model
+
+== Seqlock: optimistic reads with a version number
+kind: none
+when: Many readers need a small, fast snapshot of data that a single writer updates now and then, and readers must never block the writer.
+how: A seqlock has a counter next to the data. The writer makes the counter odd, writes the data, then makes the counter even again. Both counter updates need the right memory barriers so the data writes stay between them.
+A reader reads the counter, copies the data, then reads the counter again. If the two values are equal and even, the copy is consistent. If not, a write happened during the copy, so the reader throws the copy away and retries. Readers write nothing to shared memory, so their cache lines stay in the Shared state, and many cores can read at full speed.
+The cost is retry under heavy writes, and the data must be plain values that are safe to copy (no pointers to freed memory). The memory model decides whether this is correct: the reads of the counter need acquire ordering, and the writer needs release barriers around the data.
+used: Linux kernel seqlock_t (used for the time of day, jiffies and some counters); the vDSO clock data page; trading and telemetry code that publishes the latest value.
+avoid: Large data, or many writers; use a reader-writer lock, RCU or a lock-free queue.
+flow:
+  Writer [svc: single writer] -> Sequence counter [cache: even 10] : increment to odd 11 | The writer marks the data as being written. Readers will see an odd number.
+  Writer -> Shared data [store: small struct] : write fields | The writer updates the fields. The data may be inconsistent for a short time.
+  Writer -> Sequence counter : increment to even 12 | A release store marks the update finished.
+  Reader [client: many cores] -> Sequence counter : read s1 | The reader notes the counter before it copies.
+  Reader -> Shared data : copy fields | The reader copies the data without taking any lock.
+  Reader -x> Sequence counter : s1 odd or changed | If the counter was odd or changed, the copy may be torn. The reader retries.
+ref: docs | Sequence counters and sequential locks | The Linux kernel documentation | https://docs.kernel.org/locking/seqlock.html
+
+@@ numa
+== Pin threads and memory per socket in a database
+kind: data-locality, sharding
+when: A database or cache runs on a two-socket server, and remote memory access slows or varies the speed of queries.
+how: In a two-socket server each CPU has its own memory controller and local DRAM. A thread reading memory of the other socket goes over the interconnect (UPI on Intel, Infinity Fabric on AMD). Remote access is commonly 1.5 to 2 times slower in latency, and the link has less bandwidth than local memory.
+Linux places a page on the node of the thread that first touches it (first-touch). If one thread initializes the whole buffer pool, all pages land on one node, and half of the workers then read remotely. The fix is to give each worker a node: pin threads with numactl or sched_setaffinity, and let the worker allocate and first-touch its own partition.
+A common design splits data into partitions, one per node or per core. Each partition has its own memory, its own threads and its own lock. Queries for a partition run on its threads. Cross-partition work is rarer and pays the remote cost. Check with numastat and perf for remote access counts.
+used: ScyllaDB and Seastar (shard per core with local memory); VoltDB-style partitioned engines; Oracle and SQL Server NUMA-aware pools; JVM -XX:+UseNUMA for GC heaps.
+avoid: Single-socket machines, or workloads where all data is shared and random; use interleaved memory (numactl --interleave=all) to spread the load evenly.
+flow:
+  Query router [svc: by partition key] -> Node 0 workers [svc: pinned to socket 0], Node 1 workers [svc: pinned to socket 1] : partition by key | Queries go to the workers that own the partition, so they use local memory.
+  Node 0 workers -> Node 0 DRAM [store: local 90 ns] : first-touch alloc and read | Workers allocate and touch memory on their own socket, so reads are local.
+  Node 1 workers -> Node 1 DRAM [store: local 90 ns] : first-touch alloc and read | The second socket does the same with its own memory.
+  Node 0 workers -x> Node 1 DRAM : remote read 150 ns | A read on the other socket crosses the interconnect, so it is slower and uses shared bandwidth.
+  Admin [user] -> numastat [svc: perf counters] : check remote hits | The operator checks the remote access share and fixes pinning if it is high.
+ref: docs | NUMA memory policy | The Linux kernel documentation | https://docs.kernel.org/admin-guide/mm/numa_memory_policy.html
+
+== One service instance per NUMA node
+kind: horizontal-scale, bulkhead
+when: A memory-heavy service runs on a big multi-socket host, and tuning one process for NUMA is too hard.
+how: Instead of one process spanning both sockets, start one instance per NUMA node. Each instance is bound to the cores and to the memory of one node with numactl --cpunodebind and --membind, or with cgroup cpuset and memory node settings. A load balancer on the host spreads requests over the instances.
+Every instance sees a smaller machine with uniform local memory. There is no remote access, so latency is steady, and the garbage collector or allocator of one instance does not stop the other. One failing or restarting instance affects only half of the capacity.
+The cost is duplicate memory, such as code and caches that each instance holds, and the work to balance load between instances. Kubernetes can do the pinning with the CPU Manager and Topology Manager (static policy, single-numa-node), which gives the pod cores and devices from one node.
+used: Redis and Memcached run as one process per node or per core; Kubernetes Topology Manager for latency-sensitive pods; JVM services pinned per socket in big hosts.
+avoid: When one instance needs more memory than a single node holds; then use interleaving or a NUMA-aware design.
+flow:
+  Load balancer [svc: on host] -> Instance A [svc: socket 0 cores], Instance B [svc: socket 1 cores] : requests | The balancer spreads requests over one instance per socket.
+  Instance A -> Node 0 DRAM [store: bound memory] : local allocation | Instance A is bound to node 0, so every page it uses is local.
+  Instance B -> Node 1 DRAM [store: bound memory] : local allocation | Instance B uses only the memory of node 1.
+  Kubelet [svc: Topology Manager] -> Instance B : single-numa-node pin | In Kubernetes the Topology Manager gives the pod cores and devices from one node.
+  Instance B -x> Load balancer : instance fails | If one instance dies, the other keeps serving. Only half of the capacity is lost.
+ref: docs | Topology Manager | Kubernetes documentation | https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/
+
+@@ ooo
+== Reorder buffer: out-of-order execution, in-order retire
+kind: pipeline-stages
+when: A core wants more than one instruction per cycle and must not wait for a slow instruction before running the independent ones.
+how: Instructions enter the core in program order and get a slot in the reorder buffer (ROB), a queue of a few hundred entries in current big cores. Register renaming removes false dependencies, so two instructions that only reuse a register name do not wait for each other. Each instruction waits in a scheduler until its inputs are ready.
+Then it runs on any free execution unit, in any order. A load that misses the cache may take 100 ns, but independent adds and loads behind it still run. Results wait in the ROB. The core retires (commits) instructions only from the head of the ROB, in program order. So the program sees order, even if the execution was not in order.
+This hides latency but only as far as the window reaches: a 500-entry ROB holds about 100 cycles of work at 5 instructions per cycle, less than a DRAM miss. After a branch misprediction, the instructions in the ROB after the branch are discarded. The same machinery is why speculative execution can leak data (Spectre).
+used: Intel Core and AMD Zen cores; Apple M-series and Arm Cortex-X cores; in-order cores (small Arm cores, some RISC-V) skip it to save power.
+avoid: Small and low-power designs where area and energy matter more; choose in-order cores or many simple threads (GPU style).
+flow:
+  Front end [svc: fetch and decode] -> Reorder buffer [queue: 512 entries] : instructions in order | The front end sends decoded instructions in program order and renames registers.
+  Reorder buffer -> Scheduler [queue: waits for operands] : ready when inputs ready | Each instruction waits until its source values are available.
+  Scheduler -> Execution units [svc: ALUs and load ports] : issue out of order | Any ready instruction runs on a free unit, even if earlier ones still wait.
+  Execution units -> Load miss [store: DRAM 100 ns] : load misses cache | A slow load waits for memory while later independent work keeps running.
+  Execution units -> Reorder buffer : results | Results go back to their ROB entries and wait.
+  Reorder buffer -> Architectural state [store: registers] : retire in order | The oldest finished instructions commit in program order, so the program sees a simple order.
+ref: book | Computer Architecture: A Quantitative Approach | Hennessy and Patterson, Morgan Kaufmann |
+
+== Independent work to overlap cache misses
+kind: batching, pipeline-stages
+when: Code is slow because of cache misses, and the misses depend on each other in a chain.
+how: An out-of-order core can run many loads at once if they do not depend on each other. This is memory-level parallelism (MLP). With 10 misses in flight, 10 loads cost about the time of one. But the window is limited, so the loads must be close to each other in the instruction stream.
+Pointer chasing is the bad case. In a linked list, the address of the next node comes from the previous load, so each miss waits for the last one. A hash table lookup that touches a bucket, then a node, then a value is a chain of three misses.
+Code can be restructured to give the core independent work. Process several lookups in an interleaved loop, so the chain of lookup A overlaps with the chain of lookup B. Use arrays and indexes instead of linked nodes. Query engines use this in hash joins and index lookups, and the speedup is often 2 to 4 times on large tables. Profile with perf stat cache-miss counters first.
+used: Interleaved hash probes in analytic engines; coroutine-based index lookups in research systems; array-based structures in high-performance libraries such as Swiss tables.
+avoid: When data fits in cache or there is only one lookup to do; the extra code complexity brings nothing.
+flow:
+  Lookup batch [client: 8 keys] -> Interleaved loop [svc: round robin] : keys | The loop advances 8 lookups one step at a time instead of finishing one by one.
+  Interleaved loop -> Core [svc: out of order window] : independent loads | The loads of different lookups do not depend on each other, so the core issues them together.
+  Core -> DRAM [store: bucket and node lines] : 8 misses in flight | Eight misses overlap. Total wait is near one memory latency.
+  DRAM -> Interleaved loop : lines arrive | Data arrives, and the loop moves each lookup to its next step.
+  Linked list walk [client: dependent loads] -x> Core : next address unknown | A pointer chain cannot overlap, so each node costs a full miss.
+ref: paper | Interleaving with Coroutines: A Practical Approach for Robust Index Joins | Psaropoulos et al., VLDB 2017 |
+
+@@ pcie
+== Accelerator as a PCIe endpoint: doorbell, DMA, interrupt
+kind: offload-accelerator, layered-protocol
+when: A host CPU must hand work to a GPU, NIC or SSD and get the results back with little CPU time.
+how: The device is a PCIe endpoint. At boot the OS reads its configuration space and gives it address windows (BARs) in the CPU address space. The driver maps a BAR, and a write to it becomes a PCIe packet to the device. Such a write is a doorbell.
+The driver places commands in a queue in host RAM and rings the doorbell. The device then fetches the commands and the data with DMA, as memory read packets, and writes results back with memory write packets. Last, it sends an MSI-X message, which acts as an interrupt. The CPU never copies the payload.
+Under the software, PCIe has three layers: the transaction layer (packets), the data link layer (sequence numbers, retry and credit-based flow control) and the physical layer (serial lanes). A Gen5 x16 link gives about 63 GB/s per direction, and each generation doubles the rate. A link that trains down to fewer lanes or a lower generation silently loses bandwidth, so check it.
+used: NVMe SSD queues; GPU command buffers and CUDA launches; NIC rings; virtio devices behind PCIe; DPUs and SmartNICs.
+avoid: When data must move between devices at speeds above the link, use a device-to-device fabric (NVLink) or keep data on the device.
+flow:
+  Driver [svc: host software] -> Command queue [queue: in host RAM] : write commands | The driver builds command entries in memory. This is cheap and needs no bus transfer.
+  Driver -> Device BAR [svc: MMIO doorbell] : doorbell write | One small MMIO write tells the device that new commands wait.
+  Device [svc: GPU or SSD] -> Command queue : DMA read | The device fetches the commands as PCIe read packets over the lanes.
+  Device -> Host RAM [store: data buffers] : DMA read and write | The device moves the payload with DMA. Flow-control credits stop it from overrunning the receiver.
+  Device ~> Driver : MSI-X interrupt | The device writes an interrupt message to say the work is done.
+  Device -x> Host RAM : link trained at x4 | A link that trains with fewer lanes keeps working but at a fraction of the bandwidth.
+ref: docs | PCI Express specifications | PCI-SIG | https://pcisig.com/specifications
+
+== GPUDirect: NIC and GPU talk peer to peer
+kind: data-locality
+when: Data goes between a NIC and a GPU, such as in training or inference clusters, and the extra copy through host memory is too costly.
+how: Without help, a packet from the network goes by DMA to host RAM, and then the CPU or another DMA copies it to the GPU. Every byte crosses the PCIe link twice and uses host memory bandwidth. This limits the rate at 200 or 400 Gb/s per NIC.
+With GPUDirect RDMA the NIC does DMA straight to GPU memory. The GPU memory is exposed through a PCIe BAR, and the driver registers it with the NIC. The data then flows through the PCIe switch from NIC to GPU, and does not touch host memory or the CPU. Latency falls and the CPU is free.
+Topology matters. The path works best when the NIC and the GPU hang off the same PCIe switch. If they are on different root complexes, packets cross the CPU interconnect and speed drops. So servers are built with one NIC per GPU close to each other, and tools such as nvidia-smi topo -m show the layout.
+used: NVIDIA GPUDirect RDMA with NCCL for collective operations on InfiniBand and RoCE; GPUDirect Storage reading NVMe straight into GPU memory.
+avoid: Small messages or code on a single node; use NVLink inside a node, or normal copies when the NIC and GPU are far apart.
+flow:
+  Remote node [client: sends tensor] -> NIC [svc: RDMA NIC] : RDMA write | A remote node sends data to the registered GPU memory region.
+  NIC -> PCIe switch [svc: peer to peer routing] : DMA write TLPs | The NIC writes PCIe packets addressed to the GPU BAR.
+  PCIe switch -> GPU memory [store: HBM via BAR] : peer-to-peer write | The switch routes the packets to the GPU. They never go up to the CPU.
+  GPU memory -> GPU kernel [svc: training step] : data ready | The kernel uses the data at once. No staging copy was made.
+  NIC -x> Host RAM [store: bounce buffer] : fallback path | If peer-to-peer is not possible, data goes through host RAM, and uses twice the link bandwidth.
+ref: docs | GPUDirect RDMA | NVIDIA CUDA documentation | https://docs.nvidia.com/cuda/gpudirect-rdma/
+
+@@ pipeline
+== Branch prediction with speculative fetch and flush
+kind: pipeline-stages
+when: A deep pipeline must keep fetching instructions while it does not yet know which way a branch goes.
+how: A pipeline overlaps fetch, decode, execute, memory and write-back, so a new instruction can finish every cycle. A branch is resolved late, after execute. Without a guess, the front end would wait several cycles at every branch, and branches occur about every 5 to 6 instructions.
+So the front end predicts the branch direction and target, and keeps fetching from the guessed path. Modern predictors learn from history and get 95 to 99 percent right on typical code. If the guess was right, no time is lost.
+If the guess was wrong, the instructions after the branch are flushed from the pipeline and fetch restarts at the right place. The penalty is the depth of the pipeline, around 15 to 20 cycles on big cores. At 5 instructions per cycle that is 75 to 100 instructions of lost work. A 2 percent miss rate on 1 branch in 6 instructions is cheap, but 20 percent is very costly. Data-dependent, random branches are the worst case.
+used: All modern CPUs (Intel, AMD, Arm, Apple); compilers that lay out likely paths first; profile-guided optimization with branch probabilities.
+avoid: Do not hand-tune branches in cold code; measure with perf (branch-misses) first.
+flow:
+  Fetch [svc: next PC] -> Branch predictor [cache: history tables] : branch at PC | The front end asks the predictor about each branch before it is decoded.
+  Branch predictor -> Fetch : predicted taken | The predictor says taken. Fetch jumps to the predicted target and goes on.
+  Fetch -> Decode and execute [svc: pipeline stages] : speculative instructions | Instructions from the guessed path enter the pipeline and may run.
+  Decode and execute -> Branch unit [svc: resolves in EX stage] : real outcome | Several cycles later the branch unit knows the true direction.
+  Branch unit -x> Decode and execute : mispredict flush | If the guess was wrong, all younger instructions are thrown away. About 15 to 20 cycles are lost.
+  Branch unit -> Branch predictor : update history | The predictor learns from the real outcome, to do better next time.
+ref: book | Computer Organization and Design | Patterson and Hennessy, Morgan Kaufmann |
+
+== Branch-free hot loops with predication
+kind: pipeline-stages
+when: A loop has a data-dependent condition that the predictor cannot guess, such as a filter on random values.
+how: A filter loop such as if (x < t) count++ is cheap when the answer is nearly always the same. When the data are random and half pass, the predictor is wrong about half the time. Each miss costs 15 to 20 cycles. A loop that should take 1 cycle per item then takes 8 or more.
+The fix is to remove the branch. The compiler or the programmer turns the condition into data: count += (x < t) adds 0 or 1, or a conditional move selects a value. Both paths are computed and one result is kept. The pipeline never sees a jump, so nothing is flushed. SIMD compare instructions work in the same way, producing a mask for many items at once.
+The trade-off: branch-free code does the work of both paths, so it is worse when the branch is predictable. Compilers do this on their own for simple cases. Check with a benchmark on real data. Sorting the data first can also make branches predictable.
+used: Vectorized filters in columnar databases; selection vectors in query engines; constant-time crypto code; the famous sorted-array loop example in systems courses.
+avoid: Branches that are well predicted, or where one side is very expensive and rarely taken; keep the normal branch.
+flow:
+  Column batch [lake: 1024 values] -> Filter loop [svc: compare to threshold] : values | The loop reads one value at a time from a batch.
+  Filter loop -x> Branch predictor [cache: no pattern] : random condition | With random data the predictor fails about half of the time, and the pipeline flushes.
+  Filter loop -> Mask step [svc: x less than t as 0 or 1] : compare result | In the branch-free version the comparison gives a 0 or 1 value, with no jump.
+  Mask step -> Selection vector [store: indexes that pass] : write index, add mask | The index is always written. The output pointer moves forward by 0 or 1.
+  Selection vector -> Next operator [svc: aggregate] : passing rows | The next step reads only the passing rows. The pipeline stays full.
+ref: blog | Branchless programming | Algorithmica | https://en.algorithmica.org/hpc/pipelining/branchless/
+
+@@ powerenergy
+== DVFS governor: scale clock and voltage with load
+kind: control-loop
+when: A chip must be fast when there is work, and use little energy when there is not, within a heat limit.
+how: Dynamic power is about activity times capacitance times voltage squared times frequency. A lower clock allows a lower voltage, so power falls faster than speed: dropping frequency by 20 percent can cut power by about half. Idle cores can sleep in deeper states at almost no power, at the cost of a longer wake-up.
+A governor is a control loop in the OS or firmware. It measures utilization (and temperature, current and power) every few milliseconds, and picks a performance state: a pair of frequency and voltage. At high load it boosts to a high state. At low load it drops, and cores go to idle states. Thermal and power limits can force it down at any time.
+Phones and laptops use this all day to save battery. In servers, turbo boost lets a few busy cores run faster when others are idle. The trade-off is latency: after a quiet period the first request may meet a low clock. Latency-critical servers often set the performance governor, and accept the extra power cost.
+used: Linux cpufreq governors (schedutil, performance, powersave) and intel_pstate; Arm big.LITTLE and Apple efficiency cores; Intel Turbo Boost and AMD Precision Boost; GPU boost clocks.
+avoid: Hard real-time tasks with tight latency bounds, where a fixed clock gives predictable timing.
+flow:
+  Scheduler [svc: tracks CPU load] -> Governor [svc: cpufreq schedutil] : utilization 85 percent | The governor gets the load of each core every few milliseconds.
+  Governor -> Power controller [svc: firmware] : request high P-state | It asks for a higher frequency and voltage pair for the busy cores.
+  Power controller -> CPU cores [svc: 3.2 GHz at 0.9 V] : set frequency and voltage | The hardware changes voltage and clock, and the cores run faster.
+  Sensors [svc: temperature and power] -> Power controller : die at 95 C | The sensors report heat and current to the controller.
+  Power controller -x> CPU cores : thermal throttle | If a limit is reached, the controller cuts the clock whatever the governor asked.
+  Governor -> Power controller : low load then low P-state | When load falls, it asks for a low clock, and idle cores go to sleep states.
+ref: docs | CPU performance scaling | The Linux kernel documentation | https://docs.kernel.org/admin-guide/pm/cpufreq.html
+
+== Rack power budget with per-GPU power caps
+kind: control-loop, load-shedding
+when: A data center rack has a fixed power limit, and the GPUs in it can use more power than the limit if all run at full speed.
+how: A GPU server can draw several kilowatts, and a rack has a fixed feed, for example a few tens of kilowatts. Cooling is limited too. If every GPU runs flat out, a breaker trips or the cooling cannot keep up. Operators plan for a power budget per rack, not just for the number of servers.
+Power is controlled in layers. Each GPU has a power limit that software can set (nvidia-smi -pl) and that the firmware enforces by cutting clocks. A management service reads power from the servers and the rack's power distribution units, and lowers the caps when the rack gets close to the budget. Jobs slow down a little instead of failing.
+Capping costs less speed than power: a limit about 20 to 30 percent below the maximum often loses only a few percent of throughput, because the last watts buy little clock speed. A scheduler can also put work where power is available. Power, not chips, is often what limits cluster size.
+used: Data centers for AI training; Facebook Dynamo power capping (ISCA 2016); NVIDIA DCGM and nvidia-smi power limits.
+avoid: Small clusters that have plenty of headroom, or latency-critical jobs that cannot slow down; plan more power capacity instead.
+flow:
+  GPU servers [svc: 8 GPUs each] -> Power meter [svc: rack PDU] : watts per server | The PDU and the servers report their power use to the manager every few seconds.
+  Power meter -> Power manager [svc: rack controller] : rack at 94 percent | The manager compares the total with the rack budget.
+  Power manager -> GPU servers : lower cap to 600 W each | It sends a lower power limit to the GPUs, through the node agent.
+  GPU servers -> GPU firmware [svc: enforces limit] : clock reduced | The firmware cuts the clock to stay inside the limit. Jobs run a bit slower.
+  Job scheduler [svc: Slurm or Kubernetes] -x> GPU servers : defer new jobs | If the budget is still tight, the scheduler holds new jobs back, instead of tripping the breaker.
+ref: docs | NVIDIA DCGM | NVIDIA documentation | https://docs.nvidia.com/datacenter/dcgm/latest/
+
+@@ roofline
+== Batch decode requests to raise arithmetic intensity
+kind: continuous-batching, batching
+when: LLM token generation is slow and the GPU compute units sit idle, because every step reads all the weights for one token.
+how: Arithmetic intensity is FLOPs per byte moved. The roofline says speed is the lower of peak compute and bandwidth times intensity. Decoding one token for one request reads all model weights (for example 140 GB for a 70B model at 16 bits) and does about two FLOPs per weight. That is an intensity of about 1 FLOP per byte, far below the ridge point of a modern GPU (hundreds of FLOPs per byte). The step is limited by HBM bandwidth.
+If the server batches 64 requests into one step, the weights are read once and used 64 times. The FLOPs rise 64 times while the bytes stay about the same. Intensity goes up, so tokens per second grow almost in proportion, until the kernel nears the compute roof or the KV cache traffic dominates (the cache is read per request and does not share).
+Continuous batching keeps the batch full by adding new requests between steps. The cost is latency for each step and memory for each request's KV cache. The operator finds the batch size where throughput is high and the latency target still holds.
+used: vLLM, TensorRT-LLM and SGLang continuous batching; prefill and decode separation in large serving stacks.
+avoid: Very low traffic, or strict latency for a single user; use smaller models, quantization or speculative decoding.
+flow:
+  Requests [client: many users] -> Scheduler [svc: continuous batcher] : prompts | Requests arrive at different times, and the scheduler groups them.
+  Scheduler -> GPU decode step [svc: batch of 64] : one token per request | One step makes the next token for all 64 requests together.
+  HBM [store: 140 GB weights] -> GPU decode step : read weights once | The weights are read once per step, no matter how large the batch is.
+  GPU decode step -> KV cache [store: per request] : append keys and values | Each request has its own cache. This part of the traffic does not share.
+  GPU decode step -> Scheduler : 64 new tokens | The step ends and the scheduler adds new requests to the empty slots.
+  * GPU decode step: intensity 64 FLOPs per byte | Intensity grew about 64 times, so the step does much more work per byte read.
+ref: paper | Roofline: An Insightful Visual Performance Model for Multicore Architectures | Williams, Waterman, Patterson, CACM 2009 | https://dl.acm.org/doi/10.1145/1498765.1498785
+
+== Kernel fusion to cut memory traffic
+kind: pipes-filters, data-locality
+when: A chain of small GPU or CPU operations is limited by memory bandwidth, and each writes its result back to memory.
+how: Take x = a * b, then y = x + c, then z = relu(y) on a large tensor. Run as three kernels, each reads its input from HBM and writes its output to HBM. That makes about six memory passes for three FLOPs per element. The intensity is tiny, so all three kernels sit on the sloped, memory-bound part of the roofline.
+A fused kernel reads a, b and c once, keeps the intermediate values in registers, and writes only z. Passes drop to four. Compute is the same, bytes are fewer, so intensity rises and time drops in proportion to the bytes saved.
+Compilers do this automatically for element-wise chains. FlashAttention takes it much further: it keeps tiles of the attention matrix in on-chip SRAM, so the large matrix is never written to HBM. The limits are the register and SRAM size, and the compile time. Fusion cannot help kernels that are already compute-bound, such as large matrix multiplies.
+used: torch.compile with Inductor and Triton; XLA fusion; TensorRT; FlashAttention; fused optimizers such as fused Adam.
+avoid: Compute-bound kernels, and cases where fusion makes a kernel too big for the registers (spills); profile first.
+flow:
+  Op graph [note: mul then add then relu] -> Compiler [svc: fusion pass] : graph | The compiler finds a chain of element-wise operations that can be fused.
+  Compiler -> Fused kernel [svc: one launch] : generated code | It emits one kernel that does all three steps for each element.
+  HBM [store: tensors a b c] -> Fused kernel : read a b c once | The kernel reads each input once from main GPU memory.
+  Fused kernel -> Registers [cache: temporaries on chip] : x and y stay local | The middle results never leave the chip, so there is no extra memory traffic.
+  Fused kernel -> HBM : write z once | Only the final result is written back. The bytes moved are about a third lower.
+  HBM -x> Fused kernel : unfused x and y round trip | Without fusion, each step would write and read a full tensor.
+ref: paper | FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness | Dao et al., NeurIPS 2022 | https://arxiv.org/abs/2205.14135
+
+@@ simd
+== Vectorized scan over columnar batches
+kind: batching, pipes-filters
+when: An analytic query filters and sums millions of values, and per-row interpretation is the cost.
+how: SIMD instructions work on a vector of values at once: 8 32-bit integers with AVX2, 16 with AVX-512, and 4 with Arm NEON. A column stored as a contiguous array of one type is the right shape. One compare instruction tests 8 values, and the result is a mask.
+A vectorized engine does not run row by row. It passes batches of about 1,000 values between operators. Each operator runs a tight loop over arrays: compare, build a selection vector of passing positions, gather another column, add. The batch fits in L1 or L2 cache, and the loop has no branches, so the compiler can use vector instructions. This beats a row-at-a-time engine by an order of magnitude on scans.
+Speed depends on layout and on data types. Narrow types (8 or 16 bits, dictionary codes) put more values in a register. Strings and nulls need extra care. Memory bandwidth often becomes the limit once the vector code is fast.
+used: ClickHouse, DuckDB, Velox and Photon-style engines; Apache Arrow compute kernels; Parquet decoders using bit-unpacking with SIMD.
+avoid: Small row counts and point lookups, where setup costs more than the loop; use an index or a row store.
+flow:
+  Parquet file [lake: columns on disk] -> Decoder [svc: SIMD bit unpack] : encoded pages | The decoder unpacks many encoded values per instruction into a plain array.
+  Decoder -> Column batch [store: 1024 values in L1] : int32 array | The batch is small enough to stay in cache while operators run.
+  Column batch -> Filter [svc: AVX2 compare 8 lanes] : values | One instruction compares eight values with the constant.
+  Filter -> Selection vector [store: passing positions] : mask to indexes | The mask is turned into a list of positions that passed.
+  Selection vector -> Aggregate [svc: vector sum] : gather and add | The sum runs on selected values with vector adds. Output is one number per batch.
+ref: paper | MonetDB/X100: Hyper-Pipelining Query Execution | Boncz, Zukowski, Nes, CIDR 2005 | https://www.cidrdb.org/cidr2005/papers/P19.pdf
+
+== Bitmap indexes with word-wide AND and OR
+kind: index-table
+when: A search or analytic query combines several filters, and each filter is a large set of row ids.
+how: A bitmap index keeps, for each value, a bit per row: 1 if the row has that value. A query such as country = "IN" AND device = "tv" is the AND of two bitmaps. One 256-bit AVX2 instruction handles 256 rows, so a million rows need about 4,000 instructions.
+Plain bitmaps waste space when few bits are set. Roaring bitmaps split row ids into chunks of 65,536 and choose a container for each chunk: a sorted array when sparse, a bitmap when dense, or runs. Set operations use SIMD for the array and bitmap cases, so they are fast and small.
+The result is a bitmap of matching rows, and the engine reads only those rows. Counting the bits (popcount) gives COUNT(*) without reading data. The cost is write cost: updating a bitmap in place is expensive, so engines build them at segment creation and merge them later.
+used: Roaring bitmaps in Apache Druid, Apache Pinot, Lucene and Spark; ClickHouse bitmap functions; database bitmap indexes in Oracle and others.
+avoid: Columns with very high cardinality (for example a unique id) and frequent updates; use a B-tree or a hash index.
+flow:
+  Query [client: country IN and device tv] -> Index reader [svc: segment] : filters | The query has two filters. The engine looks up one bitmap for each.
+  Index reader -> Bitmap IN [store: Roaring] : load | The first bitmap marks all rows where the country is IN.
+  Index reader -> Bitmap tv [store: Roaring] : load | The second bitmap marks all rows where the device is tv.
+  Bitmap IN, Bitmap tv -> AND step [svc: SIMD AND] : 256 bits per instruction | A vector AND combines the two bitmaps, many rows per instruction.
+  AND step -> Row reader [svc: reads matches] : matching row ids | Only matching rows are read from the column files.
+ref: paper | Roaring Bitmaps: Implementation of an Optimized Software Library | Lemire et al., Software: Practice and Experience, 2018 | https://arxiv.org/abs/1709.07821
+
+@@ simt
+== Kernel launch: grid of blocks over streaming multiprocessors
+kind: offload-accelerator, fork-join
+when: A computation applies the same operation to a very large array or matrix, and the CPU is too slow.
+how: The CPU launches a kernel with a grid of thread blocks. Each block has, for example, 256 threads, and every 32 threads form a warp. A warp runs one instruction stream: all 32 lanes execute the same instruction on different data (SIMT, single instruction multiple threads).
+The hardware schedules blocks on streaming multiprocessors (SMs). A modern data center GPU has well over a hundred SMs. A block stays on one SM and shares fast on-chip shared memory with its threads. Each SM keeps many warps resident. When one warp waits for memory, the scheduler switches to another one with no cost, which hides latency.
+The programmer picks the block size, and the tile of data per block. A typical kernel loads a tile from global memory into shared memory, works on it, then writes back. Blocks cannot synchronise with each other inside a kernel, so each block must be independent. Launch overhead is a few microseconds, so work must be large.
+used: CUDA and HIP kernels for matrix multiply, attention and convolution; Triton-generated kernels; graphics shaders on every GPU.
+avoid: Small or serial work with many branches; stay on the CPU, or batch the work so the launch pays off.
+flow:
+  Host CPU [svc: launches kernel] -> GPU scheduler [svc: grid of 1024 blocks] : kernel launch | The CPU sends one launch with the grid and block sizes.
+  GPU scheduler -> SM 0 [svc: warps of 32], SM 1 [svc: warps of 32] : assign blocks | Blocks are spread over the SMs. Each block stays on one SM.
+  SM 0 -> Global memory [store: HBM] : load tile | The block loads a tile of the input into shared memory.
+  SM 0 -> Shared memory [cache: on chip] : compute on tile | Threads of the block share the tile. This is far faster than global memory.
+  SM 0 -> Global memory : store result | The block writes its output tile. Other blocks do the same on their own tiles.
+  Host CPU ~> GPU scheduler : wait for completion | The host waits for the kernel, or goes on with other work in a stream.
+ref: docs | CUDA C++ Programming Guide: programming model | NVIDIA | https://docs.nvidia.com/cuda/cuda-c-programming-guide/
+
+== Avoid warp divergence by grouping similar work
+kind: batching
+when: Threads in a warp take different branches or have very different amounts of work, so lanes sit idle.
+how: A warp runs one instruction at a time. If the threads in a warp take different sides of an if, the hardware runs one side with some lanes masked off, and then the other side. Time is the sum of both paths and the lanes are only partly used. Since Volta each thread has its own program counter, but divergent paths still run in turn.
+The fix is to make threads in the same warp do the same thing. Sort or bucket the work by type first, so that neighbouring threads follow the same path. In a mixture-of-experts model, tokens are grouped by expert so each group runs one dense matrix multiply. In ray tracing, rays are sorted by direction. In a sparse job, the rows with similar length go together.
+Sorting has a cost, so it only pays when the divergent work is large. Memory access should also be coalesced: neighbouring threads read neighbouring addresses so that one warp load becomes one or two memory transactions.
+used: Mixture-of-experts kernels that group tokens by expert; ray sorting in GPU ray tracers; sparse matrix formats such as sliced ELLPACK.
+avoid: Cheap branches that cost a few instructions; do not add a sort for them.
+flow:
+  Mixed work items [lake: tokens for 8 experts] -> Bucket kernel [svc: sort by expert id] : items with type | A first kernel assigns each item to a bucket by its type.
+  Bucket kernel -> Grouped items [store: contiguous per type] : reordered array | Items of one type are now next to each other in memory.
+  Grouped items -> Warp A [svc: all expert 3] : 32 same-type items | A warp gets items of one type, so all lanes follow the same path.
+  Warp A -> Result [store: coalesced writes] : full lane use | All 32 lanes are active, and neighbouring threads write neighbouring addresses.
+  Mixed work items -x> Warp B [svc: mixed types] : divergent branches | An unsorted warp runs each branch in turn with idle lanes, so it takes the time of both paths.
+ref: docs | CUDA C++ Best Practices Guide | NVIDIA | https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/
+
+@@ storagedev
+== NVMe cache tier in front of HDD capacity
+kind: tiered-storage
+when: A system needs a large amount of cheap storage, but its hot data must be read at SSD speed.
+how: A hard disk pays a seek of several milliseconds for each random read, so one drive gives only 100 to 200 random reads per second. An NVMe SSD gives hundreds of thousands. But per terabyte the HDD costs several times less, so large archives stay on hard disks.
+The design puts a small SSD tier in front of a large HDD tier. Hot data is read from the SSD. New writes go to the SSD first and are flushed to disks in large sequential chunks, which hard disks do well. Cold data is evicted from the SSD when it is full. A cache hit rate of 90 percent turns most reads into SSD reads.
+The risk is cold reads and cache loss. A scan of old data bypasses the cache and runs at disk speed. If the cache is only a cache, losing it means only a speed loss, but if it holds dirty data, it must be replicated. Size the cache for the working set, not for the total data.
+used: Ceph with BlueStore metadata (RocksDB) on SSD and data on HDD; ZFS with L2ARC and special vdevs; Linux bcache and dm-cache; object stores and big HDFS clusters with SSD tiers.
+avoid: When all data is hot (use all-flash), or when data is cold (use pure HDD or archive storage).
+flow:
+  Client [client: reads and writes] -> Cache manager [svc: tier logic] : IO request | The manager decides which tier serves the request.
+  Cache manager -> NVMe tier [store: 4 TB SSD] : hit | A hot block is read from the SSD in about 100 microseconds.
+  Cache manager -> HDD tier [store: 200 TB disks] : miss | A cold block is read from a disk. The seek costs about 8 ms.
+  HDD tier -> NVMe tier : promote hot block | A block that is read often is copied up to the SSD tier.
+  NVMe tier ~> HDD tier : flush dirty data in runs | Writes are written back to disks as long sequential chunks, which suit the disks.
+  Cache manager -x> NVMe tier : scan bypasses cache | A large cold scan is sent to the disk directly, so it does not wipe the hot data.
+ref: docs | Ceph BlueStore configuration | Ceph documentation | https://docs.ceph.com/en/latest/rados/configuration/bluestore-config-ref/
+
+== Group commit on an SSD write-ahead log
+kind: wal, batching
+when: A database must make every commit durable, but a flush to the device costs far more than the data written.
+how: A commit is durable only after fsync returns, which means the device has stored the data in non-volatile memory. On an NVMe SSD with power-loss protection, a flush takes about 20 to 100 microseconds. On consumer drives without protection it can be milliseconds, since the drive must write its cache to flash. If every transaction calls fsync alone, throughput is bounded by 1 / flush time.
+Group commit batches the flushes. Transactions append their log records to a shared in-memory buffer. One leader thread writes the buffer to the log file with one sequential write and one fsync. All transactions whose records were in that batch are then told they are durable. At 50 microseconds per flush and 100 commits per batch, the engine does about 2 million commits a second.
+The log is append-only, which is the best case for flash, and the FTL does little garbage collection. The cost is a small wait for the batch, and the need to trust the device: a drive that lies about flush breaks durability.
+used: PostgreSQL WAL with commit_delay and synchronous_commit; MySQL InnoDB redo log group commit; RocksDB and Kafka log flushing; etcd batching of raft log writes.
+avoid: When a lost last second of commits is acceptable; relax durability (async commit) and keep the speed.
+flow:
+  Transaction A [client: commit] -> Log buffer [queue: in memory] : append record | Each transaction adds its log record to a shared buffer, and then waits.
+  Transaction B [client: commit] -> Log buffer : append record | Many transactions can join the same batch while the flush runs.
+  Log buffer -> Flusher [svc: leader thread] : batch of 100 records | One thread takes the whole buffer and writes it in one sequential write.
+  Flusher -> WAL file [log: on NVMe SSD] : write and fsync | A single fsync makes all 100 records durable at once.
+  Flusher -> Transaction A, Transaction B : durable | All waiting transactions are released after the flush finishes.
+  WAL file -x> Flusher : device lies about flush | A drive that acknowledges before data is safe can lose acknowledged commits at power loss.
+ref: docs | Write-Ahead Logging (WAL) | PostgreSQL documentation | https://www.postgresql.org/docs/current/wal-intro.html
+
+@@ tensorcores
+== Mixed precision matmul with FP32 accumulate
+kind: offload-accelerator
+when: Training or serving a neural network needs the most matrix FLOPs per second and per watt, and a little rounding error is acceptable.
+how: A tensor core is a hardware unit that computes a small matrix multiply-accumulate, D = A x B + C, in one instruction, for example a 16 x 16 tile. It takes inputs in a low-precision format (FP16, BF16, FP8, and on newer chips FP4) and keeps the running sum in a wider format, usually FP32. The wide accumulator stops many small rounding errors from adding up.
+The software tiles a big matrix multiply into such small blocks. A kernel loads tiles from global memory into shared memory, feeds them to the tensor core instructions, and accumulates in registers. Libraries (cuBLAS, CUTLASS) and compilers (Triton) do this. The low-precision input also halves or quarters the memory traffic.
+In training, frameworks keep a master copy of weights in FP32, run the forward and backward passes in BF16 or FP16, and use loss scaling for FP16 so small gradients do not become zero. Tensor cores give the large peak numbers on data center GPUs, and most of that peak is reached only in low precision. Dense FP32 on regular cores is many times slower.
+used: NVIDIA Tensor Cores (Volta onward) through cuBLAS and PyTorch autocast; AMD Matrix Cores; Google TPU matrix units with BF16.
+avoid: Numerically sensitive steps such as softmax sums or normalization statistics; keep these in FP32.
+flow:
+  Framework [svc: PyTorch autocast] -> Weights FP32 [store: master copy] : cast to BF16 | The framework keeps master weights in FP32 and casts a BF16 copy for compute.
+  Framework -> GEMM kernel [svc: cuBLAS or Triton] : BF16 matrices | The kernel tiles the matrices into small blocks, such as 16 by 16.
+  GEMM kernel -> Tensor core [svc: matrix multiply-add] : A tile and B tile | One instruction multiplies two tiles. It runs on many values at once.
+  Tensor core -> Accumulator [cache: FP32 registers] : partial sums | Products are summed in FP32, so rounding error stays small.
+  Accumulator -> Framework : FP32 or BF16 output | The result goes back to the framework, for the next layer or the loss.
+  Framework -> Weights FP32 : update with scaled grads | The optimizer updates the FP32 master weights. Loss scaling keeps small FP16 gradients alive.
+ref: paper | Mixed Precision Training | Micikevicius et al., ICLR 2018 | https://arxiv.org/abs/1710.03740
+
+== Systolic array: weights stay, data flows through
+kind: pipeline-stages
+when: Large matrix multiplies dominate the workload, and moving data between memory and compute costs more than the arithmetic.
+how: A systolic array is a grid of multiply-accumulate cells. In a weight-stationary design, each cell holds one weight. Input values enter from one edge and move one cell per clock. Partial sums move along the other axis and accumulate. After a start-up delay, one result row leaves the array every cycle.
+Each value is read from memory once and used by many cells as it passes. This gives very high arithmetic intensity at the chip level and saves energy, since moving data off chip costs far more than a multiply. A 256 by 256 array does 65,536 multiply-adds per cycle.
+The array is fixed in size. A large matrix is cut into tiles that fit, and the control logic loads one weight tile, streams the activations through it, and then loads the next. Small or odd shapes leave cells idle, which is the main loss. The design is rigid, and works best for dense matrix multiply and convolution.
+used: Google TPU matrix multiply units (first TPU paper, ISCA 2017: 256 by 256 array); the matrix units of other AI accelerators; NVIDIA tensor cores are not systolic arrays in the strict sense.
+avoid: Irregular sparse workloads and small batches that leave the array mostly empty; use a flexible GPU or a CPU.
+flow:
+  Weight tile [store: 256 by 256] -> Systolic array [svc: grid of MAC cells] : load weights | Each cell stores one weight of the tile. They stay in place.
+  Activation buffer [store: on-chip SRAM] -> Systolic array : stream rows in | Input rows enter from the left edge, one per clock cycle.
+  Systolic array -> Next MAC row [svc: cell below] : partial sums move down | Each cell adds its product to the partial sum from above and passes it down.
+  Next MAC row -> Accumulators [cache: wide registers] : result row per cycle | After the start-up delay, one output row leaves per cycle.
+  Accumulators -> Activation buffer : next layer input | The output is stored on chip and feeds the next layer. It does not go to main memory.
+  Systolic array -x> Activation buffer : tile too small | A small or odd tile leaves cells idle, so the unit does not reach peak speed.
+ref: paper | In-Datacenter Performance Analysis of a Tensor Processing Unit | Jouppi et al., ISCA 2017 | https://arxiv.org/abs/1704.04760

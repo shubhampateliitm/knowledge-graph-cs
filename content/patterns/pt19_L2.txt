@@ -1,0 +1,650 @@
+@@ moe
+== Expert parallelism with all-to-all routing
+kind: model-parallel, data-parallel
+when: A model has more expert weights than one GPU can hold, and each token should run only a few experts.
+how: Each MoE layer holds many experts, for example 256 routed experts in DeepSeek-V3. The experts are split across GPUs, so each GPU stores only a few of them. A small router scores every token and picks the top-k experts, for example 8.
+Tokens are sent to the GPUs that own their experts with an all-to-all exchange, the experts run, and a second all-to-all sends the results back to the original GPU. Attention layers stay data-parallel. The network cost of these two exchanges is often the main limit on speed.
+An auxiliary loss, or a per-expert bias as in DeepSeek-V3, keeps load balanced. Without it some experts get too many tokens, their GPU becomes the straggler, and overflow tokens are dropped or delayed.
+used: GShard and Switch Transformer at Google; Mixtral; DeepSeek-V3 (671B parameters, 37B active per token); training frameworks such as Megatron-LM and DeepSpeed-MoE.
+avoid: Small models or small clusters with slow links; a dense model is simpler and has no load-balance problem.
+flow:
+  Token batch [client: on GPU 0] -> Router [svc: top-2 of 8] : hidden states | Each token is scored against every expert by a small linear layer and softmax.
+  Router -> Expert 3 [svc: GPU 1], Expert 6 [svc: GPU 2] : all-to-all dispatch | Tokens travel over the network to the GPUs that hold their chosen experts.
+  * Expert 6: 2x load | An unbalanced router sends too many tokens to expert 6, so its GPU becomes the slowest step.
+  Expert 3, Expert 6 -> Combine [svc: weighted sum] : all-to-all return | A second exchange sends each result back to its source GPU.
+  Combine -> Token batch : mixed output | Outputs are added using the router weights, and the next layer continues.
+ref: paper | Switch Transformers: Scaling to Trillion Parameter Models | Fedus, Zoph & Shazeer, 2021 | https://arxiv.org/abs/2101.03961
+ref: paper | DeepSeek-V3 Technical Report | DeepSeek-AI, 2024 | https://arxiv.org/abs/2412.19437
+
+== Sparse model serving with expert placement
+kind: online-offline, offload-accelerator
+when: You serve a large MoE model and must keep latency low while all expert weights stay in memory.
+how: All experts must be loaded in GPU memory even though each token uses only a few. A 671B model needs hundreds of GB of weights for a 37B-active compute cost. So serving is memory-bound, not compute-bound.
+Operators shard experts across the GPUs of a node or several nodes, and batch many requests together so every expert sees enough tokens to use the GPU well. Small batches leave most experts idle and waste memory bandwidth.
+Hot experts can be copied to more GPUs, and a load balancer places replicas using live routing counts. Engines such as vLLM and SGLang support expert parallelism for this.
+used: DeepSeek-V3 serving with large expert-parallel groups; vLLM and SGLang expert parallelism; common in hosted open MoE models.
+avoid: Single-user local use with little memory, where a smaller dense model gives lower memory cost per quality point.
+flow:
+  Request queue [queue] -> Batcher [svc: continuous] : prompts | Requests are grouped so each expert gets many tokens per step.
+  Batcher -> MoE layer [svc: 256 experts] : token batch | The batch enters each MoE layer in turn.
+  MoE layer -> Expert GPU A [svc: experts 0-127], Expert GPU B [svc: experts 128-255] : routed tokens | Each GPU runs only its own experts on the tokens sent to it.
+  * Expert GPU B: hot expert copied | Routing counters show one hot expert, so a replica is placed on another GPU.
+  Expert GPU A, Expert GPU B -> Batcher : layer output | Results return and decoding continues for the next token.
+ref: docs | Expert parallel deployment | vLLM documentation | https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment.html
+
+@@ objdetect
+== Two-stage vision service: detect then classify
+kind: pipes-filters, two-tower-retrieval
+when: You need to find many objects in images and then run a heavier step only on the regions that matter.
+how: A fast detector (YOLO or Faster R-CNN style) runs on every frame and returns boxes with class scores. Non-maximum suppression (NMS) removes overlapping boxes for the same object, keeping the one with the highest score.
+A second, heavier model then works only on cropped boxes: a fine classifier, an OCR model, or a face embedding. This is cheaper than running the heavy model on the whole image, and it is the same idea as candidate retrieval then ranking.
+Each stage is tuned on its own: the detector for recall at 30 frames per second, the second stage for precision. A confidence threshold between them controls how much work the second stage gets.
+used: Retail shelf scanning, license-plate reading, and video-ad safety checks that look for logos or unsafe objects in frames.
+avoid: When one whole-image classifier is enough, or when objects need exact pixel shapes; use segmentation instead.
+flow:
+  Camera [client: 30 fps] -> Detector [model: YOLO-style] : frame 640x640 | Each frame is resized and passed through the detector once.
+  Detector -> NMS [svc: IoU 0.5] : 300 raw boxes | Many overlapping boxes are predicted for the same object.
+  NMS -> Cropper [svc: top boxes] : 4 kept boxes | NMS keeps the best box per object and drops the others.
+  Cropper -> Classifier [model: fine-grained] : crops | Only the crops go to the heavy model, so most pixels are never processed twice.
+  Classifier -> Result store [db] : labels + boxes | Final labels with box positions are saved for search and review.
+ref: paper | Faster R-CNN: Towards Real-Time Object Detection with Region Proposal Networks | Ren et al., 2015 | https://arxiv.org/abs/1506.01497
+ref: paper | You Only Look Once: Unified, Real-Time Object Detection | Redmon et al., 2015 | https://arxiv.org/abs/1506.02640
+
+== Edge detection with cloud retraining loop
+kind: feedback-loop, online-offline
+when: Cameras must detect objects in real time on small devices, and the model must improve as conditions change.
+how: A small detector runs on the device (a Jetson or phone chip) so no video leaves the site. The device sends back only low-confidence frames, which are the ones the model is unsure about.
+In the cloud, people label these hard frames. The labels are added to the training set, a larger model is retrained, and then distilled or quantized (for example to INT8) into a small model for the edge.
+The new model is rolled out to a few devices first and compared to the old one. This loop keeps the detector fresh when lighting, products or camera angles change.
+used: Retail and warehouse cameras, driver-assistance and robotics stacks; common in industrial inspection.
+avoid: When data cannot be uploaded for privacy reasons, unless you use federated methods; or when the scene never changes.
+flow:
+  Edge camera [client: on-device model] -> Edge model [model: INT8] : frame | The small model runs locally with a few milliseconds of delay.
+  Edge model -> Alert service [svc] : confident detections | Confident detections trigger local actions at once.
+  Edge model ~> Hard-frame store [store: S3] : low-confidence frames | Uncertain frames are uploaded in the background.
+  Hard-frame store -> Labeling team [user] : review queue | People draw the correct boxes on the hard frames.
+  Labeling team -> Training job [svc: GPU] : new labels | The labels are added to the dataset and the model is retrained.
+  Training job -> Edge camera : new model v8 | The new quantized model is sent to a small set of devices first.
+ref: docs | Ultralytics YOLO documentation | Ultralytics | https://docs.ultralytics.com/
+
+@@ residual
+== Pre-norm residual stream in a transformer
+kind: pipes-filters, layered-arch
+when: You build a deep transformer, and every layer should add information without erasing what earlier layers wrote.
+how: The residual stream is one vector per token that runs through the whole model. Each attention block and each feed-forward block reads from it, computes a change, and adds that change back: x = x + f(norm(x)).
+Because the add is an identity path, the gradient reaches early layers without shrinking. This lets a model with 80 or more layers train with stable gradients. Placing the normalization before each block (pre-norm) makes training even more stable than the original post-norm design.
+It also gives a clear view for analysis: each layer writes a small update into a shared space, and later layers read it. Interpretability work follows these reads and writes.
+used: GPT, Llama and most modern LLMs use pre-norm residual blocks; ResNet introduced the idea for vision in 2015.
+avoid: Very shallow networks gain little; for extremely deep stacks, add scaling or initialization rules so the stream does not grow without bound.
+flow:
+  Token embedding [store: x0] -> Norm 1 [svc: RMSNorm] : x | The block reads a normalized copy of the stream.
+  Norm 1 -> Attention [svc: f1] : normalized x | Attention computes an update from the normalized input.
+  Attention -> Residual add 1 [svc: x + f1] : update | The update is added to the original, unnormalized x.
+  Token embedding -> Residual add 1 : skip path | The input goes around the block unchanged, which is the skip connection.
+  Residual add 1 -> Feed-forward [svc: f2] : x1 | The next block reads the new stream and repeats the same pattern.
+  Feed-forward -> Output logits [model] : x2 | After all layers, the final stream is projected to token scores.
+ref: paper | Deep Residual Learning for Image Recognition | He et al., 2015 | https://arxiv.org/abs/1512.03385
+
+== Skip connections in encoder-decoder segmentation nets
+kind: layered-arch, pipes-filters
+when: A network must keep fine spatial detail while it also learns wide context, as in medical or satellite images.
+how: A U-Net shrinks the image step by step in the encoder to learn context, then grows it back in the decoder. Detail is lost while shrinking, so the blurry decoder features alone cannot draw sharp edges.
+Skip connections copy the encoder feature map at each size straight to the decoder at the same size, where it is joined (concatenated) with the upsampled map. The decoder then has both context and detail.
+Gradients also take the short path back to early layers. The same pattern is used inside the denoising network of image diffusion models.
+used: U-Net in medical image segmentation; the denoiser in Stable Diffusion is a U-Net with skip links and residual blocks.
+avoid: When the output has a very different shape from the input and no matching feature size exists.
+flow:
+  Image [client: 256x256] -> Encoder block 1 [model: 64 ch] : pixels | The first block keeps fine detail at full size.
+  Encoder block 1 -> Bottleneck [model: 16x16 context] : downsample | Repeated shrinking gives a wide view but loses sharp edges.
+  Bottleneck -> Decoder block 1 [model: upsample] : context features | The decoder grows the map back to full size.
+  Encoder block 1 ~> Decoder block 1 : skip copy | The skip link carries the sharp early features straight to the decoder.
+  Decoder block 1 -> Mask [store: per-pixel classes] : concat + conv | The decoder mixes both inputs and predicts a class for each pixel.
+ref: paper | U-Net: Convolutional Networks for Biomedical Image Segmentation | Ronneberger, Fischer & Brox, 2015 | https://arxiv.org/abs/1505.04597
+
+@@ rlhf
+== Preference data to reward model to policy tuning
+kind: feedback-loop, online-offline
+when: You want an assistant that follows human taste for helpfulness and safety, and next-token training alone does not give it.
+how: First, supervised fine-tuning gives a base assistant. Then people rank pairs of answers to the same prompt, often tens of thousands of pairs. A reward model learns to give higher scores to the preferred answer, using a Bradley-Terry loss.
+Then the policy (the language model) generates answers, the reward model scores them, and PPO updates the policy to raise the score. A KL penalty against the original model stops it from drifting into odd text that fools the reward model.
+Watch for reward hacking: the policy finds answers the reward model likes but people do not. Fresh human comparisons are collected to refresh the reward model.
+used: InstructGPT and ChatGPT-style assistants; Anthropic's Claude models use human and AI feedback; open frameworks such as TRL and OpenRLHF.
+avoid: When the task has an automatic checker (math, code); use verifiable rewards instead. When pairs are cheap but compute is tight, use DPO.
+flow:
+  Prompt set [store: 50k prompts] -> Policy [model: SFT model] : prompt | The current model writes two or more answers per prompt.
+  Policy -> Labelers [user: rank answers] : answer A, answer B | People choose the better answer for each pair.
+  Labelers -> Reward model [model: Bradley-Terry] : preference pairs | The reward model is trained so the chosen answer scores higher.
+  Policy -> Reward model : new answers | During tuning, every new answer is scored automatically.
+  Reward model -> PPO trainer [svc: KL penalty] : reward | PPO raises the reward while the KL term keeps the policy close to the start model.
+  PPO trainer -> Policy : updated weights | The improved policy writes the next round of answers.
+ref: paper | Training language models to follow instructions with human feedback | Ouyang et al., 2022 | https://arxiv.org/abs/2203.02155
+
+== Direct preference optimization with AI feedback
+kind: feedback-loop, llm-workflow
+when: You have preference pairs but want a simpler, cheaper setup than training a reward model and running PPO.
+how: DPO trains the policy directly on pairs of chosen and rejected answers. It raises the probability of the chosen answer relative to a frozen reference copy of the model, using one classification-style loss. There is no reward model and no sampling loop during training.
+The pairs can come from people or from an AI judge. In RLAIF, a strong model grades answers using a written rulebook (a constitution), which cuts labeling cost from dollars per pair to cents.
+The result is easy to run on one training cluster, but it learns only from the fixed data set. If the data does not match the policy's current outputs, quality can stall; fresh pairs from the current model help.
+used: Zephyr and Tulu open models used DPO; Anthropic's Constitutional AI uses AI feedback; common in open post-training recipes.
+avoid: When you need to explore new behaviors beyond the data, such as long reasoning; use online RL with a reward instead.
+flow:
+  Prompt set [store] -> Policy [model: current] : prompts | The current model writes several answers per prompt.
+  Policy -> AI judge [model: rubric] : answer pairs | A strong model compares answers using written principles.
+  AI judge -> Pair store [store: chosen/rejected] : preference labels | Each pair is saved as a chosen and a rejected answer.
+  Pair store -> DPO trainer [svc: one loss] : batches | The trainer needs no reward model, only the policy and a frozen reference.
+  Reference model [model: frozen] -> DPO trainer : log-probs | The loss compares policy probabilities with the reference probabilities.
+  DPO trainer -> Policy : updated weights | The updated policy is evaluated, then new pairs are collected.
+ref: paper | Direct Preference Optimization: Your Language Model is Secretly a Reward Model | Rafailov et al., 2023 | https://arxiv.org/abs/2305.18290
+ref: paper | Constitutional AI: Harmlessness from AI Feedback | Bai et al., Anthropic, 2022 | https://arxiv.org/abs/2212.08073
+
+@@ rnn
+== Streaming inference with a carried hidden state
+kind: event-driven, checkpoint-restart
+when: Input arrives as an endless stream, such as audio or sensor data, and you need an answer after every step with fixed memory.
+how: A recurrent model keeps a hidden state vector that sums up everything seen so far. For each new chunk, the model reads the chunk and the old state, produces an output, and writes a new state. The state has a fixed size, for example 1,024 numbers, however long the stream is.
+So memory and compute per step are constant. A transformer must keep a growing key-value cache instead. State-space models such as Mamba keep this benefit and train in parallel.
+The service stores the state per stream (per user or per call). If a worker crashes, it reloads the last saved state and continues. Sticky routing sends all chunks of one stream to the same worker.
+used: On-device speech recognition and keyword spotting; streaming speech models such as RNN-Transducer; Mamba-based and hybrid language models.
+avoid: When long-range recall of exact details matters most; attention keeps all tokens and recalls them more exactly.
+flow:
+  Mic stream [client: 20 ms chunks] -> Stream router [svc: sticky by call id] : audio chunk | All chunks of one call go to the same worker.
+  Stream router -> RNN worker [model: LSTM] : chunk t | The worker loads the call's hidden state from memory.
+  RNN worker -> Transcript [store: partial text] : words so far | The model emits text after each chunk, so latency stays low.
+  RNN worker ~> State store [cache: h_t per call] : save state | The new hidden state is saved so another worker can resume after a crash.
+  RNN worker -x> Stream router : worker crash | The worker dies in the middle of the call.
+  State store -> RNN worker : reload h_t | A new worker loads the last saved state and the call continues.
+ref: paper | Mamba: Linear-Time Sequence Modeling with Selective State Spaces | Gu & Dao, 2023 | https://arxiv.org/abs/2312.00752
+
+== Seq2seq encoder-decoder with attention (legacy NMT)
+kind: pipes-filters, two-tower-retrieval
+when: You maintain or study a sequence-to-sequence system where an encoder reads a whole input and a decoder writes the output one token at a time.
+how: An LSTM encoder reads the source sentence and keeps one state per word. A decoder LSTM writes the output word by word. At each step it uses attention over all encoder states, so it can look back at the right source word.
+Attention was added in 2014 because squeezing a whole sentence into one fixed vector lost detail on long inputs. Decoding runs step by step, so it cannot be parallel over time, and training is slow compared to a transformer.
+This pattern powered Google Neural Machine Translation in 2016. Transformers replaced it for most tasks, but the same encoder-decoder shape remains.
+used: Google Neural Machine Translation (2016); older speech and captioning systems; small embedded models.
+avoid: New large-scale text work, where a transformer trains faster on GPUs and handles long context better.
+flow:
+  Source text [client: 12 words] -> LSTM encoder [model: bi-LSTM] : word vectors | The encoder reads the sentence in both directions.
+  LSTM encoder -> Encoder states [store: 12 vectors] : one state per word | All states are kept, not only the last one.
+  Encoder states -> Attention [svc: soft lookup] : keys | At each output step the decoder scores all states.
+  Attention -> LSTM decoder [model: step t] : context vector | The weighted sum of the best-matching states feeds the decoder.
+  LSTM decoder -> Target text [store: beam search] : next word | The decoder picks a word and feeds it back as the next input.
+ref: paper | Neural Machine Translation by Jointly Learning to Align and Translate | Bahdanau, Cho & Bengio, 2014 | https://arxiv.org/abs/1409.0473
+ref: paper | Google's Neural Machine Translation System | Wu et al., 2016 | https://arxiv.org/abs/1609.08144
+
+@@ rope
+== Rotary position in the attention block
+kind: pipes-filters, offload-accelerator
+when: A transformer needs to know token order, and it should use relative distance between tokens.
+how: Attention alone treats tokens as an unordered set. RoPE fixes this by rotating the query and key vectors before the dot product. Each pair of dimensions is turned by an angle equal to the token position times a frequency; low dimensions rotate fast and high ones slowly.
+The dot product of a rotated query and key then depends only on the distance between the two tokens, not on their absolute positions. No position table is added to the embeddings, and the value vectors are not rotated.
+The rotation is cheap, a few multiplications per head, and it fuses into the attention kernel. It is applied inside every layer, not once at the input.
+used: Llama, Mistral, Qwen, DeepSeek and Gemma model families; GPT-NeoX; implemented in FlashAttention kernels.
+avoid: Models that need exact length extrapolation without any tuning; plain RoPE degrades beyond the trained length, so use scaling (below) or ALiBi-style biases.
+flow:
+  Hidden state [store: per token] -> Q/K projection [svc: W_q and W_k] : x | Each token is projected into a query and a key per head.
+  Q/K projection -> RoPE rotate [svc: angle = pos x freq] : q, k | Each pair of dimensions is rotated by the token's position angle.
+  RoPE rotate -> Attention scores [svc: q . k] : rotated q, k | The score now depends on the distance between the tokens.
+  Attention scores -> Softmax [svc] : scores | Scores are turned into weights that sum to 1.
+  Softmax -> Context output [store: weights x V] : weights | Values are mixed with these weights, and V was never rotated.
+ref: paper | RoFormer: Enhanced Transformer with Rotary Position Embedding | Su et al., 2021 | https://arxiv.org/abs/2104.09864
+
+== Long-context extension by RoPE scaling
+kind: online-offline, shadow-ab
+when: A model was trained at 4k or 8k tokens, and you need it to handle 32k to 128k tokens without a full retrain.
+how: RoPE angles outside the trained range give attention scores the model never saw, so quality falls. Position interpolation shrinks position numbers by a factor, for example 8, so a 32k input maps into the old 4k angle range.
+Methods such as NTK-aware scaling and YaRN change the base frequency, or scale each frequency differently, to keep fine local detail. Then a short fine-tune on long text, often a few hundred to a few thousand steps, restores quality.
+Test with needle-in-a-haystack and real long-document tasks before launch, and compare against the short-context model on normal prompts, since scaling can slightly hurt short inputs.
+used: Llama 2 long-context variants and Code Llama used scaling; YaRN is used in several open models such as Qwen; common in long-context open releases.
+avoid: When the new length is more than ten times the trained length; train with long data in stages instead.
+flow:
+  Base model [model: trained at 4k] -> Scaling config [svc: factor 8 or YaRN] : rope parameters | Position numbers or base frequencies are changed by a factor.
+  Scaling config -> Long-context tuner [svc: short fine-tune] : new angles | The model is tuned on long documents for a short time.
+  Long text corpus [lake: 32k docs] -> Long-context tuner : long samples | Training uses long samples so the model learns the new angle range.
+  Long-context tuner -> Eval suite [svc: needle + QA] : checkpoint | Checks measure recall at different depths in a 32k prompt.
+  Eval suite -> Model registry [store: 32k model] : pass | A passing model replaces the base model for long inputs only.
+  Eval suite -x> Long-context tuner : short-prompt drop | If short prompts get worse, tuning is repeated with a lower factor.
+ref: paper | YaRN: Efficient Context Window Extension of Large Language Models | Peng et al., 2023 | https://arxiv.org/abs/2309.00071
+ref: paper | Extending Context Window of Large Language Models via Positional Interpolation | Chen et al., 2023 | https://arxiv.org/abs/2306.15595
+
+@@ scalinglaws
+== Small-run sweeps to plan one large training run
+kind: online-offline, shadow-ab
+when: A large training run costs millions of dollars, and you must pick model size and token count before you start.
+how: Train many small models, for example from 10 million to 1 billion parameters, at several sizes and token counts. Record the final loss of each run. Fit a power law of loss against parameters and data.
+Use the fit to predict the loss of the big run, and to choose the best split of a fixed compute budget. Chinchilla found that parameters and tokens should grow together, roughly 20 tokens per parameter for compute-optimal training.
+Many teams now train longer than that on purpose, because a smaller model that sees more data is cheaper to serve. Check that the small runs lie on a straight line in log-log plots. If the line bends, the forecast is not reliable.
+used: OpenAI, DeepMind and Meta report scaling-law forecasts for GPT-4 and Llama; Chinchilla set the 20 tokens per parameter rule.
+avoid: When the new architecture or data mix differs from the small runs, because a fit from another recipe can mislead.
+flow:
+  Sweep planner [svc: grid of runs] -> Small runs [svc: 10M to 1B params] : sizes x token counts | Many cheap runs cover a grid of model size and data size.
+  Small runs -> Loss table [db: final loss per run] : results | Each run writes its final validation loss.
+  Loss table -> Curve fit [svc: power law] : data points | A fit estimates the exponents of loss versus compute.
+  Curve fit -> Planner [svc: compute budget] : predicted loss | The fit predicts loss for the big run before it starts.
+  Planner -> Main run [svc: 70B, 1.4T tokens] : chosen size and tokens | The budget is split between model size and training tokens.
+ref: paper | Scaling Laws for Neural Language Models | Kaplan et al., 2020 | https://arxiv.org/abs/2001.08361
+ref: paper | Training Compute-Optimal Large Language Models | Hoffmann et al., 2022 | https://arxiv.org/abs/2203.15556
+
+== Inference-aware sizing and test-time compute budget
+kind: online-offline, autoscaling
+when: You must decide whether to spend a budget on a bigger model, more training tokens, or more compute at answer time.
+how: Training cost is paid once, but inference cost is paid on every request. If a model will serve billions of requests, a smaller model trained on far more tokens can cost less in total than a compute-optimal larger one.
+Teams compute total cost as training FLOPs plus expected serving FLOPs, then pick the size that minimizes it for a target loss. Reasoning models add a third axis: quality also rises with the number of tokens the model thinks before answering.
+So a product can serve an easy question with a short answer and a hard question with a long thinking budget. This is chosen per request, using the same kind of measured curve of quality against compute.
+used: Llama 3 models were trained on far more tokens than the Chinchilla rule; reasoning models with adjustable thinking budgets.
+avoid: When demand is low or unknown; then use the compute-optimal size and avoid over-training.
+flow:
+  Traffic forecast [store: 5B req per month] -> Cost model [svc: train + serve FLOPs] : expected demand | Serving cost depends on how many requests the model will handle.
+  Scaling fits [db: loss curves] -> Cost model : loss vs size and tokens | The cost model reads the measured curves.
+  Cost model -> Model plan [svc: 8B on 15T tokens] : cheapest size | A smaller, longer-trained model wins when serving dominates.
+  Router [svc: per request] -> Reasoning model [model: thinking budget] : hard question | Hard questions get a larger thinking-token budget.
+  Router -> Fast model [model: no thinking] : easy question | Easy questions get a short answer at low cost.
+ref: paper | Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters | Snell et al., 2024 | https://arxiv.org/abs/2408.03314
+
+@@ vae
+== Latent compression stage for latent diffusion
+kind: pipes-filters, online-offline
+when: Generating high-resolution images directly in pixel space is too slow, and you want a small space to work in.
+how: A VAE is trained first. Its encoder compresses a 512x512 image into a latent grid, for example 64x64x4, which is 48 times fewer numbers. Its decoder maps the grid back to pixels.
+A diffusion model is then trained and run in this latent space, which makes each denoising step far cheaper. At the end, the VAE decoder turns the final latent into an image. The VAE is frozen during diffusion training.
+The VAE sets the quality ceiling: if it blurs fine text or faces, the diffusion model cannot fix it. Recent systems train the VAE with perceptual and adversarial losses to keep detail.
+used: Stable Diffusion and its successors; the same idea is used for video and audio latent models.
+avoid: When you need exact reconstruction of pixels, such as medical images; use a lossless codec.
+flow:
+  Training images [lake: 512x512] -> VAE encoder [model: 8x downsample] : pixels | The encoder maps each image to the mean and variance of a latent.
+  VAE encoder -> Diffusion model [model: U-Net] : sampled latent z | A sample z of size 64x64x4 is drawn, and the diffusion model learns to remove noise in latent space only.
+  Text prompt [client] -> Diffusion model : condition | At serving time, text guides the denoising steps.
+  Diffusion model -> VAE decoder [model: frozen] : clean latent | After 30 to 50 steps, the clean latent is ready.
+  VAE decoder -> Image [client: 512x512] : pixels | The decoder expands the latent back into the final picture.
+ref: paper | High-Resolution Image Synthesis with Latent Diffusion Models | Rombach et al., 2021 | https://arxiv.org/abs/2112.10752
+ref: paper | Auto-Encoding Variational Bayes | Kingma & Welling, 2013 | https://arxiv.org/abs/1312.6114
+
+== Anomaly detection by reconstruction error
+kind: online-offline, feedback-loop
+when: You have plenty of normal data, very few labeled faults, and you want to flag unusual inputs.
+how: Train a VAE on normal data only, such as healthy machine sensor windows or normal transactions. The model learns to rebuild normal inputs well. Unusual inputs lie outside what it learned, so they are rebuilt badly.
+At serving time, each new input is encoded and decoded, and the error between input and output is the anomaly score. A threshold, set on a validation set to hit a target false-alarm rate, decides what to flag.
+The ELBO value can also be used as a score. Retrain on a schedule as normal behavior drifts, and send flagged cases to an analyst, whose answers become labels for later.
+used: Industrial monitoring, fraud and network-intrusion research; common in time-series anomaly detection prototypes.
+avoid: When labeled faults are plentiful; a supervised classifier is more accurate. VAEs can also rebuild some anomalies well, so test on known faults.
+flow:
+  Sensor stream [client: windows of 128] -> VAE encoder [model: trained on normal] : window | Each window is compressed to a small latent code.
+  VAE encoder -> VAE decoder [model] : latent z | The decoder rebuilds the window from the code.
+  VAE decoder -> Scorer [svc: error vs input] : rebuilt window | The scorer measures how far the rebuilt window is from the real one.
+  Scorer -> Alert queue [queue: score > threshold] : anomaly score | Only scores above the threshold create an alert.
+  Alert queue -> Analyst [user] : flagged window | A person checks the alert and labels it normal or a fault.
+ref: paper | An Introduction to Variational Autoencoders | Kingma & Welling, 2019 | https://arxiv.org/abs/1906.02691
+
+@@ antientropy
+== Read repair plus hinted handoff in a leaderless store
+kind: quorum, heartbeat
+when: Replicas of a key can miss writes while a node is down or slow, and reads should heal the gap.
+how: A coordinator reads from R of N replicas, for example 2 of 3, and compares versions. If one replica is stale, the coordinator sends it the newest value in the background. This is read repair, and it fixes hot keys quickly.
+When a write targets a replica that is down, a live node keeps a hint (the missed write) for a limited time, for example 3 hours in Cassandra by default. When the dead node returns, the hint is replayed to it. This is hinted handoff.
+Both are best effort. Hints can expire and cold keys are rarely read, so they never fix everything. Background anti-entropy repair is needed too.
+used: Amazon Dynamo (the original design); Apache Cassandra, ScyllaDB and Riak use read repair and hinted handoff.
+avoid: Strongly consistent stores with a single leader per shard (Raft or Paxos), where replicas follow one log and need no repair.
+flow:
+  Client [client] -> Coordinator [svc: read at R=2] : GET user:42 | The client reads a key with consistency level QUORUM.
+  Coordinator -> Replica A [db: v7], Replica B [db: v6] : read request | The coordinator asks two replicas for the value and its version.
+  Coordinator -> Client : value v7 | The coordinator returns the newest version it saw.
+  Coordinator ~> Replica B : repair write v7 | In the background it writes v7 to the stale replica.
+  * Replica B: v7 repaired | The stale replica is now up to date for this key.
+  Coordinator ~> Replica C [db: down] : hint for write v8 | Replica C is down, so the coordinator keeps a hint to replay later.
+ref: docs | Cassandra: hints and read repair | Apache Cassandra documentation | https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html
+
+== Merkle-tree anti-entropy repair on a schedule
+kind: quorum, cdc
+when: Replicas must be proven equal even for data nobody reads, and comparing every row would cost too much.
+how: Each replica builds a Merkle tree over a key range: leaves hash small groups of rows, and each parent hashes its children. Two replicas first compare only the root hash. If the roots match, the whole range is equal and no data moves.
+If roots differ, they compare children and go down the tree, finding the few leaf ranges that differ. Only those ranges are streamed. This costs network in proportion to the difference, not the size of the data.
+Building trees reads all the data on disk, so repair is run on a schedule, for example once within the tombstone grace period of 10 days in Cassandra. Tools such as Cassandra Reaper split it into small slices.
+used: Amazon Dynamo; Apache Cassandra nodetool repair; ScyllaDB; Riak active anti-entropy.
+avoid: When data is small and a full copy is cheap, or when a single log already keeps replicas equal.
+flow:
+  Repair scheduler [svc: Reaper] -> Replica A [db: range 0-1000] : start repair | A scheduler picks a small token range and starts a repair session.
+  Replica A -> Replica B [db: range 0-1000] : Merkle root hash | The two replicas exchange only the root hash of their trees.
+  Replica B -> Replica A : roots differ | The roots are different, so they compare child hashes level by level.
+  Replica A -> Diff finder [svc: walk the tree] : mismatched hashes | The walk narrows the problem to 2 leaf ranges out of 1,024.
+  Diff finder -> Replica B : stream 2 ranges | Only the differing ranges are sent, newest value wins.
+  * Replica B: in sync | After streaming, both trees have the same root hash.
+ref: paper | Dynamo: Amazon's Highly Available Key-value Store | DeCandia et al., SOSP 2007 |
+
+@@ broadcast
+== Replicated log through total-order broadcast
+kind: consensus-log, leader-follower
+when: Several replicas must apply the same commands in the same order, so they end in the same state.
+how: Every command is submitted to a total-order broadcast. A leader gives it the next log position, sends it to followers, and delivers it only after a majority has stored it. All replicas deliver the same messages in the same order.
+Each replica applies delivered commands to its own copy of the state machine. Because the order and the code are the same, the states are equal. Total-order broadcast and consensus are equivalent: each can build the other.
+If the leader fails, a new leader is elected and it must keep every entry that a majority already stored. Clients retry with a command id so that a duplicate is not applied twice.
+used: ZooKeeper's ZAB; etcd and Consul with Raft; Kafka KRaft metadata log; database replication logs.
+avoid: When operations commute (counters, sets); use CRDTs and skip the cost of ordering. Also avoid it across continents if you cannot afford a majority round trip.
+flow:
+  Client [client] -> Leader [svc: term 3] : command X | The client sends a command to the current leader.
+  Leader -> Follower 1 [log: slot 1 to 7], Follower 2 [log: slot 1 to 7] : append slot 8 = X | The leader assigns the next log position and sends it to followers.
+  Follower 1, Follower 2 -> Leader : ack slot 8 | Followers store the entry and acknowledge.
+  * Leader: slot 8 committed | A majority (2 of 3) holds slot 8, so it is committed.
+  Leader -> State machine [db: applies in order] : deliver X | The entry is delivered to the state machine in log order.
+  Leader -> Client : result | The client gets the answer after commit.
+ref: paper | Total Order Broadcast and Multicast Algorithms: Taxonomy and Survey | Defago, Schiper & Urban, ACM Computing Surveys, 2004 |
+
+== Causal broadcast for collaborative and chat apps
+kind: pubsub, crdt
+when: Messages need to respect cause and effect, such as a reply after its question, but a global order would be too slow.
+how: Each message carries a vector clock, or a list of the messages it depends on. A receiver delays delivery of a message until everything it depends on has been delivered locally. A reply is never shown before its question.
+This is cheaper than total order because there is no leader and no majority round trip. Concurrent messages, which have no cause between them, may be delivered in different orders at different nodes, so the data type must accept that.
+Reliable broadcast under it makes receivers relay messages, so that if the sender crashes in the middle of sending, all correct nodes still get the message or none do.
+used: Chat and collaborative editors with CRDTs; Cassandra-style and Riak stores use dependency tracking inside their replication; research systems such as COPS.
+avoid: When all replicas must agree on one order, such as bank transfers; use total-order broadcast.
+flow:
+  Alice [client: vc 2,0] -> Relay layer [svc: reliable broadcast] : question Q | Alice sends a question with her vector clock.
+  Bob [client] -> Relay layer : reply R, depends on Q | Bob sends a reply that records Q as its cause.
+  Relay layer -> Carol's buffer [queue: hold R until Q] : R arrives first | The network delivers R before Q to Carol's node.
+  Relay layer -> Carol's buffer : Q arrives | Q arrives later.
+  * Carol's buffer: Q then R | The buffer delivers Q first, then releases R.
+  Carol's buffer -> Carol [client] : Q, R | Carol sees the question before the reply.
+ref: book | Introduction to Reliable and Secure Distributed Programming | Cachin, Guerraoui & Rodrigues, 2011 |
+
+@@ cap
+== Partition-time choice: CP coordination vs AP serving store
+kind: consistent-core, quorum
+when: You must decide what each component does during a network partition, and the answer differs by data type.
+how: During a partition, a system cannot be both consistent and available. A CP component, such as etcd or ZooKeeper, lets only the side with a majority accept writes. The minority side returns errors, so no two sides ever disagree.
+An AP component, such as a Dynamo-style store, accepts writes on both sides and repairs conflicts later with versions or merge rules. Users keep getting answers, but some answers can be stale.
+A good design uses both. Configuration, locks and leader choice go to a CP core, and high-volume user data goes to an AP store. Also remember PACELC: without a partition, you still trade latency for consistency.
+used: etcd and ZooKeeper (CP) with Cassandra or DynamoDB (AP); Kubernetes keeps its state in etcd and serves data through other stores.
+avoid: Using CAP to describe normal operation; partitions are rare, and day-to-day latency choices matter more.
+flow:
+  App [client] -> Config store [db: etcd, 3 nodes] : write flag | Configuration writes need a majority of 3 nodes.
+  App -> Profile store [db: Cassandra RF 3] : write profile | User data is written to any replica set available.
+  Network partition [note: 2 nodes vs 1] -x> Config store : minority cut off | The single node on the small side loses contact with the other two.
+  Config store -x> App : minority refuses | The minority side returns errors, because it cannot get a majority.
+  Profile store -> App : accepted on both sides | The AP store keeps accepting writes on both sides of the split.
+  * Profile store: merged after heal | When the network returns, replicas merge their versions and the data converges.
+ref: paper | Perspectives on the CAP Theorem | Gilbert & Lynch, IEEE Computer, 2012 |
+ref: paper | Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services | Gilbert & Lynch, 2002 |
+
+== Degraded read-only mode during a partition
+kind: active-passive, multi-region
+when: A service must pick consistency for writes but still serve something useful to users when it loses its leader.
+how: Writes go to one leader region, which keeps writes consistent. If a region is cut off from the leader, it stops writes and returns an error or a queued message, but it keeps serving reads from a local replica, marked as possibly stale.
+Reads can show a freshness hint, for example last updated 40 seconds ago. Optional actions, such as likes, may be queued locally and sent later. Critical actions, such as payment, fail fast so that money is never counted twice.
+When the link returns, queued writes replay with idempotency keys, and the replica catches up. Each feature chooses its mode in advance, so the behavior in an outage is designed, not accidental.
+used: Common in multi-region e-commerce and banking apps; Spanner-style systems serve stale reads from replicas on request.
+avoid: When even slightly stale reads break the product, such as seat inventory at the last seat; read from the leader instead.
+flow:
+  User [user] -> Edge region [svc: region B] : view order page | The user reads data in region B.
+  Edge region -> Local replica [db: stale 40 s] : read | Reads are served from the local copy and marked as stale.
+  Edge region -x> Leader region [svc: region A] : write blocked | The link to the leader region is down, so the write is rejected.
+  Edge region -> User : read-only banner | The user sees a clear message and can still browse.
+  Edge region ~> Retry queue [queue: idempotent ops] : optional action | A low-risk action is queued for later.
+  Retry queue ~> Leader region : replay after heal | After the link returns, queued actions replay with idempotency keys.
+ref: blog | Please stop calling databases CP or AP | Martin Kleppmann, 2015 | https://martin.kleppmann.com/2015/05/11/please-stop-calling-databases-cp-or-ap.html
+
+@@ circuitbreaker
+== Client-side circuit breaker with timeout and fallback
+kind: circuit-breaker, timeout-deadline
+when: A caller depends on a service that can become slow or fail, and waiting requests would use up all its threads.
+how: Every call has a timeout, for example 300 ms. A breaker counts recent results. When the failure rate in a sliding window passes a threshold, for example 50% of 20 calls, the breaker opens and calls fail at once without touching the dependency.
+After a wait, for example 30 seconds, the breaker goes half-open and lets a few probe calls through. If they succeed it closes; if they fail it opens again. While open, the caller runs a fallback such as a cached value or a default.
+This stops a slow dependency from tying up every thread of its callers, and gives it room to recover.
+used: Netflix Hystrix (now in maintenance) and its successor Resilience4j; Polly in .NET; Envoy and Istio apply it in the proxy.
+avoid: Calls that rarely happen, where counts are too small to judge, and failures caused by bad requests rather than a sick dependency.
+flow:
+  Order service [svc] -> Breaker [svc: closed] : call price API | Each call passes through the breaker, with a 300 ms timeout.
+  Breaker -x> Price API [svc: slow] : timeouts | Calls time out, and the breaker counts the failures.
+  * Breaker: open | Failures pass 50% of the last 20 calls, so the breaker opens.
+  Breaker -> Fallback cache [cache: last price] : fail fast | While open, the breaker answers from a cache in microseconds.
+  Breaker ~> Price API : probe call | After 30 seconds, one probe call tests the service.
+  * Breaker: closed | The probe succeeds, so normal traffic resumes.
+ref: blog | CircuitBreaker | Martin Fowler, 2014 | https://martinfowler.com/bliki/CircuitBreaker.html
+
+== Proxy outlier ejection in a service mesh
+kind: circuit-breaker, service-mesh, health-check
+when: Many services call a pool of instances, and one bad instance should stop receiving traffic without code changes.
+how: The sidecar proxy (Envoy) watches responses from each endpoint of an upstream cluster. If one instance returns, for example, 5 server errors in a row, the proxy ejects it from the load-balancing pool for a base time such as 30 seconds. Each repeated ejection lasts longer.
+Ejection is capped, for example at 10% of the pool, so a global fault does not remove every instance. The proxy also limits concurrent connections and pending requests, which sheds extra load early.
+This works for every language because it lives in the proxy. Combine it with limited retries, so retries do not add load to a sick instance.
+used: Envoy outlier detection and circuit-breaking settings; Istio DestinationRule traffic policy; Linkerd failure accrual.
+avoid: Single-instance services, where ejecting the only endpoint just causes an outage; use a fallback instead.
+flow:
+  Checkout app [svc] -> Envoy sidecar [svc: client side] : request | The app calls a local proxy, not the remote pods.
+  Envoy sidecar -> Pod 1 [svc: healthy], Pod 2 [svc: failing] : load-balanced calls | The proxy spreads requests over the pods of the upstream cluster.
+  Pod 2 -x> Envoy sidecar : 5 errors in a row | Pod 2 returns five server errors in a row.
+  * Pod 2: ejected 30 s | The proxy removes Pod 2 from the pool, up to the 10% cap.
+  Envoy sidecar -> Pod 1 : all traffic | Requests now go only to healthy pods.
+  Envoy sidecar ~> Pod 2 : probe after 30 s | After the ejection time, the pod is tried again.
+ref: docs | Outlier detection | Envoy documentation | https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier
+
+@@ consensus
+== Consistent core: a small consensus cluster for metadata
+kind: consistent-core, consensus-log
+when: A large cluster needs one agreed answer about membership, configuration or leaders, and splits would be harmful.
+how: Run a small consensus cluster of 3 or 5 nodes (etcd, ZooKeeper or Consul). All writes go through a leader and become committed once a majority stores them. The data is small, so the cluster stays fast.
+Big data nodes do not vote. They read metadata from the core and watch it for changes. Kubernetes keeps all cluster state in etcd, and the API server is the only writer.
+With 5 nodes the core survives 2 failures; with 3 it survives 1. Adding more voters does not add speed, only fault tolerance and slower writes. Keep the nodes in separate failure zones, but close enough for round trips of a few milliseconds.
+used: Kubernetes with etcd; Kafka before KRaft used ZooKeeper, and now uses its own Raft quorum; HBase and ClickHouse use ZooKeeper-style cores; Consul for service catalogs.
+avoid: Storing large or high-volume data in it; use it only for small metadata, and keep user data in a scalable store.
+flow:
+  Worker node [svc: kubelet] -> API server [svc: stateless] : update pod status | Many workers talk only to the API server.
+  API server -> etcd leader [db: term 4] : write | The API server writes state to the leader of the core.
+  etcd leader -> etcd follower 1 [db], etcd follower 2 [db] : append entry | The leader sends the entry to the followers.
+  etcd follower 1, etcd follower 2 -> etcd leader : ack | Two of three nodes have stored the entry.
+  * etcd leader: committed | A majority has the entry, so it is committed.
+  etcd leader -> API server : ok | The API server then tells watchers about the change.
+ref: paper | In Search of an Understandable Consensus Algorithm (Raft) | Ongaro & Ousterhout, USENIX ATC 2014 | https://raft.github.io/raft.pdf
+ref: docs | etcd documentation | etcd project | https://etcd.io/docs/
+
+== Consensus-based leader election with fencing
+kind: leader-election, fencing-token, lease
+when: Exactly one worker at a time must own a job or a shard, and an old owner must not be able to write after losing it.
+how: Workers try to create a lock key in the consensus store with a lease. The first to succeed becomes the leader. The key's version, or the Raft term, is a number that only increases.
+The leader must renew the lease, for example every 5 seconds with a 15 second lease. If it pauses (a long garbage collection, for example), the lease expires and another worker is elected with a higher number.
+The old leader may wake up and still believe it leads. So every write to storage carries the number, and storage rejects writes with a number lower than the highest it has seen. This fencing token makes the system safe even if clocks or pauses are wrong.
+used: etcd election and lease API; ZooKeeper recipes; Consul sessions; Kubernetes leader election for controllers uses a lease object.
+avoid: Work that is safe to repeat (idempotent), where two workers running at once only waste effort.
+flow:
+  Worker A [svc] -> etcd [db: consensus store] : create lock, lease 15 s | Worker A creates the lock key first and wins.
+  etcd -> Worker A : token 33 | Worker A is told it leads, with fencing number 33.
+  Worker A -x> etcd : paused, lease expires | Worker A stops for 20 seconds, so its lease runs out.
+  Worker B [svc] -> etcd : create lock | Worker B now succeeds and receives a higher number.
+  etcd -> Worker B : token 34 | Worker B leads with number 34.
+  Worker A -> Storage [db: max token 34] : write, token 33 | The old leader wakes up and writes with its old number.
+  Storage -x> Worker A : rejected | Storage has seen 34 and rejects the stale write.
+ref: blog | How to do distributed locking | Martin Kleppmann, 2016 | https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+
+@@ conshash
+== Cache cluster sharding with virtual nodes
+kind: consistent-hashing, sharding
+when: Keys are spread over cache or storage nodes, and nodes will be added or removed without losing most of the cache.
+how: Hash each node to many points on a ring, for example 100 virtual nodes each. Hash a key onto the ring and walk clockwise to the first node point; that node owns the key. Clients compute this themselves, so there is no lookup server.
+With simple modulo hashing, going from 10 to 11 nodes moves about 90% of the keys. With a ring, only about 1/11 of the keys move, and they all go to the new node.
+Virtual nodes smooth the load. With one point per node, the biggest node may get 2 to 3 times the average. A node with more hardware gets more virtual nodes.
+used: Memcached clients such as ketama; Amazon Dynamo and Cassandra; Redis Cluster uses 16,384 fixed hash slots, a related idea; Discord and many CDNs use it for routing.
+avoid: When you need range scans or strong balance guarantees; use range sharding or bounded-load variants.
+flow:
+  App [client: ring in memory] -> Hash ring [note: 3 nodes x 100 points] : hash(key) | The client hashes the key to a point on the ring.
+  Hash ring -> Cache node B [cache: owns arc] : first point clockwise | The next node point clockwise owns the key.
+  Cache node B -> App : value | The client reads directly from node B.
+  Ops [user] -> Hash ring : add node D | An operator adds a new node with its virtual points.
+  Hash ring -> Cache node D [cache: new] : about 1/4 of keys move | Only keys on the arcs taken by D change owner; the rest stay.
+  * Cache node D: warming | D starts empty and fills from misses, so the database sees a short load spike.
+ref: paper | Consistent Hashing and Random Trees | Karger et al., STOC 1997 |
+ref: paper | Dynamo: Amazon's Highly Available Key-value Store | DeCandia et al., SOSP 2007 |
+
+== Cache-affine load balancing with Maglev or ring hash
+kind: consistent-hashing, horizontal-scale
+when: A load balancer should send the same key to the same backend, so each backend keeps a warm cache, even as backends change.
+how: The balancer hashes a request key (session id, URL or user id) and maps it to a backend with a consistent hash, such as a ring hash or Google's Maglev table. The same key goes to the same server while the pool is stable.
+When a backend dies or is added, only a small share of keys change owner, so most caches stay warm. Maglev builds a lookup table of about 65,537 entries, which gives fast lookup and even spread.
+Load can still be uneven for hot keys. Bounded-load hashing caps each backend at, for example, 1.25 times the average, and sends the extra to the next node on the ring.
+used: Google Maglev; Envoy ring-hash and Maglev load balancers; HAProxy consistent hashing; CDN edge routing.
+avoid: Stateless services with no cache, where round-robin or least-connections spreads load better.
+flow:
+  Client [client] -> Load balancer [svc: Maglev table] : GET /video/77 | The balancer hashes the URL to a table slot.
+  Load balancer -> Edge cache 2 [cache: warm] : forward | The slot maps to cache 2, which holds this video.
+  Edge cache 2 -> Client : cache hit | The same URL always lands on the same cache, so hits are high.
+  Edge cache 3 [cache] -x> Load balancer : health check fails | Cache 3 dies, and the balancer removes it.
+  * Load balancer: table rebuilt | Slots owned by cache 3 are spread over the others; other slots do not move.
+  Load balancer -> Edge cache 1 [cache] : slots of cache 3 | Only the old cache 3 keys miss once, and then they are warm again.
+ref: paper | Maglev: A Fast and Reliable Software Network Load Balancer | Eisenbud et al., NSDI 2016 | https://research.google/pubs/maglev-a-fast-and-reliable-software-network-load-balancer/
+
+@@ consmodels
+== Choosing consistency per operation in one product
+kind: quorum, polyglot-persistence
+when: Different features of one product need different guarantees, and paying for the strongest model everywhere would be too slow.
+how: List each operation and ask what error the user would notice. A bank transfer or a unique username needs linearizable or serializable writes. A profile page can read slightly stale data. A like counter can be eventually consistent.
+Then choose store settings to match. For example, read the strongly consistent value from the leader for checkout, read from any replica for the home page, and use session guarantees (read your own writes) for the user's own edits.
+Strong operations pay more, in latency and in lost availability during partitions. Eventual ones are cheap and fast. Write the choice in the design, and test it, for example with Jepsen.
+used: DynamoDB consistent read flag; Cosmos DB's five levels; Cassandra tunable consistency; Google Spanner strong reads and stale reads.
+avoid: One global setting for everything; it is either too slow or surprising to users.
+flow:
+  Checkout API [svc] -> Orders DB leader [db: linearizable] : write order | Money-related writes go through the leader and wait for a majority.
+  Checkout API -> Orders DB leader : read own order | The next read must see that write, so it also uses the leader.
+  Home page [svc] -> Read replica [db: stale 1 s] : read catalog | Browsing reads any replica, which may be a second behind.
+  Product page [svc] -> Counter store [db: eventual] : increment views | The view counter accepts writes anywhere and merges later.
+  Orders DB leader ~> Read replica : async replication | Replicas copy the leader's log in the background, which causes the lag.
+  * Read replica: lag 1 s | A page may show an old price for about a second, which is acceptable here.
+ref: docs | Consistency models | Jepsen | https://jepsen.io/consistency
+
+== Read-your-writes with a position token
+kind: read-replicas, leader-follower
+when: Reads are served by replicas that lag, and a user must always see their own recent writes.
+how: A user posts a comment, and the next page load hits a replica that has not received it yet. The comment seems lost. Read-your-writes consistency prevents this without making all reads strong.
+One method: after a write, the app returns a token such as the log position (LSN) of the commit. The next read carries the token, and a replica serves it only when it has replayed past that position; otherwise the read goes to the leader. Another method: for a few seconds after a write, send that user's reads to the leader.
+Monotonic reads is the companion rule: pin a user to one replica, so time does not move backward between two reads.
+used: Postgres replication with LSN checks in proxies; MongoDB causal consistency sessions; Cosmos DB session consistency; common in web apps with read replicas.
+avoid: When all reads must be fresh for everyone; use the leader or a linearizable store.
+flow:
+  User [user] -> App server [svc] : post comment | The user submits a comment.
+  App server -> DB leader [db: LSN 9120] : write | The leader commits the write and returns LSN 9120.
+  App server -> User : token LSN 9120 | The app stores the token in the session.
+  DB leader ~> Replica [db: LSN 9100] : replicate | Replication is asynchronous, and the replica is behind.
+  User -> App server : load page + token | The next request carries the token.
+  App server -x> Replica : behind, skip | The replica is at 9100, below 9120, so it is not used.
+  App server -> DB leader : read comments | The read goes to the leader and the user sees the comment.
+ref: book | Designing Data-Intensive Applications, chapter 5 | Martin Kleppmann, 2017 |
+
+@@ crdt
+== Multi-region active-active with CRDT merge
+kind: crdt, multi-region
+when: Every region must accept writes locally with no cross-region wait, and the copies must still converge without lost updates.
+how: Each region holds a replica of a CRDT such as a counter, a set or a map. A write is applied locally at once, so latency is one local round trip. Replicas exchange state or operations in the background.
+The merge function is commutative, associative and idempotent, so the order and repeats of messages do not matter. A grow-only counter keeps one slot per replica and merges by taking the maximum of each slot, so no increment is lost.
+The cost is metadata and meaning. Tombstones and version vectors grow and need cleanup. Some rules cannot be expressed, for example a balance that must never go below zero.
+used: Redis Enterprise Active-Active uses CRDTs; Riak data types; Azure Cosmos DB and others use merge policies; Akka Distributed Data.
+avoid: Constraints that need a global check, such as unique usernames or non-negative stock; use consensus for those.
+flow:
+  User EU [user] -> Replica EU [db: counter eu=5] : INCR | The write is applied in the local region at once.
+  User US [user] -> Replica US [db: counter us=3] : INCR | A concurrent write in the US is also accepted at once.
+  Replica EU ~> Replica US : state eu=6 | Replicas send their state to each other in the background.
+  Replica US ~> Replica EU : state us=4 | The US state reaches the EU region.
+  * Replica EU: eu=6 us=4 = 10 | The merge takes the maximum per slot, so both increments are kept.
+  * Replica US: eu=6 us=4 = 10 | The US replica reaches the same value without any coordination.
+ref: paper | Conflict-free Replicated Data Types | Shapiro, Preguica, Baquero & Zawirski, SSS 2011 |
+ref: docs | Active-Active Redis | Redis documentation | https://redis.io/docs/latest/operate/rs/databases/active-active/
+
+== Local-first collaborative editing and offline sync
+kind: crdt, event-driven
+when: Users edit the same document, including offline on phones, and edits must merge without a central lock.
+how: Each client keeps the document as a CRDT, such as a sequence CRDT for text, in local storage. Every edit is applied at once on the device, so the app feels instant even with no network.
+Edits are sent as small operations through a sync server or peer to peer. The server mainly stores and forwards updates. The CRDT guarantees that clients who have received the same operations show the same text, in any arrival order.
+Each character has a unique id, so two people typing in the same place both keep their text. Long histories grow, so systems compact old operations into snapshots.
+used: Yjs and Automerge libraries; Figma's multiplayer uses a CRDT-inspired design with a central server; common in note and whiteboard apps.
+avoid: When intent must be kept exactly, such as spreadsheets with formulas that depend on order; consider server-ordered operational transformation.
+flow:
+  Phone [client: offline] -> Local CRDT doc [store: IndexedDB] : type "Hi" | The edit is applied locally and saved on the device.
+  Laptop [client] -> Sync server [svc: relay + snapshots] : ops from Laptop | The laptop sends its operations when online.
+  Phone -> Sync server : ops after reconnect | The phone reconnects and sends everything it did offline.
+  Sync server ~> Phone, Laptop : merged ops | Each client receives the operations it has not seen.
+  * Local CRDT doc: converged | Both clients now show the same text, with both edits kept.
+  Sync server -> Snapshot store [store: S3] : compact history | The server saves snapshots so new clients load fast.
+ref: docs | Yjs documentation | Yjs project | https://docs.yjs.dev/
+ref: docs | Automerge documentation | Automerge project | https://automerge.org/docs/
+
+@@ dht
+== Kademlia peer lookup in a P2P network
+kind: consistent-hashing, gossip
+when: Many peers with no central server must find which node holds a key, and nodes join and leave all the time.
+how: Each node has a 160-bit or 256-bit id, and keys live in the same space. Distance between two ids is the XOR of the ids. A node keeps buckets of known peers, one per distance range, so it knows many close peers and few far ones.
+To find a key, a node asks its closest known peers, in parallel, for closer ones, and repeats. Each round roughly halves the distance, so a lookup takes about log2(N) steps: around 20 steps for a million nodes.
+Buckets are refreshed from lookup traffic, and old live peers are kept, because peers that were up for a long time stay up longer.
+used: BitTorrent mainline DHT; IPFS libp2p Kademlia; Ethereum node discovery (discv4 and discv5); eMule Kad.
+avoid: When you control all servers and need low, steady latency; use consistent hashing with a membership service. Open DHTs also face Sybil and eclipse attacks.
+flow:
+  Node A [svc: id 0x1a] -> Node B [svc: id 0x4c] : FIND_NODE 0x9f | A asks the closest peer it knows for peers nearer to the key.
+  Node B -> Node A : peers 0x80, 0x91 | B returns closer peers from its buckets.
+  Node A -> Node C [svc: id 0x91] : FIND_NODE 0x9f | A asks the new, closer peer.
+  Node C -> Node D [svc: id 0x9e] : closer peers | C points to a peer that is even nearer.
+  Node A -> Node D : GET_VALUE 0x9f | After about 5 hops, A asks the node closest to the key.
+  Node D -> Node A : value or providers | D answers with the value, or with the peers that hold the data.
+ref: paper | Kademlia: A Peer-to-peer Information System Based on the XOR Metric | Maymounkov & Mazieres, IPTPS 2002 |
+ref: paper | Chord: A Scalable Peer-to-peer Lookup Service for Internet Applications | Stoica et al., SIGCOMM 2001 |
+
+== One-hop DHT inside a data center store
+kind: consistent-hashing, gossip
+when: All nodes are trusted and few enough (hundreds to a few thousand) that each node can know the full ring.
+how: Instead of log N hops across strangers, each node keeps the full routing table: which node owns which key range. Gossip spreads joins, leaves and failures to every node in seconds.
+A client or coordinator hashes the key and goes straight to the owner in one hop, with no lookup chain. Replicas are the next nodes on the ring, so a read or write goes to N replicas at once.
+This is the design inside Dynamo and Cassandra. It gives low latency because a request does not pass through other peers. The price is the gossip traffic and that very large clusters strain the full table.
+used: Amazon Dynamo; Apache Cassandra; Riak; ScyllaDB.
+avoid: Open networks with untrusted peers and very high churn; use a multi-hop DHT such as Kademlia.
+flow:
+  Client [client] -> Coordinator [svc: full ring table] : PUT cart:77 | Any node can act as coordinator for a request.
+  Coordinator -> Owner node [db: primary range] : replicate | The coordinator hashes the key and sends the write straight to the owner.
+  Coordinator -> Replica 2 [db], Replica 3 [db] : replicate | The next two nodes on the ring also get a copy.
+  Node 9 [svc: joining] ~> Coordinator : gossip: joined | A new node announces itself by gossip.
+  * Coordinator: ring updated | The new node's key ranges are added to the routing table everywhere in a few seconds.
+ref: paper | Dynamo: Amazon's Highly Available Key-value Store | DeCandia et al., SOSP 2007 |
+
+@@ discovery
+== Kubernetes Services and EndpointSlices discovery
+kind: service-discovery, health-check
+when: Services run as pods that start, stop and move, and callers should use one stable name.
+how: A Service gets a stable virtual IP and a DNS name such as orders.shop.svc.cluster.local. A controller watches pods that pass their readiness probe and writes their addresses into EndpointSlices.
+Each node runs kube-proxy (or an eBPF equivalent), which turns the Service IP into one of the ready pod addresses. A pod that fails readiness is removed from the slices within seconds, so traffic stops going to it.
+Callers need no discovery code. The limits are that load balancing is per connection, so long-lived gRPC connections can stick to one pod, and that DNS answers can be cached too long by clients.
+used: Kubernetes Services and cluster DNS (CoreDNS); common in every Kubernetes-based microservice platform.
+avoid: Traffic between clusters or to VMs outside Kubernetes; use a mesh gateway or Consul. For gRPC, use a client-side or mesh balancer.
+flow:
+  Cart service [svc] -> CoreDNS [svc: cluster DNS] : orders.shop | The caller resolves the Service name.
+  CoreDNS -> Cart service : ClusterIP 10.96.4.2 | DNS returns a stable virtual IP.
+  Cart service -> kube-proxy [svc: on each node] : connect 10.96.4.2 | The connection to the virtual IP is caught on the node.
+  kube-proxy -> Orders pod 1 [svc: ready], Orders pod 2 [svc: not ready] : picks a ready pod | Only pods listed as ready in EndpointSlices are chosen.
+  Orders pod 2 -x> Endpoint controller [svc: watches pods] : readiness probe fails | The controller removes pod 2's address from the EndpointSlice.
+ref: docs | EndpointSlices | Kubernetes documentation | https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/
+
+== Client-side registry with leases and watches
+kind: service-discovery, lease, heartbeat
+when: Services outside one Kubernetes cluster must find each other, and clients should balance load themselves.
+how: Each instance registers its address in a registry (Consul, etcd or ZooKeeper) under a lease or a session. It renews the lease with a heartbeat, for example every 5 seconds. If the instance dies, the lease expires and the entry vanishes on its own.
+Clients ask the registry for the healthy instances of a service, and keep the list fresh with a watch, so they are told about changes without polling. The client then picks an instance itself, for example by round robin or power of two choices.
+The registry must be reliable, because stale lists send traffic to dead hosts. Clients should cache the last list and keep working when the registry is unreachable.
+used: Consul service catalog with health checks; Netflix Eureka; etcd leases; ZooKeeper ephemeral nodes.
+avoid: When a platform already offers discovery, such as Kubernetes inside one cluster; extra moving parts add risk.
+flow:
+  Payment instance [svc: 10.0.1.7] -> Registry [db: Consul] : register, TTL 15 s | The instance registers its address with a health check.
+  Payment instance ~> Registry : heartbeat every 5 s | Regular heartbeats renew the lease.
+  Checkout client [svc: caches list] -> Registry : watch payment | The client asks for the healthy list and subscribes to changes.
+  Registry -> Checkout client : 3 healthy instances | The registry returns the current addresses.
+  Payment instance -x> Registry : crash, no heartbeat | The instance dies and stops sending heartbeats.
+  Registry -> Checkout client : list updated: 2 | After the lease ends, the watch pushes the new list to clients.
+ref: docs | Service discovery | Consul documentation | https://developer.hashicorp.com/consul/docs/use-case/service-discovery
+
+== Control-plane pushed endpoints to sidecar proxies
+kind: control-data-plane, service-mesh, service-discovery
+when: Many services use sidecar proxies, and endpoint changes must reach every proxy in seconds, without DNS caching.
+how: A control plane (Istio's istiod, for example) watches the registries, such as Kubernetes endpoints. It builds the list of endpoints per service and pushes it to every Envoy proxy through a gRPC stream, using the xDS protocol (EDS for endpoints).
+The proxy keeps the list in memory and balances each request across it. When a pod is added or fails, the control plane sends a small update, so the change reaches proxies in about a second.
+If the control plane is down, proxies keep working with their last known list. This keeps the data path simple and fast, and keeps the slower control logic out of request handling.
+used: Istio and Envoy xDS; Linkerd uses its own destination service; gRPC proxyless xDS clients; Consul service mesh.
+avoid: Small systems with a few services; the mesh costs CPU, memory and operations work, and plain DNS is enough.
+flow:
+  Kubernetes API [svc: pods and endpoints] -> Control plane [svc: istiod] : endpoint watch | The control plane watches pod and endpoint changes.
+  Control plane -> Envoy A [svc: sidecar], Envoy B [svc: sidecar] : EDS push | It streams the updated endpoint list to every proxy.
+  Envoy A -> Orders pod 1 [svc], Orders pod 2 [svc] : load-balanced request | The proxy balances requests over the list it holds.
+  Orders pod 2 -x> Kubernetes API : pod deleted | A pod is removed in a deploy.
+  * Control plane: new list v43 | The control plane sends version 43 without pod 2 to all proxies in about 1 s.
+  * Envoy A: control plane down | If the control plane fails, the proxy keeps using version 43.
+ref: docs | xDS REST and gRPC protocol | Envoy documentation | https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol
+

@@ -1,0 +1,670 @@
+@@ dst
+== Seeded simulator with fault injection
+kind: none
+when: A distributed system has rare bugs that only show up when crashes, delays and timeouts line up, and every failure must be replayable.
+how: The whole cluster runs in one single-threaded process. Nodes, network and disks are simulated objects. Every source of non-determinism goes through the simulator: the clock, the random number generator, thread scheduling and message delivery.
+A driver picks a seed. The seed decides the workload and the faults: kill a node during a disk flush, delay one message behind a newer one, split the network in two. After each step, checkers verify invariants such as "no acknowledged write is lost". When one fails, the seed is the bug report: the same seed replays the same run, step by step, under a debugger.
+Simulated time jumps to the next event, so one CPU core can run hours of cluster life in seconds. A farm runs millions of seeds per night. The cost is discipline: all code must use the simulated clock and I/O, so libraries with their own threads or real sockets cannot be used inside the simulation.
+used: FoundationDB (the model for this technique, tested in its simulator since before 1.0); TigerBeetle's VOPR simulator; Antithesis sells a deterministic hypervisor for the same idea.
+avoid: When the system is small or mostly single-node; a normal integration test is cheaper. Real-hardware effects (firmware bugs, real network quirks) need chaos testing on real machines.
+flow:
+  Seed [note: seed 8841] -> Simulator [svc: one thread] : start run | The test driver gives the simulator one seed. The seed decides the whole run.
+  Simulator -> Node A, Node B, Node C [svc: simulated] : deliver message | The simulator delivers each message itself, in an order chosen by the seed.
+  Simulator -x> Node B : crash during flush | The seed schedules a crash of node B in the middle of a disk write.
+  Node A -> Checker [svc: invariants] : state after step | After each step the checker tests rules such as "no acknowledged write is lost".
+  Checker -x> Seed : invariant broken | A rule fails. The seed number is now a complete bug report.
+  Seed -> Simulator : replay seed 8841 | Developers replay the same seed and get the same failure every time, with a debugger attached.
+ref: paper | FoundationDB: A Distributed Unbundled Transactional Key Value Store | Zhou et al., SIGMOD 2021 |
+ref: video | Testing Distributed Systems w/ Deterministic Simulation | Will Wilson, Strange Loop 2014 |
+
+== Seed farm in continuous integration
+kind: none
+when: A team wants simulation to find bugs before release, without a human running it.
+how: Each night the CI system starts thousands of simulator jobs. Every job takes a fresh random seed, runs the cluster for a fixed simulated time, and reports pass or fail with the seed. Passing runs are thrown away. Failing seeds go to a bug queue.
+Each failing seed is stored with the exact git commit. An engineer replays the seed on that commit and gets the same failure. After the fix, the seed joins a regression list that runs on every pull request, so the bug cannot return.
+Teams also track coverage: how many different fault types and code paths the seeds reached. If a new feature is never hit by any seed, the workload generator is missing a case. The farm only finds bugs that the workload and the invariant checks can see.
+used: FoundationDB's simulation cluster runs very large numbers of runs per night, as its authors describe; TigerBeetle runs its simulator continuously. Common in databases with strong correctness goals.
+avoid: When builds are slow and seeds are few; run a small fixed set in pull requests and the big farm only nightly.
+flow:
+  Pull request [client] -> CI scheduler [svc] : new commit | A commit triggers a batch of simulation jobs, one per seed.
+  CI scheduler -> Sim worker 1, Sim worker 2 [svc: random seed] : run seed N | Each worker runs one seed on the same commit.
+  Sim worker 1 -> Results store [db: seed and verdict] : pass | Passing seeds are recorded with the commit and then forgotten.
+  Sim worker 2 -x> Results store : fail, seed 5072 | A failing seed is saved with its commit and logs.
+  Results store -> Bug queue [queue] : replay ticket | The failing seed becomes a ticket that can be replayed exactly.
+  Bug queue -> CI scheduler : add to regression list | After the fix the seed joins a list that every future commit must pass.
+ref: paper | FoundationDB: A Distributed Unbundled Transactional Key Value Store | Zhou et al., SIGMOD 2021 |
+
+@@ failuredetect
+== Heartbeat with phi-accrual suspicion
+kind: heartbeat
+when: A cluster must decide that a node is dead without a fixed timeout that is too slow on good days and too quick on bad days.
+how: Every node sends a small heartbeat to its peers, for example once per second. The monitor keeps a window of recent inter-arrival times for each peer. From that window it estimates a distribution of normal gaps.
+When a heartbeat is late, the monitor computes phi, a number that grows with how unlikely the delay is under that history. Phi 1 means about a 10% chance the peer is still alive; phi 8 means about one in a hundred million. Each application picks its own threshold, so the detector adapts when the network gets slower.
+The result is suspicion, not truth. A slow node and a dead node look the same from outside. The action taken on suspicion must be safe if the guess is wrong: for example, stop routing reads to the node, but do not delete its data.
+used: Akka cluster and Apache Cassandra use phi-accrual detectors; the idea comes from the 2004 paper by Hayashibara and others.
+avoid: Do not use fixed-threshold alone when latency varies a lot. Do not use a detector for locks: pair it with leases and fencing tokens.
+flow:
+  Node B [svc] -> Monitor A [svc: phi window] : heartbeat | Node B sends a heartbeat every second. Monitor A records the gap.
+  Node B -x> Monitor A : heartbeats stop | Node B pauses, for example in a long GC, or has crashed.
+  * Monitor A: phi 9.2 | Phi passes the threshold of 8, so node B is now suspected.
+  Monitor A -> Router [svc: routing table] : mark B down | The router stops sending reads to node B. Data is not deleted.
+  Node B ~> Monitor A : heartbeat resumes | If node B was only slow, a later heartbeat brings phi down and B returns.
+ref: paper | The Phi Accrual Failure Detector | Hayashibara, Defago, Yared, Katayama, 2004 |
+
+== Active health checks that eject backends
+kind: health-check, circuit-breaker
+when: A load balancer or proxy must stop sending traffic to unhealthy backends quickly, and bring them back safely.
+how: The balancer probes each backend on a timer, for example an HTTP call to /healthz every 5 seconds with a 1 second timeout. After 3 failures in a row the backend is marked unhealthy and removed from rotation. After 2 successes in a row it returns.
+Active probes are joined by passive checks. The proxy watches real traffic, and if a backend returns several 5xx errors or times out, it ejects that backend for a short, growing period. This is called outlier detection in Envoy.
+Two limits matter. The probe may say healthy while real requests fail, so keep the health route honest about its dependencies. And when many backends fail together, ejecting all of them makes things worse: proxies keep a minimum share in rotation (Envoy has a panic threshold for this).
+used: Envoy active health checking and outlier detection; HAProxy and NGINX health checks; Kubernetes readiness probes.
+avoid: When one slow dependency makes every health route fail; use shallow liveness checks and deep readiness checks separately.
+flow:
+  Load balancer [svc: probes /healthz] -> Backend 1, Backend 2 [svc] : GET /healthz | The balancer probes every backend on a fixed timer.
+  Backend 2 -x> Load balancer : timeout x3 | Backend 2 fails three probes in a row.
+  * Backend 2: ejected | The balancer marks backend 2 unhealthy and removes it from rotation.
+  Client [client] -> Load balancer : request | New client requests are sent only to backends that are still healthy.
+  Load balancer -> Backend 1 : forward | All traffic goes to backend 1 while backend 2 is out.
+  Load balancer ~> Backend 2 : probe again | The balancer keeps probing. After two successes backend 2 comes back.
+ref: docs | Health checking | Envoy documentation | https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/health_checking
+
+@@ fanout
+== Fan-out on write into follower inboxes
+kind: fan-out-write, precompute
+when: Reads are far more frequent than writes, and each reader needs a fast, ready-made list such as a home timeline.
+how: When a user posts, the service looks up the author's follower list. It then pushes the post id into the inbox of each follower. An inbox is usually a capped list per user in a cache such as Redis, holding the latest few hundred ids.
+Reading a timeline is then one key lookup plus a batch fetch of the post bodies. This is fast and cheap. The cost moves to the write path: a post by a user with 200 followers makes 200 inbox writes, and the work is batched per cache shard.
+The limit is the celebrity account. One post by a user with 50 million followers means 50 million writes, and the queue of such jobs delays everybody. Teams cap the work, or treat big accounts differently (see the hybrid pattern).
+used: Twitter's home timeline design, described in the talk "Timelines at Scale"; common in feeds, notification lists and activity streams.
+avoid: When a few accounts have huge follower counts, or most users never read the list; use fan-out on read for them.
+flow:
+  Author [user] -> Post service [svc] : new post 9001 | An author posts. The service stores the post once in the post store.
+  Post service -> Follower graph [db: followers of author] : who follows? | The service looks up the author's followers.
+  Post service -> Fan-out queue [queue: jobs per shard] : 200 push jobs | One job per cache shard carries the ids of followers on that shard.
+  Fan-out queue -> Inbox cache [cache: Redis lists] : push id 9001 | Workers add post 9001 to each follower's inbox list.
+  Reader [user] -> Timeline service [svc] : open home | A follower opens the app.
+  Timeline service -> Inbox cache : read ids | One list read returns the ready-made ids. Bodies come from the post store.
+ref: video | Timelines at Scale | Raffi Krikorian, QCon / InfoQ, 2013 |
+ref: book | Designing Data-Intensive Applications, chapter 1 | Martin Kleppmann, 2017 |
+
+== Hybrid: push for most, pull for celebrities
+kind: fan-out-write, scatter-gather
+when: A few accounts have millions of followers, so pure push is too costly, but pure pull makes reads slow for everyone.
+how: Choose by follower count. Accounts below a limit (for example 10,000 followers) use push: their posts go into follower inboxes at write time. Accounts above the limit are not pushed at all. Their posts stay in their own author timeline.
+When a reader opens the home timeline, the service reads the ready-made inbox. It also looks up which big accounts the reader follows, usually a short list, and fetches the latest posts of each. It merges both lists by time and returns the page.
+The write cost is now bounded, and the read cost grows only with the number of big accounts followed. The price is two code paths and a merge on every read, so the limit needs tuning and the merged list must be cached for a short time.
+used: The hybrid model described for Twitter's timelines; the same push and pull mix is common in other social feeds.
+avoid: When all accounts are small, pure push is simpler. When fan-out is tiny and reads are rare, pure pull is simpler.
+flow:
+  Small author [user] -> Post service [svc] : post | A user with 800 followers posts.
+  Post service -> Inbox cache [cache: pushed ids] : push to 800 inboxes | Small accounts are pushed at write time.
+  Celebrity [user] -> Post service : post | A user with 40 million followers posts.
+  Post service -> Author timeline [store: per-author list] : store once | The post is stored once. There is no push to 40 million inboxes.
+  Reader [user] -> Timeline service [svc: merge] : open home | A reader opens the app.
+  Timeline service -> Inbox cache, Author timeline : read + pull | The service reads the inbox and pulls recent posts of the celebrities this reader follows.
+  Timeline service -> Reader : merged page | Both lists are merged by time into one page.
+ref: video | Timelines at Scale | Raffi Krikorian, QCon / InfoQ, 2013 |
+
+@@ fencing
+== Fencing token checked at the storage
+kind: fencing-token, lease
+when: A client holds a lock or lease, may pause or be slow, and a stale holder must not corrupt shared data.
+how: A lock service grants a lock together with a token, a number higher than any it gave before. The client sends the token with every write. The storage remembers the highest token it has seen and rejects any write with a lower one.
+Without the check, this happens: client 1 gets the lock with a 30 second lease, then freezes for 40 seconds in a long GC pause. The lease expires and client 2 gets the lock. Client 1 wakes up, still believes it holds the lock, and writes. With tokens, client 1 holds token 33 and the storage has already seen token 34, so the write fails.
+The key point is that the check lives at the resource, not in the client's clock. The resource must be able to compare numbers, so it needs support: a version column, a conditional write, or a term field. Raft terms, Kafka epochs and HDFS journal epochs all work this way.
+used: Kleppmann's analysis of Redlock-style locks; ZooKeeper-based locks using zxid or version; Kafka controller and leader epochs; HDFS NameNode failover with journal node epochs.
+avoid: When the resource cannot reject old writers; then a lock cannot give safety and you should use a transaction or a compare-and-set instead.
+flow:
+  Client 1 [client] -> Lock service [svc: ZooKeeper / etcd] : acquire lock | Client 1 asks for the lock and gets a 30 second lease.
+  Lock service -> Client 1 : granted, token 33 | The lock service returns token 33, higher than any before.
+  * Client 1: paused 40 s | Client 1 freezes in a long GC pause. Its lease expires.
+  Client 2 [client] -> Lock service : acquire lock | Client 2 asks for the lock and the service grants token 34.
+  Client 2 -> Storage [db: max token 34] : write, token 34 | The storage accepts the write and records 34 as the highest token.
+  Client 1 -x> Storage : write, token 33 | Client 1 wakes up and writes. The storage rejects token 33, which is lower than 34.
+ref: blog | How to do distributed locking | Martin Kleppmann, 2016 | https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+
+== Epoch numbers in leader failover
+kind: fencing-token, leader-election
+when: A replicated system promotes a new leader, and the old leader may still be alive and think it leads.
+how: Each leader has an epoch number, also called a term or generation. When a new leader is chosen, the epoch goes up by one and is stored in the consistent core. Followers and storage nodes remember the highest epoch they have seen.
+Every request from a leader carries its epoch. A follower that has seen a higher epoch rejects the request and tells the sender, so the old leader learns that it was replaced and steps down. This stops split brain from corrupting the log, even when the old leader cannot reach the new one.
+In Kafka, the controller epoch and the partition leader epoch work like this. After a new leader is elected, followers truncate their logs to the offset where the new epoch started, so they drop writes the old leader never committed.
+used: Raft terms; Kafka controller epoch and leader epoch; HDFS NameNode with QJM epochs; Elasticsearch primary terms.
+avoid: When there is only one writer by design and no failover; the extra number then adds nothing.
+flow:
+  Controller [svc: epoch 7] -> Broker 1 [svc: leader, epoch 7] : you lead, epoch 7 | The controller picks broker 1 as leader and sends epoch 7.
+  Broker 1 -> Follower [svc: seen epoch 7] : append, epoch 7 | The leader replicates records and stamps them with epoch 7.
+  * Broker 1: network cut off | Broker 1 loses contact with the controller but keeps running.
+  Controller -> Broker 2 [svc: leader epoch 8] : you lead, epoch 8 | The controller elects broker 2 with epoch 8.
+  Broker 2 -> Follower : append, epoch 8 | The follower now accepts epoch 8 and remembers it.
+  Broker 1 -x> Follower : append, epoch 7 | The old leader sends a write with epoch 7. The follower rejects it as stale.
+ref: docs | Replication | Apache Kafka documentation | https://kafka.apache.org/documentation/#replication
+
+@@ gossip
+== Gossip membership and failure detection
+kind: gossip, heartbeat
+when: A cluster of tens to thousands of nodes needs each node to know which peers are alive, with no central registry.
+how: Every second, each node picks a few random peers and exchanges its membership table. The table lists each node with a heartbeat counter and a status. A node raises its own counter each round, and when it receives a table it keeps the higher counter for each node.
+If a node's counter has not risen for a long time, peers mark it as suspected, and later dead. A new node only needs to contact one seed node; gossip then spreads the news to all, in about log N rounds, so 1,000 nodes learn it in roughly 10 rounds.
+Load per node is constant and does not depend on cluster size. The result is only eventually consistent, so two nodes may disagree for a few seconds. SWIM-style protocols add direct and indirect probes to reduce false alarms.
+used: Apache Cassandra and Amazon Dynamo gossip for ring membership; HashiCorp memberlist and Serf (SWIM-based); Consul uses it for LAN membership.
+avoid: When you need all nodes to agree on membership at one exact moment; use a consensus group (etcd, ZooKeeper) instead.
+flow:
+  New node [svc] -> Seed node [svc] : join | A new node contacts one seed node and sends its own entry.
+  Seed node -> Node C [svc] : gossip table | Each round the seed sends its table to a random peer.
+  Node C -> Node D [svc] : gossip table | Node C passes the news on to another random peer in the next round.
+  Node D -> New node : gossip table | Within about log N rounds, every node knows the new node, and it learns the ring.
+  Node D -x> Node E : no counter growth | Node D sees that node E's heartbeat counter has stopped rising.
+  * Node E: suspected | Node D marks node E as suspected, and this status also spreads by gossip.
+ref: paper | SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol | Das, Gupta, Motivala, 2002 |
+ref: paper | Epidemic Algorithms for Replicated Database Maintenance | Demers et al., PODC 1987 |
+
+== Anti-entropy repair between replicas
+kind: gossip, quorum
+when: Replicas of the same data drift apart after failures, and they must converge without a coordinator.
+how: Replicas of a key range periodically pick a peer and compare their data. To avoid sending everything, each replica builds a Merkle tree: a tree of hashes over key ranges. Two replicas compare the root hash first. If it matches, the data is the same, and nothing more is sent.
+If the root differs, they compare child hashes and walk down the tree. They find the few key ranges that differ and exchange only those rows. The newer version of each row wins, usually by timestamp or version vector.
+This repairs what read repair and hinted handoff missed, for example a replica that was down longer than the hint window. It costs disk reads to build the trees and network for the differences, so it is run in the background and rate limited.
+used: Amazon Dynamo (as described in the paper); Apache Cassandra repair; Riak active anti-entropy.
+avoid: When a consensus log keeps replicas identical already; there is no drift to repair.
+flow:
+  Repair job [svc: background] -> Replica A [svc: Merkle tree] : start repair | A background job starts a repair round for one key range.
+  Replica A -> Replica B [svc: Merkle tree] : root hash | Replica A picks replica B at random and sends the root hash of its tree.
+  Replica B -> Replica A : root differs | The root hash does not match, so the data differs somewhere.
+  Replica A -> Replica B : child hashes | Both sides compare child hashes and walk down the tree.
+  Replica B -> Replica A : range 4200-4300 differs | They find the small key ranges that disagree, and skip all the rest.
+  Replica A -> Replica B : rows, newer wins | They exchange only the rows in those ranges. The newer version replaces the older.
+  * Replica B: repaired | Both replicas now hold the same data for the range.
+ref: paper | Dynamo: Amazon's Highly Available Key-value Store | DeCandia et al., SOSP 2007 |
+
+@@ hlc
+== Transaction timestamps with a hybrid clock
+kind: none
+when: A distributed database needs transaction timestamps that follow cause and effect and stay close to wall-clock time, without special atomic clocks.
+how: Each node keeps an HLC timestamp of two parts: the largest wall-clock time it has seen, and a small counter. To stamp a local event, the node takes the larger of its last timestamp and its current clock. If the wall part did not move, it adds 1 to the counter.
+Every message carries the sender's timestamp. On receipt, the node sets its own clock to the maximum of its clock, its wall part and the incoming wall part, then adjusts the counter so the new timestamp is above both. So a result read from another node is always ordered after what it read.
+Timestamps stay within the clock error of real time, so they can be shown to users and used for time-travel queries. HLC does not remove clock error: databases such as CockroachDB add a maximum offset (500 ms by default), and a node whose clock drifts too far stops itself.
+used: CockroachDB (timestamps for MVCC and transactions); YugabyteDB; MongoDB uses a related hybrid clock for its cluster time.
+avoid: When you have atomic or GPS clocks and can bound uncertainty tightly; use TrueTime-like commit wait. When you only need causal order, a plain Lamport clock is enough.
+flow:
+  Client [client] -> Node A [svc: HLC 100.0] : begin txn | A client starts a transaction on node A. Node A stamps it with its HLC.
+  Node A -> Node B [svc: clock 98] : read, ts 100.0 | The read request carries the timestamp 100.0 to node B.
+  * Node B: HLC 100.1 | Node B's clock is behind. It moves its HLC to 100.1, which is above the incoming stamp.
+  Node B -> Node A : value, ts 100.1 | The reply carries the new stamp, so A's clock moves forward too.
+  Node A -> Node B : write, ts 100.2 | Later events always get a higher stamp, which keeps causal order.
+  Node B -x> Node A : clock offset too big | If a node's clock is beyond the allowed offset, peers reject it and it shuts down.
+ref: paper | Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases | Kulkarni, Demirbas, et al., 2014 |
+
+== Consistent snapshot reads at a past time
+kind: none
+when: Many users must read a consistent view of data at one point in time, without blocking writers.
+how: The database stores every row version with its HLC timestamp (MVCC, multi-version concurrency control). A write adds a new version, and does not overwrite the old one.
+A read picks a read timestamp, for example the HLC value at the start of the query. It returns, for each key, the newest version at or below that timestamp. Because HLC respects causality, the view contains every write that happened before the read began, and none that came after.
+This also gives follower reads. A replica that knows no new writes will arrive below a certain timestamp (a closed timestamp) can serve reads at that time, so reads do not travel to the leader. A write inside the clock uncertainty window may force a read to retry at a higher timestamp.
+used: CockroachDB MVCC and follower reads; AS OF SYSTEM TIME queries; YugabyteDB read timestamps.
+avoid: When the workload is a single node with one clock; a simple sequence number is enough.
+flow:
+  Writer [client] -> Leader [svc: HLC] : write x=2 | A writer sends an update to the range leader.
+  Leader -> Version store [db: MVCC versions] : x=2 at ts 105.0 | The leader stores a new version of x at timestamp 105.0. The old version stays.
+  Reader [client] -> Follower [svc: closed ts 104.0] : read x at ts 100.0 | A reader asks a nearby follower for a snapshot at timestamp 100.0.
+  Follower -> Version store : newest version <= 100.0 | The follower finds the newest version at or below the read timestamp.
+  Version store -> Follower : x=1 | The reader sees x=1, a consistent past view, not blocked by the writer.
+  Follower -> Reader : x=1 | The reply comes from a local replica, so there is no trip to the leader.
+ref: docs | Architecture: Transaction Layer | CockroachDB documentation | https://www.cockroachlabs.com/docs/stable/architecture/transaction-layer
+
+@@ hotkeys
+== Write sharding with salted sub-keys
+kind: sharding
+when: One key receives more writes than a single shard can take, such as a global counter or a viral item.
+how: Add a random or computed suffix to the key. Instead of writing to "item:42", each writer picks a number from 0 to 9 and writes to "item:42#3". The hash of each sub-key lands on a different shard, so the load is split about ten ways.
+Reading needs a second step. A reader queries all 10 sub-keys, in parallel, and combines them: add up counters, or merge sets. So you trade one cheap read for ten, in return for writes that scale.
+Pick N from the load: if one key gets 10,000 writes per second and a shard handles 2,000, use at least 5 sub-keys, with room to spare. Counters and sets merge easily. Data that needs strict order across all writes does not split well.
+used: DynamoDB write sharding for hot partition keys; Spark salting for skewed group-by and join keys; sharded counters in Cloud Firestore and Datastore.
+avoid: When the key is read much more than written; use a cache or replicas instead. When writes must be strictly ordered.
+flow:
+  Writers [client: many] -> Router [svc: hash of key] : incr item:42 | Many writers update the same counter at the same time.
+  Router -> Shard 1, Shard 2, Shard 3 [db: sub-key] : item:42#0..9 | A random suffix sends each write to one of ten sub-keys on different shards.
+  * Shard 1: 1,000 writes/s | Each shard now gets a tenth of the load, not all of it.
+  Reader [client] -> Aggregator [svc: sums sub-keys] : get item:42 | A reader asks for the total.
+  Aggregator -> Shard 1, Shard 2, Shard 3 : read all 10 sub-keys | The aggregator reads every sub-key in parallel.
+  Aggregator -> Reader : total | It adds the parts and returns one number. Reads cost ten times more.
+ref: docs | Designing partition keys to distribute your workload evenly | Amazon DynamoDB documentation | https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html
+
+== Local cache and replicas for hot reads
+kind: cache-aside, read-replicas
+when: A small set of keys gets most of the reads, so one cache node or shard is overloaded.
+how: Put a small in-process cache in each application server, in front of the shared cache. The few hottest keys are served from local memory, with a short time to live such as 1 to 5 seconds. The shared cache sees only one miss per server per interval.
+The shared tier handles the long tail. For keys known to be very hot, the cache can hold several copies under names like "key#a" and "key#b", and clients pick one at random. This spreads reads over several cache nodes.
+Detection matters: the system counts requests per key over a short window and flags the top few. The cost is staleness: a hot value may be seconds old on some servers, so this fits product pages and profiles, not account balances.
+used: Memcached and Redis tiers with a local L1 cache; client-side caching in Redis; DynamoDB DAX in front of hot items; CDN edge caching for viral content.
+avoid: When reads must always be fresh. Then keep the key on its own shard or replicate through consensus reads.
+flow:
+  Clients [client: many] -> App server [svc: L1 cache 2 s] : GET product 7 | Many users ask for the same viral product.
+  App server -> Redis shard [cache: key product:7] : miss, GET | On a miss the server asks the shared cache. Only one miss per interval per server.
+  Redis shard -> App server : value | The shared cache returns the value, and the server keeps it for 2 seconds.
+  App server -> Clients : value | Next requests in the 2 seconds are served from local memory.
+  Redis shard ~> Hot key detector [svc: top-k counter] : request counts | The detector counts requests per key and flags the top few as hot.
+  Hot key detector ~> App server : replicate product:7 | Hot keys get extra copies under other names, so reads spread over more nodes.
+ref: docs | Client-side caching in Redis | Redis documentation | https://redis.io/docs/latest/develop/reference/client-side-caching/
+
+== Adaptive skew handling in batch joins
+kind: map-reduce
+when: A batch join or group-by is slow because one key (such as a null id) sends most rows to one task.
+how: In a shuffle, all rows with the same key go to the same task. If 40% of the rows have the key "unknown", that one task does 40% of the work, and the whole stage waits for it. This straggler is the usual sign of skew.
+There are three fixes. First, filter or handle the null key on its own. Second, salt the key on the big side (add a random number 0 to N), and replicate the small side N times, so one key spreads over N tasks. Third, let the engine do it: Spark adaptive query execution detects oversized shuffle partitions at run time and splits them, with the matching side copied.
+Always check the task time distribution first. A median task of 20 seconds and a maximum of 15 minutes shows skew. Do not salt blindly, since it multiplies the small side.
+used: Spark AQE skew join; Spark and Hive salting; Apache Beam hot key fanout for combine operations.
+avoid: When the skew is small (the slowest task is under 2 times the median); the extra shuffle costs more than it saves.
+flow:
+  Events table [lake: big side] -> Shuffle [svc: group by key] : hash by user_id | Rows are sent to tasks by the hash of the join key.
+  Shuffle -> Task 1 [svc: 8M rows] : key unknown | Most rows share one key, so this task gets a huge partition.
+  Shuffle -> Task 2, Task 3 [svc: 200k rows] : other keys | The other tasks get small partitions and finish early.
+  * Task 1: straggler 15 min | The stage cannot finish until task 1 ends. This is the skew symptom.
+  Shuffle -> AQE [svc: skew detector] : partition sizes | Adaptive execution sees the oversized partition at run time.
+  AQE -> Task 1 : split into 8 parts | It splits the big partition into 8 smaller tasks and copies the matching rows of the other side.
+ref: docs | Adaptive Query Execution: Optimizing Skewed Joins | Apache Spark documentation | https://spark.apache.org/docs/latest/sql-performance-tuning.html
+
+@@ idempotence
+== Idempotency key on a payment API
+kind: idempotent-consumer
+when: A client may retry a request after a timeout, and the server must not charge twice.
+how: The client creates a unique key, for example a UUID, and sends it in a header with the request. The server stores the key with the request result in a table that has a unique constraint on the key. On first use, it processes the request and saves the response under the key.
+If the same key arrives again, the server finds the saved row and returns the saved response without doing the work again. A second request that arrives while the first is still running waits or gets a conflict, so two charges cannot run in parallel.
+Keys are kept for a limited time, such as 24 hours. The server should also check that a reused key comes with the same request body, and reject it if not. The key check and the charge must be atomic with respect to each other, usually in one database transaction.
+used: Stripe's Idempotency-Key header (described in their API docs and blog); Adyen and PayPal offer similar request IDs; common in payment and order APIs.
+avoid: Reads and naturally idempotent operations such as PUT of a full resource; no key table is needed there.
+flow:
+  Client [client] -> API [svc] : POST /charge, key K1 | The client sends the charge with a new idempotency key.
+  API -> Key table [db: unique on key] : insert K1 | The API inserts the key. The unique constraint blocks a second insert.
+  API -> Payment processor [svc] : charge 20 USD | The API charges the card once.
+  Payment processor -x> Client : response lost | The reply is lost on the network. The client sees a timeout.
+  Client -> API : retry, key K1 | The client retries with the same key.
+  API -> Key table : found K1, saved reply | The key already exists, so the API returns the stored result. There is no second charge.
+ref: blog | Designing robust and predictable APIs with idempotency | Stripe, 2017 | https://stripe.com/blog/idempotency
+
+== Exactly-once effect with a dedupe store
+kind: idempotent-consumer, event-driven
+when: A message queue delivers at least once, and a consumer must apply each message only once to its database.
+how: Every message carries a unique id, or a stable pair of producer id and sequence number. The consumer writes the business change and the message id in one database transaction. A unique index on the id makes a second insert fail.
+When a duplicate arrives after a retry, the insert fails, the transaction rolls back, and the consumer acknowledges the message anyway. The effect has happened exactly once, even though the delivery happened twice.
+Kafka does this inside the broker for producers: the idempotent producer attaches a producer id and a sequence number per partition, and the broker drops a repeat batch. This covers producer retries only. For effects in an outside database, you still need a dedupe table or an upsert keyed by the event id.
+used: Kafka idempotent producer (on by default since Kafka 3.0); consumers in payment and order systems; inbox tables in microservices.
+avoid: When the operation is already idempotent, such as setting a value; an upsert alone is enough and no dedupe table is needed.
+flow:
+  Producer [svc: id 7, seq 42] -> orders topic [log] : batch, seq 42 | The producer sends a batch with its producer id and sequence number.
+  Producer -x> orders topic : ack lost, retry | The ack is lost, so the producer sends batch 42 again.
+  orders topic -> Producer : duplicate dropped | The broker sees sequence 42 again and does not append it twice.
+  orders topic -> Consumer [svc: at-least-once] : event e-9001 | The consumer receives the event. After a crash it may receive it again.
+  Consumer -> Orders DB [db: unique on event id] : apply + insert id | The consumer applies the change and records the event id in one transaction.
+  Consumer -x> Orders DB : same id again | On redelivery the unique key rejects the insert. The change is not applied twice.
+ref: docs | Producer idempotence | Apache Kafka documentation | https://kafka.apache.org/documentation/#producerconfigs_enable.idempotence
+
+== Idempotent batch loads by partition overwrite
+kind: backfill-replay, etl-elt
+when: A data pipeline must be safe to re-run after a failure, a late fix or a backfill, without double-counting.
+how: Make each run own one slice of output, for example one date. The job reads the input for that date and writes the result with overwrite for that date's partition. It never appends blindly.
+If the job fails halfway, you run it again. The new run replaces the old partial output for that date, and the final table is the same as after a single clean run. A backfill is then just the same job run for many dates, in any order.
+This needs a deterministic job: the same input must give the same output, so avoid now() and random values inside the transformation. Pass the run date as a parameter. Table formats such as Delta and Iceberg make the overwrite atomic, so readers never see a half-written partition.
+used: Airflow and dbt incremental models with partition overwrite; Spark dynamic partition overwrite; Delta Lake replaceWhere; Iceberg overwrite.
+avoid: When the output slice cannot be defined by a key; use a MERGE by business key instead.
+flow:
+  Scheduler [svc: Airflow] -> Spark job [svc: date=2026-10-01] : run for date | The scheduler starts the job with the date as a parameter.
+  Spark job -> Raw events [lake: Parquet] : read that date only | The job reads only the input for that date.
+  Spark job -> Daily table [lake: Iceberg] : overwrite partition | The job replaces the partition for that date in one atomic commit.
+  Spark job -x> Scheduler : task failed | A node fails and the run is marked failed. Partial files are not visible.
+  Scheduler -> Spark job : retry same date | The scheduler retries the same date.
+  Spark job -> Daily table : overwrite again | The retry replaces the partition. The result is the same as one clean run.
+ref: docs | Overwriting partitions | Apache Iceberg documentation | https://iceberg.apache.org/docs/latest/spark-writes/
+
+@@ idgen
+== Snowflake-style IDs minted in each service
+kind: horizontal-scale
+when: Many services must create unique, roughly time-sorted ids at high rate, with no central counter.
+how: Each id is a 64-bit number: 41 bits of milliseconds since a custom epoch, 10 bits of machine id and 12 bits of per-millisecond sequence. One machine can make 4,096 ids per millisecond, and the time bits make ids sort by creation time.
+Each worker gets a unique machine id at startup, from a coordination service such as ZooKeeper or from a config file. After that it needs no network call: it reads its clock, increments the sequence, and packs the bits.
+The risks are clocks and machine ids. If the clock moves backward, the worker must wait or refuse, or it may repeat an id. Two workers with the same machine id will collide. Ids are only roughly ordered across machines, because clocks differ by a few milliseconds.
+used: Twitter Snowflake (2010); Discord and Instagram use similar time-plus-shard layouts; many ad and messaging systems use the same bit layout.
+avoid: When ids must be unguessable or give no hint of creation time; use random UUIDs. When strict global order is needed; use a single sequencer or consensus.
+flow:
+  Worker boot [svc: starts] -> ZooKeeper [svc: machine ids] : claim machine id | A new worker claims a free machine id once, at startup.
+  ZooKeeper -> Worker boot : machine id 17 | The worker now has id 17 and needs no more coordination.
+  Order service [svc] -> ID generator [svc: ts + 17 + seq] : new id | The service asks the local library for an id.
+  ID generator -> Order service : new 64-bit id | The id packs time, machine and sequence into 64 bits.
+  ID generator -> Orders DB [db: B-tree on id] : insert row | New ids are increasing, so inserts append at the end of the index.
+  * ID generator: clock moved back | If the clock steps back, the generator waits until time catches up.
+ref: blog | Announcing Snowflake | Twitter Engineering, 2010 |
+
+== Time-ordered UUIDv7 as database primary key
+kind: none
+when: A database needs globally unique keys created by any client, and random keys are slowing inserts.
+how: UUIDv7 puts a 48-bit Unix millisecond timestamp in the first bits, then random bits. Any client can create one without talking to the database, and new ids are larger than old ones.
+Random UUIDv4 keys scatter inserts over the whole B-tree index. Each insert touches a random page, which is often not in memory, and pages split often. Time-ordered keys append to the right edge, so the hot pages stay in cache and the index stays dense.
+The costs are small. The id leaks its creation time, and ids made in the same millisecond are only ordered if the library adds a counter. Some libraries make the order within a millisecond monotonic, which RFC 9562 allows. Do not use it where creation time is secret.
+used: PostgreSQL 18 added uuidv7(); ULID and KSUID follow the same idea; MongoDB ObjectId starts with a timestamp.
+avoid: Public tokens that must not reveal time or be guessable; use random UUIDv4 or a separate secret token.
+flow:
+  Client [client] -> App server [svc: makes UUIDv7] : create order | The app creates the id itself, with no round trip to the database.
+  App server -> Postgres [db: B-tree on id] : insert, id 0192..a7 | The insert carries a time-ordered id.
+  * Postgres: append at right edge | New keys land on the last index page, which is already in memory.
+  App server -> Event bus [topic: order events] : OrderCreated 0192..a7 | The same id is used in events, so all systems share one key.
+  Analyst [client] -> Postgres : range scan by id | A scan of recent ids reads a compact, time-ordered part of the index.
+  Postgres -x> App server : duplicate id | A duplicate would be rejected by the primary key, but the odds are tiny with 74 random bits.
+ref: spec | RFC 9562: Universally Unique IDentifiers (UUIDs) | IETF, 2024 | https://www.rfc-editor.org/rfc/rfc9562
+
+@@ isr
+== Leader with in-sync replicas and min.insync.replicas
+kind: leader-follower, quorum
+when: A replicated log must not lose acknowledged writes, but must keep working when one replica is slow or dead.
+how: A partition has a leader and followers, for example replication factor 3. Followers fetch from the leader. The leader keeps the in-sync replica set (ISR): the replicas that are caught up within a time limit (replica.lag.time.max.ms, default 30 seconds).
+With acks=all, the leader answers the producer only when every ISR member has the record. The high watermark moves up to that offset, and consumers can read only up to it. If the ISR shrinks to the leader alone, min.insync.replicas=2 makes the leader reject writes, which keeps safety over availability.
+A slow follower is dropped from the ISR, so it does not stall writes. It rejoins once it catches up. The setting trio that is common for important topics is replication factor 3, min.insync.replicas 2, acks=all, which survives one broker failure with no loss and no downtime.
+used: Every Apache Kafka cluster; Redpanda and managed Kafka services use their own variants; the idea also appears in other log replication systems.
+avoid: When throughput and latency matter more than loss risk (metrics, debug logs); use acks=1.
+flow:
+  Producer [client: acks=all] -> Leader [svc: broker 1] : record, offset 90 | The producer sends a record to the partition leader.
+  Leader -> Follower 2 [svc: in ISR], Follower 3 [svc: in ISR] : fetch from 90 | Both followers pull the new record from the leader.
+  * Follower 2: LEO 91 | Follower 2 has the record and reports its log end offset 91 to the leader.
+  * Follower 3: slow, lag 35 s | Follower 3 stays behind longer than the lag limit, so the leader drops it from the ISR.
+  Leader -> Producer : ack, offset 90 | The leader acks after every remaining ISR member has the record.
+  Producer -x> Leader : NotEnoughReplicas | If the ISR falls below min.insync.replicas the write is rejected.
+ref: docs | Replication | Apache Kafka documentation | https://kafka.apache.org/documentation/#replication
+
+== Controller picks a new leader from the ISR
+kind: active-passive, leader-election
+when: The broker that leads a partition fails, and a replica must take over without losing committed data.
+how: The cluster controller watches broker liveness. In current Kafka it is a quorum of controllers using KRaft, with no ZooKeeper. When a leader dies, the controller picks a new leader from the ISR of that partition and writes the change in the metadata log with a higher leader epoch.
+Every ISR member holds all committed records, so the new leader has no committed data missing. Followers learn the new leader from metadata, truncate their logs to the epoch start offset, and continue fetching.
+By default, unclean leader election is off. If no ISR replica is alive, the partition stays offline rather than electing an out-of-sync replica, which would drop committed records. A team can turn it on for a topic where availability matters more than data.
+used: Apache Kafka KRaft controller; other leader-based replicated logs use the same idea in their own forms.
+avoid: Do not enable unclean election for payment or audit topics; accept downtime instead.
+flow:
+  Broker 1 [svc: leader, epoch 4] -> Broker 2 [svc: follower] : replicate | Broker 1 leads the partition and Broker 2 stays in the ISR.
+  Broker 1 -x> Controller [svc: KRaft quorum] : heartbeat lost | Broker 1 crashes and stops its heartbeats to the controller.
+  Controller -> Metadata log [log: KRaft log] : leader=2, epoch 5 | The controller commits a new leader choice from the ISR with epoch 5.
+  Metadata log -> Broker 2 : become leader, epoch 5 | Broker 2 is told it leads. It already has all committed records.
+  * Broker 2: leader, epoch 5 | Broker 2 now takes reads and writes for the partition.
+  Producer [client] -> Broker 2 : produce | Clients refresh metadata and send new writes to broker 2.
+ref: docs | KRaft | Apache Kafka documentation | https://kafka.apache.org/documentation/#kraft
+
+@@ lamport
+== Lamport timestamps on messages
+kind: none
+when: Machines must agree on an order of events that respects cause and effect, with no trusted physical clock.
+how: Each process keeps an integer counter. Before each local event or send, it adds 1. Every message carries the counter. On receive, the process sets its counter to the maximum of its own and the message's, plus 1.
+This gives one rule: if event A happened before event B, then the timestamp of A is lower than that of B. Add the process id as a tie-break and you get a total order, so all nodes can sort events the same way.
+The reverse does not hold: a lower timestamp does not prove that A caused B. They may be concurrent. To detect concurrency you need vector clocks. Lamport clocks are cheap, one number per message, and are the base of replicated state machines and of log offsets.
+used: Lamport's 1978 paper; the idea sits inside Raft terms, Kafka offsets and many databases; distributed tracing systems record causal order in a similar way.
+avoid: When you must detect concurrent writes (use vector clocks) or need times close to wall-clock time (use hybrid logical clocks).
+flow:
+  Process A [svc: clock 4] -> Process B [svc: clock 9] : msg, ts 5 | A adds 1 to its clock and sends a message with timestamp 5.
+  * Process B: clock max(9, 5)+1 = 10 | B's clock is already ahead, so it only adds 1 and takes 10.
+  Process B -> Process C [svc: clock 2] : msg, ts 11 | B sends another message with timestamp 11.
+  * Process C: clock 12 | C jumps from 2 to 12, so its next event is after the event it received.
+  Process C -> Process A : msg, ts 13 | C sends a reply with timestamp 13.
+  * Process A: clock 14 | A jumps ahead, so every effect has a larger timestamp than its cause.
+ref: paper | Time, Clocks, and the Ordering of Events in a Distributed System | Leslie Lamport, CACM 1978 |
+
+== Total-order replicated state machine
+kind: consensus-log
+when: Several replicas must apply the same commands in the same order so that they stay identical.
+how: Clients send commands to any replica. Each replica stamps the command with a Lamport timestamp and its own id, then sends it to all others. Everyone sorts commands by (timestamp, id), which is the same order on every replica.
+A replica may apply a command only when it knows that no earlier command can still arrive, for example once it has received a later message from every other replica. Then all replicas apply the same list and reach the same state.
+This is the idea in Lamport's original paper. It is not fault tolerant: one silent replica blocks everybody. Modern systems keep the idea of a single agreed order but get it from consensus (Paxos, Raft), where a majority is enough.
+used: The basis of replicated state machines in Paxos, Raft and Viewstamped Replication; total-order broadcast in ZooKeeper (Zab) and etcd.
+avoid: When any node may fail; use a consensus log instead of waiting for every replica.
+flow:
+  Client 1 [client] -> Replica A [svc: clock 7] : command X | A client sends command X to replica A.
+  Client 2 [client] -> Replica B [svc: clock 7] : command Y | At the same time another client sends command Y to replica B.
+  Replica A -> Replica B : X ts 8, id A | A stamps X with timestamp 8 and sends it to B.
+  Replica B -> Replica A : Y ts 8, id B | B stamps Y with timestamp 8 and sends it to A.
+  * Replica A: order X, Y | Both timestamps tie at 8, so the id decides, and X comes first.
+  * Replica B: order X, Y | B reaches the same order, so both replicas apply X then Y.
+ref: paper | Time, Clocks, and the Ordering of Events in a Distributed System | Leslie Lamport, CACM 1978 |
+
+@@ lbalgos
+== L4 consistent-hash balancer in front of L7 proxies
+kind: horizontal-scale, consistent-hashing
+when: Very high connection rates must be spread over many proxies, and a flow must stay on one backend even when the balancer fleet changes.
+how: A layer 4 balancer sees only packets. It hashes the 5-tuple (source and destination address and port, and protocol) and looks up a backend in a table. Maglev builds a lookup table of fixed size, a prime number such as 65,537, filled so that each backend gets nearly equal share.
+Because the table is built the same way on every balancer, any balancer picks the same backend for the same flow. Traffic can then be spread over balancers by the network with ECMP routing, and a balancer can fail with no state sync. When a backend is added or removed, only a small part of the table changes.
+Behind the L4 tier sit L7 proxies such as Envoy or NGINX, which read HTTP and choose a backend per request. The L4 tier is fast and cheap per packet. The L7 tier is smarter but costs more CPU.
+used: Google Maglev (NSDI 2016 paper); Envoy supports Maglev and ring hash policies; Meta's Katran is an L4 balancer using consistent hashing with XDP.
+avoid: When a small service needs only one cloud load balancer; use the managed one.
+flow:
+  Client [client] -> Router [svc: ECMP] : packet to VIP | Client packets go to one public address that many balancers share.
+  Router -> L4 balancer [svc: Maglev table] : 5-tuple flow | The network router spreads flows over balancers by hash.
+  L4 balancer -> Envoy 1 [svc: L7 proxy] : hash(5-tuple) -> slot | The balancer hashes the flow and looks up a proxy in its table.
+  Envoy 1 -> App pod [svc: backend] : HTTP request | The proxy reads the request and picks a backend for it.
+  * L4 balancer: table rebuilt | A proxy is removed, and only a small share of table slots move.
+  Router -> L4 balancer : same flow, same pick | Another balancer with the same table sends the same flow to the same proxy.
+ref: paper | Maglev: A Fast and Reliable Software Network Load Balancer | Eisenbud et al., NSDI 2016 |
+
+== Power of two choices for request balancing
+kind: horizontal-scale
+when: Requests have uneven cost, and plain round robin leaves some backends overloaded while others are idle.
+how: For each request, the proxy picks two backends at random. It compares their load, such as the number of requests in flight, and sends the request to the lighter one. This is called power of two choices (P2C).
+It is almost as good as asking all backends for their load. Random choice alone gives a maximum load that grows like log n over log log n. Two choices bring it down to about log log n, a large gain for one extra comparison. It also avoids a herd: when many proxies use one stale view of the least loaded backend, all of them pick the same server.
+Envoy uses this for its least-request policy by default with two choices. Weights, slow start for new backends and health checks still apply on top.
+used: Envoy least-request policy (default of 2 random choices); NGINX random two least_conn; HAProxy has a random-based balancing mode, and the idea is common in service meshes.
+avoid: When requests must go to a specific backend, for example cache affinity; use consistent hashing.
+flow:
+  Client [client] -> Envoy [svc: P2C picker] : request | A request arrives at the proxy.
+  Envoy -> Backend A [svc: 12 in flight], Backend B [svc: 3 in flight] : sample two | The proxy picks two backends at random and reads their in-flight counts.
+  * Envoy: pick B | Backend B has fewer requests in flight, so it wins.
+  Envoy -> Backend B : forward request | The request goes to the lighter backend.
+  Backend B -> Envoy : response | The response returns and the in-flight count of B drops.
+  Envoy -x> Backend C [svc: unhealthy] : skipped | Unhealthy backends are never in the sample.
+ref: paper | The Power of Two Choices in Randomized Load Balancing | Michael Mitzenmacher, 2001 |
+ref: docs | Load balancers | Envoy documentation | https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers
+
+@@ leaderelect
+== Lease-based leader election in a coordination store
+kind: leader-election, lease
+when: Several replicas of a service run, but only one may act at a time, such as a controller or a scheduler.
+how: All replicas try to create or update one record in a consistent store such as etcd or ZooKeeper. The record names the holder and has a lease time, for example 15 seconds. Only one replica wins the write. It is the leader.
+The leader renews the lease every few seconds, for example every 5. If it crashes or is cut off, it stops renewing. When the lease expires, the other replicas try again, and one wins.
+Time makes this tricky. A leader that pauses for longer than the lease may still think it leads. So the lease time must be longer than the renew interval plus the clock drift, and the leader must stop work when a renew fails. For real safety, pair the lease with fencing tokens at the resource.
+used: Kubernetes controllers and the scheduler (Lease objects); etcd election API; ZooKeeper-based election in Kafka (before KRaft), HBase and Hadoop.
+avoid: When the work can be done safely by many nodes at once; then use idempotent workers and no leader.
+flow:
+  Replica 1 [svc: candidate] -> etcd [db: lease record] : create lease, 15 s | Replica 1 writes the lease record first and becomes leader.
+  Replica 2 [svc: standby] -x> etcd : create lease | Replica 2 tries the same write and is rejected. It stays standby.
+  Replica 1 -> etcd : renew every 5 s | The leader renews the lease before it expires.
+  * Replica 1: crashed | Replica 1 crashes and no longer renews.
+  * etcd: lease expired | After 15 seconds without a renew, the record expires and the key is free again.
+  Replica 2 -> etcd : create lease | Replica 2 retries and wins. It is the new leader.
+ref: docs | Leases | Kubernetes documentation | https://kubernetes.io/docs/concepts/architecture/leases/
+
+== Built-in election with majority vote
+kind: leader-election, consensus-log
+when: A replicated database or log must pick its own leader, with no outside coordination service.
+how: Each node is a follower and waits for heartbeats from a leader. If none comes within a random election timeout (for example 150 to 300 ms in Raft), the node becomes a candidate. It raises its term by one, votes for itself and asks the others for votes.
+A node gives one vote per term. A candidate that gets votes from a majority becomes the leader and sends heartbeats at once. Random timeouts make split votes rare, and if one happens, a new term starts.
+The majority rule means that two leaders in one term are impossible, and that a cluster of 2f+1 nodes survives f failures. The cost is that a minority side of a network split cannot elect anyone and stops accepting writes.
+used: etcd and Consul (Raft); CockroachDB per-range Raft groups; Kafka KRaft controllers; TiKV.
+avoid: When two nodes only are available; there is no majority. Use three or add an external tie-breaker.
+flow:
+  Follower B [svc: term 4] -> Follower C [svc: term 4] : RequestVote term 5 | Node B's timeout fires first. It becomes a candidate with term 5.
+  Follower B -> Follower A [svc: term 4] : RequestVote term 5 | It also asks node A.
+  Follower C -> Follower B : vote granted | Node C has not voted in term 5, so it grants its vote.
+  * Follower B: leader, term 5 | Node B has 2 of 3 votes, a majority. It becomes leader.
+  Follower B -> Follower A, Follower C : heartbeat term 5 | The leader sends heartbeats to stop new elections.
+  Follower A -x> Follower B : old leader term 4 rejected | An old leader with term 4 is rejected by the higher term.
+ref: paper | In Search of an Understandable Consensus Algorithm (Raft) | Ongaro and Ousterhout, USENIX ATC 2014 |
+
+@@ ledger
+== Double-entry ledger with idempotent postings
+kind: wal, idempotent-consumer
+when: A system moves money and must never lose, create or double-count a cent, even with retries and crashes.
+how: Every movement is a transaction with at least two entries: debit one account, credit another. The entries sum to zero. They are written in one database transaction, and entries are never updated or deleted. A mistake is fixed with a new reversing transaction.
+A balance is not stored as the truth. It is the sum of entries for the account, and may be cached in a balance column that is updated in the same transaction. The payment request carries an idempotency key with a unique index, so a retry returns the first result and posts nothing new.
+Constraints in the database enforce the rules: debits equal credits, no entry without a transaction, and, for accounts that must not go negative, a check on the balance. The audit trail is complete because history is never rewritten.
+used: Payment and wallet platforms, banks and fintechs; TigerBeetle is a database built for double-entry accounting; Stripe, Square and Modern Treasury describe ledger designs publicly.
+avoid: When the data is not money or an inventory with strict totals; a simple table with counters is enough.
+flow:
+  Payment API [svc] -> Ledger service [svc: posts entries] : transfer 50, key K7 | A transfer of 50 arrives with an idempotency key.
+  Ledger service -> Ledger DB [db: append-only entries] : begin transaction | The service opens one database transaction.
+  Ledger service -> Ledger DB : debit 42, credit escrow | It writes two entries that sum to zero, and the balance cache is updated.
+  Ledger DB -> Ledger service : commit | Both entries commit together, or neither does.
+  Payment API -x> Ledger service : retry, key K7 | The client retries after a timeout, with the same key.
+  Ledger service -> Payment API : first result | The unique key finds the first result. Nothing is posted twice.
+ref: book | Designing Data-Intensive Applications | Martin Kleppmann, 2017 |
+
+== Daily reconciliation against bank files
+kind: etl-elt, control-loop
+when: Your ledger says where the money is, but banks and processors hold their own records, and both must agree.
+how: Every day, or every hour, the bank sends a settlement file. A job loads it and matches each line to a ledger entry, by reference id, amount and date. It then produces three lists: matched, in the ledger only, and in the bank file only.
+Differences have common causes: a timing gap (the bank settles one day later), a fee that was not booked, a refund, or a lost callback. Timing gaps clear on their own after a day. The others open a case for a person, who fixes them with a new ledger transaction, never by editing old entries.
+The ledger can also hold clearing accounts, such as "money in transit from processor". They must reach zero when all files match. A clearing account that stays above zero is the alarm.
+used: Payment service providers and marketplaces; banks run daily reconciliation with processors and card networks; open tools and finance platforms support the same matching steps.
+avoid: When there is no external record to compare, for example internal points; then check ledger invariants only.
+flow:
+  Bank [svc: SFTP] -> File loader [svc: settlement file] : settlement CSV | The bank delivers its daily file of settled payments.
+  File loader -> Bank lines [lake: staged rows] : load rows | Raw lines are stored unchanged for audit.
+  Matcher [svc: SQL join] -> Bank lines : read | The matcher reads the bank lines.
+  Matcher -> Ledger DB [db: entries] : join on ref id | It joins each line to ledger entries by reference, amount and date.
+  Matcher -> Exceptions queue [queue: open cases] : 3 unmatched items | Items found in only one side go to a case queue.
+  Exceptions queue -> Ledger DB : adjusting transaction | An operator posts a new correcting transaction. Old entries stay unchanged.
+ref: docs | TigerBeetle: Financial accounting concepts | TigerBeetle documentation |
+
+@@ ot
+== Central server transforms concurrent edits
+kind: none
+when: Several users edit the same document, each must see their own edit at once, and all must end with the same text.
+how: Each client applies its own edit locally at once and sends it to the server with the revision number it was based on. The server keeps one ordered history of operations. If the client's revision is behind, the server transforms the incoming operation against the operations the client has not seen.
+Example: the document is "ABC". User 1 inserts "X" at position 0. User 2 deletes the character at position 2 (the "C"). After the server orders them, User 2's delete must move to position 3, because the insert shifted the text by one. The transform function does this shift.
+The server then stores the transformed operation, advances the revision, and sends it to all other clients. Each client transforms it against its own pending edits before applying it. The server needs one outstanding message per client, which keeps the algorithm simple.
+used: Google Docs (the OT technique, as Google has described it); Etherpad; Google Wave; ShareDB for Node.js.
+avoid: When clients must work offline for a long time or there is no central server; use CRDTs. Peer-to-peer OT is very hard to get right.
+flow:
+  User 1 [client: doc ABC] -> OT server [svc: rev 5] : insert X at 0, rev 5 | User 1 inserts a character and sends it with the revision it saw.
+  User 2 [client: doc ABC] -> OT server : delete pos 2, rev 5 | User 2 deletes the last character, based on the same revision.
+  * OT server: rev 6 | The server accepts the first edit and moves to revision 6.
+  * OT server: delete moved to pos 3 | The server transforms the delete against the insert, so it now points at the same letter C.
+  OT server -> Operation log [log: ordered ops] : store both | The server stores the ordered, transformed operations.
+  OT server -> User 1, User 2 : broadcast ops | Each client gets the operations it missed, and both end with XAB.
+ref: paper | Concurrency Control in Groupware Systems | Ellis and Gibbs, SIGMOD 1989 |
+ref: docs | Google Wave Operational Transformation | Google, 2009 |
+
+== Real-time collaboration over WebSocket
+kind: event-driven, pubsub
+when: Many people edit one document and must see each other's cursors and changes within a fraction of a second.
+how: Each open document has a room on a collaboration server. Clients keep a WebSocket to the server. Edits go up as small operations, and the server sends back an acknowledgement and the operations from others.
+The server keeps the live document state in memory and writes the operation log to a database, so any client can load a snapshot and replay later operations. Presence data, such as cursor position and user name, is sent on the same connection but is not stored, since it changes often and is only useful for a moment.
+For many servers, all connections for one document are routed to the same server, for example by hashing the document id. Without that, two servers would order operations differently and the documents would diverge.
+used: Google Docs; Etherpad and ShareDB deployments; many editors and whiteboards use WebSockets for the same flow.
+avoid: When documents are edited rarely by one person at a time; save with plain HTTP and optimistic locking.
+flow:
+  Browser [client] -> Gateway [svc: hash(doc id)] : WebSocket connect | A browser connects. The gateway routes it by the document id.
+  Gateway -> Doc server [svc: room for doc 77] : join room | All users of document 77 land on the same server.
+  Doc server -> Snapshot store [store: doc snapshot] : load snapshot + ops | The server loads the last snapshot and replays newer operations.
+  Browser -> Doc server : op, rev 12 | The browser sends an edit.
+  Doc server -> Op log [log: operations] : append op | The server orders the edit, stores it and sends it to everyone in the room.
+  Doc server ~> Browser : cursors of others | Presence data goes out on the same connection, but is not stored.
+ref: docs | ShareDB: Operational Transformation | ShareDB project | https://share.github.io/sharedb/
+
+@@ outbox
+== Outbox table with a polling relay
+kind: outbox
+when: A service must save data and publish an event, and a plain database with no change log reader is all it has.
+how: The service writes the business row and an outbox row in one local transaction. A separate relay process polls the outbox table every second or so, for example "select unsent rows order by id limit 100". It publishes each row to the broker and then marks it sent, or deletes it.
+A crash between publish and mark causes the row to be sent again, so delivery is at least once and consumers must be idempotent. Order is kept by id, but with several relay copies, rows can be sent out of order unless each relay takes a different partition of aggregates.
+Polling is simple and works in any database. Its costs are delay of about one polling interval, and load on the table. Delete sent rows in batches, or the table grows without limit.
+used: Many microservices on Postgres or MySQL; documented by microservices.io as the transactional outbox pattern; Spring Modulith and similar libraries ship a version of it.
+avoid: When latency must be under tens of milliseconds, or volume is very high; read the database log with CDC instead.
+flow:
+  Order API [svc] -> Orders DB [db: orders + outbox] : one transaction | The API inserts the order row and the outbox row together.
+  Relay [svc: polls 1/s] -> Orders DB : select unsent, limit 100 | The relay reads unsent outbox rows in id order.
+  Relay -> Broker [topic: order events] : OrderPlaced | The relay publishes each event to the broker.
+  Relay -x> Orders DB : crash before mark sent | The relay dies before it marks the rows sent.
+  Relay -> Broker : OrderPlaced again | After restart the same rows are sent again. This is a duplicate.
+  Broker -> Email service [svc: dedup by id] : OrderPlaced | The consumer drops a duplicate by event id.
+ref: blog | Pattern: Transactional outbox | Chris Richardson, microservices.io | https://microservices.io/patterns/data/transactional-outbox.html
+
+== Saga with compensating steps
+kind: saga, choreography
+when: A business process spans several services, each with its own database, and a failure midway must undo the earlier steps.
+how: There is no transaction over all services. Each step is a local transaction in one service. After it commits, it publishes an event through its own outbox. The next service reacts to that event and does its step.
+If a step fails, for example the payment is declined, the saga runs compensating actions for earlier steps, in reverse order. Cancel the reservation, then cancel the order. A compensation is a new action, not a rollback, so it must be safe to run twice.
+Users can see in-between states, such as an order that is pending, so the design must show them. Compensations can fail too, so they are retried until they work. A process manager or workflow engine can hold the saga state instead of pure event choreography.
+used: Order, booking and payment flows in microservices; Temporal and AWS Step Functions run sagas as workflows; the idea comes from the 1987 paper by Garcia-Molina and Salem.
+avoid: When one database can hold all the data; use a normal ACID transaction.
+flow:
+  Order service [svc] -> orders topic [topic] : OrderCreated | The order service commits the order and publishes an event from its outbox.
+  orders topic -> Stock service [svc] : OrderCreated | The stock service reserves the items in its own database.
+  Stock service -> stock topic [topic] : StockReserved | It publishes the result for the next step.
+  stock topic -> Payment service [svc] : StockReserved | The payment service tries to charge the card.
+  Payment service -x> stock topic : PaymentFailed | The card is declined, and the payment service reports failure.
+  stock topic -> Stock service : release stock | The stock service runs its compensation. The order service then cancels the order.
+ref: paper | Sagas | Garcia-Molina and Salem, SIGMOD 1987 |
+ref: blog | Pattern: Saga | Chris Richardson, microservices.io | https://microservices.io/patterns/data/saga.html
+
+@@ pacelc
+== Choosing a PACELC profile per datastore
+kind: polyglot-persistence
+when: An architect must pick a database for a data set and wants to know what it gives up in normal operation, not only in a partition.
+how: PACELC asks two questions. If there is a partition (P), the system gives up availability (A) or consistency (C). Else (E), in normal operation, it gives up latency (L) or consistency (C). Each store gets a label such as PA/EL or PC/EC.
+Dynamo-style stores such as Cassandra, with default settings, are PA/EL: they keep answering in a partition, and in normal operation they answer from one or a few replicas at low latency. Spanner and CockroachDB are PC/EC: they favour consistency, and every write waits for a majority, which costs round trips between zones or regions.
+The label depends on configuration. Cassandra with quorum reads and writes moves toward EC. Teams use the label per data set: carts and counters on PA/EL stores, balances and inventory on PC/EC stores.
+used: Daniel Abadi's 2012 paper classifies Dynamo, Cassandra, Riak, PNUTS, MongoDB and others; architects use the labels when comparing Cassandra, DynamoDB, Spanner and CockroachDB.
+avoid: Do not use it as an exact grade. Real products have tunable settings, so measure latency in your own setup.
+flow:
+  Architect [user] -> Requirements [note: 3 data sets] : cart, balance, feed | The architect lists the data sets and how wrong each can be.
+  Requirements -> Cassandra [db: PA/EL] : cart and feed | Data that can be a little stale goes to a low-latency, available store.
+  Requirements -> Spanner [db: PC/EC] : account balance | Money data goes to a store that always agrees, at higher write latency.
+  Client [client] -> Cassandra : write, ONE | The write is acknowledged by one replica. This is fast.
+  Client -> Spanner : write, majority | The write waits for a majority across zones, which takes longer.
+  * Spanner: 12 ms commit | The extra milliseconds are the price of consistency.
+ref: paper | Consistency Tradeoffs in Modern Distributed Database System Design | Daniel Abadi, IEEE Computer, 2012 |
+
+== Local reads with replicated writes across regions
+kind: multi-region, read-replicas
+when: Users in several regions need fast reads, and some data can be a little stale while other data cannot.
+how: Data is replicated to every region. Each region serves reads from its local replica, taking about 1 to 5 ms instead of 80 to 150 ms across an ocean. This is the L side of the trade: low latency, and the read may miss the latest write.
+For data that must be fresh, the client asks for a stronger read: from the leader, or from a quorum. That read pays the round trip to another region. The application chooses per request, for example a profile page uses the local replica and a checkout uses the strong read.
+Writes can go to one home region, with a wait or not for replicas, or be accepted in any region and merged later. Waiting makes writes slow but safe. Not waiting makes them fast but can lose data in a region failure.
+used: DynamoDB global tables with eventually consistent or strongly consistent reads; Cassandra LOCAL_QUORUM and EACH_QUORUM; Spanner stale reads and read-only transactions.
+avoid: When every read must show the latest write; then read from the leader and accept the latency.
+flow:
+  User EU [client] -> EU replica [db: local copy] : read profile | A user in Europe reads from the replica in the same region.
+  EU replica -> User EU : value, 3 ms | The answer is fast but may be a few hundred milliseconds old.
+  User EU -> EU replica : checkout, strong read | A checkout needs the latest data.
+  EU replica -> US leader [db: home region] : forward read | The strong read crosses the ocean to the leader.
+  US leader -> EU replica : fresh value, 95 ms | It returns the latest value, at the cost of about 95 ms.
+  US leader ~> EU replica : async replication | Writes reach other regions in the background.
+ref: paper | Consistency Tradeoffs in Modern Distributed Database System Design | Daniel Abadi, IEEE Computer, 2012 |
+
+@@ partitioning
+== Hash partitioning with a routing layer
+kind: sharding, consistent-hashing
+when: Data or traffic no longer fits one machine, and requests are lookups by key.
+how: Pick a partition key, such as user id. A router computes hash(key) and maps it to one of many partitions. Each partition lives on one node and has replicas. A lookup touches one node, so throughput grows as you add nodes.
+Do not use hash mod N with N machines, since changing N moves almost all keys. Instead use many fixed partitions, such as 1,024, and a table that maps partitions to nodes. Adding a node moves only a few whole partitions. Consistent hashing gives a similar effect.
+The cost is that range queries and cross-partition joins must ask many partitions. The partition key must also spread load: a bad key such as country sends most traffic to one partition.
+used: Kafka topic partitions by key hash; DynamoDB and Cassandra (hash of the partition key); Redis Cluster (16,384 hash slots); Elasticsearch shards.
+avoid: When most queries are range scans by time or key; use range partitioning instead.
+flow:
+  Client [client] -> Router [svc: partition map] : get user 8841 | A client asks for one user.
+  * Router: hash gives slot 77 | The router computes hash(8841) mod 1024 and gets partition 77.
+  Router -> Node 2 [db: partitions 64-127] : read partition 77 | The map says partition 77 lives on node 2.
+  Node 2 -> Client : row | Only one node is touched.
+  * Router: node 4 added | A new node takes over a few partitions from others.
+  Router -> Node 4 [db: new owner] : move partition 77 | Only whole partitions move, and the rest stay where they are.
+ref: book | Designing Data-Intensive Applications, chapter 6 | Martin Kleppmann, 2017 |
+
+== Range partitioning by time with pruning
+kind: sharding, tiered-storage
+when: Queries ask for a range of time or keys, and old data is dropped or moved as a whole.
+how: Data is split by key range, usually by date: one partition or directory per day, such as dt=2026-10-28. A query with a date filter reads only the matching partitions. This is called partition pruning, and it can turn a scan of 3 years into a scan of one day.
+Old data is easy to handle. Dropping a partition deletes a whole day at once, with no row-by-row delete. Old partitions can also move to cheaper storage.
+The risk is a hot partition: all new writes go to the newest partition, so one node takes all the load. Fixes are to combine range and hash, such as hash of the device id inside each day, or to pick partitions per tenant. Too many tiny partitions also slow the metadata layer.
+used: Hive-style and Iceberg partitioned tables in data lakes; PostgreSQL declarative partitioning; time-series databases; Bigtable and HBase row ranges (tablets and regions).
+avoid: When queries filter by a key unrelated to time; then partition by that key instead.
+flow:
+  Ingest job [svc: daily batch] -> Lake table [lake: partitioned by date] : write dt=2026-10-28 | The job writes each day into its own partition folder.
+  Analyst [user] -> Query engine [svc: Trino or Spark] : where dt = 2026-10-28 | An analyst asks for one day.
+  Query engine -> Lake table : list matching partitions | The engine prunes: only one partition folder out of about 1,000 matches.
+  Lake table -> Query engine : files of one day | Only the files of that day are read.
+  Retention job [svc: cron] -x> Lake table : drop dt < 2025-10-28 | A cleanup job drops old days as whole partitions.
+  * Lake table: newest day hot | All new writes hit the newest partition, so add a hash bucket within the day.
+ref: docs | Partitioning | Apache Iceberg documentation | https://iceberg.apache.org/docs/latest/partitioning/

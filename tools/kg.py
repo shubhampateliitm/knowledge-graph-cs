@@ -278,15 +278,24 @@ def load(root=None, extra=(), extra_designs=()):
         cur["steps"].append([nid.strip(), txt.strip()])
 
     # curriculum: programs, course groups, courses -> ordered concept ids
-    programs, courses, pending_groups = [], [], []
-    cur_course = None
+    # "@school id | short name | full name | url" sets the school for the programs and courses after it in the same
+    # file; files without one are Stanford (the original curriculum)
+    programs, courses, pending_groups, schools = [], [], [], {}
+    cur_course, cur_file, school = None, None, "stanford"
     for f, ln, line in _lines("content/curriculum/*.txt"):
+        if f != cur_file: cur_file, school, cur_course = f, "stanford", None
         if not line.strip() or line.startswith("# "): continue
         where = f"{f}:{ln}"
+        if line.startswith("@school "):
+            p = [x.strip() for x in line[8:].split("|")]
+            if len(p) != 4: errs.append(f"{where} @school needs 4 fields"); continue
+            school = p[0]
+            if school not in schools: schools[school] = dict(id=p[0], short=p[1], name=p[2], url=p[3])
+            continue
         if line.startswith("@program "):
             p = [x.strip() for x in line[9:].split("|")]
-            if len(p) != 5: errs.append(f"{where} @program needs 5 fields"); continue
-            programs.append(dict(id=p[0], name=p[1], year=p[2], url=p[3], summary=p[4], groups=[])); continue
+            if len(p) not in (5, 6): errs.append(f"{where} @program needs 5 fields (6 with a short button label)"); continue
+            programs.append(dict(id=p[0], name=p[1], year=p[2], url=p[3], summary=p[4], short=p[5] if len(p) == 6 else p[0].upper(), school=school, groups=[])); continue
         if line.startswith("@group "):
             p = [x.strip() for x in line[7:].split("|")]
             if len(p) != 4: errs.append(f"{where} @group needs 4 fields"); continue
@@ -294,7 +303,7 @@ def load(root=None, extra=(), extra_designs=()):
         if line.startswith("## "):
             p = [x.strip() for x in line[3:].split("|")]
             if len(p) != 5: errs.append(f"{where} course header needs 5 fields"); cur_course = None; continue
-            cur_course = dict(code=p[0], title=p[1], url=p[2], term=p[3], text=p[4], concepts=[])
+            cur_course = dict(code=p[0], title=p[1], url=p[2], term=p[3], text=p[4], school=school, concepts=[])
             courses.append(cur_course); continue
         if cur_course is None: errs.append(f"{where} concept list outside a course"); continue
         for cid in [x.strip() for x in line.split(",") if x.strip()]:
@@ -310,6 +319,10 @@ def load(root=None, extra=(), extra_designs=()):
         progs[pid]["groups"].append(dict(name=name, courses=cl, note=note))
     for c in courses:
         if not c["concepts"]: errs.append(f"course {c['code']} has no concepts")
+    if len(codes) != len(courses): errs.append("duplicate course codes: " + ", ".join(sorted({c['code'] for c in courses if sum(1 for d in courses if d['code'] == c['code']) > 1})))
+    schools.setdefault("stanford", dict(id="stanford", short="Stanford", name="Stanford University", url="https://www.stanford.edu/"))
+    for x in programs + courses:
+        if x["school"] not in schools: errs.append(f"{x.get('code') or x['id']}: unknown school {x['school']}")
 
     designs = load_designs(nodes, errs, extra_designs)
 
@@ -441,4 +454,4 @@ def load(root=None, extra=(), extra_designs=()):
     stats["designs"] = len(designs)
     stats["words"] += sum(d["w"] for d in designs)
     return dict(nodes=[nodes[i] for i in order], edges=edges, side=side, tours=tours, layers=layer_reads, stats=stats,
-                curriculum=dict(programs=programs, courses=courses), designs=designs)
+                curriculum=dict(schools=list(schools.values()), programs=programs, courses=courses), designs=designs)

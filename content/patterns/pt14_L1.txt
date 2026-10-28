@@ -1,0 +1,874 @@
+@@ mediastream
+== Encode once into a bitrate ladder, serve by segments
+kind: precompute, cdn-edge
+when: Many viewers with very different networks and screens must watch the same title without buffering.
+how: A packaging job encodes the master file once into a ladder of renditions, for example 240p at 0.4 Mbit/s up to 2160p at 15 Mbit/s. Each rendition is cut into segments of 2 to 6 seconds that start on a keyframe, so the player can switch at any boundary. A manifest (HLS playlist or DASH MPD) lists every rendition and segment URL.
+The player downloads segments over plain HTTP from a CDN. After each segment it measures throughput and buffer level, and picks the rendition for the next one. If the buffer drains, it steps down; if the buffer is full, it steps up.
+All the heavy work is done before the first viewer arrives. Serving is only file reads, so it scales with cache hits. The cost is storage: every title is stored many times.
+used: Netflix, YouTube and every HLS or DASH service; the ladder is often tuned per title, as Netflix has described in its per-title encoding work.
+avoid: For a call or a game where delay must be under about 500 ms; use WebRTC instead.
+flow:
+  Master file [store: mezzanine] -> Encoder [svc: H.264, HEVC, AV1] : decode and re-encode | The encoder makes each rendition of the ladder, once.
+  Encoder -> Packager [svc: cuts segments] : renditions | The packager cuts renditions into keyframe-aligned segments and writes the manifest.
+  Packager -> Origin [store: segments + manifest] : upload | Segments and manifest are stored as ordinary files.
+  Player [client: ABR logic] -> CDN edge [cache] : GET manifest, segment 1 | The player fetches the manifest and the first segment from a nearby edge.
+  CDN edge -> Origin : GET on miss | On a miss the edge fetches from the origin and keeps a copy for the next viewer.
+  * Player: buffer low, step down | Throughput drops, so the player asks for a lower rendition for the next segment.
+ref: spec | HTTP Live Streaming (RFC 8216) | Pantos & May, IETF, 2017 | https://www.rfc-editor.org/rfc/rfc8216
+ref: blog | Per-Title Encode Optimization | Netflix Technology Blog, 2015 | https://netflixtechblog.com/per-title-encode-optimization-7e99442b62a2
+
+== Chunked parallel encoding
+kind: fork-join, map-reduce
+when: A long video must be encoded fast, and one encoder on one machine takes too long.
+how: A splitter cuts the source at scene changes or at fixed keyframe boundaries into chunks of a few seconds to a few minutes. Each chunk is independent, so a scheduler sends chunks to many workers at once. Each worker encodes its chunk for every rendition in the ladder.
+When all chunks of one rendition are done, a stitcher joins them in order. Because every chunk starts on a keyframe, the joins are clean. A failed worker only repeats its own chunk, not the whole film.
+A two-hour film cut into 1,200 chunks can finish in minutes if enough machines are free. The trade-off is that a chunk cannot use motion prediction from earlier chunks, so a little compression efficiency is lost.
+used: Common in large video-on-demand pipelines; Netflix has described chunk-parallel encoding in its media pipeline, and FFmpeg-based tools do the same.
+avoid: For a short clip or a live stream, where the split-and-stitch overhead is larger than the gain.
+flow:
+  Source [store: mezzanine file] -> Splitter [svc: scene detect] : read | The splitter finds scene changes and picks cut points on keyframes.
+  Splitter -> Job queue [queue: 1200 chunks] : one task per chunk | Each chunk becomes a task, so work can be spread over any number of machines.
+  Job queue -> Worker A, Worker B, Worker C : chunk n | Workers pull chunks and encode them for every rendition.
+  Worker A -x> Job queue : crash, no ack | A crashed worker never confirms, so only its chunk goes back to the queue.
+  Worker B, Worker C -> Stitcher [svc: concat] : encoded chunks | Finished chunks arrive in any order.
+  Stitcher -> Origin [store: renditions] : joined file | The stitcher joins chunks in order and writes the final rendition.
+ref: blog | Dynamic optimizer: a perceptual video encoding optimization framework | Netflix Technology Blog, 2018 | https://netflixtechblog.com/dynamic-optimizer-a-perceptual-video-encoding-optimization-framework-e19f1e3a277f
+
+== Low-latency live pipeline with origin shield
+kind: pipes-filters, cdn-edge
+when: A live event must reach many viewers within a few seconds of the camera, at large scale.
+how: A contribution encoder sends the live feed over SRT or RTMP to a cloud encoder. The packager writes small pieces as they are produced: CMAF chunks for DASH or LL-HLS parts, well under one second each. The player can request a piece before its full segment is finished.
+The CDN has two layers. Edge servers serve viewers. A shield layer sits in front of the origin, so thousands of edge misses become one origin request. The same live piece is asked for by a whole crowd at once, so request coalescing matters most here.
+Delay comes from many small buffers: encoder, packager, CDN and player. Typical low-latency live reaches 2 to 5 seconds; normal HLS is often 15 to 30 seconds.
+used: Live sports and events on Twitch, YouTube Live and Apple LL-HLS clients; AWS Elemental MediaLive and MediaPackage are one managed form.
+avoid: When 20 seconds of delay is acceptable; normal segments are cheaper and more cache-friendly.
+flow:
+  Camera [client: live feed] -> Live encoder [svc: SRT in] : contribution stream | The camera feed enters the cloud over a reliable protocol.
+  Live encoder -> Packager [svc: CMAF chunks] : ladder renditions | The encoder outputs a ladder and the packager emits chunks of under 1 second.
+  Packager -> Origin shield [cache] : publish chunk | The newest chunk is available as soon as it is written.
+  Origin shield -> Edge A [cache], Edge B [cache] : chunk | The shield serves many edges from one origin copy.
+  Edge A -> Player [client: LL-HLS] : chunked transfer | The player starts receiving a chunk before it is complete.
+  Edge B -x> Origin shield : same chunk, one request | Edges ask the shield, which collapses duplicate requests into one.
+ref: spec | Low-Latency HLS | Apple, HTTP Live Streaming 2nd edition (RFC 8216bis) | 
+
+@@ ssai
+== Manifest stitching with an ad decision call
+kind: none
+when: Ads must play without ad blockers or player changes, and the viewer must see one continuous stream.
+how: The player asks a manifest service for the stream. For each viewer the service builds a personal manifest. At an ad break marker (SCTE-35 in live), it calls the ad decision server (ADS) with the viewer's session data and a deadline of about 200 ms. The ADS returns a VAST response with the chosen ads.
+The service replaces the content segment URLs in the break with the ad segment URLs. The player sees one manifest with one timeline and plays it as usual. Ad segments come from the same CDN as the content.
+If the ADS is late, the service plays a slate or a default ad. A late answer costs a viewer's experience; a missing answer only costs revenue.
+used: AWS Elemental MediaTailor, Google Ad Manager dynamic ad insertion, Yospace and Brightcove SSAI; common in live sports and FAST channels.
+avoid: When the player must run client-side viewability code that only an SDK can give; use client-side ad insertion (CSAI).
+flow:
+  Player [client: HLS] -> Manifest service [svc: stitcher] : GET manifest | Each viewer asks for a personal manifest with a session id.
+  Manifest service -> Ad decision server [svc: ADS] : ad request, 200 ms | At the break marker the stitcher asks for ads, with a strict deadline.
+  Ad decision server -> Manifest service : VAST with 2 ads | The ADS returns ad creatives chosen by auction and frequency caps.
+  Manifest service -> Player : manifest with ad segments | Ad segment URLs replace the break, so the timeline stays continuous.
+  Player -> CDN [cache] : GET ad segments | Ads are fetched like content, so blockers see no separate ad request.
+  Ad decision server -x> Manifest service : timeout | If the ADS is too slow, the stitcher plays a slate instead of waiting.
+ref: docs | AWS Elemental MediaTailor user guide | Amazon Web Services | https://docs.aws.amazon.com/mediatailor/latest/ug/what-is.html
+ref: spec | VAST 4.2 | IAB Tech Lab, 2019 | https://iabtechlab.com/standards/vast/
+
+== Pre-transcoded ad pool and creative cache
+kind: precompute, cdn-edge
+when: Ads must match the stream's codec and bitrate ladder, and no ad may wait for a transcode at break time.
+how: A stitched ad must have the same codec, resolution ladder and segment length as the content, or the player will glitch. Transcoding on demand takes seconds and is too slow for a live break.
+So the system transcodes each new creative before it is ever used. It reads the creative URL from VAST, encodes it into the channel's ladder, and stores the segments under a key made from creative id and ladder. Later requests for the same ad find the segments in cache.
+The first request for an unseen creative falls back to a default ad, and a background job transcodes it for next time. Popular ads are then served as cached files, so the cost is a one-time encode per creative.
+used: AWS Elemental MediaTailor transcodes and caches ads this way; the same idea runs in other SSAI services. The first play of a new ad often shows a slate.
+avoid: For live streams that change codec settings often, where the ladder key keeps changing and the cache hit rate drops.
+flow:
+  Ad decision server [svc: ADS] -> Stitcher [svc] : VAST with creative id | The ADS names the creative to play.
+  Stitcher -> Ad cache [cache: segments by key] : lookup creative + ladder | The stitcher checks for ready segments.
+  Ad cache -> Stitcher : hit, segment URLs | On a hit the ad is spliced at once.
+  Ad cache -x> Stitcher : miss | On a miss the stitcher plays a default ad instead of waiting.
+  Stitcher -> Transcode queue [queue] : creative id | A miss queues a background job for next time.
+  Transcode queue -> Transcoder [svc: ladder encode] : job | The transcoder encodes the ad to the channel ladder.
+  Transcoder -> Ad cache : segments | Later requests for this creative hit the cache.
+ref: docs | AWS Elemental MediaTailor user guide | Amazon Web Services | https://docs.aws.amazon.com/mediatailor/latest/ug/what-is.html
+
+== Server-side beacons with deduplication
+kind: idempotent-consumer, event-driven
+when: Impressions must be counted for billing even though the server, not the player, knows when an ad played.
+how: The ad response includes tracking URLs (impression, quartiles, complete). With SSAI the player only sees segments, so the server must fire beacons. The stitcher records which ad segments each session fetched. A tracking service turns that into events: "session 77 passed 25% of ad 9".
+Beacons can be sent twice, for example when a player re-requests a segment after a network error. The service keeps a key of session id, ad id and event name, and sends each key only once.
+For the client-side parts, VAST 4 lets the server forward some beacons to the player. The measured impression is still the one billing uses. Counting too early or twice breaks trust with advertisers.
+used: SSAI vendors such as MediaTailor and Yospace do server-side tracking; billing pipelines use dedup keys, as in the Kafka outbox and idempotent-consumer patterns.
+avoid: When the buyer needs viewability signals only a client SDK can measure; combine with a client-side measurement SDK.
+flow:
+  Player [client] -> CDN [cache: ad segments] : GET ad segment 3 | The player fetches an ad segment from the stitched manifest.
+  CDN -> Tracking service [svc: edge logs] : segment fetch log | Fetch logs show the session reached that point of the ad.
+  Tracking service -> Dedup store [cache: session+ad+event] : seen this key? | The service checks whether it already sent this event.
+  Dedup store -> Tracking service : no, new | A new key means the beacon is sent.
+  Tracking service -> Ad server [svc] : GET impression URL | The tracking URL from VAST is called once.
+  Player ~> CDN : retry same segment | A retry produces a second log line for the same key.
+  Dedup store -x> Tracking service : duplicate, drop | A known key is dropped, so billing counts the impression once.
+ref: spec | VAST 4.2 | IAB Tech Lab, 2019 | https://iabtechlab.com/standards/vast/
+
+@@ mqueue
+== Competing consumers with acknowledgement
+kind: competing-consumers
+when: A pool of identical workers must share a stream of jobs, and each job must be done by exactly one of them.
+how: Producers put jobs in a queue. Workers pull a message, process it and then send an acknowledgement. Until the acknowledgement arrives, the broker keeps the message but hides it from other workers. In SQS this hiding time is the visibility timeout, 30 seconds by default.
+If a worker crashes, no acknowledgement comes. The timeout ends and the message becomes visible again, so another worker takes it. Delivery is therefore at least once, so the work must be safe to repeat.
+Throughput scales by adding workers. A prefetch limit (RabbitMQ) or a batch size (SQS, up to 10) controls how many messages one worker holds at once. A high prefetch gives speed but uneven load.
+used: SQS with Lambda or ECS workers; RabbitMQ work queues; Celery and Sidekiq style job systems.
+avoid: When many services each need every message; use publish-subscribe instead.
+flow:
+  Producer [svc] -> Jobs queue [queue: 3 visible] : send job 7 | A producer adds a job and moves on.
+  Jobs queue -> Worker A [svc], Worker B [svc] : receive | Each worker gets different messages; each message is now hidden.
+  Worker A -> Jobs queue : ack job 7 | After processing, the worker acknowledges and the broker deletes job 7.
+  Worker B -x> Jobs queue : crash, no ack | Worker B dies while holding job 8, so it sends no acknowledgement.
+  * Jobs queue: job 8 visible again | The timeout ends and job 8 returns to the queue.
+  Jobs queue -> Worker A : redeliver job 8 | Another worker processes job 8. The job must be idempotent.
+ref: docs | Competing Consumers pattern | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/patterns/competing-consumers
+ref: docs | Amazon SQS visibility timeout | Amazon Web Services | https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html
+
+== Retry queue and dead-letter queue
+kind: dead-letter, retry-backoff
+when: Some messages fail again and again, and they must not block the good ones or be lost.
+how: A message that fails is not acknowledged. The broker redelivers it. A message with bad data fails every time, so it would loop forever and waste the workers.
+The queue counts deliveries. In SQS you set maxReceiveCount on a redrive policy, for example 5. After that count, the broker moves the message to a dead-letter queue (DLQ). RabbitMQ does this with a dead-letter exchange.
+For transient errors, a delay between retries helps. Use a delay queue or a message timer, or let the consumer raise the visibility timeout after each failure. An alarm on DLQ depth tells a person to look. After a fix, a redrive moves the messages back to the main queue.
+used: SQS DLQs with redrive; RabbitMQ dead-letter exchanges; Azure Service Bus has a built-in dead-letter sub-queue.
+avoid: When order matters strictly; a failed message moved aside lets later ones overtake it.
+flow:
+  Orders queue [queue] -> Worker [svc: parse order] : receive | The worker takes a message and tries to process it.
+  Worker -x> Orders queue : fail, no ack | The message is bad, so the worker cannot finish it.
+  * Orders queue: receive count 5 | The same message has now been delivered five times.
+  Orders queue -> Dead-letter queue [queue: poison messages] : move after 5 tries | The broker parks the message, so other jobs keep flowing.
+  Dead-letter queue -> Alarm [svc: depth > 0] : metric | An alarm tells the team that something is stuck.
+  Dead-letter queue ~> Orders queue : redrive after fix | After a bug fix, messages return to the main queue.
+ref: book | Enterprise Integration Patterns: Dead Letter Channel | Hohpe & Woolf, 2003 | https://www.enterpriseintegrationpatterns.com/patterns/messaging/DeadLetterChannel.html
+ref: docs | Amazon SQS dead-letter queues | Amazon Web Services | https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html
+
+== Queue as a buffer in front of a slow dependency
+kind: load-leveling, load-shedding
+when: Traffic comes in bursts, but a database or partner API can only take a steady rate.
+how: The front end accepts a request, puts a message in the queue and replies at once, for example "202 Accepted". A fixed pool of workers drains the queue at the rate the dependency can take, say 200 calls per second.
+During a spike of 2,000 requests per second for 30 seconds, the queue grows by about 54,000 messages. The workers need a few more minutes to catch up. Nothing fails; users only wait longer for the result.
+The queue must be bounded or watched. Set an age alarm and a maximum length. Queue depth or message age can also drive autoscaling of workers. If the queue grows without end, it only hides an overload.
+used: Order intake in retail systems; email and webhook senders; SQS in front of a relational database or a rate-limited SaaS API.
+avoid: When the caller needs the answer right now; use a synchronous call with load shedding instead.
+flow:
+  Web API [svc] -> Intake queue [queue: depth 54k] : enqueue, 202 | The API stores the request and replies at once, even in a spike.
+  Intake queue -> Worker pool [svc: 20 workers] : steady pull | Workers pull at a fixed pace, no matter how fast messages arrive.
+  Worker pool -> Partner API [svc: 200 req/s cap] : call | The partner sees a smooth, safe rate.
+  * Intake queue: depth falling | After the burst the queue drains and returns to near zero.
+  Intake queue -> Autoscaler [svc: age metric] : oldest message age | Age above the target adds workers, within the dependency's limit.
+  Web API -x> Intake queue : rejected at max length | If the queue is full, the API returns 429 instead of growing without limit.
+ref: docs | Queue-Based Load Leveling pattern | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/patterns/queue-based-load-leveling
+
+@@ pubsub
+== Topic fan-out to one queue per subscriber
+kind: pubsub, competing-consumers
+when: One event must reach several different services, and each service needs its own retries and its own speed.
+how: The publisher sends the event once to a topic. The broker copies it to every subscription. Each subscriber owns a queue, so its workers compete only with each other. The billing service and the email service each receive every event, and neither sees the other's backlog.
+On AWS this is SNS with one SQS queue per subscriber. Each queue has its own dead-letter queue and its own retry settings. On Google Cloud, a topic with several subscriptions does the same.
+A new subscriber is added by creating a new queue and a subscription. The publisher does not change. The cost is that the publisher does not know who listens, so event schemas need clear owners and versioning.
+used: SNS to SQS fan-out is a documented AWS pattern; Google Cloud Pub/Sub topics with many subscriptions; Kafka consumer groups work the same way.
+avoid: When each message needs one handler only; a plain queue is simpler.
+flow:
+  Order service [svc] -> orders topic [topic: SNS] : publish OrderPlaced | The service publishes once and does not know the readers.
+  orders topic -> Billing queue [queue], Email queue [queue], Search queue [queue] : copy per subscription | The broker gives each subscription its own copy.
+  Billing queue -> Billing workers [svc] : receive | Billing workers compete on their own queue.
+  Email queue -> Email workers [svc] : receive | Email workers process at their own speed.
+  * Search queue: depth 9k | The search indexer is slow; only its own queue grows.
+  Email workers -x> Email queue : fail 5 times | After repeated failures the message goes to the email dead-letter queue, not to others.
+ref: docs | Fanout to Amazon SQS queues | Amazon Web Services | https://docs.aws.amazon.com/sns/latest/dg/sns-sqs-as-subscriber.html
+ref: docs | Publisher-Subscriber pattern | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/patterns/publisher-subscriber
+
+== Pub/sub channel to push updates to clients
+kind: pubsub, fan-out-write
+when: Users hold open WebSocket connections to many servers, and an event must reach the server that holds the right connection.
+how: A client connects to any gateway server over WebSocket. The server subscribes to a channel for what the client follows, for example "chat:room42". When another service publishes a message to that channel, the broker sends it to every gateway server subscribed to it. Each server pushes the message down its local sockets.
+Redis pub/sub is a common broker here. It is fire and forget: a server that is offline misses the message, and nothing is stored. So the client should keep a sequence number and fetch missed messages from a database on reconnect.
+This pattern solves routing: the sender does not need to know which of 200 servers holds a user. The cost is that each channel with many members creates a lot of fan-out work on the gateways.
+used: Chat and live-score systems built on Redis pub/sub, Socket.IO adapters, or NATS; Slack and Discord describe similar gateway designs.
+avoid: When messages must never be lost; use a durable log (Kafka) and replay from an offset.
+flow:
+  Client A [client: phone] -> Gateway 1 [svc: WebSocket] : connect, join room42 | The client connects to any gateway server.
+  Gateway 1 -> Redis [topic: pub/sub] : SUBSCRIBE chat:room42 | The gateway subscribes once for all its local members.
+  Client B [client: web] -> Gateway 2 [svc: WebSocket] : connect, join room42 | Another member lands on a different server.
+  Gateway 2 -> Redis : SUBSCRIBE chat:room42 | Both gateways are now subscribers of the same channel.
+  Chat API [svc] -> Redis : PUBLISH chat:room42 | A new message is published to the channel once.
+  Redis -> Gateway 1, Gateway 2 : message | The broker sends a copy to each subscribed gateway.
+  Gateway 1 -> Client A : push over socket | Each gateway writes to its own connected clients.
+ref: docs | Redis Pub/Sub | Redis documentation | https://redis.io/docs/latest/develop/interact/pubsub/
+
+== Thin event, then fetch the data
+kind: event-driven, claim-check
+when: Events are large or sensitive, and subscribers should read the data only if they need it.
+how: The publisher writes the data to a store first, for example an object in S3. Then it publishes a small event that holds only a key: bucket, object key and size. Subscribers get the event and decide whether to fetch the object.
+S3 event notifications work this way. The event goes to SNS, SQS, Lambda or EventBridge. The topic never carries the payload, so message size limits (256 KB for SNS) do not matter and the topic stays cheap.
+It also helps access control: a subscriber that cannot read the object cannot use the event. The risk is a race and stale data: the object may change or be deleted before the subscriber reads it. Use immutable object names or versions to avoid this.
+used: S3 event notifications to Lambda or SQS; Azure Event Grid with Blob Storage events; Debezium events that carry only keys.
+avoid: When subscribers always need the whole payload and it is tiny; put the data in the event.
+flow:
+  Uploader [client] -> Object store [store: S3] : PUT video.mp4 | The data goes to storage first, not through the broker.
+  Object store -> events topic [topic: object created] : event with bucket and key | The store publishes a small event, a few hundred bytes.
+  events topic -> Thumbnailer [svc], Virus scanner [svc] : event | Each subscriber receives the same small event.
+  Thumbnailer -> Object store : GET by key | Only the subscribers that need the bytes fetch them.
+  Virus scanner -x> Object store : 403 denied | A subscriber without read rights learns the event but cannot read the data.
+ref: docs | Claim-Check pattern | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/patterns/claim-check
+ref: docs | Amazon S3 Event Notifications | Amazon Web Services | https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html
+
+@@ catalog
+== Catalog as the commit point for table versions
+kind: open-table-format, lease
+when: Many engines read and write the same tables on object storage, and each commit must be atomic.
+how: Data lives as immutable files on object storage. A table is a tree of metadata files that list those data files. The catalog stores one thing per table: a pointer to the current metadata file.
+A writer creates new data files and a new metadata file, then asks the catalog to swap the pointer from the old version to the new one. The swap is a compare-and-set. If another writer committed first, the swap fails; the writer re-reads, checks for conflict and retries.
+Readers ask the catalog for the pointer, then read files directly. They see a consistent snapshot even while writes continue. Spark, Trino and Flink can share tables this way, because they agree on the catalog, not on a vendor engine.
+used: Apache Iceberg with a REST catalog, Hive Metastore, AWS Glue or Unity Catalog; Delta Lake commits through its log with the same idea.
+avoid: When there is one engine and small tables; a plain database table is enough.
+flow:
+  Spark writer [svc: job] -> Object store [lake: data + metadata] : write new files | The writer first adds new data files and a new metadata file; nobody sees them yet.
+  Spark writer -> Catalog [db: table pointers] : commit v8 if current is v7 | The writer asks to swap the pointer, only if it is still at v7.
+  Trino writer [svc: job] -x> Catalog : commit v8 if current is v7 | A second writer used the same base version, so its commit is refused.
+  Trino writer -> Catalog : re-read, commit v9 | After checking for conflicts, it retries on top of v8.
+  Trino reader [svc: query] -> Catalog : load table orders | A reader asks for the current pointer.
+  Trino reader -> Object store : read v9 files | The reader then reads a consistent snapshot straight from storage.
+ref: spec | Apache Iceberg REST Catalog specification | Apache Iceberg | https://iceberg.apache.org/spec/
+ref: paper | Delta Lake: High-Performance ACID Table Storage over Cloud Object Stores | Armbrust et al., VLDB 2020 |
+
+== Governance at the catalog with credential vending
+kind: valet-key, control-data-plane
+when: Access rules for data must be set in one place and hold for every engine and every user.
+how: The catalog holds the names, schemas and permissions of tables. A user asks an engine to read a table. The engine asks the catalog, which checks the user's grants (RBAC, tags or attribute rules).
+If the user is allowed, the catalog returns the table location and a short-lived storage credential limited to that table's path. This is called credential vending. The engine uses it to read files from object storage. The user never gets a long-lived cloud key.
+This splits control and data. Policy is decided in a small control plane. Bytes move through the fast data path, straight from storage. Column masks and row filters are applied by trusted engines that read the policy from the catalog. Every grant and read can be logged for audit.
+used: Unity Catalog on Databricks; Iceberg REST catalogs with credential vending; Apache Polaris (an Iceberg REST catalog); Lake Formation on AWS.
+avoid: When the engine is untrusted and can ignore column masks; then serve filtered data through a view or a governed service.
+flow:
+  Analyst [user] -> Query engine [svc: Spark or Trino] : SELECT from sales.orders | The analyst runs a query by table name.
+  Query engine -> Catalog [svc: policy + names] : load table, who is asking | The engine asks for the table on behalf of the user.
+  Catalog -> Policy store [db: grants] : check SELECT | The catalog looks up grants for this user and table.
+  Catalog -> Query engine : location + 15-min token | A scoped, short-lived credential comes back with the path.
+  Query engine -> Object store [lake: Parquet] : read with token | The engine reads files directly using the token.
+  Catalog -x> Query engine : denied | A user with no grant gets no location and no token.
+  Catalog ~> Audit log [log] : who read what | Each access is recorded for audit.
+ref: docs | Unity Catalog documentation | Databricks | https://docs.databricks.com/en/data-governance/unity-catalog/index.html
+ref: docs | Apache Polaris | Apache Software Foundation | https://polaris.apache.org/
+
+== Lineage events from jobs into the catalog
+kind: event-driven, observability-pipeline
+when: Teams need to know which jobs and tables feed a report, and what breaks if a table changes.
+how: Each job reports what it read and wrote. The OpenLineage standard defines an event with a job, a run and input and output datasets. Spark, Airflow and dbt integrations emit these events at the start and end of a run.
+A lineage service (Marquez, DataHub or the catalog itself) receives the events and builds a graph: dataset to job to dataset. Column-level lineage can be added where the engine gives it.
+Users then ask two questions. Upstream: where did this dashboard number come from? Downstream: who is affected if I drop this column? The graph is only as good as its coverage, so jobs that do not emit events leave holes.
+used: OpenLineage with Marquez; DataHub and OpenMetadata ingest lineage; Unity Catalog collects lineage from Databricks workloads.
+avoid: When there are only a few pipelines; a diagram in the wiki is cheaper.
+flow:
+  Airflow task [svc: scheduler] -> Spark job [svc: transform] : run | The orchestrator starts a job that reads raw.orders.
+  Spark job -> Lineage API [svc: OpenLineage] : START, inputs: raw.orders | The job tells the service what it reads.
+  Spark job -> Lake [lake: tables] : write curated.orders | The job writes its output table.
+  Spark job -> Lineage API : COMPLETE, outputs | At the end it reports the output dataset.
+  Lineage API -> Graph store [db: datasets and jobs] : add edges | The service links raw.orders to curated.orders through this job.
+  Engineer [user] -> Graph store : who uses curated.orders? | Before a schema change, an engineer asks for downstream users.
+ref: docs | OpenLineage documentation | LF AI & Data Foundation | https://openlineage.io/docs/
+
+@@ apigateway
+== Edge gateway for authentication and rate limits
+kind: api-gateway, rate-limit
+when: Many back-end services need the same checks on each request, and you do not want to repeat them in every service.
+how: All outside traffic enters through the gateway. It ends TLS, checks the token (for example a JWT, verified with the issuer's public keys) and matches the route by host and path. It rejects bad requests before they reach a back end.
+Then it applies a limit per client key, often a token bucket: for example 100 requests per second with a burst of 200. Over the limit, it returns 429 with a Retry-After header. Counters can live in the gateway node, or in a shared store such as Redis if the limit must be global.
+The gateway adds trusted headers (user id, scopes) and forwards the call. Back ends then trust the gateway and do their own fine-grained checks. The gateway is on every path, so it must be run as a highly available, stateless fleet.
+used: Kong, Envoy-based gateways, NGINX, AWS API Gateway and Azure API Management.
+avoid: For service-to-service traffic inside a cluster; use a mesh or direct calls. Do not put business logic in the gateway.
+flow:
+  Mobile app [client] -> API gateway [svc: TLS, routes] : GET /orders, Bearer JWT | Every call enters through one public address.
+  API gateway -> Identity provider [svc: JWKS keys] : fetch signing keys, cached | The gateway verifies the token locally with cached keys.
+  API gateway -> Rate store [cache: Redis] : token bucket for key | The gateway counts the call against the client's bucket.
+  Rate store -> API gateway : 3 tokens left | The call is within the limit.
+  API gateway -> Orders service [svc] : forward + X-User-Id | A valid call is routed with trusted identity headers.
+  Mobile app -x> API gateway : 11th burst call, 429 | A client over its limit is stopped at the edge.
+ref: docs | Gateway Routing pattern | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/patterns/gateway-routing
+ref: docs | Kong Gateway documentation | Kong Inc. | https://docs.konghq.com/gateway/latest/
+
+== Gateway aggregation per client type
+kind: bff, scatter-gather
+when: A screen needs data from several services, and mobile and web need different shapes of it.
+how: Without a gateway, the phone makes five calls over a slow network. With aggregation, the client makes one call. The gateway (or a backend for frontend per client type) calls the services in parallel and merges the answers into one response.
+Each downstream call gets a deadline shorter than the client's. If an optional part is late, such as recommendations, the gateway returns the rest with that part empty. If a required part fails, the whole call fails.
+Separate back ends for web, TV and mobile keep payloads small and let each team change its own API. GraphQL gateways do this with a schema; the parallel fan-out and merge idea is the same.
+used: Netflix has described its device-specific API layer; SoundCloud described the BFF idea; Apollo Router and Hasura as GraphQL gateways.
+avoid: When one service already owns the whole answer; extra hops only add latency.
+flow:
+  TV app [client] -> TV BFF [svc: gateway] : GET /home | One call from the device, instead of several.
+  TV BFF -> Profile service [svc], Catalog service [svc], Recs service [svc] : parallel calls, 150 ms | The gateway fans out with a deadline.
+  Profile service -> TV BFF : profile | A required part arrives.
+  Catalog service -> TV BFF : titles | Another required part arrives.
+  Recs service -x> TV BFF : timeout | The optional part is late, so it is dropped.
+  TV BFF -> TV app : merged JSON, rows only | The device gets one small response shaped for its screen.
+ref: docs | Backends for Frontends pattern | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/patterns/backends-for-frontends
+ref: blog | Pattern: Backends For Frontends | Sam Newman, 2015 | https://samnewman.io/patterns/architectural/bff/
+
+== Strangler facade for migrating an API
+kind: strangler-fig, blue-green
+when: An old system is being replaced, and clients must not change or see downtime.
+how: The gateway becomes the single address clients use. At first it routes every path to the old system. Then, route by route, the team builds the new service and changes the gateway rule.
+A rule can send by path (/v2/orders to new), by header, or by a percentage of traffic. Start with 1 percent, watch error rate and latency, then move to 10, 50 and 100. If errors rise, change the weight back; the old system is still running.
+Shadow traffic is also possible: the gateway sends a copy of the request to the new service and compares answers, without returning them. When no route is left on the old system, you turn it off.
+used: Migration from monoliths to services at many companies; Envoy and NGINX weighted routes; AWS API Gateway stage canaries.
+avoid: When the data model changes so much that old and new cannot share a database during the move; plan a data migration first.
+flow:
+  Client [client] -> API gateway [svc: routing rules] : GET /orders/42 | Clients use one address that never changes.
+  API gateway -> Legacy monolith [svc: old] : 99% of /orders | At first almost all traffic goes to the old system.
+  API gateway -> Orders service [svc: new] : 1% of /orders | A small share goes to the new service.
+  Orders service -> API gateway : response | The new service answers in the same contract.
+  * API gateway: 50% new | After clean metrics, the weight moves up in steps.
+  Orders service -x> API gateway : 5xx spike | If errors rise, the weight goes back to the old system.
+ref: blog | StranglerFigApplication | Martin Fowler, 2004 | https://martinfowler.com/bliki/StranglerFigApplication.html
+
+@@ cdn
+== Tiered cache with origin shield and request collapsing
+kind: cdn-edge, cache-aside
+when: Many users ask for the same content, and the origin must not see most of that traffic.
+how: A viewer's request goes to a nearby edge server. On a hit, the edge answers in a few milliseconds. On a miss, the edge asks a regional or shield cache. Only on a second miss does the shield ask the origin.
+Request collapsing matters for popular new objects. If 5,000 viewers ask for a new file at once, the edge sends one request upstream and holds the others until it arrives. Inside a site, consistent hashing sends each object to one cache server, so the site stores one copy, not one per server.
+The edge obeys Cache-Control: max-age sets freshness. After it ends, the edge revalidates with an ETag and gets a small 304 reply if the object has not changed. A 95 percent hit ratio means the origin sees one request in twenty.
+used: Cloudflare Tiered Cache, Amazon CloudFront Origin Shield, Fastly shielding, Akamai tiered distribution.
+avoid: For private, per-user responses with no shared copy; caching them gives a low hit rate and a risk of leaks.
+flow:
+  Viewer [client] -> Edge cache [cache: nearest PoP] : GET /app.js | The viewer goes to the nearest edge location.
+  Edge cache -> Shield cache [cache: one region] : miss, fetch | The edge does not know the object, so it asks the shield.
+  Shield cache -> Origin [svc: web servers] : miss, fetch | Only the shield can reach the origin.
+  Origin -> Shield cache : 200, max-age 3600 | The origin sets the freshness time.
+  Shield cache -> Edge cache : object | The object is stored in both layers.
+  Edge cache -> Viewer : hit, 8 ms | The next 5,000 viewers get hits and the origin sees no more requests.
+ref: docs | HTTP Caching (RFC 9111) | Fielding, Nottingham & Reschke, IETF, 2022 | https://www.rfc-editor.org/rfc/rfc9111
+ref: docs | Cloudflare Tiered Cache | Cloudflare | https://developers.cloudflare.com/cache/how-to/tiered-cache/
+
+== Fast purge and stale-while-revalidate
+kind: cdn-edge, cache-aside
+when: Pages are cached for speed, but an edit must show up quickly, and slow origin refreshes must not hurt users.
+how: Set a long cache time for speed. For freshness, use two tools. First, stale-while-revalidate: after max-age ends, the edge may serve the old copy for a set time (for example 60 seconds) while it fetches a fresh one in the background. Users never wait for the origin.
+Second, purge by key. The origin tags each response with surrogate keys, for example "product-42". When a product changes, the publisher calls the CDN purge API with that key. The CDN drops every page that carries the key, on all edges. Fastly and Cloudflare document purge by tag.
+Purge is fast but not free of limits, and must be called after the database commit. Versioned file names (app.4f3a.js) avoid purges for static assets entirely.
+used: Fastly surrogate keys; Cloudflare purge by cache tag; news and shop sites that purge on publish.
+avoid: For data that changes every second; use short TTLs or no caching and keep logic at the origin.
+flow:
+  Editor [user] -> CMS [svc: origin] : update product 42 | A person edits a page at the origin.
+  CMS -> CDN purge API [svc: control plane] : purge key product-42 | The CMS asks the CDN to drop every object tagged product-42.
+  CDN purge API -> Edge cache [cache: all PoPs] : invalidate tagged | The purge reaches edges in seconds.
+  Viewer [client] -> Edge cache : GET /p/42 | The next viewer asks for the page.
+  Edge cache -> CMS : fetch fresh page | The edge misses and loads the new version.
+  Edge cache ~> CMS : background refresh | For other pages, stale copies are served while refresh happens in the background.
+ref: docs | Purging with surrogate keys | Fastly documentation | https://www.fastly.com/documentation/guides/full-site-delivery/purging/working-with-surrogate-keys/
+ref: spec | Cache-Control: stale-while-revalidate (RFC 5861) | Nottingham, IETF, 2010 | https://www.rfc-editor.org/rfc/rfc5861
+
+== Signed URLs for private content at the edge
+kind: valet-key, cdn-edge
+when: Paid or private files must be served from the CDN, but only to users who are allowed.
+how: The app authenticates the user and checks the right to the file. It then creates a signed URL: the path, an expiry time and a signature made with a secret key shared with the CDN. CloudFront uses a key pair; many CDNs use an HMAC token.
+The client fetches the file from the edge with that URL. The edge checks the signature and expiry without calling the origin. If valid, it serves the cached object. If not, it returns 403.
+This keeps the app out of the data path: the app only signs, and the CDN carries the bytes. Keep expiry short for downloads, such as 5 minutes, and longer for video segments. A signed URL can be shared by the holder, so bind it to an IP or use cookies where needed.
+used: Amazon CloudFront signed URLs and cookies; Cloudflare and Akamai token authentication; paid video and software download sites.
+avoid: When content is public; signing only adds work and hurts the cache hit rate if the signature is part of the cache key.
+flow:
+  User [user] -> App server [svc: auth] : GET download link | The user logs in and asks for a file.
+  * App server: signs path + expiry | The app signs the path and expiry with the key shared with the CDN.
+  App server -> User : signed URL, 5 min | The link is returned to the user.
+  User -> Edge cache [cache: verifies sig] : GET with signature | The user fetches from the nearest edge.
+  Edge cache -> Origin [store: private bucket] : fetch on miss | A valid request on a miss loads the object from the private bucket.
+  User -x> Edge cache : expired, 403 | An old or changed link is refused at the edge.
+ref: docs | Serve private content with signed URLs and cookies | Amazon CloudFront | https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/PrivateContent.html
+ref: docs | Valet Key pattern | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/patterns/valet-key
+
+@@ loadbalancing
+== Two tiers: L4 spreads connections, L7 routes requests
+kind: horizontal-scale, health-check
+when: One address must front hundreds of servers at very high traffic, with smart routing by URL or header.
+how: Tier one is an L4 balancer. It sees only TCP or UDP packets and picks a backend by hashing the connection tuple. Software ones such as Google's Maglev or Meta's Katran use consistent hashing, so most flows stay on the same machine when a backend is added. Routers spread packets over L4 nodes with ECMP.
+Tier two is a fleet of L7 proxies (NGINX, Envoy, HAProxy). They end TLS, read the HTTP request and route by host, path or header. They pick a server with an algorithm. Least-request with power of two choices samples two servers and takes the one with fewer active requests; it avoids both herding and global state.
+Each tier scales alone. L4 is cheap per packet. L7 costs more CPU but gives retries, timeouts and metrics.
+used: Google Maglev (NSDI 2016 paper); Meta Katran; GitHub's GLB; Envoy's least-request policy uses two random choices by default.
+avoid: For small services; one L7 proxy or a cloud load balancer is enough.
+flow:
+  Client [client] -> L4 balancer [svc: Maglev style] : TCP SYN to VIP | Clients connect to one virtual IP.
+  L4 balancer -> L7 proxy A [svc: Envoy], L7 proxy B [svc: Envoy] : hash of 5-tuple | Consistent hashing picks a proxy; no per-flow state is shared.
+  L7 proxy A -> App 1 [svc: 12 active], App 2 [svc: 3 active] : pick of two random | The proxy samples two apps and compares their load.
+  L7 proxy A -> App 2 : GET /cart | It chooses App 2, which has fewer active requests.
+  App 1 -x> L7 proxy A : 503, outlier | Repeated errors mark App 1 as an outlier.
+  * App 1: ejected 30 s | The proxy skips App 1 for a while, then tries it again.
+ref: paper | Maglev: A Fast and Reliable Software Network Load Balancer | Eisenbud et al., Google, NSDI 2016 | https://research.google/pubs/maglev-a-fast-and-reliable-software-network-load-balancer/
+ref: docs | Envoy load balancing: least request | Envoy documentation | https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers
+
+== Global load balancing across regions
+kind: multi-region, active-passive
+when: Users are spread across the world, and traffic must go to the nearest healthy region and survive a region outage.
+how: The first decision is made by DNS or anycast. With GeoDNS, the resolver's location picks a regional address. With anycast, the same IP is announced from many sites by BGP and routing delivers users to the nearest one.
+A health system checks each region from outside, with probes every 10 to 30 seconds. If a region fails, its address is removed from DNS answers or its BGP route is withdrawn. Traffic moves in seconds with anycast; with DNS it is limited by the record TTL, so use 30 to 60 seconds.
+Each region has its own local load balancers. Weights allow a canary region or gradual drain. Keep spare capacity: if one of three regions fails, the others take 50 percent more traffic.
+used: Google Cloud global external Application Load Balancer; AWS Route 53 latency and failover routing; Cloudflare anycast network.
+avoid: When the data layer is single-region; a global front door just sends users to a region that cannot serve them.
+flow:
+  User [user] -> GeoDNS [svc: latency routing] : lookup shop.example | The user's resolver asks for the address.
+  GeoDNS -> User : EU region address | The answer points to the nearest region.
+  User -> EU load balancer [svc: region] : HTTPS request | The user connects to the EU region.
+  Prober [svc: health probes] -x> EU load balancer : probe fails 3 times | An outside prober sees that the EU region is down.
+  Prober -> GeoDNS : remove EU address | The control system updates DNS answers.
+  User -> US load balancer [svc: region] : next lookup | After the TTL, new requests go to the US region.
+ref: docs | Geode pattern | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/patterns/geodes
+ref: docs | Amazon Route 53 routing policies | Amazon Web Services | https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy.html
+
+== Health checks and connection draining in rolling deploys
+kind: health-check, blue-green
+when: Servers are replaced or fail often, and users must not see errors when it happens.
+how: Each backend exposes a readiness endpoint, such as /healthz. The balancer probes it every few seconds. Two or three failures remove the server from rotation; a few successes bring it back. Active probes find a dead server; passive checks on live errors find a sick one faster.
+During a deploy, the orchestrator first marks the old instance as draining. The balancer stops sending new requests but lets in-flight ones finish, usually for 30 to 60 seconds. Then the instance is stopped. A new instance only gets traffic after its readiness check passes.
+Set the drain time longer than the slowest normal request, and keep a limit on how many instances are out at once, for example 25 percent. Otherwise remaining servers get overloaded.
+used: AWS ALB and NLB target groups with deregistration delay; Kubernetes readiness probes with Services; HAProxy and Envoy health checking.
+avoid: When the health endpoint only checks that the process is alive; it should test the dependencies the server needs, but not so deep that a slow database removes every server at once.
+flow:
+  Deployer [svc: orchestrator] -> Load balancer [svc: pool of 4] : drain instance 1 | The deployer marks the old instance as draining.
+  Load balancer -> Instance 1 [svc: draining] : in-flight only | No new requests; running ones finish.
+  * Instance 1: stopped | After the drain time, the old instance stops.
+  Deployer -> Instance 5 [svc: v2, starting] : start new version | A new instance starts.
+  Load balancer -> Instance 5 : GET /healthz | The balancer probes readiness.
+  Instance 5 -> Load balancer : 200 OK ×3 | After three passes, it joins the pool.
+  Load balancer -x> Instance 3 [svc: crashed] : probe timeout | A crashed instance fails its probes and leaves rotation.
+ref: docs | Health Endpoint Monitoring pattern | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/patterns/health-endpoint-monitoring
+
+@@ servicemesh
+== Sidecar proxies with automatic mutual TLS
+kind: service-mesh, sidecar, zero-trust
+when: Many services in a cluster must talk securely, and you cannot change every service's code to add encryption.
+how: A sidecar proxy (Envoy in Istio) is injected next to each pod. All inbound and outbound traffic of the pod goes through it. The service speaks plain HTTP to localhost; the proxies speak mutual TLS to each other.
+The control plane (istiod in Istio) acts as a certificate authority. It gives each proxy a short-lived certificate that names the workload, using the SPIFFE identity form. In Istio the default lifetime is 24 hours, and the proxy renews it before it ends, with no restart.
+Authorization rules then say which identity may call which service, for example "frontend may call orders on GET". The proxy checks the caller's certificate on each request. The price is about one extra proxy hop per call and extra CPU and memory per pod.
+used: Istio and Linkerd for mTLS between pods; Consul Connect; common in regulated environments that require encryption in transit.
+avoid: For a few services; a library or plain TLS to the database may be enough. Also costly for very latency-sensitive paths.
+flow:
+  Frontend pod [svc: app + proxy] -> istiod [svc: control plane + CA] : request certificate | At start, the sidecar asks for an identity certificate.
+  istiod -> Frontend pod : cert frontend, 24 h | The control plane issues a short-lived certificate for this workload.
+  Frontend pod -> Orders pod [svc: app + proxy] : mTLS, GET /orders | The app sends plain HTTP; proxies encrypt it and show their certificates.
+  Orders pod -> istiod : fetch policy | The orders proxy holds the rule for who may call.
+  * Orders pod: allows frontend | The proxy checks the caller's certificate against its allow rule and lets the call pass.
+  Batch pod [svc: app + proxy] -x> Orders pod : no matching rule, 403 | A caller with no allow rule is rejected by the proxy.
+ref: docs | Istio security | Istio documentation | https://istio.io/latest/docs/concepts/security/
+ref: spec | SPIFFE specification | SPIFFE project, CNCF | https://spiffe.io/docs/latest/spiffe-about/overview/
+
+== Mesh-level retries, timeouts and traffic shifting
+kind: control-data-plane, blue-green
+when: Teams want the same retry, timeout and canary rules for every service without library changes.
+how: Rules live in the control plane as configuration, for example an Istio VirtualService and DestinationRule. The control plane sends them to every Envoy proxy over xDS. The proxies enforce them on live traffic, so changing a rule needs no deploy.
+A route can send 95 percent of calls to version 1 and 5 percent to version 2. It can set a timeout of 2 seconds and at most 2 retries on 503 errors only. Outlier detection ejects an endpoint after several 5xx replies in a row, for a period.
+Retries need care. Retrying at every layer multiplies load: three layers with three tries each can make 27 calls. Use a retry budget and retry only calls that are idempotent.
+used: Istio, Linkerd and Envoy-based meshes; Flagger and Argo Rollouts drive weights for automatic canaries.
+avoid: When one gateway already does the job for a single hop; a mesh adds operating cost.
+flow:
+  Operator [user] -> Control plane [svc: Istio] : apply 95/5 route | The operator changes a route rule as configuration.
+  Control plane -> Cart proxy [svc: Envoy] : xDS push | The new rule reaches the caller's proxy in seconds.
+  Cart proxy -> Pricing v1 [svc: stable] : 95% of calls | Most calls go to the stable version.
+  Cart proxy -> Pricing v2 [svc: canary] : 5% of calls | A small share goes to the new version.
+  Pricing v2 -x> Cart proxy : 503 | The canary fails on a call.
+  Cart proxy -> Pricing v1 : retry once | The proxy retries on another endpoint, within the timeout.
+  Cart proxy ~> Control plane : metrics, 503 rate | Metrics show the canary error rate; a rollout tool can set weight to 0.
+ref: docs | Istio traffic management | Istio documentation | https://istio.io/latest/docs/concepts/traffic-management/
+ref: docs | Envoy xDS configuration API | Envoy documentation | https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol
+
+== Sidecarless mesh with per-node proxies and eBPF
+kind: service-mesh, control-data-plane
+when: Sidecars cost too much memory, slow pod start or complicate upgrades, but you still want mesh features.
+how: Put the data plane in the node, not in each pod. Istio ambient mode runs a ztunnel on every node. It handles mTLS and L4 authorization for all pods on that node. Only services that need L7 features, such as header routing or HTTP retries, get a waypoint proxy (Envoy) that runs as its own deployment.
+Cilium takes another path. Its eBPF programs in the kernel handle identity-based L3 and L4 policy, and its Envoy runs per node for L7 rules.
+The result is that apps need no injection and no restart to join the mesh. Upgrading the mesh means upgrading node components, not every pod. The trade-off is a shared proxy per node: a fault or noisy neighbour affects more pods, and the policy model differs from sidecars.
+used: Istio ambient mode; Cilium service mesh; Linkerd and classic Istio keep sidecars.
+avoid: When you need strong isolation per workload at L7, or your kernel is too old for the eBPF features you need.
+flow:
+  App pod [svc: no sidecar] -> ztunnel [svc: per-node, L4] : outbound call | Traffic leaves the pod and is captured by the node proxy.
+  ztunnel -> Remote ztunnel [svc: node B] : mTLS tunnel | Node proxies encrypt traffic between nodes with workload identity.
+  Remote ztunnel -> Orders pod [svc: no sidecar] : plain call | The destination node proxy delivers the request.
+  ztunnel -> Waypoint [svc: Envoy, L7] : only if L7 policy | Services with L7 rules are sent through a waypoint first.
+  Waypoint -> Orders pod : routed request | The waypoint applies header routing and retries.
+  Istiod [svc: control plane] ~> ztunnel : config and certs | The control plane keeps node proxies up to date.
+ref: docs | Istio ambient mode overview | Istio documentation | https://istio.io/latest/docs/ambient/overview/
+ref: docs | Cilium service mesh | Cilium documentation | https://docs.cilium.io/en/stable/network/servicemesh/
+
+@@ vpc
+== Public and private subnets with NAT egress
+kind: none
+when: Most servers must reach the internet for updates or APIs, but must not be reachable from the internet.
+how: A VPC is split into subnets in several availability zones. A public subnet has a route to an internet gateway. Only load balancers and NAT gateways live there. Application servers and databases sit in private subnets, with no public IP.
+A route table says where each destination goes. For a private subnet, 0.0.0.0/0 points to a NAT gateway. The NAT gateway translates the private source address to its own public address, so a server can start outbound calls, but no one outside can start a call in.
+Security groups are stateful firewalls on each network interface. Allow the load balancer's group to reach the app on port 8080, and the app's group to reach the database on 5432. Use one NAT gateway per zone, so a zone failure does not cut egress. NAT is billed per hour and per GB.
+used: The standard layout for web applications on AWS, and the same idea on Google Cloud VPC with Cloud NAT and Azure VNets.
+avoid: For heavy traffic to AWS services such as S3; use VPC endpoints, which are cheaper than sending it through NAT.
+flow:
+  User [user] -> Load balancer [svc: public subnet] : HTTPS 443 | The only public entry is the load balancer.
+  Load balancer -> App server [svc: private subnet] : port 8080, SG allows | The security group allows only the load balancer's group.
+  App server -> Database [db: private subnet] : port 5432 | The database accepts only the app's group.
+  App server -> NAT gateway [svc: public subnet] : route 0.0.0.0/0 | The route table sends internet traffic to NAT.
+  NAT gateway -> Package repo [svc: internet] : source = NAT public IP | The outside party sees only the NAT address.
+  Package repo -x> App server : unsolicited inbound | Nothing from outside can open a connection to a private server.
+ref: docs | How Amazon VPC works | Amazon Web Services | https://docs.aws.amazon.com/vpc/latest/userguide/how-it-works.html
+
+== Hub-and-spoke network with a transit gateway
+kind: none
+when: Dozens of VPCs or accounts must talk to each other and to on-premises, without a full mesh of peering links.
+how: Peering every VPC to every other needs n times n minus 1, over 2 links, so 50 VPCs need 1,225. Instead, attach each VPC to one central router, such as AWS Transit Gateway, Google Network Connectivity Center or Azure Virtual WAN. Each VPC is a spoke.
+The router has route tables. Spokes in the same table can reach each other. Separate tables keep production apart from development. Shared services, such as DNS, a central firewall and the VPN to the office, sit in a hub VPC.
+VPC CIDR ranges must not overlap, so plan an address scheme early. For inspection, send traffic through a firewall in the hub. This is easy to run, but data processing charges per GB apply, and the router is a central dependency.
+used: AWS Transit Gateway designs in landing zones; Azure hub-and-spoke reference architecture; Google Cloud hub-and-spoke with Network Connectivity Center.
+avoid: For two or three VPCs; direct peering is simpler and cheaper.
+flow:
+  App VPC [svc: 10.1.0.0/16] -> Transit gateway [svc: route tables] : attach, spoke | Each VPC has one attachment to the central router.
+  Data VPC [svc: 10.2.0.0/16] -> Transit gateway : attach, spoke | The data VPC joins the same router.
+  App VPC -> Transit gateway : to 10.2.0.0/16 | A packet for the data VPC goes to the router.
+  Transit gateway -> Data VPC : routed by table | The prod route table allows this path.
+  Dev VPC [svc: 10.9.0.0/16] -x> Transit gateway : to prod, no route | A separate dev table has no route to production.
+  Transit gateway -> Hub VPC [svc: DNS, firewall] : to shared services | All spokes reach shared services in the hub.
+ref: docs | Building a scalable and secure multi-VPC AWS network infrastructure | Amazon Web Services | https://docs.aws.amazon.com/whitepapers/latest/building-scalable-secure-multi-vpc-network-infrastructure/welcome.html
+
+== Private endpoints to managed services
+kind: zero-trust, valet-key
+when: Workloads must use cloud services or a partner's API without sending traffic over the public internet.
+how: A VPC endpoint puts a private network interface for a service inside your subnet. With an interface endpoint (AWS PrivateLink), the service gets private IPs in your VPC, and DNS names resolve to them. A gateway endpoint for S3 or DynamoDB is a route table entry that sends traffic over the provider's network.
+Traffic never leaves the provider network and needs no internet gateway or NAT. An endpoint policy can limit which buckets or actions are allowed from this VPC. A bucket policy can then accept calls only from that endpoint.
+PrivateLink also lets a company expose its own service to customers' VPCs without peering or overlapping-address problems. The consumer sees only an interface, not the provider's network.
+used: S3 gateway endpoints; PrivateLink for SaaS such as Snowflake and Databricks; Azure Private Link; Google Private Service Connect.
+avoid: When many endpoints cost more than the NAT traffic they remove; interface endpoints are billed per hour per zone.
+flow:
+  Job server [svc: private subnet] -> VPC endpoint [svc: ENI in subnet] : s3.amazonaws.com resolves | DNS or route sends S3 calls to the endpoint.
+  VPC endpoint -> Endpoint policy [svc: allow list] : check bucket | The endpoint policy permits only named buckets.
+  Endpoint policy -> Data bucket [store: S3] : GET object | An allowed call reaches the bucket over the provider network.
+  Data bucket -> Job server : object | The data returns without touching the internet.
+  Job server -x> Other bucket [store: S3] : not in policy, 403 | A call to an unlisted bucket is denied.
+  Internet user [user] -x> Data bucket : only via endpoint | The bucket accepts calls only from this endpoint.
+ref: docs | AWS PrivateLink concepts | Amazon Web Services | https://docs.aws.amazon.com/vpc/latest/privatelink/concepts.html
+
+@@ finops
+== Cost and usage export into a showback pipeline
+kind: etl-elt, medallion
+when: Teams share cloud accounts, and finance asks who spent what, and why the bill rose.
+how: Each cloud writes a detailed bill: AWS Cost and Usage Report, Google Cloud billing export to BigQuery, Azure cost exports. These files have one row per resource and hour. The FOCUS open specification gives them one common column set across providers.
+The pipeline lands raw files unchanged, then cleans them and joins them with tags (team, service, environment) and an account-to-owner table. Costs that cannot be tagged, such as shared Kubernetes nodes or network, are split by a rule, for example by CPU request share. The gold layer is cost per team, product and day.
+Teams see their number in a dashboard (showback). With chargeback the number goes into the internal budget. Tag coverage is the key number: untagged spend above 10 percent makes the report hard to trust.
+used: AWS CUR with Athena, BigQuery billing export with Looker, OpenCost and Kubecost for Kubernetes, Databricks system billing tables.
+avoid: For a single small account; the provider's own cost explorer is enough.
+flow:
+  Cloud bill [store: CUR or export] -> Raw layer [lake: bronze] : daily load | The bill files land unchanged.
+  Tag policy [svc: IaC + checks] -> Resources [svc: tagged] : owner, env | Resources carry owner tags from creation.
+  Raw layer -> Clean layer [lake: silver] : join tags and owners | Rows are joined to owners; unknown rows are flagged.
+  Clean layer -> Allocation job [svc: split shared cost] : shared costs | Shared costs are split by a stated rule.
+  Allocation job -> Cost mart [db: per team per day] : aggregates | The gold table has cost per team and day.
+  Team lead [user] -> Cost mart : dashboard view | Each team sees its own spend and its change from last week.
+ref: spec | FOCUS (FinOps Open Cost and Usage Specification) | FinOps Foundation | https://focus.finops.org/
+ref: book | Cloud FinOps, 2nd ed. | Storment & Fuller, O'Reilly, 2023 |
+
+== Commitments for the base, spot for bursts
+kind: autoscaling, horizontal-scale
+when: Compute is the biggest cost line, and load has a steady base plus peaks and fault-tolerant batch work.
+how: Split demand into layers. The steady base that runs all day is covered by a commitment: a Savings Plan, Reserved Instance or committed-use discount, with a 1 or 3 year term. These can save a large share against on-demand prices, depending on term and service.
+The variable part runs on an autoscaling group that adds on-demand instances when load rises. Fault-tolerant work, such as batch jobs and stateless workers, runs on spot capacity, which can be much cheaper but can be taken back with a short warning (2 minutes on AWS).
+Design for interruption: spread over many instance types and zones, checkpoint work, and fall back to on-demand if spot is not available. Review commitment coverage monthly. Over-commit and you pay for idle capacity; under-commit and you pay full price.
+used: AWS Auto Scaling groups with mixed instances policy and Savings Plans; Karpenter and spot node pools on Kubernetes; Spark clusters on spot workers.
+avoid: For single-instance databases or stateful services that cannot tolerate being stopped.
+flow:
+  Load balancer [svc] -> Base fleet [svc: 20 committed] : steady traffic | The base fleet is always on and billed at the committed rate.
+  Autoscaler [svc: target 60% CPU] -> Burst fleet [svc: on-demand] : add nodes | When CPU passes the target, on-demand nodes are added.
+  Batch scheduler [svc: Spark or K8s] -> Spot fleet [svc: spot instances] : stateless tasks | Fault-tolerant jobs use cheap spot nodes.
+  Cloud provider [svc: capacity] -x> Spot fleet : 2-minute warning | The provider reclaims some spot nodes.
+  Spot fleet -> Batch scheduler : tasks failed, retry | The scheduler requeues lost tasks on other nodes.
+  Batch scheduler -> Burst fleet : fallback to on-demand | If spot is short, the work runs at full price instead of waiting.
+ref: docs | Amazon EC2 Spot Instances | Amazon Web Services | https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-spot-instances.html
+ref: docs | Karpenter documentation | Karpenter project, CNCF | https://karpenter.sh/docs/
+
+== Storage lifecycle tiering with rules
+kind: tiered-storage
+when: Data volume grows every month, but most of it is almost never read after the first weeks.
+how: Define rules on the bucket by prefix and age. For example: logs stay in standard storage for 30 days, move to an infrequent-access class at 30 days, to an archive class at 90, and are deleted at 400. The storage service applies the rules by itself.
+Classes trade price for access. Colder classes cost much less per GB, but charge a retrieval fee, may have a minimum storage period, and archive classes can take minutes to hours to read. Moving small objects can cost more than it saves, because requests are billed per object.
+Where access is unknown, use an automatic class (S3 Intelligent-Tiering) that moves objects by observed use. Always check the retrieval pattern first. A weekly report that scans 1 year of archived logs may cost more than keeping them warm.
+used: S3 lifecycle rules and Intelligent-Tiering; Google Cloud Storage Autoclass; Azure Blob lifecycle management; Kafka tiered storage uses the same idea.
+avoid: For data that is read often or must be read at once with no wait; keep it in the hot tier.
+flow:
+  App [svc] -> Standard tier [store: day 0-30] : PUT logs | New data is written to the fast, higher-priced tier.
+  Lifecycle rule [svc: bucket policy] -> Standard tier : age over 30 days | A rule checks object age every day.
+  Standard tier -> Infrequent tier [store: day 30-90] : transition | Older objects move to a cheaper class.
+  Infrequent tier -> Archive tier [store: day 90-400] : transition | Very old objects move to the cheapest class.
+  Analyst [user] -> Archive tier : restore request | An old object needs a restore before reading.
+  Archive tier -> Analyst : ready later, fee | The user waits and pays a retrieval charge.
+  Lifecycle rule -x> Archive tier : delete at day 400 | At the end of retention, data is deleted for good.
+ref: docs | Managing the lifecycle of objects | Amazon S3 | https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html
+
+@@ iac
+== Plan, apply and remote state with locking
+kind: control-loop, lease
+when: Several engineers and pipelines change the same cloud environment and must not overwrite each other.
+how: The code declares the wanted resources. The tool (Terraform or OpenTofu) reads the state file, which records what it created, and asks the cloud APIs for the real status. It computes a plan: create, change or destroy, in dependency order.
+State is kept in a shared backend such as an S3 bucket, not on a laptop. Before it plans or applies, the tool takes a lock in the backend. A second run that wants the lock waits or fails, so two applies cannot write state at the same time. Versioning on the bucket lets you recover an old state file.
+After the apply, the next plan should show no changes. If someone changed a resource by hand, the plan shows drift and can set it back. This is a reconcile step run on demand, not a continuous loop.
+used: Terraform and OpenTofu with S3, GCS or Terraform Cloud backends; Pulumi and CloudFormation use the same plan and state idea.
+avoid: For frequent changes to a few resources; a scripted CLI call is simpler. Do not edit state by hand.
+flow:
+  Engineer [user] -> Terraform [svc: plan] : plan | An engineer runs a plan against the code.
+  Terraform -> State backend [store: S3 + lock] : acquire lock, read state | The tool locks the state, then reads it.
+  Terraform -> Cloud API [svc: AWS] : describe real resources | The tool compares state with reality.
+  Terraform -> Engineer : plan: 2 add, 1 change | The engineer reviews the diff before anything changes.
+  Pipeline [svc: CI job] -x> State backend : lock held, wait | A second run is blocked while the first holds the lock.
+  Terraform -> Cloud API : apply in dependency order | Subnets come before servers, and so on.
+  Terraform -> State backend : write new state, unlock | The new state is saved and the lock is released.
+ref: docs | State and remote backends | Terraform documentation | https://developer.hashicorp.com/terraform/language/state
+ref: docs | OpenTofu documentation | OpenTofu project | https://opentofu.org/docs/
+
+== Pull request pipeline with plan review
+kind: gitops
+when: Infrastructure changes need review, an audit trail and safe rollout like application code.
+how: The infrastructure code is in Git. An engineer opens a pull request. CI runs format checks, validation and policy checks (for example Open Policy Agent or Checkov), then runs a plan and posts it as a comment. Reviewers read the real diff, not only the code.
+When the PR is merged to main, a pipeline runs apply with a service identity that has limited rights. Humans do not keep admin keys. The apply log is stored with the commit. Environments are separate folders or workspaces, each with its own state, promoted from dev to staging to production.
+Rollback is a revert commit and a new apply. Remember that a revert does not bring data back: a destroyed database stays destroyed. Mark critical resources with prevent-destroy and require approval for destroys.
+used: Atlantis, Terraform Cloud, Spacelift and GitHub Actions pipelines for Terraform; Argo CD and Flux apply the pull model for Kubernetes.
+avoid: For quick experiments in a sandbox account; the review steps slow learning.
+flow:
+  Engineer [user] -> Git repo [store: main + PRs] : open pull request | A change starts as a pull request.
+  Git repo -> CI pipeline [svc: validate + policy] : webhook | CI starts on each push.
+  CI pipeline -> Cloud API [svc: read only] : terraform plan | The plan uses read-only rights.
+  CI pipeline -> Git repo : plan as PR comment | Reviewers see exactly what will change.
+  Reviewer [user] -> Git repo : approve and merge | A second person approves.
+  Git repo -> Apply job [svc: scoped role] : merge event | The merge starts the apply with a limited role.
+  Apply job -> Cloud API : create and change | Only the approved change is applied.
+ref: docs | Atlantis documentation | Atlantis project | https://www.runatlantis.io/docs/
+ref: docs | OpenGitOps principles | OpenGitOps, CNCF | https://opengitops.dev/
+
+== Immutable images baked and rolled out
+kind: immutable-infra, blue-green
+when: Servers drift when patched by hand, and you want every instance in a fleet to be identical and replaceable.
+how: A build pipeline creates a machine image, for example an AMI, with Packer. It installs the OS patches and the app and runs tests on a test instance. The image gets an id and is never changed afterwards.
+IaC then updates the launch template to the new image id. An autoscaling group does an instance refresh: it starts new instances, waits for health checks, and then stops old ones, keeping a minimum healthy percentage such as 90 percent. A bad image is stopped by failed health checks, and the rollout can be cancelled.
+Rollback means pointing the template back to the old image id. No one logs into servers to fix them; they are replaced. This works best with stateless servers, with state kept in databases and object storage.
+used: Netflix baked AMIs with Spinnaker; Packer with Terraform and Auto Scaling groups; container images follow the same rule in Kubernetes.
+avoid: For stateful hosts with large local data; replacing them needs data copy time and care.
+flow:
+  CI pipeline [svc: Packer] -> Image registry [store: AMI v42] : bake and test image | The pipeline builds a patched image once.
+  Terraform [svc: IaC] -> Launch template [db: ami = v42] : update image id | IaC points the template to the new image.
+  Launch template -> Auto scaling group [svc: 10 servers] : start refresh | The group starts replacing old servers.
+  Auto scaling group -> New server [svc: v42] : launch | A new instance starts from the image.
+  New server -> Load balancer [svc] : health check passes | Only a healthy server gets traffic.
+  Auto scaling group -x> Old server [svc: v41] : terminate | The old instance is removed after the new one is healthy.
+ref: book | Infrastructure as Code, 2nd ed. | Kief Morris, O'Reilly, 2020 |
+ref: docs | Packer documentation | HashiCorp | https://developer.hashicorp.com/packer/docs
+
+@@ observability
+== Instrument once, collect centrally, store per signal
+kind: observability-pipeline
+when: Many services need metrics, logs and traces, and you want to change back ends without changing app code.
+how: Each service uses an OpenTelemetry SDK. It emits metrics, logs and traces in the OTLP format, and tags each with the service name and the trace id. The SDK sends to a local agent or a Collector gateway.
+The Collector runs a pipeline of receivers, processors and exporters. Processors batch data, add Kubernetes labels, drop noisy debug logs and redact secrets. Exporters then send each signal to its store: metrics to Prometheus or Mimir, traces to Tempo or Jaeger, logs to Loki or Elasticsearch.
+Because every record carries the trace id, an engineer can go from a slow-request graph to one trace, and from that trace to the log lines of the same request. A queue or buffer at the gateway protects back ends during spikes.
+used: OpenTelemetry Collector with the Grafana stack (Loki, Tempo, Mimir); Datadog and Elastic accept OTLP too; Prometheus scraping is the common pull alternative for metrics.
+avoid: For one small service; the platform's built-in logs and metrics are enough.
+flow:
+  Checkout service [svc: OTel SDK] -> OTel Collector [svc: gateway] : OTLP metrics, logs, traces | The SDK sends all three signals with one protocol.
+  OTel Collector -> Prometheus [db: metrics] : remote write | Metrics go to the time-series database.
+  OTel Collector -> Tempo [store: traces] : spans | Traces go to a trace store.
+  OTel Collector -> Loki [store: logs] : log lines + trace id | Logs go to a log store, still carrying the trace id.
+  Engineer [user] -> Grafana [svc: dashboards] : p99 latency panel | A slow graph is the entry point.
+  Grafana -> Tempo : open trace by id | The engineer jumps to one slow trace and then to its logs.
+ref: docs | OpenTelemetry Collector architecture | OpenTelemetry | https://opentelemetry.io/docs/collector/architecture/
+
+== Tail-based trace sampling
+kind: observability-pipeline, consistent-hashing
+when: Storing every trace is too costly, but errors and slow requests must always be kept.
+how: Head sampling decides at the start of a request, for example keep 1 percent. It is cheap but blind: it throws away most of the rare failing traces. Tail sampling decides after the trace is complete, so it can keep all errors and all traces slower than 1 second, plus 1 percent of the rest.
+For that, all spans of one trace must reach the same collector. A first layer of Collectors uses the load-balancing exporter to route spans by trace id with consistent hashing. A second layer runs the tail sampling processor. It holds spans in memory for a decision wait time, such as 30 seconds, then applies the policies.
+Costs: memory for buffered spans, extra delay, and a risk of broken traces if a collector restarts. Count traces per second to size the memory.
+used: OpenTelemetry Collector contrib tail_sampling processor; Grafana Tempo and Jaeger back ends; vendors offer hosted equivalents.
+avoid: At low volume, where keeping everything is cheap; or when only an overall rate matters, then head sampling is enough.
+flow:
+  Services [svc: emit spans] -> Router collectors [svc: loadbalancing] : spans | All services send spans to the first layer.
+  Router collectors -> Sampler A [svc: tail sampling], Sampler B [svc: tail sampling] : hash of trace id | The same trace id always lands on the same sampler.
+  * Sampler A: buffering 30 s | The sampler holds the spans until the trace is likely complete.
+  Sampler A -> Trace store [store: Tempo] : keep, status=error | A trace with an error is kept.
+  Sampler B -> Trace store : keep, latency over 1 s | A slow trace is kept.
+  Sampler B -x> Trace store : drop, fast and OK | Most fast, healthy traces are dropped, with 1 percent kept at random.
+ref: docs | Tail sampling processor | OpenTelemetry Collector contrib | https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/tailsamplingprocessor
+ref: docs | Sampling | OpenTelemetry | https://opentelemetry.io/docs/concepts/sampling/
+
+== Control metric cost with recording rules and label limits
+kind: pre-aggregation
+when: The metrics bill or query time grows fast, and most dashboards only need totals by a few labels.
+how: Cost in a metrics system is the number of active time series. It is the product of label values: a label like user_id or full URL creates millions of series. Review labels at code review. Keep labels with a small, fixed set of values, such as route template, status class and region.
+Then use recording rules. A rule in Prometheus computes an expression every minute, such as the request rate summed by service and route. The result is stored as a new series. Dashboards and alerts read the small series instead of scanning millions of raw ones.
+Keep raw data for a short time and rolled-up data for long periods. Latency should be stored as histograms, which can be summed across hosts, not as per-host percentiles, which cannot. Alerts on cardinality tell you before the bill does.
+used: Prometheus recording rules; Grafana Mimir and Thanos with downsampling; Datadog and Grafana Cloud offer cardinality tools.
+avoid: When you need to search by high-cardinality fields such as user id; use logs or traces for that.
+flow:
+  Pods [svc: 500 pods] -> Prometheus [db: raw series] : scrape every 15 s | Each pod exposes counters and histograms.
+  Prometheus -> Recording rules [svc: every 1 min] : sum by service, route | A rule rolls up pod-level series.
+  Recording rules -> Rollup series [db: small set] : 200 series, not 40k | The result is much smaller than the raw input.
+  Dashboard [client: Grafana] -> Rollup series : query 30 days | Long-range dashboards read only the rolled-up series.
+  Engineer [user] -x> Prometheus : label user_id rejected | A limit on labels or series drops a metric with unbounded labels.
+  Prometheus -> Alertmanager [svc: cardinality alert] : series count high | An alarm fires before the bill rises.
+ref: docs | Recording rules | Prometheus documentation | https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/
+ref: docs | Metric and label naming | Prometheus documentation | https://prometheus.io/docs/practices/naming/
+
+@@ slo
+== Multi-window burn-rate alerts
+kind: none
+when: You want alerts that fire fast for real outages, but stay quiet for small, harmless errors.
+how: Set an SLO, such as 99.9 percent of requests succeed over 30 days. The error budget is the other 0.1 percent. Burn rate is how fast you use it: a rate of 1 uses exactly the whole budget in 30 days; a rate of 14.4 uses 2 percent of it in one hour.
+Alert on burn rate over two windows at once. A page fires if the rate is over 14.4 for both the last 1 hour and the last 5 minutes. The long window shows the problem is big; the short window shows it is still happening, so the alert resets quickly. A second page uses rate 6 over 6 hours and 30 minutes. A slow burn of rate 1 over 3 days and 6 hours opens a ticket.
+These numbers come from the Google SRE Workbook. Pick yours from the budget share you accept to lose before a person is woken.
+used: Google SRE Workbook; Prometheus alert rules with Alertmanager; Sloth and Pyrra generate such rules; Grafana SLO.
+avoid: For services with very low traffic, where a few failed requests swing the rate; use longer windows or synthetic probes.
+flow:
+  Service [svc: API] -> Metrics store [db: Prometheus] : request counts by status | Success and error counts are recorded per minute.
+  Metrics store -> Burn-rate rules [svc: alert rules] : error ratio 1 h and 5 m | The rule reads the error ratio over two windows.
+  * Burn-rate rules: rate 15, both windows | Both windows pass 14.4 times the allowed error ratio.
+  Burn-rate rules -> Alertmanager [svc: routing] : page, 2% budget in 1 h | The alert says how much budget is gone and how fast.
+  Alertmanager -> On-call engineer [user] : page | A person is woken for a real, active burn.
+  Service -x> Metrics store : short blip, 5 m only | A short blip fails the long window and does not page.
+ref: book | The Site Reliability Workbook: Alerting on SLOs | Beyer et al., Google, O'Reilly, 2018 | https://sre.google/workbook/alerting-on-slos/
+
+== Error budget gates releases
+kind: blue-green, feature-flags
+when: Product teams want to ship fast, and reliability must still hold without long arguments.
+how: Each service has an SLO and a monthly error budget. A dashboard shows budget left. The team and the product owner agree a policy in advance. For example: while budget remains, ship at will; below 25 percent, ship only fixes and tested changes; at zero, freeze feature launches until the service is back inside its SLO.
+Releases use canaries or feature flags, so each change meets a small share of users first. The pipeline reads the SLI of the canary and compares it with the baseline. If the canary burns budget faster, the pipeline stops or rolls back.
+The policy turns a hard debate into a rule both sides agreed to. It works only if leaders back the freeze. Pick a budget the product really needs; 100 percent is not a goal.
+used: Google SRE practice; Argo Rollouts and Flagger with Prometheus analysis; LaunchDarkly or other flag tools for staged exposure.
+avoid: For services with no clear users or SLI; first define what the user cares about.
+flow:
+  Developer [user] -> CI pipeline [svc: deploy gate] : release v2 | A team wants to ship a change.
+  CI pipeline -> SLO service [svc: budget calculator] : budget left? | The gate asks for the current error budget.
+  SLO service -> CI pipeline : 62% left, go | There is enough budget, so the release may start.
+  CI pipeline -> Canary [svc: 5% of traffic] : deploy v2 | The new version gets a small share of traffic.
+  Canary -x> CI pipeline : error ratio 3x baseline | The canary's SLI is worse than baseline.
+  CI pipeline -> Canary : roll back | The pipeline reverses the rollout before most users see it.
+  * SLO service: budget 18%, freeze | Later, low budget switches the policy to fixes only.
+ref: book | Site Reliability Engineering: Embracing Risk | Beyer et al., Google, O'Reilly, 2016 | https://sre.google/sre-book/embracing-risk/
+
+== Measure the SLI at the load balancer with histograms
+kind: pre-aggregation, observability-pipeline
+when: You need a trustworthy user-facing SLI across many instances, cheaply and without averaging percentiles.
+how: Measure at a point near the user, such as the load balancer or API gateway. That sees failures the app itself cannot see, such as a crashed instance. Export two things: a counter of requests by status class, and a latency histogram with buckets that include the SLO threshold, for example 300 ms.
+Percentiles cannot be averaged across hosts, but histogram buckets can be summed. The availability SLI is good requests divided by all requests. The latency SLI is the count in buckets at or under 300 ms divided by all requests. Prometheus recording rules compute these ratios over 5 minutes, 1 hour and 30 days.
+Count only real user requests. Exclude health checks and known bots, and do not count a user's 400 error as a failure of yours.
+used: Prometheus with Envoy or NGINX metrics; Google Cloud Monitoring SLOs; Sloth and Pyrra for generated rules.
+avoid: Do not use average latency or a single host's p99 as the SLI; both hide the pain of the slowest users.
+flow:
+  Users [user] -> Load balancer [svc: edge metrics] : requests | Real requests pass the edge.
+  Load balancer -> Prometheus [db: counters + buckets] : status counts, buckets | The edge exports success counts and latency buckets.
+  Prometheus -> Recording rules [svc: SLI rules] : sum buckets across hosts | Buckets from all hosts are added together.
+  Recording rules -> SLI series [db: ratios] : good/total, 5m, 1h, 30d | The ratios become small, cheap series.
+  SLI series -> SLO dashboard [client: Grafana] : 99.93% vs 99.9% | The dashboard shows the SLI against the target.
+  Load balancer -x> Prometheus : health checks excluded | Health checks and bot traffic are filtered out of the SLI.
+ref: docs | Prometheus histograms and summaries | Prometheus documentation | https://prometheus.io/docs/practices/histograms/
+ref: book | The Site Reliability Workbook: Implementing SLOs | Beyer et al., Google, O'Reilly, 2018 | https://sre.google/workbook/implementing-slos/
+
+@@ sre
+== Incident command, escalation and blameless postmortem
+kind: none
+when: A serious outage needs fast, coordinated action and a lasting fix, not blame.
+how: An alert pages the primary on-call engineer. If they do not acknowledge within a few minutes, the page escalates to the secondary and then to a manager. For a large incident, the first responder declares an incident and roles are split: an incident commander who decides, an operations lead who changes systems, and a communications lead who updates stakeholders.
+One shared channel and a timeline keep all work visible. The first goal is to stop the harm, by rolling back or failing over, not to find the root cause. After resolution, the team writes a postmortem within days. It records the timeline, the contributing factors, what went well, and action items with owners and dates.
+It is blameless: it asks how the system allowed the mistake, not who made it. Action items are tracked like product work, or the same incident returns.
+used: Google SRE and many others; PagerDuty, Opsgenie and incident.io for paging and incident tooling; Atlassian publishes its incident handbook.
+avoid: For minor issues a single engineer can fix in minutes; keep the process light for those.
+flow:
+  Alert [svc: burn-rate page] -> Primary on-call [user] : page | A burn-rate alert wakes the primary engineer.
+  Primary on-call -x> Alert : no ack in 5 min | If no one acknowledges, the page does not stop.
+  Alert -> Secondary on-call [user] : escalate | The page moves to the next person.
+  Secondary on-call -> Incident channel [svc: chat + timeline] : declare SEV2, assign roles | A commander, an operations lead and a communications lead are named.
+  Incident channel -> Production [svc: rollback or failover] : mitigate first | The team stops the harm before looking for the cause.
+  Incident channel -> Postmortem doc [store: blameless] : timeline, actions | Within days, a postmortem lists causes and owned action items.
+ref: book | Site Reliability Engineering: Managing Incidents | Beyer et al., Google, O'Reilly, 2016 | https://sre.google/sre-book/managing-incidents/
+ref: book | Site Reliability Engineering: Postmortem Culture | Beyer et al., Google, O'Reilly, 2016 | https://sre.google/sre-book/postmortem-culture/
+
+== Automate toil with self-healing loops
+kind: control-loop, circuit-breaker
+when: The same manual fix happens every week, such as restarting a stuck worker or clearing a full disk.
+how: SRE sets a goal that toil, the repetitive manual work, stays under about 50 percent of an engineer's time. For each frequent page, write the fix as code. An alert triggers a runbook automation that checks the symptom, applies the fix and verifies the result.
+Keep the automation safe. It checks preconditions, limits its own action rate (for example three restarts per hour) and stops if the fix does not work. When the limit is hit, it pages a person with the log of what it tried. This is a circuit breaker for the automation itself.
+Kubernetes liveness probes and controllers do this for processes. For higher-level problems, use event-driven runbooks such as Rundeck, StackStorm or cloud automation. Log every action for review, and still read the postmortem: automation must not hide a real bug.
+used: Kubernetes controllers and probes; AWS Systems Manager Automation; Rundeck and StackStorm runbooks; Google describes the 50 percent toil goal.
+avoid: For unclear or rare failures; automating a bad guess can make the outage larger.
+flow:
+  Monitor [svc: alert rules] -> Automation [svc: runbook runner] : disk 95% full | An alert starts the matching runbook.
+  Automation -> Host [svc: app server] : rotate logs, clear temp | The runbook applies the known fix.
+  Automation -> Monitor : disk now 60%? | It checks that the symptom is gone.
+  * Automation: 1 of 3 runs used | A rate limit counts each run in the last hour.
+  Host -x> Automation : fix failed, 3rd time | The fix did not work again and again.
+  Automation -> On-call engineer [user] : page with action log | The loop stops and hands over to a person with full details.
+ref: book | Site Reliability Engineering: Eliminating Toil | Beyer et al., Google, O'Reilly, 2016 | https://sre.google/sre-book/eliminating-toil/
+
+== Restore test and failure drill
+kind: active-passive, health-check
+when: You must be sure that backups restore and that failover works before a real disaster tests it.
+how: A backup is not proven until it is restored. A scheduled job restores the latest backup into an isolated environment, runs checks (row counts, a test query, an app smoke test) and records the time taken. That time is your measured recovery time. The age of the backup is your recovery point.
+Failure drills practice the people side. A game day injects a planned fault, such as stopping the primary database in a staging copy or in production with a small blast radius, and the team follows the runbook. The drill reveals missing permissions, old docs and slow steps.
+Compare results with targets: recovery time objective (RTO) and recovery point objective (RPO). Fix gaps and repeat every quarter. Include the cold path: can you rebuild from code and backups in a new region?
+used: Google DiRT exercises; Netflix chaos engineering; AWS Fault Injection Service; automated restore tests in many managed backup tools.
+avoid: Running a drill in production without a stop button, a clear owner and approval.
+flow:
+  Scheduler [svc: weekly job] -> Backup store [store: snapshots] : fetch latest snapshot | A job picks the most recent backup.
+  Backup store -> Scratch DB [db: isolated copy] : restore | The snapshot is restored away from production.
+  Scratch DB -> Checker [svc: counts and smoke] : verify | Checks prove the data is complete and usable.
+  Checker -> Dashboard [svc: RTO and RPO] : restore took 42 min | The measured time is compared with the target.
+  Game day lead [user] -> Primary DB [db: staging copy] : stop primary | A planned fault stops the primary.
+  Primary DB -x> Replica DB [db: standby] : primary down | The standby must take over; the team follows the runbook.
+  Replica DB -> Dashboard : promoted in 3 min | The team records the real failover time and fixes the slow steps.
+ref: book | Site Reliability Engineering: Data Integrity | Beyer et al., Google, O'Reilly, 2016 | https://sre.google/sre-book/data-integrity/
+
+@@ workflow
+== Scheduled DAG with retries and idempotent tasks
+kind: backfill-replay, scheduler-agent
+when: A daily data job has many steps with dependencies, and failures must be retried without duplicate output.
+how: The workflow is a DAG: extract, then transform, then load, then publish. A scheduler creates a run for each time interval and starts a task when its upstream tasks have succeeded. The state of every task, such as queued, running, success or failed, is stored in a metadata database. Workers run the tasks.
+Each task has a retry policy, for example 3 tries with a 5-minute delay. Because a retry can run again, a task must be idempotent. A good way is to write to a partition named by the run date and overwrite it, not append to it.
+Backfill uses the same design. To reload last month, ask the scheduler for 30 runs in the past. Each run writes its own date partition, so reruns are safe. Limit parallel runs so you do not overload the source.
+used: Apache Airflow with scheduler, metadata database and executors; Dagster and Prefect work in a similar way; dbt jobs are often run as one task.
+avoid: For long-lived business processes with timers and human steps; use a durable execution engine.
+flow:
+  Scheduler [svc: Airflow] -> Metadata DB [db: task states] : create run 2026-10-27 | The scheduler records a new run for the date.
+  Scheduler -> Extract task [svc: worker] : upstream ready, start | The first task starts at once.
+  Extract task -> Raw table [lake: dt=2026-10-27] : overwrite partition | The task writes only its own date partition.
+  Transform task [svc: worker] -x> Metadata DB : failed, try 1 of 3 | The next task fails and is marked failed.
+  * Transform task: retry in 5 min | The scheduler queues a retry after the delay.
+  Transform task -> Clean table [lake: dt=2026-10-27] : overwrite partition | The retry succeeds and replaces the partial output.
+  Scheduler -> Metadata DB : backfill 30 past runs | A backfill is just more past runs with the same code.
+ref: docs | Airflow architecture overview | Apache Airflow documentation | https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/overview.html
+
+== Durable workflow with saga compensation
+kind: saga, event-sourcing
+when: A business process takes minutes to days across several services, and must survive crashes and finish or undo itself.
+how: The workflow is written as ordinary code: reserve stock, charge the card, ship. The engine (Temporal, for example) saves each step's result in an event history in its database. Workflow code is run by workers. If a worker dies, another worker replays the history to rebuild the state and continues from the last step. This needs the workflow code to be deterministic.
+Side effects run as activities, with their own retry policies and timeouts. A timer can wait for 7 days with no thread held. A signal can bring in a human approval.
+If a late step fails for good, the workflow runs compensating steps in reverse order: refund the card, release the stock. This is the saga pattern. Activities must be idempotent, because a retry may repeat one.
+used: Temporal and Cadence (from Uber); AWS Step Functions and Azure Durable Functions for similar flows; common in payments and onboarding.
+avoid: For short, simple jobs; a queue and a worker are cheaper to run.
+flow:
+  Order API [svc] -> Temporal server [svc: event history] : start OrderWorkflow | The API starts a workflow with an id.
+  Temporal server -> Worker [svc: workflow code] : workflow task | A worker runs the next step of the code.
+  Worker -> Payment service [svc: activity] : charge card, retry policy | The call is an activity with retries and a timeout.
+  Worker -> Shipping service [svc: activity] : create shipment | The next step starts after the charge.
+  Shipping service -x> Worker : bad address, final fail | The step fails and retries cannot fix it.
+  Worker -> Payment service : refund card | The workflow runs the compensation for the earlier step.
+  Temporal server ~> Worker : replay history after crash | If a worker dies, another one rebuilds state from history.
+ref: docs | Temporal documentation: workflows | Temporal Technologies | https://docs.temporal.io/workflows
+ref: paper | Sagas | Garcia-Molina & Salem, SIGMOD 1987 |
+
+== Data-aware triggers instead of clock schedules
+kind: event-driven, pipes-filters
+when: A job should run when its input data is ready, not at a fixed hour that may be too early or too late.
+how: A clock schedule can start a report at 06:00 even though the source load ends at 06:20. Data-aware orchestration links jobs to the data they make. In Airflow 3 these are assets (called datasets before); in Dagster they are software-defined assets.
+When a producer task finishes and updates an asset, the orchestrator records an event. Every downstream job that depends on that asset becomes ready and runs. A sensor can also watch for a new file in object storage or a message on a queue.
+The graph then shows data lineage as well as task order: which table comes from which. Failures stay local: if one input is late, only its consumers wait. Add freshness checks that alert when an asset is older than its target, such as 2 hours.
+used: Airflow assets and event-driven scheduling; Dagster assets, sensors and freshness policies; dbt models run after upstream loads.
+avoid: For fixed business-calendar jobs, such as month-end close at a set time; keep a clock schedule there.
+flow:
+  Ingest job [svc: loads orders] -> Orders asset [lake: raw.orders] : update asset, 06:20 | The load finishes and records that the asset is fresh.
+  Orders asset -> Orchestrator [svc: asset graph] : materialized event | The event reaches the orchestrator.
+  Orchestrator -> dbt job [svc: model run] : start, dependencies ready | The orchestrator runs every job that waits for this asset.
+  dbt job -> Sales mart [lake: analytics.sales] : build table | The job builds the table from fresh input.
+  Orchestrator -> Report job [svc: dashboard refresh] : sales mart updated | The report refreshes only after the table is ready.
+  Ingest job -x> Orders asset : late, not updated | If the load is late, nothing downstream runs on stale data.
+  Orchestrator ~> On-call [user: freshness alert] : asset older than 2 h | A freshness check alerts a person.
+ref: docs | Dagster software-defined assets | Dagster Labs | https://docs.dagster.io/concepts/assets/software-defined-assets
+ref: docs | Airflow assets | Apache Airflow documentation | https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/asset-scheduling.html
+

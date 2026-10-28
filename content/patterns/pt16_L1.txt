@@ -1,0 +1,881 @@
+@@ oltp
+== Primary with read replicas
+kind: leader-follower, read-replicas
+when: One database server cannot serve all reads, but every write must still go through one place.
+how: All writes go to one primary. Each commit is first made durable in the write-ahead log, usually with one fsync of about 1 ms on an SSD. The primary then streams the log records to replicas, which replay them in the same order.
+The application sends reads that can accept slightly old data (product pages, lists, reports) to replicas. Reads that must see the user's own write, such as "show my order after checkout", still go to the primary.
+Replication is usually asynchronous, so a replica can be a few milliseconds to seconds behind. Synchronous replication removes data loss on failover, but each commit then waits for a network round trip.
+used: PostgreSQL streaming replication and MySQL replication; Amazon RDS and Aurora read replicas; most web back ends that grow past one server.
+avoid: When write volume is the limit; replicas do not add write capacity. Use sharding instead.
+flow:
+  App [svc] -> Primary [db: accepts writes] : INSERT order | The app writes to the primary. The commit is durable after one log flush.
+  Primary -> Replica 1 [db: lag 20 ms], Replica 2 [db: lag 35 ms] : stream WAL records | The primary ships log records, and each replica replays them in order.
+  App -> Replica 1 : SELECT product list | Reads that can accept old data go to a replica and spare the primary.
+  App -> Primary : SELECT my order | A read that must see the user's own write goes to the primary.
+  * Replica 2: lag 4 s | A slow replica falls behind, so the app must not trust it for fresh reads.
+ref: docs | High availability, load balancing, and replication | PostgreSQL documentation | https://www.postgresql.org/docs/current/high-availability.html
+
+== Cache-aside in front of the OLTP database
+kind: cache-aside
+when: A small set of rows is read very often, and the database spends most of its time on the same lookups.
+how: The app first asks the cache (Redis or Memcached) for a key such as user:42. On a miss it reads the row from the database by primary key, then stores it in the cache with a time to live of, for example, 60 seconds.
+On a write, the app commits to the database first and then deletes the cache key. The next read refills it. Deleting is safer than updating the cache, because two racing writers cannot leave an old value behind as easily.
+A cache hit costs about 0.2 ms; a database lookup costs 1 to 5 ms and uses a connection. With a 95% hit rate, database read load falls by 20 times. The price is a short window of stale data.
+used: Facebook's Memcache layer in front of MySQL; Redis in front of PostgreSQL in most web stacks.
+avoid: When reads must always be fresh, or the data is written as often as it is read. Read from the primary instead.
+flow:
+  App [svc] -> Cache [cache: Redis] : GET user:42 | The app checks the cache first.
+  Cache -x> App : miss | The key is not there, so the app must go to the database.
+  App -> Postgres [db: primary key lookup] : SELECT user 42 | The database finds the row through its B-tree index in a few page reads.
+  App ~> Cache : SET user:42, TTL 60 s | The app fills the cache so the next reader gets a hit.
+  App -> Postgres : UPDATE user 42 | A write commits to the database first.
+  App -> Cache : DEL user:42 | Then the app deletes the key so no reader sees the old row for long.
+ref: paper | Scaling Memcache at Facebook | Nishtala et al., NSDI 2013 |
+
+== Sharding with a transaction on one shard
+kind: sharding, two-phase-commit
+when: Data and write rate no longer fit one primary, and most transactions touch data of one customer or one account.
+how: Choose a shard key such as the tenant id. A router maps the key to a shard, and each shard is a normal OLTP database with its own log and replicas. A transaction that touches rows with one key runs on one shard, with the normal single-node ACID speed.
+Design the schema so the common transactions stay inside one shard. A transfer between two accounts on different shards needs a distributed transaction. It uses two-phase commit: all shards prepare, and then all commit. That costs extra round trips and holds locks while the coordinator decides.
+Keep such cross-shard transactions rare, or replace them with a saga when a delay is acceptable.
+used: Vitess in front of MySQL; Citus for PostgreSQL; Google Spanner and CockroachDB, which run two-phase commit inside the database.
+avoid: When one server still fits the data. Sharding adds routing, resharding work and loss of cross-shard joins.
+flow:
+  App [svc] -> Router [svc: shard map] : BEGIN, tenant 77 | The router hashes the tenant id to find the shard.
+  Router -> Shard 2 [db: tenant 77] : single-shard txn | All rows of tenant 77 live on shard 2, so a plain local transaction is enough.
+  App -> Router : transfer 77 to 205 | A transfer between two tenants touches two shards.
+  Router -> Shard 2, Shard 5 [db: tenant 205] : PREPARE | The coordinator asks both shards to prepare. Each shard promises it can commit.
+  Shard 2, Shard 5 -> Router : vote yes | Both shards answer yes, so the coordinator writes its decision.
+  Router -> Shard 2, Shard 5 : COMMIT | Both shards commit. Locks were held for two round trips.
+ref: paper | Spanner: Google's Globally-Distributed Database | Corbett et al., OSDI 2012 |
+
+@@ mobilearch
+== Offline-first local database with an outbox
+kind: outbox, retry-backoff, idempotent-consumer
+when: The app must work without network and must never lose a user's change.
+how: The screens read only from a local database (SQLite, Room, Core Data). A user action writes the change to the local database and to an outbox table in one local transaction. The screen updates at once, with no network wait.
+A background worker reads the outbox and sends each change to the server. If the call fails, it retries with exponential backoff and jitter, for example 2 s, 4 s, 8 s, up to a limit. Each change carries a client-made id, so the server can ignore a repeat when a reply was lost.
+The server answers with the final state and a version. If two devices changed the same record, the server applies a conflict rule (last write wins, or a merge) and the app updates its local copy.
+used: Android offline-first guidance with Room and WorkManager; Core Data with CloudKit; apps such as note and task tools.
+avoid: When data must be checked live on the server for each action, such as a payment or a seat booking. Call the server and show a waiting state.
+flow:
+  UI [client: mobile screen] -> Local DB [db: SQLite] : save task + outbox row | One local transaction stores the change and a pending send.
+  Local DB -> UI : updated row | The screen refreshes at once from the local source of truth.
+  Sync worker [svc: background job] -> Local DB : read outbox | The worker wakes when a network exists and reads pending changes.
+  Sync worker -x> API [svc: sync endpoint] : POST change #81 | The network drops. The change stays in the outbox.
+  Sync worker ~> API : retry after 4 s | The worker retries with backoff. The client id makes a repeat safe.
+  API -> Sync worker : version 12 | The server confirms the change and returns the new version.
+  Sync worker -> Local DB : delete outbox row | The pending item is removed and the local copy has the server version.
+ref: docs | Build an offline-first app | Android Developers | https://developer.android.com/topic/architecture/data-layer/offline-first
+
+== Push as a signal, then delta sync
+kind: pubsub, webhook-callback
+when: The app is closed, and it must show new data soon without keeping a connection open all day.
+how: The server cannot hold a socket to a sleeping phone. It sends a small push message through the platform service, APNs on iOS or FCM on Android. The phone's operating system keeps one shared connection for all apps, which saves battery.
+The push carries little data, often only a "something changed" hint. Platforms limit payload size (about 4 KB) and may delay or drop messages, so push is not reliable delivery. When the app wakes, it calls the server with its last sync cursor and asks for changes after it.
+The server returns a page of changes and a new cursor. This pull is the source of truth, so a lost push only delays the update until the next open. Cursor paging, not page numbers, keeps results stable while data changes.
+used: Chat, mail and news apps on APNs and FCM; Firebase Cloud Messaging data messages.
+avoid: When updates must be exact and instant while the app is open. Use a WebSocket or SSE connection in the foreground.
+flow:
+  Backend [svc: event source] -> Push gateway [svc: APNs / FCM] : notify device token | After a change, the backend asks the platform to notify one device.
+  Push gateway ~> Phone [client: app asleep] : small push | The platform delivers a hint over the shared system connection. It may be late.
+  Phone -> API [svc: sync API] : GET changes, cursor 90 | The app wakes and asks for changes since its stored cursor.
+  API -> Phone : 20 changes, cursor 110 | The server returns a page and the next cursor.
+  Phone -> Local DB [db: SQLite] : apply changes | The app writes the changes locally. The screen reads from there.
+  Push gateway -x> Phone : push dropped | A dropped push is harmless; the next app open syncs from the cursor.
+ref: docs | Firebase Cloud Messaging | Google Firebase documentation | https://firebase.google.com/docs/cloud-messaging
+
+== Backend for frontend for the mobile app
+kind: bff, api-gateway
+when: A phone needs one screen of data from many services, on a slow network, and old app versions stay in use for years.
+how: A mobile back end for frontend (BFF) sits between the app and the internal services. For one screen, the app makes one call. The BFF calls the profile, orders and recommendation services in parallel, merges the answers and returns only the fields the screen needs.
+This cuts round trips, which cost 100 to 300 ms each on a mobile network, and it cuts payload size. The BFF also keeps old versions working. It maps internal changes to the older response shape, so a user who never updates still works.
+The BFF can be REST or GraphQL. Whichever, list endpoints use cursors and a page limit, so the app loads 20 items at a time.
+used: Mobile back ends at companies such as Netflix and SoundCloud that popularized the BFF idea; GraphQL gateways for apps.
+avoid: When one simple service already gives the app what it needs. A BFF is another service to run and version.
+flow:
+  App [client: mobile] -> Mobile BFF [svc: one call per screen] : GET /home?cursor= | The app asks once for the whole home screen.
+  Mobile BFF -> Profile service [svc], Orders service [svc], Reco service [svc] : parallel calls | The BFF calls three services at the same time, not one after another.
+  Reco service -x> Mobile BFF : timeout 300 ms | One slow service must not block the screen.
+  Profile service, Orders service -> Mobile BFF : data | The BFF receives the other two answers in time.
+  Mobile BFF -> App : trimmed JSON + cursor | The BFF returns one small payload without the recommendations row and a cursor for the next page.
+ref: blog | Backends for Frontends | Sam Newman, 2015 | https://samnewman.io/patterns/architectural/bff/
+
+@@ realtime
+== WebSocket gateways with a pub/sub backplane
+kind: pubsub, horizontal-scale
+when: Many users hold open connections, and any backend service must be able to push an event to them.
+how: Clients connect over WebSocket to a fleet of gateway servers. Each gateway is an event-loop process that can hold tens of thousands of idle connections. A load balancer spreads new connections, so the gateways are nearly stateless.
+Each gateway subscribes to channels in a pub/sub system (Redis pub/sub, Kafka, NATS) for the rooms its users are in. When a service publishes an event to a channel, every gateway that has a subscriber receives it and writes it to the matching sockets.
+The limit is that every gateway sees every message of its channels. Redis pub/sub is fire and forget, so a gateway that is disconnected misses events. Clients must be able to catch up after a reconnect.
+used: Slack and Discord style chat, live scores and dashboards; Socket.IO with the Redis adapter; Phoenix Channels with PubSub.
+avoid: When updates are rare. Plain polling every 30 seconds is simpler and cheaper.
+flow:
+  Browser A [client] -> Gateway 1 [svc: 40k sockets] : open WebSocket | The client opens one long-lived connection through the load balancer.
+  Gateway 1 -> Redis pub/sub [topic: room:7] : SUBSCRIBE room:7 | The gateway subscribes once per room that has a local user.
+  Chat service [svc] -> Redis pub/sub : PUBLISH room:7 | A service publishes an event without knowing who is connected where.
+  Redis pub/sub -> Gateway 1, Gateway 2 [svc: 38k sockets] : message | Every gateway with a subscriber for room 7 gets a copy.
+  Gateway 1, Gateway 2 -> Browser A, Browser B [client] : frame | Each gateway writes the frame to its local sockets.
+ref: docs | The WebSocket Protocol (RFC 6455) | IETF, 2011 | https://www.rfc-editor.org/rfc/rfc6455
+ref: docs | Redis pub/sub | Redis documentation | https://redis.io/docs/latest/develop/interact/pubsub/
+
+== Connection registry and targeted routing
+kind: consistent-hashing, horizontal-scale
+when: Events are for one user, not for a whole room, so sending every event to every gateway wastes work.
+how: Each gateway registers its connections in a fast store, for example the key conn:user42 with the value "gateway-3" and a time to live of 60 seconds that the heartbeat renews. A sender looks up the user and sends the event only to that gateway.
+Rooms can also be assigned by consistent hashing, so room 7 always lands on the same gateway. Then senders compute the target without a lookup. When a gateway is added or removed, only about 1 of N rooms move.
+Heartbeats and the time to live remove entries of dead gateways. If the lookup finds no entry, the user is offline, and the event goes to a store or to push notification instead.
+used: Presence and direct-message systems in large chat apps; WhatsApp-style routing by user id; Phoenix and Erlang style process registries.
+avoid: When broadcasts to large rooms dominate. A pub/sub backplane has less lookup traffic for them.
+flow:
+  Gateway 3 [svc: holds user 42] -> Registry [cache: Redis] : SET conn:user42 = gw3 | When user 42 connects, the gateway writes the route with a 60 s time to live.
+  Notifier [svc] -> Registry : GET conn:user42 | A service that wants to send looks up the user's gateway.
+  Registry -> Notifier : gw3 | The registry returns the gateway name.
+  Notifier -> Gateway 3 : deliver event | The event goes to one gateway only, not to all of them.
+  Gateway 3 -> Phone [client: user 42] : frame | The gateway writes to the one socket.
+  Notifier -x> Registry : no entry | If the key has expired, the user is offline, so the notifier falls back to push.
+ref: blog | Scaling Slack's Job Queue and real-time messaging | Slack Engineering | 
+
+== Resume after reconnect with a replay buffer
+kind: retry-backoff, backfill-replay
+when: Connections drop often, and clients must not lose events or reconnect all at the same moment.
+how: Every event gets an increasing id in a short log (a Redis stream or a Kafka topic that keeps the last few minutes). The client remembers the id of the last event it saw. Server-Sent Events do this natively with the Last-Event-ID header.
+After a drop, the client reconnects with exponential backoff and random jitter. Without jitter, 100,000 clients that lost one gateway reconnect together and overload the others. On reconnect the client sends its last id, and the server replays everything after it from the log.
+If the id is older than the log keeps, the server tells the client to do a full refresh from the normal API.
+used: SSE with Last-Event-ID in the browser standard; Kafka-backed event feeds; chat and trading UIs that must not skip a message.
+avoid: When only the latest value matters, such as a live price. Send a fresh snapshot on reconnect instead of a replay.
+flow:
+  Server [svc: event source] -> Event log [log: last 10 min] : append event 501 | Each event gets an increasing id.
+  Event log -> Client [client: last id 500] : event 501 | The client processes the event and stores id 501.
+  Client -x> Server : connection lost | The gateway restarts and the connection drops.
+  Client ~> Server : reconnect after 2.7 s | The client waits a random time, so clients do not all return at once.
+  Client -> Event log : resume from 501 | The client sends its last id.
+  Event log -> Client : events 502 to 507 | The server replays what was missed, in order.
+ref: spec | Server-sent events | WHATWG HTML Standard | https://html.spec.whatwg.org/multipage/server-sent-events.html
+
+@@ webarch
+== CDN with origin shield
+kind: cdn-edge, cache-aside
+when: Many users in many places load the same static files or pages, and the origin should not carry that load.
+how: DNS sends each user to a nearby CDN edge. The edge returns a cached copy if it has one. Cache-Control headers set how long, for example "max-age=31536000, immutable" for a file whose name has a content hash, and a short time for HTML.
+On a miss the edge asks a shield layer, one cache tier in front of the origin. Many edges then share one origin request, so a popular file is fetched once, not once per city. A hit takes 10 to 30 ms from the edge, a miss that goes to the origin can take several hundred.
+To change content, publish a new file name or send a purge. Do not rely on short expiry for big files.
+used: Cloudflare, Fastly, Akamai and CloudFront in front of most public sites; origin shield in CloudFront and Fastly.
+avoid: For private pages that differ per user, unless the CDN caches only the shared parts. Mark them Cache-Control: private.
+flow:
+  Browser [client] -> CDN edge [cache: Frankfurt] : GET /app.9f3a.js | DNS routes the browser to the nearest edge, and the request arrives there.
+  CDN edge -x> Browser : first request: miss | The edge has no copy yet.
+  CDN edge -> Shield [cache: one region] : fetch | The edge asks the shield tier, not the origin.
+  Shield -> Origin [svc: web servers] : GET /app.9f3a.js | Only the shield goes to the origin, so one request serves many edges.
+  Origin -> CDN edge : 200, max-age 1 year | The file returns and both cache layers keep it.
+  Browser -> CDN edge : next request | Later users get a hit in about 20 ms.
+ref: docs | HTTP Caching (RFC 9111) | IETF, 2022 | https://www.rfc-editor.org/rfc/rfc9111
+
+== Stateless web tier behind a load balancer
+kind: horizontal-scale, layered-arch
+when: Traffic grows or one server may fail, and the site must stay up without users noticing.
+how: The web servers keep no user state in memory. A load balancer spreads requests over them by round robin or least connections, and removes a server that fails its health check. To add capacity, start more identical servers.
+Anything that must survive between requests lives outside: a session in Redis or in a signed cookie, data in the database, files in object storage. Code is split in layers: the HTTP handler, the domain logic and the data access. This keeps each layer testable and replaceable.
+Each request is one HTTP call on a pooled TCP connection, usually under TLS. The load balancer ends TLS, and keep-alive saves one handshake of 1 to 2 round trips per request.
+used: NGINX or HAProxy in front of app servers; AWS ALB with auto scaling groups; nearly every web back end at scale.
+avoid: When the app needs fast local state per user, such as a game server or a collaborative editor. Pin users to a node or use an actor model.
+flow:
+  Browser [client] -> Load balancer [svc: ends TLS] : HTTPS request | The browser connects over TLS and the balancer decrypts the request.
+  Load balancer -> App server 1 [svc: stateless], App server 2 [svc: stateless] : round robin | The balancer picks a healthy server for each request.
+  App server 1 -> Redis [cache: sessions] : GET session | The server loads the session from shared storage.
+  App server 1 -> Postgres [db] : SELECT | The domain layer reads data through the data layer.
+  App server 2 -x> Load balancer : health check fails | The server crashes, so the balancer stops sending it traffic.
+  Load balancer -> App server 1 : all requests | The remaining server takes the load; no session is lost.
+ref: docs | Application Load Balancer overview | AWS Elastic Load Balancing documentation | https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html
+
+== Static front end with an API behind a gateway
+kind: api-gateway, bff
+when: The page is rich and interactive, and the same back end must also serve a mobile app or partners.
+how: The browser downloads a static bundle (HTML, JavaScript, CSS) from a CDN, and the JavaScript renders the page. Data comes from JSON calls to /api on an API gateway. The gateway checks the token, applies rate limits and routes each path to the right service.
+This splits front end and back end deployments. The front end team ships a new bundle to the CDN many times a day, with no server restart. The cost is a slower first paint, because the browser must load and run JavaScript before it shows data.
+Server-side rendering or static generation fixes this for public pages. The server sends HTML first, and the script then makes it interactive.
+used: React or Vue single-page apps on a CDN with a gateway such as Kong, NGINX or AWS API Gateway; Next.js for the server-rendered variant.
+avoid: For content sites that need fast first load and search ranking. Render on the server or at build time.
+flow:
+  Browser [client] -> CDN [cache: static bundle] : GET /index.html | The browser downloads the small static shell and the script bundle.
+  Browser -> API gateway [svc: auth + limits] : GET /api/orders | The script then asks for data as JSON.
+  API gateway -x> Browser : 401 token expired | The gateway rejects a bad token before any service does work.
+  API gateway -> Orders service [svc] : routed request | A valid request goes to the service that owns /orders.
+  Orders service -> API gateway : JSON | The service answers.
+  API gateway -> Browser : 200 JSON | The script renders the data into the page.
+ref: docs | Architectural Styles and the Design of Network-based Software Architectures | Roy Fielding, 2000 | https://roy.gbiv.com/pubs/dissertation/top.htm
+
+@@ auction
+== Exchange auction with a hard deadline
+kind: rtb, scatter-gather, timeout-deadline
+when: One ad slot must be sold to the highest bidder in the time a page takes to load.
+how: When a page loads, the exchange builds a bid request (site, user id, ad size, floor price) and sends it in parallel to many bidders. Each bidder has a deadline, often 100 to 120 ms in all, and the exchange waits only that long.
+Late or missing bids are dropped. The exchange applies the floor price and picks the highest bid. In a first-price auction, the winner pays its own bid. In a second-price auction, it paid the runner-up's bid plus a small step. Most exchanges moved to first-price around 2017 to 2019.
+The exchange then returns the winning ad markup. Bidders learn the result through a win notice and the clearing price, so they can adjust later bids.
+used: Exchanges that speak OpenRTB, such as Google Ad Manager, Magnite, PubMatic and Xandr; connected-TV ad exchanges.
+avoid: For guaranteed deals where a fixed price and volume were agreed in advance. Use direct or programmatic guaranteed instead.
+flow:
+  Publisher page [client] -> Exchange [svc: runs the auction] : ad request | The page asks for an ad for one slot.
+  Exchange -> DSP A [svc], DSP B [svc], DSP C [svc] : bid request, 100 ms | The exchange sends one bid request to all bidders in parallel.
+  DSP A, DSP B -> Exchange : bid 2.10, bid 1.80 | Two bidders answer in time with their prices.
+  DSP C -x> Exchange : too late | The third answer arrives after the deadline and is ignored.
+  Exchange -> Publisher page : winner A | DSP A wins and pays 2.10 (first price).
+  Exchange ~> DSP A : win notice, price 2.10 | The exchange tells the winner what it paid.
+ref: spec | OpenRTB specification | IAB Tech Lab | 
+
+== Header bidding with a unified auction
+kind: rtb, scatter-gather
+when: A publisher wants many exchanges to compete fairly before its ad server decides, not one after another.
+how: Code on the page (for example Prebid.js) sends bid requests to many exchanges at the same time, before the ad server is called. The page waits for a timeout, often 1000 to 1500 ms, and collects the bids.
+The page then sends the best header bid, as a key-value price, to the ad server. The ad server compares it with its own direct deals and its exchange demand, and the highest value wins. This is a unified auction, and every source competes in one round.
+It replaced the older "waterfall", where exchanges were asked in a fixed order and the first with a bid above its floor won, even if a later one paid more. The cost is more page weight and latency. Server-side Prebid moves the fan-out off the browser.
+used: Prebid.js and Prebid Server; Amazon Publisher Services bidding; Google Ad Manager unified pricing rules.
+avoid: On pages where speed matters more than yield, or with one dominant buyer. A single exchange call is enough.
+flow:
+  Page script [client: Prebid.js] -> Exchange A [svc], Exchange B [svc] : bid request, 1 s | The script asks all exchanges at the same time.
+  Exchange A, Exchange B -> Page script : bids 1.40, 1.65 | Each exchange runs its own auction and returns a bid.
+  Page script -> Ad server [svc: GAM] : ad call + hb_price 1.65 | The best header bid goes to the ad server as a key-value pair.
+  Ad server -> Page script : creative of the winner | The ad server compares 1.65 with direct deals and picks the highest.
+  Ad server -x> Exchange A : no impression | The losing bid is dropped without a charge.
+ref: docs | Prebid overview | Prebid.org | https://docs.prebid.org/overview/intro.html
+
+== Bid shading in a first-price auction
+kind: feedback-loop, online-offline
+when: A bidder pays its own bid and wants to win the slot at the lowest price that still wins.
+how: In a first-price auction, bidding your true value leaves no profit. The bidder instead predicts the price needed to win. It learns this from past results: the logged bid, the clearing price if known, and whether it won.
+A model, trained offline, takes features such as site, ad size, time and floor. It outputs a win probability for each bid level. The bidder picks the bid that maximizes (value minus bid) times win probability. For example, with value 2.00, a bid of 1.40 at 60% win gives 0.36, and a bid of 1.80 at 85% gives 0.17.
+New win and loss logs feed the next training run, so the shading follows market changes. Exchanges that share the minimum bid to win make this model more accurate.
+used: DSP bidding stacks after the move to first-price; The Trade Desk and Google DV360 describe bid-shading features.
+avoid: In second-price auctions, where truthful bidding is already the best strategy.
+flow:
+  Bid request [client: from exchange] -> Bidder [svc: DSP] : value 2.00 | The bidder first computes its true value for the impression.
+  Bidder -> Shading model [model: win curve] : features | The bidder asks the model for the win probability at each price.
+  Shading model -> Bidder : 1.40 maximizes profit | The model returns the best bid, 1.40 instead of 2.00.
+  Bidder -> Exchange [svc] : bid 1.40 | The bid is sent in the deadline.
+  Exchange ~> Bidder : won/lost, price | The result is logged, and later it trains the model again.
+ref: paper | Optimal Real-Time Bidding for Display Advertising | Zhang, Yuan & Wang, KDD 2014 |
+
+@@ cookies
+== Stateless signed session cookie
+kind: horizontal-scale
+when: A login must work across many app servers without a shared session database.
+how: After login, the server puts the session data (user id, role, expiry) in a cookie and signs it with an HMAC, using a secret key that only servers know. On each request the browser sends the cookie back. The server recomputes the HMAC and trusts the data only if it matches.
+Any server can check any request, so no session lookup is needed. The cookie flags matter: HttpOnly hides it from JavaScript, Secure sends it only over HTTPS, and SameSite=Lax or Strict blocks most cross-site request forgery.
+The cost is revocation. A signed cookie stays valid until expiry, so a stolen one cannot be cancelled early unless the server keeps a deny list. Keep the lifetime short and rotate keys. Browsers limit a cookie to about 4 KB.
+used: Rails and Django signed-cookie sessions; JSON Web Tokens in cookies; many single sign-on front ends.
+avoid: When sessions must be revoked at once or hold much data. Keep only a random session id in the cookie and the data in Redis.
+flow:
+  Browser [client] -> App server 1 [svc] : POST /login | The user logs in with a password.
+  App server 1 -> Browser : Set-Cookie: sid=data.sig | The server signs the data with its secret and sets an HttpOnly, Secure, SameSite cookie.
+  Browser -> App server 2 [svc] : Cookie: sid=data.sig | The next request goes to a different server with the cookie.
+  App server 2 -> Browser : 200 page | The server checks the signature with the shared key and finds no need for a session lookup.
+  Attacker [client] -x> App server 2 : tampered cookie | A changed value fails the HMAC check and is rejected.
+ref: spec | HTTP State Management Mechanism (RFC 6265) | IETF, 2011 | https://www.rfc-editor.org/rfc/rfc6265
+
+== Cookie syncing between ad platforms
+kind: identity-graph
+when: Two ad companies each know the user under their own id, and they need to match the ids to bid or measure.
+how: A browser holds a separate third-party cookie for each ad domain, and neither domain can read the other's. In cookie sync, platform A's pixel redirects the browser to platform B with A's user id in the URL. B reads its own cookie and so sees both ids together.
+B stores the pair in a match table: A's id maps to B's id. Later, when A sends a bid request that holds A's id, B finds its own profile at once. Syncs often run in pairs or chains and add a few extra redirects to page loads.
+This depends on third-party cookies, which Safari and Firefox block by default. Google Chrome kept them after announcing a plan to remove them, so the share of matchable browsers is uneven. Mobile apps use resettable advertising ids, and hashed emails are the other common key.
+used: Exchange and DSP sync pixels in OpenRTB bidding; match tables in DSPs and DMPs.
+avoid: Where users have not consented, or in browsers that block third-party cookies. Use first-party data or a clean room.
+flow:
+  Browser [client] -> Platform A pixel [svc: id a-71] : GET sync.gif | A page loads A's sync pixel with A's cookie.
+  Platform A pixel -> Browser : 302 to B?a=a-71 | A redirects the browser to B and puts its id in the URL.
+  Browser -> Platform B [svc: id b-93] : GET /sync?a=a-71 | The browser sends B's cookie and A's id in one request.
+  Platform B -> Match table [db: a-71 to b-93] : store pair | B saves the link between the two ids.
+  Platform B -x> Browser : no cookie | In a browser that blocks third-party cookies, B sees no id and no match is saved.
+ref: spec | OpenRTB specification | IAB Tech Lab | 
+
+@@ ctrpred
+== Batch training, online serving with a feature store
+kind: online-offline, feature-store
+when: A pCTR model must score each bid in a few milliseconds using features that are also used in training.
+how: Impression and click logs flow into a data lake. A daily or hourly job joins them, builds training rows and trains the model. The model is published to bidders as a file.
+At bid time the bidder has only a few ms. It reads precomputed features by key (user, campaign, site) from a low-latency store, adds the request features, and runs the model on CPU. The feature store gives the same feature code to both sides, which avoids training-serving skew.
+Typical budgets: under 5 ms for the model and about 100 ms for the whole bid. Models use hashed sparse features, so memory is fixed, and updates are pushed often.
+used: Google's ad click prediction system; Meta and Criteo ad ranking; Feast or Tecton as feature stores.
+avoid: For a tiny volume of traffic where a rule or a fixed price is enough.
+flow:
+  Impression logs [lake: clicks + views] -> Training job [svc: daily] : join labels | The job joins impressions with clicks to make labeled rows.
+  Training job -> Model registry [store: pCTR v42] : publish model | The new model file is stored with a version.
+  Bidder [svc: 5 ms budget] -> Feature store [cache: user + campaign] : GET features | At bid time the bidder reads features by key.
+  Model registry -> Bidder : load v42 | Bidders download and load the new model file.
+  Bidder -> Bid response [note: pCTR 0.8%] : bid = pCTR x value | The bidder scores the request and computes the bid.
+ref: paper | Ad Click Prediction: a View from the Trenches | McMahan et al., KDD 2013 | https://research.google/pubs/ad-click-prediction-a-view-from-the-trenches/
+
+== Calibration and delayed-label feedback loop
+kind: feedback-loop
+when: Bids use pCTR as a probability, so a model that ranks well but predicts the wrong level loses money.
+how: A bid is pCTR times the value of a click. If the model says 2% when the true rate is 1%, the bidder overpays by two times. Ranking metrics such as AUC do not show this, so the team also tracks calibration: predicted rate against actual rate in buckets.
+A calibration layer, such as isotonic regression or Platt scaling, maps raw scores to well-calibrated probabilities. It is refit on recent data.
+Conversions arrive late, sometimes days after the click. The pipeline logs the click first as a negative, then corrects it when the conversion arrives, or it models the delay. Without this, recent traffic looks worse than it is.
+used: Large display and search ad systems; the Google paper on ad click prediction discusses calibration checks.
+avoid: When the model output is only used to rank and never as a price or a bid.
+flow:
+  Bidder [svc] -> Model [model: raw score] : features | The model returns a raw score for the request.
+  Model -> Calibrator [svc: isotonic map] : raw 0.031 | The raw score goes into a calibration map.
+  Calibrator -> Bidder : pCTR 0.018 | The calibrated probability is used in the bid price.
+  Bidder ~> Event log [log: impressions] : impression + features | Each impression is logged with its predicted value.
+  Postback [client: conversion] ~> Event log : conversion, 3 days later | A late conversion is joined to the old impression.
+  Event log ~> Calibrator : refit on fresh data | The map is refit, and reliability drift is checked in buckets.
+ref: paper | Practical Lessons from Predicting Clicks on Ads at Facebook | He et al., ADKDD 2014 |
+
+== Cascade: cheap filter, then the full model
+kind: two-tower-retrieval
+when: There are thousands of candidate ads per request, but the full model is too slow to score them all.
+how: Stage one is a cheap retrieval or pre-ranking step. It uses targeting rules, budgets and a small model, such as logistic regression or a two-tower model, to cut thousands of ads to about 100.
+Stage two scores these with a larger model (a deep network with embeddings and feature crosses). Its output is pCTR and pCVR for each ad. An auction then ranks ads by pCTR times bid, or by expected value.
+Each stage has a latency share. For a 100 ms bid window, stage one may have 10 ms and stage two 20 ms. The cheap stage must not drop good ads, so teams measure its recall against the full model.
+used: Ad ranking at Meta, Google, Alibaba and Pinterest; the same shape is used in recommender systems.
+avoid: When the candidate set is small (under a few hundred). Score all of them with the full model.
+flow:
+  Request [client: user + slot] -> Retrieval [svc: targeting + budget] : 4,000 ads | The first stage gets all eligible ads.
+  Retrieval -> Pre-ranker [model: small 10 ms] : 4,000 candidates | A small model scores all candidates fast.
+  Pre-ranker -> Full ranker [model: deep 20 ms] : top 100 | Only the best 100 reach the large model.
+  Full ranker -> Auction [svc] : pCTR per ad | The deep model gives a calibrated probability for each ad.
+  Auction -> Request : winning ad | The ad with the highest pCTR times bid wins.
+ref: paper | Deep Neural Networks for YouTube Recommendations | Covington, Adams & Sargin, RecSys 2016 |
+
+@@ freqcap
+== Counter check in a key-value store before bidding
+kind: rate-limit, sharding
+when: A campaign must not show the same user more than N ads per day, and the check must fit in the bid time.
+how: Use a key per user and campaign, for example fc:camp9:user42, with a counter and a time to live equal to the window (24 hours). Before bidding, the bidder reads the counter. If it is at or above the cap, the bidder does not bid.
+The store is a fast in-memory key-value system such as Redis, Aerospike or DynamoDB with DAX. Keys are sharded by user id, so one lookup hits one node. A read costs well under 1 ms. At 1 million requests per second, that is 1 million lookups per second, so the store must scale out.
+The check is cheap, but the user must be identified. If the same person has a phone and a laptop, the cap counts them separately unless an identity graph links them.
+used: DSP and ad server pacing and capping in Redis or Aerospike; common in programmatic stacks.
+avoid: When a cap per user is not needed, or users are anonymous. Use a cap per household or per IP range instead.
+flow:
+  Bid request [client: user 42] -> Bidder [svc] : request | The bidder gets a request for user 42.
+  Bidder -> Counter store [cache: Redis sharded] : GET fc:camp9:user42 | The bidder reads the exposure count for this campaign and user.
+  Counter store -> Bidder : count = 3 | The user has seen 3 ads in the last 24 hours.
+  Bidder -x> Bid request : no bid, cap 3 reached | The cap is 3, so the bidder skips this request.
+  Bidder -> Exchange [svc] : bid, count was 2 | Another user is under the cap, so the bidder bids.
+ref: docs | Redis INCR and EXPIRE patterns | Redis documentation | https://redis.io/docs/latest/commands/incr/
+
+== Impression events update counters asynchronously
+kind: event-driven, windowed-agg
+when: The counter must count what was shown, not what was bid on, and must stay correct as traffic grows.
+how: A bid does not mean an impression. The count must rise only when the ad was shown, which the player or page reports with a beacon. Beacons go into a log (Kafka). A stream job reads them, removes duplicates by event id and increments the counter in the key-value store.
+Steps take time, from 100 ms to several seconds. In that gap, a user may get more ads than the cap, because the counter is behind. This is over-delivery. Teams add a small safety margin, or add an in-flight count for bids that won but are not confirmed yet.
+The same stream job also writes counts into the data lake for billing and reports.
+used: Ad servers that count on impression beacons; CTV and SSAI stacks that must deduplicate beacons.
+avoid: When a hard guarantee of zero over-delivery is needed. That needs one synchronous counter, with the cost of latency and failure risk.
+flow:
+  Player [client] ~> Beacon service [svc] : impression beacon | The player reports that the ad was shown.
+  Beacon service -> Impression topic [log: Kafka] : event id e7 | Beacons are written to a log.
+  Impression topic -> Stream job [svc: dedup by id] : poll | A stream job reads them and drops repeated event ids.
+  Stream job -> Counter store [cache: Redis] : INCR fc:camp9:user42 | The job raises the user's counter.
+  Bidder [svc] -> Counter store : GET | The next bid sees the new count, after a delay of about 1 s.
+  Beacon service -x> Impression topic : beacon lost | A lost beacon means the count stays low and a small over-delivery follows.
+ref: docs | Kafka design | Apache Kafka documentation | https://kafka.apache.org/documentation/#design
+
+== Per-region counters merged in the background
+kind: crdt, multi-region
+when: Bidders run in several regions, and a cross-region call per bid is too slow.
+how: Each region keeps its own counter for a user and campaign, and bids use the sum of all known regional counts. A region increments only its own slot. The slots are shipped to other regions in the background every few seconds.
+This is a grow-only counter, a simple CRDT. Merging takes the max per region slot, so repeated or out-of-order messages are harmless and no coordination is needed. Each region sees the others' counts a few seconds late.
+So the cap can be broken slightly: with 3 regions and a cap of 3, a user could get up to 3 ads in each region before they sync. Teams accept this error, or send a user to one home region by user id, so most counts are local.
+used: Active-active ad stacks; Redis Enterprise and Riak style CRDT counters; DynamoDB global tables use last-writer-wins, so counters need care.
+avoid: When the cap is strict and legal, such as a mandated limit. Route each user to one region.
+flow:
+  Bidder US [svc: region us] -> Counter US [cache: us 2 eu 1] : INCR us slot | A US impression raises only the US slot.
+  Bidder EU [svc: region eu] -> Counter EU [cache: us 1 eu 2] : INCR eu slot | An EU impression raises only the EU slot.
+  Counter US ~> Counter EU : slots us=2 | Slots are copied across regions in the background.
+  Counter EU ~> Counter US : slots eu=2 | The other direction does the same.
+  * Counter US: us 2 eu 2 | After merge by max, both regions show the same total of 4.
+  Bidder US -> Counter US : read total | The bidder reads the sum of all slots.
+ref: paper | A comprehensive study of Convergent and Commutative Replicated Data Types | Shapiro et al., INRIA, 2011 |
+
+@@ idgraph
+== Batch connected components over identifier links
+kind: map-reduce, identity-graph
+when: A company has billions of id pairs seen together, and it needs one person or household id per group.
+how: Each log line that shows two ids together (a login with a cookie and a device id, or an email hash with a phone) gives an edge. Edges are stored as a table in the lake. A distributed job on Spark or a graph engine finds connected components.
+Each component gets a stable group id. Union-find solves this in near linear time on one machine, and big jobs use label propagation or similar rounds in Spark. Links carry a source and a confidence: deterministic (a login) or probabilistic (same IP and time).
+The job also guards against giant components. One shared public device can join millions of ids by mistake, so the job caps component size and drops edges from hub nodes.
+used: Identity graphs at LiveRamp, Tapad and The Trade Desk; Spark GraphFrames connected components.
+avoid: For small data, where one machine and union-find are enough. Or when links must be removed fast for privacy; keep per-edge ids to allow deletion.
+flow:
+  Event logs [lake: logins + syncs] -> Edge builder [svc: Spark] : id pairs | The job extracts pairs of ids seen together.
+  Edge builder -> Components job [svc: label propagation] : edges + confidence | It keeps edges above a confidence level and drops hub nodes.
+  Components job -> Graph table [lake: id to group] : cookie9 to group G5 | Each id gets the id of its connected component.
+  Components job -x> Graph table : giant group rejected | A group over the size cap is split, because it is probably a shared device.
+  Graph table -> Serving store [cache: id to group] : publish | The table is loaded into a fast store for use.
+ref: docs | GraphFrames user guide: connected components | GraphFrames project | https://graphframes.io/
+
+== Precomputed id lookup at bid time
+kind: precompute, identity-graph
+when: Bidding, capping and measurement need the person id of any incoming id within a few milliseconds.
+how: The graph is never traversed at request time. A batch or stream job writes a table that maps each raw id (cookie, device id, hashed email) to one group id. The bidder reads this table from a key-value store with one lookup.
+The group id is then used for frequency caps, audiences and attribution. When a new link appears, the job writes the new mapping, and old entries expire. Two groups may merge, so group ids need a rule to survive, for example the smaller id wins, and the old id points to the new one.
+Memory is the cost. A graph with 5 billion ids at 40 bytes each is 200 GB before replicas.
+used: DSP and data-management platforms that keep an id map beside the bidder; common in programmatic advertising.
+avoid: When ids and links change by the second and a stale map would be harmful. Query the graph live for those flows.
+flow:
+  Bid request [client: cookie c9] -> Bidder [svc] : request | A bid request arrives with a raw cookie id.
+  Bidder -> ID map [cache: id to group] : GET c9 | One key lookup, about 1 ms.
+  ID map -> Bidder : group G5 | The map returns the group id.
+  Bidder -> Freq store [cache: counts by group] : GET G5 | The caps and audiences use the group id, not the cookie.
+  Graph job [svc: hourly] ~> ID map : merge G5 into G2 | The job updates the map when two groups merge.
+ref: docs | Aerospike documentation | Aerospike | 
+
+== Match through a clean room with hashed emails
+kind: privacy-clean-room, identity-graph
+when: Two companies want to link their customers without handing over raw personal data.
+how: Each side normalizes its email (lowercase, trim) and hashes it with SHA-256. Hashes are joined in a controlled environment, a data clean room. Neither side sees the other's rows. Only query results, such as counts above a minimum group size, leave the room.
+This gives a deterministic match: the same hash on both sides means the same person. The match rate is often below 100%, because people use different emails. Hashing alone is weak privacy, as emails can be guessed and hashed again, so rooms also add access rules and noise.
+The match supports measurement (did exposed users buy?) and audience overlap without moving data into the other party's graph.
+used: Snowflake and BigQuery data clean rooms, LiveRamp Safe Haven, AWS Clean Rooms.
+avoid: When consent for matching is missing. Do not match without a legal basis.
+flow:
+  Advertiser data [lake: hashed emails] -> Clean room [svc: join only] : SHA-256 emails | The advertiser uploads hashed emails.
+  Publisher data [lake: hashed emails] -> Clean room : SHA-256 emails | The publisher uploads its own hashed emails.
+  Clean room -> Match result [store: joined hashes] : join on hash | The room joins the two lists on the hash value.
+  Match result -> Analyst [user] : counts, group >= 50 | Only aggregate results with a minimum size leave the room.
+  Analyst -x> Match result : SELECT raw rows | A query that asks for single rows is blocked by the room rules.
+ref: docs | AWS Clean Rooms | Amazon Web Services | https://aws.amazon.com/clean-rooms/
+
+@@ pacing
+== Feedback controller on the bid rate
+kind: control-loop
+when: A daily budget must last the whole day, and traffic changes from hour to hour in ways nobody can predict well.
+how: The system sets a target spend curve, for example 4% of the budget per hour on average. Every minute, a controller compares actual spend with the target and changes a pacing multiplier between 0 and 1. The bidder uses it to decide how many requests to bid on.
+A PID controller is common. The proportional part reacts to the gap now. The integral part corrects a steady lag. The derivative part reduces overshoot. If spend runs ahead of plan, the multiplier falls and fewer requests get a bid.
+The multiplier can act as a throttle on bid probability or as a bid price scale. Probability throttling keeps the bid quality, while price scaling changes win rates. Without a limit on how fast the multiplier changes, the loop can oscillate.
+used: DSP and ad server pacing described in papers from Yahoo, LinkedIn and Google; common in programmatic bidders.
+avoid: When the budget is tiny and one auction can spend it all. Use a hard cap check instead.
+flow:
+  Spend counter [cache: spend so far] -> Pacing controller [svc: PID every 60 s] : spent 41 vs plan 36 | The controller reads real spend and compares it to the plan.
+  Pacing controller -> Config store [store: multiplier] : multiplier 0.72 | Spend is ahead, so it lowers the multiplier from 0.90 to 0.72.
+  Config store -> Bidder [svc: 50 pods] : pull new value | All bidders read the new multiplier.
+  Bidder -> Exchange [svc] : bid on 72% of requests | Fewer bids means a lower spend rate.
+  Exchange ~> Spend counter : win notices | Wins add to spend and close the loop.
+ref: paper | Budget Pacing for Targeted Online Advertisements at LinkedIn | Agarwal et al., KDD 2014 |
+
+== Budget slices leased to bidder instances
+kind: lease, batching
+when: Hundreds of bidder instances spend one budget, and a central counter on every bid is too slow.
+how: A budget service owns the campaign budget. Each bidder instance asks it for a slice, for example 50 dollars, with a short time to live (a lease). The bidder spends from its local slice with no network call, and asks for another when it is nearly empty.
+Local checks are fast, so the bid path stays under its time limit. The budget service has one write per slice, not one per bid. If a bidder crashes, its unused slice returns after the lease expires.
+Slices cause two kinds of error. Late win notices can push spend slightly past the budget. And idle slices lock money that another instance could use. Small slices and short leases reduce both, at the cost of more calls.
+used: Distributed budget allocation in DSPs and ad servers; a common pattern for any shared quota.
+avoid: With one bidder process, where a local counter is exact and simple.
+flow:
+  Bidder 1 [svc: slice 50] -> Budget service [svc: owns campaign] : request slice | A bidder asks for a part of the budget.
+  Budget service -> Bidder 1 : lease 50 USD, 60 s | The service grants a slice with a short lease.
+  * Bidder 1: slice 38 | Each win lowers the local slice without a network call.
+  Bidder 2 [svc: slice 50] -x> Budget service : crashed | A bidder crashes with 30 dollars left in its slice.
+  * Budget service: 30 USD returned | After 60 s the unused part returns to the campaign.
+  Bidder 1 -> Budget service : slice nearly empty | The bidder asks for the next slice.
+ref: paper | Budget Constrained Bidding by Model-free Reinforcement Learning in Display Advertising | Wu et al., CIKM 2018 |
+
+== Forecast-based hourly spend plan
+kind: precompute, online-offline
+when: Traffic has a strong daily shape, and the budget should follow it so it is spent where good traffic is.
+how: An offline job forecasts traffic and win rates for each hour from history, for example the last 4 weeks. It splits the daily budget into an hourly plan, in proportion to the value expected in each hour. A linear program can do this when there are many campaigns with limits.
+The plan is written to a config store. The online controller then tracks the plan for the current hour instead of a flat line. A launch at noon, or a day with a big event, can make the plan wrong, so the controller still corrects it.
+Plan and controller work as two layers: the plan sets the shape, and the feedback loop fixes the errors.
+used: Pacing systems that use traffic forecasts, such as those described by Google and Yahoo research; sports and news days where traffic jumps.
+avoid: For new campaigns with no history. Use a flat target and a feedback loop at first.
+flow:
+  History [lake: 4 weeks of logs] -> Forecast job [svc: nightly] : traffic by hour | The job learns the traffic shape from the past.
+  Forecast job -> Plan table [db: hourly targets] : 6% at 20:00, 2% at 04:00 | It writes how much to spend each hour.
+  Plan table -> Controller [svc: PID] : target for this hour | The online loop reads the target for the hour.
+  Controller -> Bidder [svc] : multiplier | The loop sets the bid rate to follow the plan.
+  Bidder -x> Controller : big event, traffic x3 | Real traffic differs from the forecast.
+  Controller -> Bidder : lower multiplier | The loop corrects the gap in a few minutes.
+ref: paper | Smart Pacing for Effective Online Ad Campaign Optimization | Xu et al., KDD 2015 |
+
+@@ contexteng
+== Context assembly pipeline with a token budget
+kind: pipes-filters, rag
+when: The model has a fixed window, and the right instructions, documents and history must fit in it for every call.
+how: A context builder runs for each model call. It starts with fixed parts: the system prompt and the tool definitions. It then adds the user message, recent turns, and retrieved documents. Each part has a token budget, for example 2,000 for instructions, 8,000 for documents and 4,000 for history.
+Retrieved text is ranked and cut to fit. Important items go near the start or the end, because models use the middle of a long prompt less well. Stable parts come first so the provider's prompt cache can reuse them, which cuts cost and delay for repeated prefixes.
+The builder logs what went in. When an answer is wrong, the team can see if the right fact was missing, buried or cut.
+used: RAG systems in production; Claude and ChatGPT style apps; frameworks such as LangChain and LlamaIndex.
+avoid: For a single short question with no documents. A plain prompt is enough.
+flow:
+  User [user] -> Context builder [svc: token budget] : question | A question arrives.
+  Context builder -> Vector index [store: documents] : top 20 chunks | It retrieves candidate documents.
+  Vector index -> Context builder : chunks + scores | The index returns scored text.
+  * Context builder: trimmed to 8k | The builder keeps the best chunks that fit the budget.
+  Context builder -> LLM [model: 32k window] : system + docs + history | The prompt is built with stable parts first for cache reuse.
+  LLM -> User : answer | The answer is shown, and the context is logged for review.
+ref: blog | Effective context engineering for AI agents | Anthropic, 2025 | https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents
+
+== Compaction with an external memory store
+kind: memory-tiering
+when: A long task produces more text than the window can hold, but old facts must stay available.
+how: The agent keeps recent turns in the window. When use passes a limit, for example 80% of the window, the system asks the model to summarize older turns. The summary replaces them, and the window falls to a small size.
+Important facts are also saved outside the window: a notes file, a database or a vector store. The agent writes a note, and reads it back later with a tool call or a search. Large tool outputs are stored as files, and only a short pointer stays in the prompt.
+This is like a memory hierarchy. The window is fast and small. Notes and files are large and slow to reach. The risk is a summary that drops a detail the task needs, so key decisions and open items go into notes before the cut.
+used: Claude Code context compaction and memory files; agent notes in long coding or research tasks.
+avoid: For short tasks that fit in the window. Compaction adds cost and a chance of loss.
+flow:
+  Agent [svc: 160k used] -> Notes store [store: files + DB] : save decisions | The window is at 80%, so key facts are written to notes first.
+  Agent -> Summarizer [model: LLM] : old turns | The old turns go to a model call.
+  Summarizer -> Agent [svc: 30k used] : 1k token summary | The summary replaces the old turns, and the window shrinks.
+  Agent -> Notes store : search "API key name" | Later the agent needs a lost detail and looks it up.
+  Notes store -> Agent : the saved note | The detail returns without keeping all old text.
+ref: docs | Context management and memory | Anthropic Claude documentation | 
+
+== Sub-agent with its own clean context
+kind: scatter-gather, agent-loop
+when: A side task needs to read a lot of text, and the main agent should see only the answer.
+how: The lead agent starts a sub-agent for a narrow task, such as "find where the login bug is". The sub-agent has its own window with its own instructions and tools. It may read dozens of files and use 100,000 tokens.
+When it finishes, it returns a short report, perhaps 500 tokens. The lead agent adds only that report to its own window. Several sub-agents can run in parallel on different questions, and the lead merges their reports.
+The gain is a smaller main window and less noise. The cost is more tokens in total, and a risk that the report misses a detail. The lead should give clear scope and an expected format for the answer.
+used: Claude Code sub-agents; Anthropic's multi-agent research system; deep research tools.
+avoid: For small tasks, where starting a sub-agent costs more than doing the work in place.
+flow:
+  Lead agent [svc: main context] -> Search agent [svc: own context], Test agent [svc: own context] : task + scope | The lead gives each sub-agent a narrow question.
+  Search agent -> Code store [store: repo] : read 40 files | The sub-agent reads a lot, in its own window.
+  Test agent -> Code store : run tests | The second one works in parallel.
+  Search agent, Test agent -> Lead agent : short reports | Each returns about 500 tokens, not the full trace.
+  * Lead agent: small window | The lead has a small window and uses only the findings.
+ref: blog | How we built our multi-agent research system | Anthropic, 2025 | https://www.anthropic.com/engineering/multi-agent-research-system
+
+@@ promptinj
+== Quarantined reader and privileged planner
+kind: zero-trust, bulkhead
+when: An agent must read untrusted text (mail, web pages) and also hold powerful tools, such as send mail or delete files.
+how: Split the agent in two. The quarantined model reads the untrusted text and has no tools. It can only return data in a strict schema, for example a list of fields. The privileged model has the tools, but it never sees the raw untrusted text.
+The planner works with references or checked values, such as "$summary_1", and the program replaces them. An instruction hidden in the web page can then only change the data in the fields. It cannot call a tool.
+This does not remove all risk. The extracted fields can still be wrong or misleading, so output formats stay narrow, and a human confirms important actions. Research designs such as CaMeL (Google DeepMind, 2025) take this further, with control flow and data flow tracked in code.
+used: The dual-LLM pattern described by Simon Willison; CaMeL research design; careful agent products that isolate web content.
+avoid: For low-risk assistants with no tools and no private data. A simple prompt filter is enough.
+flow:
+  User [user] -> Planner [model: has tools] : task | The trusted user task goes to the privileged model.
+  Planner -> Reader [model: no tools] : read page, return schema | The planner asks the quarantined model to extract fields from a page.
+  Web page [store: untrusted] -> Reader : hidden text: send files | The page has an injected instruction.
+  Reader -> Planner : price=40, ref $v1 | Only schema fields come back, as data and not as commands.
+  Planner -x> Mail tool [svc: send mail] : injected command ignored | The injected text never reached the model that holds tools.
+  Planner -> User : answer | The user gets the result built from the checked fields.
+ref: blog | The Dual LLM pattern for building AI assistants that can resist prompt injection | Simon Willison, 2023 | https://simonwillison.net/2023/Apr/25/dual-llm-pattern/
+
+== Least-privilege tool broker with human approval
+kind: zero-trust, api-gateway
+when: An agent can call tools that change things, and one bad instruction must not cause serious harm.
+how: Tool calls do not go straight to the system. They pass a broker that checks a policy. Each agent run gets a narrow identity, with short-lived tokens that allow only the needed actions, such as read-only access to one repository.
+Low-risk calls (read a file, search) run at once. High-risk calls (send mail, pay, delete, push code) wait for a human to approve, and the approval screen shows the real arguments. The broker also limits rate and records every call.
+The rule is to remove the harmful path itself. If the agent holds private data, reads untrusted text and can send data out, an attacker can steal data. Removing any one of these three breaks the attack.
+used: Claude Code permission prompts and allow lists; MCP hosts that ask before a tool runs; OWASP guidance for LLM apps.
+avoid: For read-only agents on public data. Approval prompts then add only friction.
+flow:
+  Agent [model: reads web] -> Broker [svc: policy check] : call read_file | The agent asks to use a tool.
+  Broker -> File tool [svc: read only] : allowed | Low-risk calls pass, with a token that can only read.
+  Agent -> Broker : send_email(attacker) | Hidden web text tricked the agent into this call.
+  Broker -> Approver [user: human] : confirm send_email? | A high-risk call waits for a person and shows the real recipient.
+  Approver -x> Broker : deny | The person sees the strange recipient and refuses.
+  Broker -> Audit log [log: all calls] : record | Every call and decision is stored for later review.
+ref: docs | OWASP Top 10 for LLM Applications | OWASP GenAI Security Project | https://genai.owasp.org/llm-top-10/
+
+== Input and output guardrail filters
+kind: pipes-filters, sidecar
+when: A public chat or agent product needs a cheap first line of defense against attacks and unsafe output.
+how: A guardrail layer wraps the model. Before the call, an input filter checks the user text and any retrieved documents with rules and a small classifier. It looks for known injection phrases, secrets and banned content. After the call, an output filter checks the answer, for example for leaked system prompt text, private data or links to unknown domains.
+Flagged items are blocked, cleaned or sent to review. Filters run in tens of milliseconds, so they fit into the request path. Run them in parallel with the model where you can, and stop the call if a filter fails.
+No classifier catches every attack, so treat filters as one layer, with least privilege and approval behind them. Track the false positive rate, because strict filters block real users.
+used: NVIDIA NeMo Guardrails; Llama Guard; Azure AI Content Safety and Prompt Shields; Anthropic and OpenAI moderation tools.
+avoid: As the only defense for an agent with powerful tools. Filters can be bypassed.
+flow:
+  User [user] -> Input filter [svc: classifier] : message | The message is scored before the model sees it.
+  Input filter -x> User : blocked: injection | A known attack pattern is rejected with a safe message.
+  Input filter -> LLM [model] : clean prompt | A clean prompt goes through.
+  LLM -> Output filter [svc: leak check] : draft answer | The draft is checked for leaks and unsafe content.
+  Output filter -> User : answer | A safe answer is returned.
+  Output filter -> Audit log [log: flagged items] : flagged events | Flags are stored to tune the filters.
+ref: docs | NeMo Guardrails documentation | NVIDIA | 
+
+@@ reactloop
+== Reason, act, observe loop with tools
+kind: agent-loop
+when: A task needs several steps, and the next step depends on what the last tool returned.
+how: The program sends the model the task and the tool list. The model writes a short thought and picks an action, such as search("order 4411 status"). The program runs the tool and appends the result as an observation. The model sees the full history and chooses the next action.
+This repeats until the model returns a final answer. Each turn is one model call, so latency and cost grow with the number of steps, often 3 to 15 for a normal task. The history grows too, so long loops need context management.
+The strength is recovery: if a search returns nothing, the model can try a different query. The weakness is that a wrong early observation can lead it astray, and loops can run in circles.
+used: The ReAct paper (Yao et al., 2022); LangGraph and similar agent frameworks; coding agents such as Claude Code and Codex.
+avoid: When the steps are fixed and known. Use a plain workflow with model calls at set points.
+flow:
+  User [user] -> Agent loop [svc: host program] : task | The user asks a question that needs lookups.
+  Agent loop -> LLM [model: reason + act] : history + tools | The program sends the full history.
+  LLM -> Agent loop : thought + search(order) | The model explains its plan and picks one tool call.
+  Agent loop -> Order API [svc: tool] : GET order 4411 | The host runs the tool, not the model.
+  Order API -> Agent loop : status shipped | The result is added to history as an observation.
+  Agent loop -> User : final answer | After a few turns, the model answers and the loop stops.
+ref: paper | ReAct: Synergizing Reasoning and Acting in Language Models | Yao et al., ICLR 2023 | https://arxiv.org/abs/2210.03629
+
+== Loop with step budget, timeout and checkpoints
+kind: checkpoint-restart, circuit-breaker
+when: An agent runs unattended, and a loop that never ends would burn money or break things.
+how: The host program puts hard limits around the loop: a maximum number of steps (for example 25), a total token budget, and a wall-clock timeout. When a limit is reached, the loop stops and returns a partial result with a clear reason.
+It also watches for repeats. If the same tool call with the same arguments fails three times, the breaker stops that tool and tells the model to try another way or ask a person.
+After each step the host saves the history and tool results as a checkpoint. If the process crashes, it resumes from the last checkpoint and does not repeat finished side effects. This needs tool calls to carry idempotency keys.
+used: LangGraph checkpointers; Temporal-based agent runtimes; max-turns limits in agent SDKs.
+avoid: For short, supervised chat, where a person can press stop.
+flow:
+  Agent loop [svc: step 7 of 25] -> LLM [model] : history | Each turn counts against the step budget.
+  LLM -> Agent loop : search("same query") | The model repeats the same call.
+  Agent loop -x> Search tool [svc] : 3rd identical failure | The breaker blocks the tool after three equal failures.
+  Agent loop -> Checkpoint store [store: per step] : save state step 7 | History is saved after every step.
+  Agent loop -> LLM : tool blocked, try again | The model gets feedback and changes its plan.
+  * Agent loop: step 26, stopped | At the limit, the loop ends and returns a partial answer with the reason.
+ref: docs | Building effective agents | Anthropic, 2024 | https://www.anthropic.com/engineering/building-effective-agents
+
+== Planner with ReAct workers
+kind: llm-workflow, agent-loop
+when: A goal is large, and one long loop loses track of the parts.
+how: A planner model first writes a short plan with separate subtasks, such as "find the data", "run the analysis", "write the summary". Each subtask goes to a worker that runs its own ReAct loop with a small tool set.
+Workers have shorter histories, so each stays focused. Independent subtasks can run in parallel. A worker returns a short result to the planner, which can revise the plan if a result is surprising.
+This costs an extra model call for the plan and for replanning. It works best when subtasks are fairly independent, and when a clear end test exists for each one.
+used: Plan-and-execute agents in LangGraph; orchestrator-worker designs described by Anthropic.
+avoid: For short tasks that need only a few steps. A single ReAct loop is cheaper.
+flow:
+  User [user] -> Planner [model: writes plan] : goal | The user gives a large goal.
+  Planner -> Worker A [svc: ReAct loop], Worker B [svc: ReAct loop] : subtask 1, subtask 2 | The planner assigns separate subtasks.
+  Worker A -> Data API [svc: tool] : query | Worker A uses its tools in its own loop.
+  Worker B -> Code sandbox [svc: tool] : run analysis | Worker B runs in parallel.
+  Worker A, Worker B -> Planner : results | Short results go back to the planner.
+  Planner -> User : combined answer | The planner merges the results or revises the plan.
+ref: blog | Building effective agents | Anthropic, 2024 | https://www.anthropic.com/engineering/building-effective-agents
+
+@@ toolcall
+== Host-executed tool loop with schema validation
+kind: agent-loop, request-reply
+when: A model must use real systems, and the program must stay in control of what actually runs.
+how: The program sends the model the user message and a list of tools, each with a name, a description and a JSON schema for its arguments. The model does not run anything. It returns a structured call, for example get_weather with {"city": "Oslo"}.
+The host parses the call and validates it against the schema. It then runs the function, with its own checks and credentials, and sends the result back in a tool result message. The model reads it and writes the final answer, or asks for another tool.
+Validation matters because a model may return a wrong name or a bad type. On an error, the host returns the error text so the model can fix the call. Several independent calls can come in one reply and run in parallel.
+used: Claude tool use, OpenAI function calling and Gemini function calling APIs; every major agent framework.
+avoid: When one fixed API call is always made. Call it directly and give the result to the model.
+flow:
+  App [svc: host program] -> LLM [model: sees tool schemas] : message + tool list | The app sends the question and the tool definitions.
+  LLM -> App : get_weather({city: Oslo}) | The model replies with a structured call, not text.
+  * App: call validated | The host checks the name and argument types.
+  App -> Weather API [svc: real tool] : GET /oslo | The host runs the call with its own credentials.
+  Weather API -> App : 3 C, rain | The tool returns data.
+  App -> LLM : tool_result 3 C, rain | The result is sent back in the next message.
+  LLM -> App : final text answer | The model writes the answer for the user.
+ref: docs | Tool use with Claude | Anthropic documentation | https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/overview
+
+== Tool servers over MCP
+kind: plugin-arch, sidecar
+when: Many agent apps need the same tools, and each tool should be written once.
+how: A tool provider writes an MCP server that lists its tools, with names and schemas, and runs them. The host app has an MCP client for each server. Local servers talk over stdio, as a child process. Remote servers talk over HTTP, with JSON-RPC messages.
+At start, the client asks the server for its tool list and adds those tools to the model's tool definitions. When the model calls a tool, the host sends a tools/call request to the right server and returns the result to the model.
+This turns a many-to-many integration problem into a standard protocol. The host still decides which servers to trust, because tool descriptions and results are untrusted input. A server with many tools also fills the context, so hosts can filter tools.
+used: Claude Desktop and Claude Code, VS Code, Cursor and others as MCP hosts; servers for GitHub, Slack, databases and file systems.
+avoid: For one app with two internal functions. Direct function calling is simpler.
+flow:
+  Host app [svc: MCP client] -> GitHub MCP server [svc: stdio child] : tools/list | At start, the client asks what tools exist.
+  GitHub MCP server -> Host app : create_issue, list_prs | The server returns names and schemas.
+  Host app -> LLM [model] : tool definitions | The host adds those tools to the model call.
+  LLM -> Host app : create_issue({...}) | The model picks a tool.
+  Host app -> GitHub MCP server : tools/call | The host forwards the call over JSON-RPC.
+  GitHub MCP server -> GitHub API [svc: HTTPS] : POST /issues | The server calls the real API with its own token.
+ref: spec | Model Context Protocol specification | Model Context Protocol project | https://modelcontextprotocol.io/specification
+
+== Sandboxed code execution tool
+kind: bulkhead, timeout-deadline
+when: The model writes code or shell commands, and they must run without risk to the host.
+how: The host gives the model a tool such as run_python. The code never runs in the host process. It runs in a sandbox: a container with namespaces and cgroups, a microVM such as Firecracker, or gVisor. The sandbox has no secrets, a read-only base image and a small writable folder.
+Limits are set on CPU, memory and run time (for example 30 s). The network is off, or allows only a short list of hosts. When the time ends, the host kills the sandbox and returns a timeout error as the tool result.
+You cannot know in advance what arbitrary code will do, so you contain it. Results come back as text and files, and the sandbox is deleted after use or after a session.
+used: Code interpreter tools from Anthropic and OpenAI; E2B sandboxes; Claude Code sandbox mode.
+avoid: For fixed operations with known inputs. Expose a narrow function instead of general code.
+flow:
+  LLM [model] -> Host [svc: tool runner] : run_python(code) | The model sends code as a tool call.
+  Host -> Sandbox [svc: microVM, no net] : start + copy code | The host starts a fresh isolated sandbox.
+  Sandbox -> Host : stdout, file plot.png | The code finishes and returns output.
+  Sandbox -x> Internet [svc: blocked] : outbound request | Network access is denied by default.
+  Host -x> Sandbox : kill at 30 s | A loop that never ends is stopped by the time limit.
+  Host -> LLM : tool_result | The model gets the output or the timeout error.
+ref: docs | Firecracker | AWS open source | https://firecracker-microvm.github.io/
+
+@@ lsh
+== MinHash banding for near-duplicate detection
+kind: map-reduce, pre-aggregation
+when: A huge set of documents must be grouped by near-duplicates, and comparing every pair is impossible.
+how: Break each document into shingles, such as every 5 words. Compute a MinHash signature of 128 numbers. The chance that two signature slots match equals the Jaccard similarity of the two shingle sets.
+Cut the signature into bands, for example 32 bands of 4 numbers. Hash each band to a bucket. Two documents that share a bucket in any band become a candidate pair. With these settings, pairs above about 0.7 similarity are very likely to collide, and pairs below 0.3 almost never do.
+Only candidates are checked with the exact similarity. In MapReduce or Spark, the band hash is the shuffle key, so the work is spread over many machines and grows near linearly with the number of documents.
+used: Web page deduplication at search engines; Spark MLlib MinHashLSH; deduplicating text for LLM training sets.
+avoid: When exact duplicates are enough. A plain hash of the content is cheaper. For small sets, compare directly.
+flow:
+  Documents [lake: 1B pages] -> Signature job [svc: MinHash 128] : shingles | Each document becomes a 128-number signature.
+  Signature job -> Band hasher [svc: 32 bands x 4] : signature | Each signature is cut into bands, and each band is hashed.
+  Band hasher -> Bucket store [store: band hash key] : (band 7, hash) -> doc id | Documents with the same band hash meet at the same key.
+  Bucket store -> Verifier [svc: exact Jaccard] : candidate pairs | Only pairs that share a bucket are compared.
+  Verifier -> Dedup table [db: cluster id] : duplicates at 0.8+ | Verified near-duplicates get one cluster id.
+ref: book | Mining of Massive Datasets, chapter 3: Finding similar items | Leskovec, Rajaraman & Ullman | http://www.mmds.org/
+
+== SimHash check at crawl or ingest time
+kind: pipes-filters
+when: A crawler must skip pages that are almost copies of pages it already has, as they arrive.
+how: Compute a 64-bit SimHash for each page from its weighted words. Similar pages get fingerprints that differ in only a few bits. Two pages are near-duplicates when their Hamming distance is small, for example 3 bits or fewer.
+To search fast, split the 64 bits into blocks and keep tables for permutations of them. Pages within distance 3 must match exactly in at least one block, so a few table lookups find all candidates. The check runs inside the pipeline, before the page is stored or indexed.
+This saves storage and keeps results from filling with copies. The threshold needs tuning: too loose removes real distinct pages, such as product pages that differ in one price.
+used: Google's web crawl deduplication (Manku, Jain and Das Sarma, 2007); Common Crawl style pipelines.
+avoid: When the pages must be kept as exact records. Mark duplicates, but do not drop them.
+flow:
+  Crawler [svc: fetches pages] -> Fingerprinter [svc: 64-bit SimHash] : page text | Each page is turned into a 64-bit fingerprint.
+  Fingerprinter -> Fingerprint tables [store: 4 block tables] : lookup within 3 bits | The system looks for stored fingerprints that are close.
+  Fingerprint tables -x> Crawler : near-duplicate found | A close fingerprint exists, so the page is skipped.
+  Fingerprint tables -> Indexer [svc] : new page | If nothing is close, the page goes on to indexing.
+  Indexer -> Fingerprint tables : add fingerprint | The new fingerprint is added for future checks.
+ref: paper | Detecting near-duplicates for web crawling | Manku, Jain & Das Sarma, WWW 2007 |
+
+== LSH as a candidate generator before exact ranking
+kind: two-tower-retrieval, precompute
+when: Similar items must be found by content among millions, such as audio clips or image vectors, and a full scan is too slow.
+how: Index each item vector in several hash tables. Each table uses a different random hash that tends to send close vectors to the same bucket, such as random hyperplanes for cosine similarity. A query is hashed with the same functions and reads its bucket in every table.
+The union of the buckets gives a few hundred candidates. The system then computes exact distance on only these and returns the top results. More tables raise recall and use more memory. More bits per table make buckets smaller and faster, but miss more neighbors.
+Modern vector search often uses graph or cluster indexes (HNSW, IVF), which usually give better recall for the same time. LSH is still useful for simple, streaming and low-memory settings and for fingerprint matching.
+used: Content recognition and audio fingerprinting; early image search; near-duplicate grouping in recommendation pipelines.
+avoid: For high recall dense vector search at scale. Use HNSW or IVF with product quantization.
+flow:
+  Items [lake: 10M vectors] -> Index builder [svc: 12 tables x 16 bits] : hash all vectors | Each vector is hashed into one bucket in each table.
+  Index builder -> Hash tables [store: buckets] : write buckets | Buckets are stored with item ids.
+  Query [client: one vector] -> Hash tables : same hashes | The query uses the same hash functions.
+  Hash tables -> Reranker [svc: exact cosine] : 400 candidates | The union of the buckets gives a short list.
+  Reranker -> Query : top 10 | Exact scoring on only 400 items returns the best matches.
+ref: paper | Similarity Search in High Dimensions via Hashing | Gionis, Indyk & Motwani, VLDB 1999 |
+
+@@ pagerank
+== Offline power iteration over the link graph
+kind: map-reduce, precompute
+when: A search engine needs a global importance score for billions of pages, and it can be refreshed on a schedule.
+how: Treat the web as a directed graph. Every page starts with the same score. In each round, a page splits its score among the pages it links to, and each page sums what it receives. A damping factor of 0.85 means the surfer follows a link 85% of the time and jumps to a random page otherwise.
+This is power iteration on the link matrix. It converges to the stationary distribution of the random surfer. About 50 to 100 rounds are usually enough. Each round is a join on page id plus a group-by sum, which fits MapReduce, Spark GraphX or a Pregel-style graph engine.
+Dangling pages with no links and spider traps are handled by the random jump. The result is one score per page, written to a table and refreshed after each crawl.
+used: Google's original ranking (Brin and Page, 1998); Spark GraphX and Apache Giraph PageRank examples.
+avoid: For personal ranking per user or per topic. Use personalized PageRank. For tiny graphs, one machine is enough.
+flow:
+  Link graph [lake: page to links] -> Rank job [svc: Spark round 1] : edges + scores | Each page sends score / outlinks to its targets.
+  * Rank job: round 2 | The job shuffles by target page, sums the incoming scores and starts the next round.
+  Rank job -> Score table [db: page to rank] : scores after 50 rounds | Rounds repeat until scores change by very little.
+  Score table -> Ranker [svc: search] : load scores | The search ranker loads the scores.
+ref: paper | The PageRank Citation Ranking: Bringing Order to the Web | Page, Brin, Motwani & Winograd, Stanford, 1999 |
+
+== PageRank as one signal in query-time ranking
+kind: precompute, online-offline
+when: A search query must be answered in 200 ms, and link importance should help order the results.
+how: PageRank does not depend on the query, so it is computed offline and stored as a number per document. At query time, the index returns the documents that match the words, and the first ranking stage scores them by text match, such as BM25.
+The ranker then combines text score, link score and many other signals, today often with a learned model. The link score helps most for broad queries with many matches, where text match cannot separate good pages from poor ones.
+Link signals can be gamed with link farms, so engines combine them with spam detection and trust scores. PageRank is now one of many signals, and not the only one.
+used: Web search engines in general; Google said PageRank is still part of its ranking in some form; link scores in academic citation tools.
+avoid: For sites with few links, such as private company search. Use text and click signals.
+flow:
+  Query [client: "python tutorial"] -> Search ranker [svc: 200 ms budget] : terms | The query arrives at the ranker.
+  Search ranker -> Inverted index [store: postings] : match docs | The index returns the 10,000 documents that match.
+  Search ranker -> Score table [db: PageRank per doc] : lookup ranks | The ranker reads the precomputed link score for each match.
+  Search ranker -> Learned ranker [model: text + link + clicks] : features | A model combines text match and link score.
+  Learned ranker -> Query : top 10 results | The final list is returned.
+ref: paper | The Anatomy of a Large-Scale Hypertextual Web Search Engine | Brin & Page, WWW 1998 |
+
+== Personalized random walks for recommendations
+kind: two-tower-retrieval
+when: A graph of users, items and boards exists, and related items must be found for one user in real time.
+how: Personalized PageRank restarts the random walk at a chosen node, such as the item the user just saved, instead of at a random page. Nodes that the walk visits often are closely related to the start node.
+Running full power iteration for each user is too slow. Instead, the system runs many short random walks live, for example 100,000 steps, and counts visits. The graph is kept in memory on one big machine, and counts decide the candidates.
+The top counts become candidates for a ranking model. Pinterest's Pixie system does this, with a graph of billions of edges and responses in tens of milliseconds.
+used: Pinterest Pixie; Twitter's GraphJet and "who to follow" use related graph methods.
+avoid: When the graph is sparse or changes little. Precomputed item-to-item lists are simpler.
+flow:
+  User action [client: saved pin P] -> Walk service [svc: Pixie-style] : start node P | The walk starts at the item the user just saved.
+  Walk service -> Graph store [store: in-memory graph] : 100k random steps | The service takes short walks with random restarts.
+  Graph store -> Walk service : visit counts | Nodes that were visited often are close to P.
+  Walk service -> Ranker [model: ranking] : top 500 by count | The most visited nodes are sent as candidates.
+  Ranker -> User action : top 20 pins | A ranker orders the candidates and the best are shown.
+ref: paper | Pixie: A System for Recommending 3+ Billion Items to 200+ Million Users in Real-Time | Eksombatchai et al., WWW 2018 |
+
+@@ dagsched
+== Orchestrator with a ready queue and workers
+kind: none
+when: Many tasks depend on each other, and each must start only after its inputs are done.
+how: A pipeline is defined as a graph with no cycles. The scheduler counts, for each task, how many upstream tasks are not yet done. Tasks with zero are ready. They go into a queue, and workers take them.
+When a task finishes, the scheduler lowers the count of each downstream task. Any that reach zero become ready. Independent branches run at the same time, so the run takes as long as the longest path (the critical path), not the sum of all tasks.
+If a task fails, its downstream tasks are not started and are marked upstream-failed. After a fix, only the failed task and its downstream tasks are rerun. Limits on workers and priorities decide which ready task starts first.
+used: Apache Airflow and Dagster; Prefect and Argo Workflows; Spark's DAG scheduler; make and Bazel for builds.
+avoid: When the work has loops or needs long-lived state between steps. Use a state machine or workflow engine such as Temporal.
+flow:
+  DAG definition [store: 3 tasks] -> Scheduler [svc: dependency counts] : tasks + edges | The scheduler reads the graph and counts each task's upstream tasks.
+  Scheduler -> Ready queue [queue: extract] : extract has 0 deps | Only tasks with no waiting inputs are queued.
+  Ready queue -> Worker 1 [svc], Worker 2 [svc] : take task | Workers pull ready tasks.
+  Worker 1 -> Scheduler : extract done | The scheduler lowers the counts of the downstream tasks.
+  Scheduler -> Ready queue : clean_a, clean_b ready | Two independent tasks become ready and run in parallel.
+  Worker 2 -x> Scheduler : clean_b failed | The load task, which needs both, is blocked and not started.
+ref: docs | DAGs | Apache Airflow documentation | https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html
+
+== Dependency graph from ref() with incremental runs
+kind: materialized-view
+when: Data models depend on each other, and analysts should declare inputs, not order.
+how: In a tool such as dbt, each model is a SQL file that names its inputs with ref('orders'). The tool reads all files and builds the graph. It sorts the graph in topological order and runs models in that order, with several in parallel up to a thread limit.
+The graph also gives selection. Running "model and everything downstream" rebuilds only what a change can affect. State comparison against the last run skips models whose code and inputs have not changed.
+The graph is the same for medallion layers: bronze, silver and gold tables are steps in one DAG. Cycles are errors, found before anything runs.
+used: dbt Core and dbt Cloud; Dagster software-defined assets; Terraform resource graphs.
+avoid: For logic that needs loops or runtime branching. Write it in an orchestrator task instead.
+flow:
+  Model files [store: SQL with ref] -> Compiler [svc: dbt parse] : ref() calls | The tool reads every model and finds its inputs.
+  Compiler -> Graph [store: sorted DAG] : topological order | It sorts models so inputs always come first.
+  Graph -> Runner [svc: 4 threads] : stg_orders, stg_users | Models with no waiting inputs run in parallel.
+  Runner -> Warehouse [db: tables] : CREATE TABLE AS | Each model becomes a table or view.
+  Runner -> Warehouse : mart_revenue | The downstream mart runs after both inputs exist.
+  Compiler -x> Model files : cycle detected | A circular ref is rejected before any SQL runs.
+ref: docs | dbt documentation: ref | dbt Labs | 
+
+== Idempotent partition backfill over a DAG
+kind: backfill-replay
+when: Old data must be recomputed after a bug fix, and each run must be safe to repeat.
+how: Each task works on one partition, such as a date, and overwrites that partition's output. It does not append. Running it twice gives the same result, which is called idempotency. The scheduler can then retry and rerun without fear of duplicates.
+A backfill creates one DAG run for each date in a range, for example the last 90 days. A limit on parallel runs, such as 5 at a time, protects the warehouse. Inside each run, the tasks still go in dependency order.
+If days depend on the previous day, such as a running total, run them in order. Otherwise, run them in parallel.
+used: Airflow backfill and catchup; dbt incremental models with full refresh; Dagster partitioned assets.
+avoid: When tasks write to external systems with no overwrite, such as sending emails. A rerun would repeat the effect.
+flow:
+  Engineer [user] -> Scheduler [svc: Airflow] : backfill Jan 1 to Mar 31 | The engineer asks for a rerun over a date range.
+  Scheduler -> Run Jan 1 [svc: DAG run], Run Jan 2 [svc: DAG run] : create runs, max 5 | The scheduler creates one DAG run per date, up to 5 at once.
+  Run Jan 1 -> Warehouse [db: partitioned table] : overwrite dt=Jan 1 | A task replaces its own partition.
+  Run Jan 2 -> Warehouse : overwrite dt=Jan 2 | Another date runs at the same time on a different partition.
+  Run Jan 2 -x> Warehouse : task failed | One date fails and the other dates are not affected.
+  Scheduler ~> Run Jan 2 : retry | Retry overwrites the partition, so no duplicates appear.
+ref: docs | Backfill | Apache Airflow documentation | https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dag-run.html
+
+@@ lineage
+== Recompute a lost partition from its lineage
+kind: none
+when: A cluster job runs on many machines, and a machine failure must not restart the whole job.
+how: A dataset such as a Spark RDD records how it was made: the parent dataset and the function applied, for example read file, filter, map. This record is the lineage. Data is split into partitions, and each is made by a deterministic function of its parent partitions.
+If an executor dies, its partitions are lost. The scheduler walks the lineage back to data that still exists, such as the input files or saved shuffle outputs, and reruns only the work for the lost partitions on other nodes. The rest of the job is kept.
+This avoids copying every intermediate result to other machines, which would cost network and disk. It works because transformations are deterministic. Random code or reading a changing source can give a different result on rerun.
+used: Apache Spark RDDs and DataFrames; the RDD paper (Zaharia et al., 2012); Ray tasks also rebuild lost objects from their lineage.
+avoid: When recomputation is very costly or the code is not deterministic. Save the result with a checkpoint or replicas.
+flow:
+  Input files [lake: HDFS or S3] -> Stage 1 [svc: 100 partitions] : read | Stage 1 builds 100 partitions from the input.
+  Stage 1 -> Stage 2 [svc: reduceByKey] : shuffle | Stage 2 reads shuffle output from stage 1.
+  Executor 7 [svc: holds part 42] -x> Stage 2 : executor lost | A machine fails, and partition 42 is lost.
+  Stage 2 -> Stage 1 : need lineage of part 42 | The scheduler walks back through the recorded steps.
+  Stage 1 -> Executor 3 [svc: recompute 42] : rerun for part 42 only | Only the lost partition is rebuilt on another node.
+  Executor 3 -> Stage 2 : part 42 restored | The job continues. The other 99 partitions were not touched.
+ref: paper | Resilient Distributed Datasets: A Fault-Tolerant Abstraction for In-Memory Cluster Computing | Zaharia et al., NSDI 2012 | https://www.usenix.org/system/files/conference/nsdi12/nsdi12-final138.pdf
+
+== Checkpoint to cut a long lineage
+kind: checkpoint-restart
+when: A job has many steps or loops, and replaying the lineage from the source after a failure would take too long.
+how: In an iterative job, such as a graph algorithm that runs 100 rounds, each round adds to the lineage. After a failure, recomputing the whole chain from the input is slow, and the lineage record itself grows large.
+The fix is a checkpoint. Every N rounds, the job writes the dataset to reliable storage such as HDFS or S3. Its lineage is cut at that point, and recovery starts from the saved copy. In Spark, call checkpoint() on the dataset.
+The trade-off is cost: writing a checkpoint takes time and space, so use it where recompute is longer than the save. Wide dependencies with a shuffle are good places, because a loss there can force many parents to rerun.
+used: Spark checkpointing in iterative jobs such as PageRank and ML training; Structured Streaming checkpoints.
+avoid: For short jobs that run in minutes. Rerunning from the source is cheaper than saving.
+flow:
+  Iteration job [svc: round 31] -> Lineage [note: 30 steps long] : each round adds a step | Each round extends the recorded recipe.
+  Iteration job -> Checkpoint store [store: HDFS or S3] : checkpoint() at round 30 | The data is saved to reliable storage.
+  * Lineage: reset at round 30 | The saved copy becomes the new starting point.
+  Executor [svc: worker] -x> Iteration job : lost at round 37 | A worker is lost seven rounds later.
+  Checkpoint store -> Iteration job : load round 30 data | The job rebuilds from the checkpoint, not from the input.
+  Iteration job -> Executor : replay 7 rounds only | Only seven rounds are replayed, not thirty-seven.
+ref: docs | RDD programming guide: persistence and checkpointing | Apache Spark documentation | https://spark.apache.org/docs/latest/rdd-programming-guide.html

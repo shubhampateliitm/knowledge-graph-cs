@@ -1,0 +1,673 @@
+@@ bm25
+== Per-shard BM25 scoring with scatter-gather top-k
+kind: scatter-gather, sharding
+when: An index is too big for one node, and each query needs the best ten documents from all of it.
+how: The coordinator sends the query to one copy of every shard. Each shard reads the posting lists of the query terms and scores each matching document with BM25, using term frequency, document length and document frequency stored in its own segments. It keeps only its local top k in a small heap and returns document ids and scores.
+The coordinator merges these lists and keeps the global top k. A second phase fetches the stored fields only for those k documents, so full documents never cross the network for losers.
+Scores are only comparable if the idf values are alike. Each shard computes idf from its own statistics, so a tiny or skewed shard can rank unfairly. Elasticsearch offers a dfs_query_then_fetch search type that first gathers global document frequencies, at the cost of one more round trip.
+used: Elasticsearch, OpenSearch and Solr (BM25 is the default in Lucene since version 6); Vespa and Tantivy rank text with BM25 too.
+avoid: When the index has few documents per shard, where local idf is noisy; use dfs_query_then_fetch or fewer shards.
+flow:
+  Client [client] -> Coordinator [svc: query node] : search "disk full" | The client sends one query to any node, which becomes the coordinator for this request.
+  Coordinator -> Shard 1 [svc: local idf], Shard 2 [svc: local idf], Shard 3 [svc: local idf] : query phase | The coordinator fans the query out to one copy of every shard in parallel.
+  Shard 1 -> Segments [store: tf, dl, df] : read postings | Each shard reads posting lists and scores each hit with BM25 from its own statistics.
+  Shard 1, Shard 2, Shard 3 -> Coordinator : top 10 ids + scores | Each shard returns only its local top ten, not all matches.
+  Coordinator -> Shard 2 : fetch 10 docs | In the fetch phase only the global winners are loaded from stored fields.
+  Coordinator -> Client : final top 10 | The client gets one merged ranked list.
+ref: book | Introduction to Information Retrieval, ch. 6 | Manning, Raghavan & Schütze, 2008 |
+ref: paper | The Probabilistic Relevance Framework: BM25 and Beyond | Robertson & Zaragoza, 2009 |
+
+== BM25 as first-stage retrieval for RAG
+kind: rag, two-tower-retrieval
+when: A question-answering system must find exact names, error codes and rare terms in a large document set.
+how: Documents are split into chunks and indexed in an inverted index. At question time the system runs BM25 over the chunks and takes the top 50 to 100 candidates. This step is cheap, because all the numbers it needs are already in the index.
+A reranker or the language model sees only the best few chunks. Vector search often misses an exact string such as "ERR_4012" or a product code, while BM25 finds it, because a rare term has a high idf.
+BM25 needs no training and no embedding step, so a new document is searchable as soon as it is indexed. It cannot match synonyms, which is why many systems add a vector search beside it.
+used: Common in production RAG stacks on Elasticsearch, OpenSearch or Vespa; BM25 is the standard baseline in the BEIR benchmark.
+avoid: When most questions use different words from the documents (paraphrase); add dense retrieval and fuse the lists.
+flow:
+  Docs [lake: chunks] -> Index [store: inverted index] : tokenize and index | Chunks are indexed once; term statistics are stored with the postings.
+  User [user] -> RAG service [svc] : "what is ERR_4012?" | A question arrives at the RAG service.
+  RAG service -> Index : BM25 query | The service scores chunks with BM25 and takes the top 50 candidates.
+  Index -> RAG service : 50 chunks | The rare code token has a high idf, so the chunk that names it ranks first.
+  RAG service -> LLM [model: answers] : top 5 chunks + question | Only the best few chunks go into the prompt.
+  LLM -> User : answer with sources | The model answers from the retrieved text.
+ref: paper | BEIR: A Heterogeneous Benchmark for Zero-shot Evaluation of Information Retrieval Models | Thakur et al., NeurIPS 2021 | https://arxiv.org/abs/2104.08663
+
+@@ crawling
+== Polite crawl frontier with per-host queues
+kind: priority-queue, rate-limit, producer-consumer
+when: A crawler must fetch billions of pages without overloading any single website.
+how: The frontier is a set of URL queues, one per host, plus a priority layer. A scheduler picks a host whose politeness timer has expired, for example one request every few seconds, and hands one URL to a fetcher. Fetchers check the host's robots.txt (cached for hours) before the request.
+The fetcher stores the page, and a parser extracts links. Each new link is normalized and checked against a "seen" set (a Bloom filter or hash set) before it goes back to the frontier. Priority comes from signals such as page rank, change rate and depth.
+This design is the core of Mercator, and Heritrix and Apache Nutch follow the same idea. The limit is the frontier size: with billions of URLs it must live on disk, with only the heads of queues in memory.
+used: Mercator (AltaVista research crawler); Heritrix (Internet Archive); Apache Nutch; Common Crawl runs Nutch-based crawls.
+avoid: When you need a few known pages; call their API or a sitemap instead of building a crawler.
+flow:
+  Seeds [store: start URLs] -> Frontier [queue: per-host queues] : enqueue URLs | Seed URLs are added to per-host queues, ordered by priority.
+  Frontier -> Fetcher [svc: DNS + HTTP] : next URL, host ready | The scheduler releases a URL only when the host's delay has passed.
+  Fetcher -> Web host [svc: example.com] : GET /robots.txt, GET page | The fetcher obeys robots.txt rules and fetches at a gentle rate.
+  Web host -x> Fetcher : 429 too many requests | A rate-limit answer makes the crawler slow that host down.
+  Fetcher -> Parser [svc: links + text] : HTML | The parser extracts text and outgoing links.
+  Parser -> Seen set [cache: Bloom filter] : new links? | Links already seen are dropped here.
+  Parser -> Frontier : new URLs | Only unseen links go back into the queues.
+ref: paper | Mercator: A Scalable, Extensible Web Crawler | Heydon & Najork, World Wide Web 1999 |
+
+== Crawl, deduplicate and index pipeline
+kind: pipes-filters, medallion
+when: Raw crawled pages must become a clean searchable index or a training corpus.
+how: Fetchers write raw responses (WARC files) to object storage. A batch job then extracts the main text, detects language, and removes boilerplate such as menus.
+Next comes near-duplicate removal. Each document gets a fingerprint, for example a SimHash or a set of MinHash signatures over word shingles. Documents with close fingerprints are grouped, and one is kept. The step usually removes a large share of pages, because mirrors and templates are everywhere.
+The clean text then goes to an indexer for a search engine, or to a tokenizer for model pretraining. Keeping the raw layer lets you rerun the later steps when the rules change.
+used: Common Crawl (WARC files on S3, used for LLM pretraining sets such as C4 and FineWeb); web search indexers.
+avoid: When pages change every minute and freshness matters most; use a separate incremental crawl and index path.
+flow:
+  Fetchers [svc] -> Raw WARC [lake: object storage] : raw responses | Raw pages are stored unchanged, so later steps can be rerun.
+  Raw WARC -> Extractor [svc: text + language] : HTML | The extractor removes menus and ads and keeps the main text.
+  Extractor -> Deduper [svc: MinHash] : clean text | Each document gets a fingerprint that is cheap to compare.
+  Deduper -x> Dropped copies [note] : near-duplicate dropped | Documents with close fingerprints are collapsed to one.
+  Deduper -> Search indexer [svc], Corpus [lake: pretraining text] : unique docs | Unique documents go to the search index or to a training corpus.
+ref: paper | Detecting Near-Duplicates for Web Crawling | Manku, Jain & Das Sarma, WWW 2007 |
+
+@@ docvalues
+== Inverted index plus column store in one segment
+kind: polyglot-persistence, pre-aggregation
+when: One system must run full-text search and also sort and aggregate on the same documents.
+how: Each Lucene segment writes the same document twice. The inverted index maps terms to document ids for matching. Doc values store each field as a column indexed by document id, in a memory-mapped file.
+A query first uses the inverted index to find matching document ids. Then it reads the doc values columns for only those ids to sort by price or to sum latency. Without doc values the engine would invert the index at query time and keep the result on the Java heap, which is the old fielddata approach.
+Because the column is on disk and mapped by the operating system, the page cache decides what stays in RAM. The price is more disk space and slower indexing for each field that has doc values on.
+used: Elasticsearch, OpenSearch and Solr (doc values are on by default for most field types); log search and e-commerce facets.
+avoid: When a field is never sorted or aggregated; turn doc_values off for it to save disk.
+flow:
+  Indexer [svc] -> Segment [store: one Lucene segment] : write document | A new document is written to the current segment.
+  Segment -> Inverted index [store: term to docIDs] : terms | Text terms go into the inverted index.
+  Segment -> Doc values [store: columns by docID] : price, country | Sortable fields are also written as columns.
+  Query [client] -> Inverted index : match "shoes" | The query finds matching document ids first.
+  Inverted index -> Doc values : docIDs 12, 40, 977 | The engine reads only these rows of the column.
+  Doc values -> Query : sorted by price | Sorting and sums use one dense array, in docID order.
+ref: docs | Doc values | Elasticsearch reference | https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/doc-values
+
+== Terms aggregation with global ordinals
+kind: scatter-gather, pre-aggregation
+when: A dashboard needs the top values of a text field, such as top 10 countries, across many segments and shards.
+how: Doc values for a keyword field store ordinals: each distinct string gets a small integer, sorted in alphabetical order, per segment. Counting by ordinal is a cheap array increment.
+Segments have different ordinal numbers for the same string. A global ordinals map, built per shard when first needed, gives one numbering for all segments of the shard. The shard then counts into one array and converts only the top terms back to strings.
+Each shard returns its top terms, and the coordinator merges them. The merge is approximate for high-cardinality fields, because a term can be outside the top list of one shard and still be large overall.
+used: Elasticsearch and OpenSearch terms aggregations; Solr facets.
+avoid: When the field has huge cardinality and exact counts are needed; use composite aggregation to page through all values, or precompute.
+flow:
+  Dashboard [client] -> Coordinator [svc] : top 10 country | The dashboard asks for the ten most common countries.
+  Coordinator -> Shard A [svc: global ordinals], Shard B [svc: global ordinals] : terms aggregation | The query goes to all shards.
+  Shard A -> Doc values [store: ordinals per doc] : read ordinal for each hit | The shard reads small integers, not strings, for each matching document.
+  * Shard A: counts in an array | Counting is an array increment per ordinal.
+  Shard A, Shard B -> Coordinator : top terms + counts | Each shard turns its top ordinals back into strings.
+  Coordinator -> Dashboard : merged top 10 | The coordinator adds up counts and returns the final list.
+ref: docs | Aggregations | Elasticsearch reference | https://www.elastic.co/docs/explore-analyze/query-filter/aggregations
+
+@@ fst
+== In-memory term index over an on-disk term dictionary
+kind: tiered-storage, index-table
+when: A search index has hundreds of millions of terms, and the heap cannot hold all of them.
+how: Lucene writes terms in sorted blocks on disk. A small index over the block prefixes stays in memory or in a memory-mapped file. In most Lucene versions this index is an FST; a trie replaced it in newer releases.
+To find a term, the reader walks the index one byte at a time to find the block, reads that one block from disk, and scans a few dozen terms inside it. The walk costs one step per byte, however many terms exist.
+Suffix sharing makes the FST much smaller than a plain trie. The result is one disk read per term lookup, and a posting list pointer at the end.
+used: Lucene, and so Elasticsearch, OpenSearch and Solr; Tantivy uses an FST for its term dictionary.
+avoid: When the key set is tiny; a hash map is simpler and faster.
+flow:
+  Query [client] -> Term index [cache: FST in memory] : term "compaction" | The reader looks up the term prefix in the in-memory index.
+  Term index -> Term block [store: sorted terms on disk] : block offset | The index returns the offset of one block, not the term itself.
+  Term block -> Query : postings pointer | The reader scans a few terms in the block and finds the exact one.
+  Query -> Postings [store: doc lists] : read list | The pointer leads to the posting list for the term.
+  Term index -x> Query : no such prefix | A term that is not in the index is rejected without any disk read.
+ref: docs | Lucene FST package | Apache Lucene documentation | https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/util/fst/package-summary.html
+
+== Prefix autocomplete and fuzzy match with automata
+kind: precompute, index-table
+when: A search box needs type-ahead suggestions or typo-tolerant matching over a large vocabulary.
+how: For suggestions, the suggester builds an FST at index time. Each key is a phrase, and the output is its weight. At query time the engine walks the FST along the typed prefix, then searches the sub-tree for the best weighted completions.
+For fuzzy matching, a Levenshtein automaton accepts every string within edit distance 2 of the query word. The engine intersects this automaton with the term index, so only the branches that can still match are visited. A scan of all terms is never needed.
+The suggester FST is built in memory when the segment is written, so it adds to heap and disk. Updating a live suggestion list means building a new FST.
+used: Elasticsearch completion suggester; Lucene fuzzy queries (FuzzyQuery uses automata); Solr suggesters.
+avoid: When suggestions must update in real time per keystroke from live data; use a prefix search on a normal field.
+flow:
+  Index time [svc: build] -> Suggest FST [cache: phrase to weight] : phrases + weights | At index time all suggestion phrases are compiled into an FST.
+  User [user] -> Search box [client] : types "sea" | Each keystroke sends a prefix.
+  Search box -> Suggest FST : walk prefix "sea" | The engine walks three arcs and reaches the sub-tree.
+  Suggest FST -> Search box : top 5 by weight | It returns the five best completions, such as "search engine".
+  Search box -> Term index [cache: FST] : fuzzy "serch", automaton | For a typo, an automaton is intersected with the term index.
+  Term index -> Search box : "search" | Only matching branches are visited, then the match is returned.
+ref: blog | Using Finite State Transducers in Lucene | Michael McCandless, 2010 | https://blog.mikemccandless.com/2010/12/using-finite-state-transducers-in-lucene.html
+
+@@ hybridsearch
+== Parallel BM25 and vector retrieval with rank fusion
+kind: scatter-gather, rag
+when: Queries mix exact terms and loose meaning, and neither keyword nor vector search alone is good enough.
+how: The query runs twice at the same time. A BM25 search over the inverted index returns the top 100 by keyword score. An approximate nearest neighbour search over embeddings returns the top 100 by vector similarity.
+The two scores are on different scales, so the system fuses ranks, not scores. Reciprocal rank fusion gives each document 1 / (60 + rank) from each list and adds them. A document near the top of both lists wins. No tuning or training is needed, which is why RRF is a common default.
+The cost is two searches and one embedding call for the query, so latency is the slower of the two plus a few milliseconds. Scores can also be normalized and mixed with weights, which needs tuning on judged queries.
+used: Elasticsearch RRF retriever; OpenSearch hybrid query with score normalization; Vespa, Weaviate and Qdrant offer hybrid modes.
+avoid: When the corpus is tiny or only exact lookups matter; BM25 alone is simpler and cheaper.
+flow:
+  Query [client] -> Search service [svc: embeds the query] : "reset 2FA on iPhone" | One user query enters the search service.
+  Search service -> BM25 index [store: inverted index], Vector index [store: HNSW] : same query | The service sends the text to one index and the embedding to the other, in parallel.
+  BM25 index -> Fusion [svc: RRF] : top 100 by BM25 | The keyword side returns a ranked list.
+  Vector index -> Fusion : top 100 by cosine | The vector side returns its own ranked list.
+  Fusion -> Query : top 20 fused | RRF adds 1 / (60 + rank) per list and returns the merged order.
+ref: paper | Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods | Cormack, Clarke & Büttcher, SIGIR 2009 |
+ref: docs | Reciprocal rank fusion | Elasticsearch reference | https://www.elastic.co/docs/reference/elasticsearch/rest-apis/reciprocal-rank-fusion
+
+== Retrieve, then rerank with a cross-encoder
+kind: two-tower-retrieval, rag
+when: First-stage results are roughly right, but the top five must be very precise, for example before they go to an LLM.
+how: A cheap first stage returns 50 to 200 candidates. A cross-encoder reads the query and one document together, with attention across both, and outputs a relevance score. This sees word interactions that a single embedding cannot.
+Cross-encoders are slow, because each pair needs one model run and nothing can be precomputed. So they score only the shortlist, often 20 to 50 documents, on a GPU or a hosted reranking API.
+The latency budget decides the list size: 50 pairs with a small model can take tens of milliseconds, and a large model takes much longer. Keep the final list to what the consumer can use.
+used: Cohere Rerank and open BGE rerankers as hosted or self-run steps; Elasticsearch and OpenSearch support rerank steps; common in RAG pipelines.
+avoid: When latency must stay below a few milliseconds, or the first stage already gives the right order.
+flow:
+  Query [client] -> Retriever [svc: hybrid] : question | The question goes to the first-stage retriever.
+  Retriever -> Candidates [store: 100 docs] : fused top 100 | A fast hybrid search returns a wide shortlist.
+  Candidates -> Reranker [model: cross-encoder] : 100 query-doc pairs | The cross-encoder scores each pair, reading both texts together.
+  Reranker -> Query : top 5 by score | The best five are returned, in the new order.
+  Query -> LLM [model: answer] : 5 passages | In RAG, only these five passages are put in the prompt.
+ref: paper | Passage Re-ranking with BERT | Nogueira & Cho, 2019 | https://arxiv.org/abs/1901.04085
+
+@@ invindex
+== Segment-based index with merge in the background
+kind: lsm-compaction, copy-on-write
+when: Documents arrive all the time, and the index must stay searchable while it changes.
+how: New documents are buffered in memory and flushed as a small immutable segment, each a complete inverted index. Searches read all segments and merge the results. A refresh makes new segments visible, in Elasticsearch about once per second by default.
+Deletes do not change a segment. A delete marks the document in a live-docs bitmap, and the data goes away only when segments are merged. A background merge policy combines small segments into bigger ones, which keeps the segment count low and cleans out deleted documents.
+Immutable files are easy to cache and safe to read without locks. The price is write amplification from merges, and slower searches if merges fall behind.
+used: Lucene, and so Elasticsearch, OpenSearch and Solr; Tantivy uses the same segment idea.
+avoid: When you need a single, always-current structure with in-place updates and no merge cost; a B-tree index in a database fits better.
+flow:
+  Writer [svc] -> Buffer [cache: in-memory docs] : add document | New documents wait in an in-memory buffer; a translog or WAL keeps them safe.
+  Buffer -> Segment 1 [store: immutable] : refresh | A flush writes a new small segment that searches can now see.
+  Searcher [client] -> Segment 1, Segment 2 [store: immutable] : query | A query runs on every segment and merges the hits.
+  Segment 1, Segment 2 -> Merged segment [store: bigger] : background merge | The merge policy combines small segments and drops deleted documents.
+  * Merged segment: 2 segments became 1 | The old files are deleted after readers finish with them.
+ref: docs | Lucene core documentation | Apache Lucene | https://lucene.apache.org/core/
+
+== Filter bitmaps from inverted lists
+kind: index-table, scatter-gather
+when: Analytics queries filter by equality on many columns, and a full scan is too slow.
+how: For every value of a column the index stores the sorted list of row ids that have it, for example country = DE. A query with country = DE AND device = tv takes the two lists and intersects them. If lists are stored as compressed bitmaps (Roaring bitmaps), the intersection is a fast bitwise AND.
+Only the rows in the result are then read from the column store to compute sums or counts. For a filter that keeps 0.1% of rows, this reads 0.1% of the data instead of all of it.
+Time series databases use the same idea. A label index maps each label pair to the series that carry it, so a selector like {job="api", env="prod"} is an intersection of two lists.
+used: Apache Pinot and Druid inverted and bitmap indexes; Prometheus TSDB label index; Elasticsearch filters.
+avoid: When a column has very high cardinality and queries use ranges; use a sorted or range index instead.
+flow:
+  Dashboard [client] -> Query engine [svc] : country=DE AND device=tv | The query has two equality filters.
+  Query engine -> Index country [store: value to row ids] : lookup DE | The engine reads the row list for country = DE.
+  Query engine -> Index device [store: value to row ids] : lookup tv | It reads the row list for device = tv.
+  Index country, Index device -> Query engine : two bitmaps | Both lists come back as compressed bitmaps.
+  * Query engine: AND gives 1.2M rows | The AND leaves only rows that pass both filters.
+  Query engine -> Column store [store: metrics] : read 1.2M rows | Only the matching rows of the metric column are read and summed.
+ref: paper | Consistently faster and smaller compressed bitmaps with Roaring | Lemire et al., 2016 | https://arxiv.org/abs/1603.06549
+
+@@ irmetrics
+== Offline evaluation gate before shipping a ranker
+kind: shadow-ab, feedback-loop
+when: A team changes the ranking and must know, before users see it, whether quality went up or down.
+how: Keep a judged set: queries with documents labeled by human raters or by a trusted process, for example on a 0 to 3 scale. Run the old and new rankers on every query. Compute NDCG@10, recall@100 and MAP per query, then average.
+Compare with a paired test over queries, not just the mean, because a few queries can move the average. Look at the worst queries as well. A change that lifts NDCG by 0.5 point but breaks a key query class should be stopped.
+This is a gate in the CI or release pipeline. It is cheap and repeatable, but it only measures what the judgments cover, so it is followed by an online A/B test.
+used: TREC test collections, MS MARCO and BEIR for research; search teams at most large retailers and web companies run judged sets before A/B tests.
+avoid: When there are no judgments and no budget to make them; use click-based online tests and interleaving.
+flow:
+  Judged set [store: queries + labels] -> Eval runner [svc: CI job] : 2,000 queries | The CI job loads queries with relevance labels.
+  Eval runner -> Ranker v1 [svc: production], Ranker v2 [svc: candidate] : each query | Both rankers answer every query.
+  Ranker v1, Ranker v2 -> Metrics [svc: NDCG and recall] : ranked lists | The metrics step compares each list to the labels.
+  * Metrics: NDCG@10 0.412 to 0.431 | The candidate scores higher on average.
+  Metrics -> Release gate [svc: paired test] : per-query deltas | A paired test checks that the gain is not just noise.
+  Release gate -> A/B test [svc: online] : pass | A passing change goes to a small online experiment.
+ref: paper | Cumulated Gain-Based Evaluation of IR Techniques | Järvelin & Kekäläinen, ACM TOIS 2002 |
+
+== Per-stage metrics for a RAG retrieval pipeline
+kind: rag, feedback-loop
+when: A RAG system gives bad answers and you must know whether retrieval or generation is at fault.
+how: Build a test set of questions with the chunks that contain the answer. Measure the retriever alone with recall@k: is the right chunk in the top 20? Measure the final list with NDCG@5 or MRR, which show how high the right chunk is.
+If recall@20 is low, the retriever or the chunking is wrong, and no prompt will fix that. If recall is high but NDCG@5 is low, add or improve a reranker. If both are high and answers are still wrong, look at the generator.
+Run the test on every change of the chunk size, embedding model or reranker. Track the numbers over time, so a regression is caught before release.
+used: BEIR and MTEB retrieval benchmarks; teams that evaluate RAG with recall@k and NDCG before judging answers with an LLM.
+avoid: When the corpus has no clear ground truth chunks; use an LLM judge for answers and keep a small human-labeled sample.
+flow:
+  Test questions [store: question to chunk] -> Retriever [svc: top 20] : 500 questions | Each test question is sent to the retriever.
+  Retriever -> Recall check [svc: recall@20] : 20 chunks each | The check asks if the labeled chunk is in the list.
+  * Recall check: recall@20 = 0.91 | Retrieval finds the right chunk in 91% of cases.
+  Retriever -> Reranker [model: cross-encoder] : 20 chunks | The list is reordered by the reranker.
+  Reranker -> Rank check [svc: NDCG and MRR] : top 5 | The check measures how high the right chunk sits.
+  Rank check -> Dashboard [client] : per-stage metrics | The team sees which stage lost the answer.
+ref: paper | BEIR: A Heterogeneous Benchmark for Zero-shot Evaluation of Information Retrieval Models | Thakur et al., NeurIPS 2021 | https://arxiv.org/abs/2104.08663
+
+@@ ltr
+== Cheap retrieval, then learned reranker with LambdaMART
+kind: two-tower-retrieval, online-offline
+when: A search or recommendation list must be ordered by many signals, not only a text score.
+how: The first stage (BM25 or a recommender candidate source) returns 100 to 1,000 items. A second stage computes features for each query-item pair: BM25 score, click rate, freshness, price, popularity. A gradient-boosted tree model such as LambdaMART scores each item, and the list is sorted by that score.
+The model is trained offline on judged or click-derived data with a list-wise loss, so it learns a better order of the whole list, not just a score per item. It is retrained on a schedule and deployed as a model file.
+Feature computation is the main cost. Features must be computed the same way in training and serving, or the model silently gets worse.
+used: LightGBM and XGBoost rankers; Elasticsearch LTR plugins (Elasticsearch and OpenSearch have plugins); web search engines and e-commerce search.
+avoid: When you have under a few thousand labeled queries or clicks; tune BM25 fields and boosts by hand first.
+flow:
+  User [user] -> Search API [svc] : query | The user sends a query.
+  Search API -> Index [store: BM25] : retrieve | The first stage returns 500 candidates with a BM25 score.
+  Index -> Feature service [svc: feature builder] : 500 candidates | Features such as clicks and freshness are added to each candidate.
+  Feature service -> Ranker [model: LambdaMART] : 500 feature rows | The tree model scores each row.
+  Ranker -> User : top 10 sorted | The list is sorted by the learned score and the top ten are shown.
+ref: paper | From RankNet to LambdaRank to LambdaMART: An Overview | Burges, Microsoft Research, 2010 |
+
+== Click logs to training data to new ranker
+kind: feedback-loop, online-offline
+when: There are few human labels, but plenty of user clicks, and ranking should improve over time.
+how: The search service logs each result list with its position, and the clicks and purchases that follow. A batch job joins impressions and clicks into training rows. A click is a noisy label: users click top results more, even when they are worse.
+To reduce this position bias, the job uses inverse propensity weights, or a click model, or randomizes a small slice of traffic to measure bias. The ranker is trained on these labels with a list-wise loss.
+The new model is first tested offline on NDCG, then in an online A/B test. If it wins, it replaces the old one, and the loop repeats. The risk is a feedback loop: the model only learns about items it already showed.
+used: Common in large web search and e-commerce teams; open-source LightGBM and XGBoost provide ranking objectives.
+avoid: When clicks are rare or biased by design (for example autoplay); use human judgments or a small controlled experiment.
+flow:
+  Search service [svc] -> Click log [log: impressions + clicks] : position, item, click | Every shown list and every click is logged with its rank.
+  Click log -> Training job [svc: debias + join] : daily batch | A batch job builds training rows and adjusts for position bias.
+  Training job -> Model registry [store: ranker v8] : trained model | The new ranker is stored with its offline NDCG.
+  Model registry -> A/B test [svc: 5% traffic] : candidate ranker | A small share of users sees the new ranker.
+  A/B test -> Search service : promote if better | If metrics improve, the new ranker becomes the default.
+ref: paper | Unbiased Learning-to-Rank with Biased Feedback | Joachims, Swaminathan & Schnabel, WSDM 2017 | https://arxiv.org/abs/1608.04468
+
+@@ postings
+== Block-compressed postings with skip data
+kind: tiered-storage, pipeline-stages
+when: Posting lists are the biggest part of the index, and queries must scan or intersect them fast.
+how: Document ids in a list are sorted, so the index stores gaps. Lucene packs the gaps in blocks of 128 using frame of reference: the whole block uses the smallest bit width that fits its largest gap. The last few ids of a list are stored as variable-byte integers.
+Each block has a small header and, every few blocks, skip data holds a document id and file offset. To intersect two lists, the engine jumps through the rarer list and uses skip data on the longer one to leap over blocks, without decoding them.
+Smaller lists mean more of the index stays in the OS page cache, so there is less disk I/O. Decoding runs at billions of integers per second with SIMD code, so the CPU cost is repaid by the bytes saved.
+used: Lucene (Elasticsearch, OpenSearch, Solr); Tantivy uses bit-packed blocks; PForDelta-style codes are also used in other engines.
+avoid: When lists are tiny or very dense; a plain bitmap can be smaller and faster for dense sets.
+flow:
+  Indexer [svc] -> Gap encoder [svc: sorted ids to gaps] : docIDs 3, 7, 21, 28 | The indexer turns sorted ids into small gaps: 3, 4, 14, 7.
+  Gap encoder -> Block packer [svc: 128 per block] : gaps | Each block of 128 gaps uses one bit width, such as 5 bits.
+  Block packer -> Postings file [store: blocks + skips] : blocks + skip entries | Skip entries are written every few blocks for later jumps.
+  Query [client] -> Postings file : AND of two terms | A query reads the short list first.
+  Postings file -> Query : skip, decode few blocks | Skip data lets the reader jump over blocks that cannot match.
+ref: paper | Decoding billions of integers per second through vectorization | Lemire & Boytsov, 2015 | https://arxiv.org/abs/1209.2137
+
+== Compressed bitmaps for dense filter sets
+kind: cache-aside, index-table
+when: A filter such as "in stock" matches millions of documents and is reused by many queries.
+how: A dense posting list is better stored as a bitmap: one bit per document id. Roaring bitmaps split the id space into chunks of 65,536. A sparse chunk is a sorted array, a dense chunk is a plain bitmap, and a chunk of long runs is run-length coded.
+The engine caches the bitmap of a filter after it is used several times. Next time, the filter is an AND of two bitmaps, which is fast on modern CPUs. When the cache is full, the least used bitmaps are dropped.
+This adapts the format to each chunk, so it is small for both rare and common terms. The cost is memory for the cache and the work of building a bitmap the first time.
+used: Lucene filter caching (RoaringDocIdSet); Apache Pinot, Druid and Spark use Roaring bitmaps.
+avoid: When a filter is used once; skip the cache and run it as a normal posting list.
+flow:
+  Query [client] -> Filter cache [cache: filter bitmaps] : filter in_stock=true | A query asks for a filter that is used often.
+  Filter cache -x> Postings [store: posting lists] : miss, read list | On a miss the engine reads the posting list.
+  Postings -> Roaring builder [svc] : 4M docIDs | The builder picks the best format for each chunk of 65,536 ids.
+  Roaring builder -> Filter cache : store bitmap | The bitmap is cached for the next query.
+  Filter cache -> Query : AND with term list | The next query only does a fast bitwise AND.
+ref: paper | Roaring bitmaps: Implementation of an optimized software library | Lemire et al., 2018 | https://arxiv.org/abs/1709.07821
+
+@@ spatialidx
+== Cell index for nearby search
+kind: index-table, sharding
+when: An app must find the items near a point (drivers, stores) among millions, with updates every few seconds.
+how: The map is cut into cells: geohash prefixes, S2 cells or H3 hexagons. Each item is stored under the id of its cell, for example in a Redis sorted set (Redis GEO stores a geohash as the score) or in a key-value store.
+A query for "within 2 km" finds the cell that holds the point, adds its neighbours so that the circle is fully covered, and reads those cells. Then the service filters the candidates by exact distance and sorts. Cells turn a 2D problem into a few key lookups.
+Cell size is the main tuning choice. Cells too big return too many candidates; too small need many lookups. Items near a cell edge are why neighbour cells must be read.
+used: Redis GEOSEARCH; Uber's H3 for dispatch and supply maps; Elasticsearch geo_point queries use similar tree and cell ideas.
+avoid: When shapes are polygons or the data is mostly static and complex; use an R-tree (PostGIS GiST).
+flow:
+  Driver app [client] -> Location service [svc] : lat, lng every 4 s | Drivers send their position often.
+  Location service -> Cell store [cache: cell to drivers] : move driver to cell 8f2a | The driver is stored under the id of the cell that contains the point.
+  Rider [user] -> Match service [svc] : drivers within 2 km | A rider asks for nearby drivers.
+  Match service -> Cell store : read cell + 6 neighbours | The service reads the rider's cell and the cells around it.
+  Cell store -> Match service : 80 candidates | A few dozen drivers come back, not millions.
+  Match service -> Rider : 5 nearest, exact distance | Exact distance is computed only for the candidates.
+ref: docs | GEOSEARCH | Redis documentation | https://redis.io/docs/latest/commands/geosearch/
+ref: docs | H3: Uber's hexagonal hierarchical spatial index | H3 documentation | https://h3geo.org/docs/
+
+== Hexagon roll-up for heat maps and pricing
+kind: pre-aggregation, windowed-agg
+when: A map needs counts or averages per area, updated every minute, for demand maps or surge pricing.
+how: Each event (ride request, ad impression, sensor reading) is mapped to an H3 cell at a fixed resolution, for example about 0.7 km² cells. A stream job counts events per cell in one-minute windows and writes the result to a store keyed by cell id.
+Because H3 is hierarchical, a parent cell's value is the sum of its children. So the same data serves a city view at a coarse level and a street view at a fine level, without new jobs.
+Hexagons have six equal-distance neighbours, so smoothing a value with neighbouring cells is simple. The limit is that the cell grid is fixed, so a result is only as precise as the cell size.
+used: Uber (H3 was created there for marketplace analytics); geo analytics on Spark and Flink commonly use H3 or S2 cell ids as group-by keys.
+avoid: When exact boundaries matter, such as legal zones; use polygon joins with an R-tree.
+flow:
+  Events [topic: ride requests] -> Stream job [svc: windowed count] : lat, lng, time | Events carry a position and a timestamp.
+  * Stream job: lat, lng to H3 cell | Each position is converted to a cell id with H3.
+  Stream job -> Cell stats [db: cell, minute, count] : count per cell per minute | The job writes one row per cell and window.
+  Pricing service [svc] -> Cell stats : read cell + neighbours | The pricing service reads demand for a cell and the cells around it.
+  Pricing service -> Map UI [client] : smoothed surge values | The service smooths values over neighbours and draws the map.
+ref: docs | H3 documentation | Uber / H3 project | https://h3geo.org/docs/
+
+@@ startree
+== Star-tree accelerated group-by in Pinot
+kind: pre-aggregation, materialized-view
+when: Dashboards run the same group-by queries at high volume and need results in tens of milliseconds.
+how: When a Pinot segment is built, the star-tree index sorts rows by a chosen list of dimensions (the split order) and builds a tree. Each node has a special star child that means all values of a dimension, and the aggregates of that branch are stored with it.
+A query such as SUM(impressions) WHERE country = 'US' GROUP BY device walks the tree: the country level takes the US node, the device level takes each value, and other levels take the star child. The answer is a few precomputed rows, not millions of raw rows.
+A node with at most maxLeafRecords raw rows (10,000 by default) is not split further, so a small scan covers the rest. The storage cost is chosen by the dimension list and this threshold.
+used: Apache Pinot (created at LinkedIn for user-facing analytics such as profile views); Pinot is also used at Uber and Stripe for fast analytics.
+avoid: When queries use many ad hoc dimensions or non-additive measures; use a plain column scan with inverted indexes.
+flow:
+  Segment builder [svc: Pinot minion/server] -> Star-tree [store: tree in segment] : sort + pre-aggregate | The builder aggregates rows by the split order and stores the tree.
+  Dashboard [client] -> Broker [svc: Pinot broker] : SUM by device, country=US | The dashboard sends a SQL query to the broker.
+  Broker -> Server [svc: Pinot server] : query for each segment | The broker fans the query out to servers that hold segments.
+  Server -> Star-tree : walk US, star, device | The server answers from tree nodes, not raw rows.
+  Server -> Broker : partial sums | Each server returns small partial results.
+  Broker -> Dashboard : result in 12 ms | The broker adds the partial sums and answers fast.
+ref: paper | Pinot: Realtime OLAP for 530 Million Users | Im et al., SIGMOD 2018 |
+ref: docs | Star-tree index | Apache Pinot documentation | https://docs.pinot.apache.org/basics/indexing/star-tree-index
+
+== Choose dimensions from query logs, then rebuild segments
+kind: feedback-loop, precompute
+when: The star-tree must match what users really ask, and query patterns change over time.
+how: A star-tree helps only queries whose filter and group-by columns are in its split order and whose functions are in its list, such as SUM or COUNT. Look at the query log to find the most common patterns and their latency.
+Put the dimensions with the highest cardinality last in the split order, set the metrics to pre-aggregate, and pick maxLeafRecords. Test the new config on a copy of the table and compare tree size with latency.
+Then update the table config and reload segments, so that each segment builds the new tree. Queries that do not match the tree fall back to a normal scan, so nothing breaks while you iterate.
+used: Teams that run Apache Pinot for user-facing analytics; the tuning process is common in Pinot operations.
+avoid: When there are few repeated queries; add inverted or range indexes instead of a tree.
+flow:
+  Query log [log: SQL + latency] -> Analyst [user: platform team] : top patterns | The team reads which group-bys are slow and common.
+  Analyst -> Table config [store: star-tree config] : new split order | They set dimensions, aggregations and maxLeafRecords.
+  Table config -> Servers [svc: Pinot servers] : reload segments | Servers rebuild each segment with the new tree.
+  Servers -> Dashboard [client] : fast answers | Queries that match the tree now use it.
+  Servers -x> Dashboard : unmatched query scans | A query that does not match falls back to a normal scan, which is slower but correct.
+ref: docs | Star-tree index | Apache Pinot documentation | https://docs.pinot.apache.org/basics/indexing/star-tree-index
+
+@@ authn
+== Federated sign-in with OIDC and a session cookie
+kind: federated-identity, zero-trust
+when: Many apps need the same sign-in, MFA and account lifecycle, and apps should not handle passwords.
+how: The app redirects the browser to the identity provider (Okta, Entra ID, Keycloak or Google). The user signs in there, with password and MFA or a passkey. The IdP redirects back with a short-lived authorization code, and the app swaps it for an ID token over a back channel.
+The app checks the token signature, issuer, audience and nonce, then creates its own session: a random id in an HttpOnly, Secure, SameSite cookie, with the user data kept on the server. Later requests carry only the cookie.
+Turning off a user at the IdP stops new sign-ins at once, but existing app sessions live until they expire. Keep session lifetimes short, or support back-channel logout.
+used: Keycloak, Okta, Microsoft Entra ID and Google as IdPs; most enterprise SaaS single sign-on.
+avoid: For a single small app with few users; local accounts with passkeys may be simpler.
+flow:
+  Browser [client] -> App [svc: relying party] : GET /orders | An unauthenticated user asks for a page.
+  App -> Browser : 302 to IdP | The app redirects to the IdP with a state and nonce.
+  Browser -> IdP [svc: Okta or Keycloak] : sign in + MFA | The user proves who they are at the IdP only.
+  IdP -> App : code | The IdP sends a one-time code back through the browser.
+  App -> IdP : code for ID token | The app swaps the code for tokens over a direct connection.
+  App -> Session store [cache: session id to user] : create session | The app stores the session and sets an HttpOnly cookie.
+ref: spec | OpenID Connect Core 1.0 | OpenID Foundation, 2014 | https://openid.net/specs/openid-connect-core-1_0.html
+ref: spec | NIST SP 800-63-4 Digital Identity Guidelines | NIST, 2025 | https://pages.nist.gov/800-63-4/
+
+== Passkey sign-in with a signed challenge
+kind: zero-trust
+when: You want sign-in that cannot be phished and has no shared secret stored on the server.
+how: At registration the device creates a key pair for this site. The private key stays on the device, protected by a fingerprint or PIN. The server stores only the public key and a credential id.
+At sign-in the server sends a random challenge. The device asks the user to unlock the key, signs the challenge together with the site origin, and returns the signature. The server verifies it with the stored public key. A fake site has a different origin, so its signature is useless.
+A breach of the server's database leaks only public keys. The hard parts are recovery when a device is lost, and sync of passkeys between devices, which platform providers now handle.
+used: WebAuthn in Chrome, Safari, Firefox and Edge; passkeys in Apple, Google and Microsoft accounts; many banks and retailers.
+avoid: When users sign in on shared or very old devices; keep a second factor as a fallback.
+flow:
+  Browser [client] -> Server [svc: relying party] : start sign-in | The user begins to sign in.
+  Server -> Browser : random challenge | The server sends 32 or more random bytes, used only once.
+  Browser -> Authenticator [svc: device key] : sign challenge + origin | The browser asks the device to sign. The user unlocks with a fingerprint.
+  Authenticator -> Browser : signature | The private key never leaves the device.
+  Browser -> Server : signed assertion | The server gets the signature and origin.
+  Server -> Key store [db: public keys] : verify with public key | The server checks the signature and the origin, then opens a session.
+ref: spec | Web Authentication: An API for accessing Public Key Credentials, Level 3 | W3C | https://www.w3.org/TR/webauthn-3/
+
+@@ authz
+== Central relationship-based authorization service
+kind: none
+when: Many services must answer "can this user act on this object?" with shared objects such as folders, teams and documents.
+how: Permissions are stored as relation tuples: document:readme#viewer@user:ann, or folder:x#parent@document:readme. A schema says that viewers of a folder are viewers of its documents. Services call a central check API with user, relation and object.
+The service walks the graph of tuples, often with a cache, and returns allowed or denied. This is the design of Google Zanzibar. A token (the zookie) from the last write lets the caller ask for a result no older than that write, which avoids the "new enemy" problem: a revoked user still seeing new data.
+Writes go to a replicated store. Reads fan out to many cached nodes. Deep graphs and big groups make some checks costly, so the service caches and limits depth.
+used: Google Zanzibar (Drive, YouTube and others); open-source SpiceDB and OpenFGA follow the Zanzibar model.
+avoid: When a few static roles are enough; RBAC in the application or the IdP is simpler.
+flow:
+  Docs API [svc] -> Authz service [svc: Zanzibar-style] : check ann viewer doc:42 | Before it returns a document the API asks the central service.
+  Authz service -> Tuple store [db: relation tuples] : read tuples + parents | The service reads the tuples for the document and its folder.
+  * Authz service: ann is in team, team is viewer of folder | The graph walk finds a path from ann to the document.
+  Authz service -> Docs API : allowed | The API gets a yes or no.
+  Admin [user] -> Tuple store : remove ann from team | An admin revokes access by deleting one tuple.
+  Docs API -x> Authz service : check, token from write | A check with the new write token is denied; no stale answer is given.
+ref: paper | Zanzibar: Google's Consistent, Global Authorization System | Pang et al., USENIX ATC 2019 | https://research.google/pubs/zanzibar-googles-consistent-global-authorization-system/
+
+== Policy decision point with local enforcement
+kind: sidecar, zero-trust
+when: Many services need the same rules (roles, attributes, time, risk), and rules must change without redeploying each service.
+how: Each service has a policy enforcement point: code that asks "may this request proceed?" before it acts. The question goes to a local policy engine such as Open Policy Agent, running as a sidecar or library, with the user, action, resource and context as input.
+Policies are written as code, kept in Git and tested like software. A control plane builds bundles and every engine pulls them on a schedule. Data such as role assignments is pushed or pulled too.
+Decisions are local, so they take under a millisecond and do not need a network call to a central service. The risk is stale data: a change reaches each engine after its next pull. Log every decision for audit.
+used: Open Policy Agent in Kubernetes admission control and Envoy or Istio filters; Kubernetes uses RBAC in its own API server.
+avoid: When relationships between objects (sharing, folders) decide access; use a relationship-based service.
+flow:
+  Client [client] -> Service [svc: PEP] : DELETE /invoices/7 | A request reaches a service that enforces policy.
+  Service -> OPA sidecar [svc: PDP] : user, action, resource | The service asks the local policy engine for a decision.
+  OPA sidecar -> Service : deny, reason: not owner | The engine evaluates rules in memory and replies in under a millisecond.
+  Service -x> Client : 403 | The service refuses the request.
+  Policy repo [store: Git] -> Bundle server [svc] : merged policy change | A reviewed change is built into a bundle.
+  Bundle server ~> OPA sidecar : new bundle | Every engine downloads the new bundle in the background.
+ref: docs | Open Policy Agent documentation | Open Policy Agent project | https://www.openpolicyagent.org/docs/latest/
+
+@@ kms
+== Envelope encryption for object storage
+kind: envelope-encryption
+when: Large amounts of data must be encrypted at rest, and the master key must never leave a protected service.
+how: For each object, the service asks the KMS for a data key (AWS KMS GenerateDataKey). The KMS returns the key in plain form and also encrypted under a master key. The service encrypts the object locally with the plain key (AES-256-GCM), stores the encrypted data key next to the object, and drops the plain key from memory.
+To read, the service sends the encrypted data key to the KMS, which decrypts it only if the caller's policy allows. Bulk data never travels to the KMS, only 32-byte keys do. Rotating the master key means re-wrapping data keys, not re-encrypting terabytes.
+KMS calls cost time and money, so services cache data keys for a short time or use one key per bucket. Every KMS call is logged, which gives an audit trail of who touched which key.
+used: Amazon S3 SSE-KMS; Google Cloud KMS with CMEK on BigQuery and Cloud Storage; Azure Key Vault with storage encryption.
+avoid: For tiny secrets that fit the KMS direct encrypt limit (4 KB in AWS KMS); call encrypt directly.
+flow:
+  App [svc: storage client] -> KMS [svc: master key in HSM] : GenerateDataKey | The app asks for a new data key, naming the master key.
+  KMS -> App : plain key + wrapped key | The KMS returns the key twice: plain, and encrypted by the master key.
+  App -> Object store [store: ciphertext + wrapped key] : put encrypted object | The app encrypts locally, then stores the ciphertext and the wrapped key.
+  App -> KMS : Decrypt wrapped key | Later, to read, the app sends only the wrapped key.
+  KMS -x> App : AccessDenied | If the policy has been revoked, the KMS refuses and the data stays unreadable.
+ref: docs | AWS KMS concepts: envelope encryption | AWS documentation | https://docs.aws.amazon.com/kms/latest/developerguide/kms-cryptography.html
+
+== Per-tenant keys and crypto-shredding
+kind: envelope-encryption
+when: Each customer's data must be separable, and "delete my data" must also reach copies in backups.
+how: Each tenant gets its own key encryption key (KEK) in the KMS. Data keys for that tenant's records are wrapped by that KEK. Records, replicas and backups all hold only ciphertext and wrapped keys.
+To delete a tenant, schedule deletion of the KEK. Without it, every wrapped key is useless, so all copies of the data become unreadable at once, even in backups that you cannot edit. This is called crypto-shredding. AWS KMS enforces a waiting period of 7 to 30 days before deletion, to protect against mistakes.
+Some customers also bring their own key (BYOK or customer-managed keys). They can then cut off the vendor by disabling the key. The cost is many keys to manage and more KMS calls per tenant.
+used: SaaS platforms with customer-managed keys; Snowflake, Databricks and cloud data stores with CMEK options.
+avoid: When data must stay readable by the provider for legal reasons; then a shared key with strict access control is clearer.
+flow:
+  Tenant admin [user] -> KMS [svc: per-tenant KEKs] : create KEK for tenant 17 | Each tenant gets its own key, with its own access policy.
+  App [svc] -> KMS : wrap data key with KEK 17 | The app wraps the data keys of tenant 17 under that key.
+  App -> Records [db: ciphertext] : write | Records are stored encrypted, in the primary and in backups.
+  Backup job [svc] ~> Backups [lake: ciphertext only] : copy | Backups hold ciphertext only, and cannot be edited later.
+  Tenant admin -> KMS : schedule key deletion | The tenant asks for the key to be deleted after the waiting period.
+  KMS -x> App : key gone, cannot unwrap | After deletion, nothing for tenant 17 can be decrypted, in any copy.
+ref: docs | AWS KMS key deletion | AWS documentation | https://docs.aws.amazon.com/kms/latest/developerguide/deleting-keys.html
+
+== Encryption as a service with a transit engine
+kind: envelope-encryption
+when: Applications must encrypt fields such as card numbers, but should never hold keys.
+how: The app sends plaintext to the transit engine of Vault or OpenBao over TLS, and names a key. The engine returns ciphertext with a version prefix, such as vault:v2:... The app stores only the ciphertext in its database.
+To read, the app sends the ciphertext back and gets plaintext, if its token's policy allows. The key never leaves Vault. A key rotation adds a new version, and old ciphertext still decrypts. A rewrap call upgrades old ciphertext to the new version without exposing plaintext.
+Every request is a network call, so use it for small values or use the transit engine to wrap data keys. Vault becomes a critical dependency, so run it highly available.
+used: HashiCorp Vault and OpenBao transit secrets engine; payment and healthcare applications that encrypt single fields.
+avoid: For bulk data or very high call rates; use envelope encryption with a cached data key.
+flow:
+  App [svc] -> Vault transit [svc: keys stay inside] : encrypt card number | The app sends one small value and a key name.
+  Vault transit -> App : vault:v1:8SDd3 | It returns ciphertext tagged with the key version.
+  App -> Orders DB [db: ciphertext only] : store | The database holds no plaintext and no key.
+  Ops [user] -> Vault transit : rotate key | An operator adds key version 2; old data still decrypts.
+  App -> Vault transit : rewrap ciphertext | The app upgrades old values to version 2 without seeing plaintext.
+ref: docs | Transit secrets engine | HashiCorp Vault documentation | https://developer.hashicorp.com/vault/docs/secrets/transit
+
+@@ mtls
+== Mesh sidecars with automatic workload certificates
+kind: service-mesh, sidecar, zero-trust
+when: Dozens of services must prove identity to each other and encrypt traffic, without changing application code.
+how: Each pod has a proxy sidecar (Envoy in Istio). The mesh control plane acts as a certificate authority. It gives each workload an X.509 certificate that carries a SPIFFE identity, for example spiffe://cluster/ns/shop/sa/cart, tied to its Kubernetes service account.
+When the cart service calls payments, its sidecar opens a TLS connection, and both sides show certificates. The payments sidecar checks the caller's identity against an authorization policy, then passes plain traffic to the local app over localhost.
+Certificates are short-lived, 24 hours by default in Istio, and are renewed in the background, so revocation lists are rarely needed. The cost is extra CPU and latency for each hop, and some more memory for each sidecar.
+used: Istio and Linkerd (both turn on mTLS between meshed pods); Consul Connect; common in regulated Kubernetes setups.
+avoid: For a few services or non-Kubernetes legacy hosts; use library-level TLS or a gateway.
+flow:
+  Cart pod [svc: app + sidecar] -> Mesh CA [svc: istiod] : CSR with service account | At start the sidecar asks the CA for a certificate.
+  Mesh CA -> Cart pod : 24 h SPIFFE cert | The CA checks the pod identity and returns a short-lived certificate.
+  Cart pod -> Payments pod [svc: app + sidecar] : TLS hello + client cert | The caller shows its certificate in the handshake.
+  Payments pod -> Cart pod : server cert | The server shows its certificate too, so both sides are proven.
+  * Payments pod: cart is allowed | The policy lets the cart identity call the payments API.
+  Cart pod -x> Payments pod : no cert, rejected | A caller without a valid certificate is refused in the handshake.
+ref: docs | Istio security concepts | Istio documentation | https://istio.io/latest/docs/concepts/security/
+ref: docs | SPIFFE overview | SPIFFE project | https://spiffe.io/docs/latest/spiffe-about/overview/
+
+== Internal CA issuing short-lived certificates
+kind: zero-trust, control-data-plane
+when: Services outside a mesh (VMs, databases, brokers) need mTLS, and long-lived certificates are a risk.
+how: A private CA (Vault PKI, step-ca or a cloud private CA) signs certificates. A service proves its identity to the CA with a cloud instance identity or a Kubernetes token, and gets a certificate that lasts hours or days. An agent renews it at about two thirds of its life.
+Clients and servers trust the private root through their trust store. The server asks for a client certificate and can read the identity from it, for example for a database role mapping.
+Short life replaces revocation: a stolen key works for hours, not for a year. The CA is the control plane; if it is down, existing certificates still work until they expire, so keep the lifetime longer than a CA outage you can accept.
+used: Vault PKI secrets engine; cert-manager on Kubernetes; Kafka and database clusters that require client certificates.
+avoid: When a mesh already gives identity; avoid two systems doing the same job.
+flow:
+  Agent [svc: cert agent] -> Vault PKI [svc: private CA] : login with platform token | The agent proves who it is using a platform token.
+  Vault PKI -> Agent : 12 h certificate | The CA signs a short-lived certificate.
+  Agent -> Broker [svc: Kafka] : TLS with client cert | The service connects and shows its certificate.
+  * Broker: cert name mapped to ACL | The broker uses the certificate name to find permissions.
+  Agent ~> Vault PKI : renew at 8 h | A background renewal keeps the service running without a person.
+ref: docs | PKI secrets engine | HashiCorp Vault documentation | https://developer.hashicorp.com/vault/docs/secrets/pki
+
+@@ oauth
+== Authorization code with PKCE, tokens checked at the gateway
+kind: federated-identity, api-gateway
+when: A web or mobile app calls your APIs for a user, and the app must not see the user's password.
+how: The app creates a random code verifier and sends its hash (the challenge) with the redirect to the authorization server. The user signs in there. The server returns a one-time code, and the app swaps it for tokens, proving it with the original verifier. A stolen code is then useless.
+The access token is a short-lived JWT, for example 10 minutes. The app sends it as a Bearer token to the API gateway. The gateway checks the signature with keys from the server's JWKS endpoint (cached), then the issuer, audience, expiry and scopes. Only then does it route to the service.
+Because the check is local, no call to the authorization server is needed per request. The limit is that a JWT cannot be revoked before it expires, so keep the life short and use refresh tokens for longer sessions.
+used: Auth0, Okta, Keycloak and Microsoft Entra ID as authorization servers; Kong, Envoy and cloud API gateways with JWT validation.
+avoid: For server-to-server calls with no user; use the client credentials grant.
+flow:
+  App [client: SPA or mobile] -> Auth server [svc: OIDC provider] : authorize + code challenge | The app redirects the user with a hashed challenge.
+  Auth server -> App : one-time code | After sign-in the code returns through the browser.
+  App -> Auth server : code + verifier | The app proves it started the flow by showing the verifier.
+  Auth server -> App : 10 min access token | The server returns a signed JWT with scopes.
+  App -> API gateway [svc: JWT check] : Bearer token | The app calls the API with the token.
+  API gateway -> Orders API [svc] : verified call | The gateway checks signature, audience and scope, then forwards the call.
+ref: spec | Proof Key for Code Exchange (PKCE) | IETF RFC 7636 | https://datatracker.ietf.org/doc/html/rfc7636
+ref: spec | OAuth 2.0 Security Best Current Practice | IETF RFC 9700 | https://datatracker.ietf.org/doc/html/rfc9700
+
+== Client credentials for service-to-service calls
+kind: zero-trust, cache-aside
+when: A backend job or service calls another API on its own behalf, with no user present.
+how: The calling service holds a client id and a secret, or better a private key or a workload identity. It sends them to the token endpoint with the client credentials grant and asks for scopes. The server returns a short-lived access token, usually 5 to 60 minutes.
+The caller caches the token in memory and reuses it until shortly before it expires. This is a cache-aside use: on a miss or near expiry it asks for a new one. The target API checks the token and its scopes, as it would for any token.
+Do not call the token endpoint for each request. It adds latency and may hit rate limits. Store the client secret in a secrets manager, rotate it, and prefer certificate-bound tokens (RFC 8705) where available.
+used: Machine-to-machine apps in Auth0, Okta and Entra ID; cloud workload identity federation, which trades a platform token for a short-lived access token.
+avoid: When a user's identity and consent must travel with the call; use token exchange to pass the user context.
+flow:
+  Batch job [svc] -> Token cache [cache: in memory] : need token | The job first looks for a valid token in memory.
+  Token cache -x> Batch job : miss or expiring | The cached token is missing or near expiry.
+  Batch job -> Token endpoint [svc: auth server] : client credentials + scope | The job asks for a new token with its own credentials.
+  Token endpoint -> Token cache : token, 15 min | The new token is stored for reuse.
+  Batch job -> Reports API [svc] : Bearer token | Many calls reuse the same token until it expires.
+ref: spec | The OAuth 2.0 Authorization Framework | IETF RFC 6749 | https://datatracker.ietf.org/doc/html/rfc6749
+ref: spec | OAuth 2.0 Mutual-TLS Client Authentication and Certificate-Bound Access Tokens | IETF RFC 8705 | https://datatracker.ietf.org/doc/html/rfc8705
+
+== Refresh token rotation to limit theft
+kind: federated-identity
+when: Users should stay signed in for weeks, but a stolen token must stop working quickly.
+how: The access token lives for minutes. The refresh token lives longer, and each use returns a new refresh token while the old one becomes invalid. The authorization server keeps the chain of refresh tokens for each session.
+If a token that was already used shows up again, someone has copied it. The server cannot tell the thief from the user, so it revokes the whole chain. The user signs in again, and the thief loses access.
+Public clients such as single-page apps need this, because they cannot keep a secret. Store refresh tokens carefully: in the system keychain on mobile, or in an HttpOnly cookie for the web. The cost is state at the server and some failed refreshes when a network call is retried.
+used: Auth0, Okta and Keycloak refresh token rotation; recommended by the OAuth 2.0 Security Best Current Practice.
+avoid: For short sessions where users can simply sign in again.
+flow:
+  App [client] -> Auth server [svc: token store] : refresh token R1 | The access token has expired, so the app presents R1.
+  Auth server -> App : new access + R2 | The server issues new tokens and marks R1 as used.
+  Thief [client: has old R1] -x> Auth server : refresh token R1 | Someone replays R1, which is already used.
+  * Auth server: chain revoked | The server sees reuse and revokes R2 and the session.
+  App -x> Auth server : refresh token R2 | The real app fails and sends the user to sign in again.
+ref: spec | OAuth 2.0 Security Best Current Practice | IETF RFC 9700 | https://datatracker.ietf.org/doc/html/rfc9700
+
+@@ privacytech
+== Clean-room match with aggregate-only output
+kind: privacy-clean-room
+when: An advertiser and a publisher want to measure campaign results without sharing user-level data.
+how: Both parties load their tables into a clean room: the advertiser's purchases and the publisher's ad exposures. User ids are hashed or encrypted with a shared scheme. A join runs inside the room, where neither side can query raw rows.
+Only approved queries run. Output rules block small groups: a result row must cover at least a set number of users, for example 100. Results may also get noise added. The partners see counts such as "conversions by campaign", never a list of people.
+All queries are logged, and the room can expire the data after the study. The limit is the match rate, as only users that exist in both tables count, and the output rules cost some detail.
+used: AWS Clean Rooms, Snowflake data clean rooms and BigQuery data clean rooms; IAB Tech Lab publishes clean room guidance.
+avoid: When one side must get row-level data for a legal reason; use a data sharing agreement instead.
+flow:
+  Advertiser [svc: purchases] -> Clean room [svc: governed join] : hashed ids + purchases | The advertiser uploads hashed ids with purchase data.
+  Publisher [svc: exposures] -> Clean room : hashed ids + exposures | The publisher uploads its own data in the same way.
+  * Clean room: joined on hashed id | The join runs where neither party can read raw rows.
+  Analyst [user: advertiser] -> Clean room : approved query | The analyst can run only queries that the rules allow.
+  Clean room -x> Analyst : groups under 100 users | Small groups are blocked, so no one is singled out.
+  Clean room -> Analyst : conversions by campaign | Only aggregate numbers leave the room.
+ref: docs | IAB Tech Lab Data Clean Room Guidance | IAB Tech Lab, 2023 |
+
+== Differentially private release with a privacy budget
+kind: none
+when: You must publish statistics or train on sensitive data, and no single person may change the result much.
+how: Each query on the data has a sensitivity: the most one person can change the answer. For a count it is 1. The system adds noise from a Laplace or Gaussian distribution, scaled to sensitivity divided by epsilon. A small epsilon means more noise and stronger privacy.
+Every released answer uses up part of a privacy budget. The budget accountant adds up epsilon over all queries. When the total reaches the limit, the system refuses new queries on that data. This stops an attacker from averaging many answers to remove the noise.
+Contributions are clipped first, for example at most 5 rows per user, so sensitivity stays small. Large groups lose little accuracy, while small groups can be swamped by noise.
+used: US Census Bureau 2020 disclosure avoidance; Google and Apple use differential privacy for usage statistics; OpenDP and Google's open-source libraries.
+avoid: When exact numbers are required, such as invoices; use access control and audit instead.
+flow:
+  Analyst [user] -> DP gateway [svc: query rewriter] : count by region | The analyst asks a query through a gateway, never the raw table.
+  DP gateway -> Sensitive DB [db: raw rows] : clip to 5 rows per user | The gateway limits each person's effect before it counts.
+  Sensitive DB -> DP gateway : exact counts | Exact counts stay inside the gateway.
+  DP gateway -> Budget ledger [db: epsilon used] : charge epsilon 0.5 | The ledger records how much privacy budget was spent.
+  DP gateway -> Analyst : noisy counts | The analyst gets counts with Laplace noise added.
+  Budget ledger -x> Analyst : budget exhausted | When the budget is used up, new queries are refused.
+ref: paper | The Algorithmic Foundations of Differential Privacy | Dwork & Roth, 2014 |
+
+@@ supplychain
+== Sign at build, verify at deploy
+kind: zero-trust, control-data-plane
+when: A cluster must run only images that your own pipeline built, from reviewed source.
+how: The CI pipeline builds an image and pushes it. It then signs the image digest with Sigstore cosign. In keyless mode the signer uses its CI identity (an OIDC token) to get a short-lived certificate from Fulcio, and the signature is recorded in the Rekor transparency log.
+A signed provenance statement and an SBOM are attached to the image as attestations. At deploy time, an admission controller (Kyverno, the Sigstore policy-controller or Ratify with Gatekeeper) checks the signature. The policy says who may sign, for example only this repository's release workflow.
+Unsigned images or images from the wrong identity are refused before they start. The limit is that a signature proves who built the image, not that the code is free of bugs.
+used: Sigstore cosign with Kubernetes admission policies; Docker and OCI registries that store signatures and attestations beside images.
+avoid: When you cannot enforce admission, such as hand-run servers; then verify in the deploy script.
+flow:
+  CI pipeline [svc: build] -> Registry [store: OCI images] : push image digest | The pipeline pushes an image and gets its digest.
+  CI pipeline -> Fulcio [svc: short-lived CA] : OIDC token | The pipeline proves its identity and gets a certificate valid for minutes.
+  CI pipeline -> Rekor [log: transparency log] : signature entry | The signature is recorded in a public, append-only log.
+  Kubernetes [svc: admission] -> Registry : fetch signature | At deploy time the admission policy fetches the signature.
+  * Kubernetes: signer matches policy | The signer identity matches the allowed workflow, so the pod starts.
+  Kubernetes -x> Registry : unsigned image refused | An unsigned or foreign image is rejected before it runs.
+ref: docs | Sigstore documentation | Sigstore project | https://docs.sigstore.dev/
+ref: spec | SLSA specification v1.2 | OpenSSF SLSA | https://slsa.dev/spec/v1.2/
+
+== SBOM inventory with continuous vulnerability matching
+kind: materialized-view, feedback-loop
+when: When a new vulnerability is published, you must know in minutes which of your products contain the library.
+how: Each build creates an SBOM in SPDX or CycloneDX format, listing every package and version, with a tool such as Syft. The SBOM is stored with the image and also sent to an inventory (for example OWASP Dependency-Track).
+The inventory keeps a table from products to components. A scanner such as Grype or the inventory itself matches components against vulnerability feeds (OSV and NVD). When a new CVE arrives, the match runs again on stored SBOMs, with no rebuild.
+The team gets a list of affected products, ranked by exposure and by VEX statements that say a flaw is not reachable. The limit is SBOM quality: missing or wrong components give false calm.
+used: OWASP Dependency-Track; Syft and Grype; US government software suppliers must supply SBOMs under federal guidance.
+avoid: When you have no way to act on the results; start with automated dependency updates first.
+flow:
+  CI build [svc: Syft] -> SBOM store [db: components per image] : CycloneDX SBOM | Every build uploads its list of packages.
+  Vuln feed [svc: OSV and NVD] ~> Matcher [svc: Dependency-Track] : new CVE published | A new vulnerability arrives from the public feed.
+  Matcher -> SBOM store : which images use it? | The matcher searches stored SBOMs, not source code.
+  SBOM store -> Matcher : 14 images affected | The inventory lists affected products and versions.
+  Matcher -> Owners [user: team channel] : alert + VEX status | Teams see what is affected and what is reachable.
+ref: docs | CycloneDX specification | OWASP CycloneDX | https://cyclonedx.org/specification/overview/
+ref: docs | SPDX specification | SPDX project | https://spdx.dev/use/specifications/
+
+== Isolated build with signed provenance
+kind: immutable-infra, zero-trust
+when: You must prove that an artifact came from a given commit and a trusted builder, not from a developer laptop.
+how: The build runs in a fresh, isolated runner, with pinned dependencies and no manual steps. The builder, not the project's own script, writes a provenance statement: source repo, commit, build steps and input digests. It signs this statement with its own identity.
+Consumers check the provenance before use: is the source the expected repo, was it built by the trusted builder, and are the inputs pinned? This is what SLSA build levels grade. At Build level 3 the signing keys are out of reach of the build steps, so a tampered job cannot forge them.
+Reproducible builds add a second check: two independent builds should give the same digest. The cost is stricter pipelines and effort to pin everything.
+used: SLSA GitHub generator and GitHub artifact attestations; Google Cloud Build provenance; npm provenance for packages.
+avoid: For prototypes that never leave the team; start with signed commits and a basic pipeline.
+flow:
+  Git repo [store: signed commits] -> Build runner [svc: fresh and isolated] : checkout commit | A clean runner checks out one pinned commit.
+  Build runner -> Registry [store: artifacts] : artifact + digest | The runner builds and publishes the artifact.
+  Build runner -> Provenance [svc: builder signs] : repo, commit, inputs | The builder, not the script, signs a statement of how it was made.
+  Deploy gate [svc: policy] -> Provenance : fetch statement | Before release the gate reads the statement.
+  Deploy gate -x> Registry : wrong repo, blocked | An artifact that did not come from the trusted repo and builder is blocked.
+ref: spec | SLSA specification v1.2 | OpenSSF SLSA | https://slsa.dev/spec/v1.2/

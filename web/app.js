@@ -62,7 +62,14 @@ const deepList = DATA.nodes.filter(n=>n.deep).sort((a,b)=>a.l-b.l||byLabel(a,b))
 const CUR = DATA.curriculum || {programs:[], courses:[]};
 const COURSE = {}; CUR.courses.forEach(c=>COURSE[c.code]=c);
 const TAUGHT = {}; CUR.courses.forEach(c=>c.concepts.forEach(id=>(TAUGHT[id]=TAUGHT[id]||[]).push(c.code)));
-const courseLabel = code => code.replace(/^([A-Z]+)(\d)/,"$1 $2");
+// schools: Stanford codes are bare ("CS103" -> "CS 103"); other schools' codes carry the school ("MIT 6.1210", "Caltech CS 124")
+const SCHOOLS = (CUR.schools && CUR.schools.length ? CUR.schools : [{id:"stanford", short:"Stanford"}]).slice().sort((a,b)=>(a.id==="stanford"?0:1)-(b.id==="stanford"?0:1));
+const SCHOOL = {}; SCHOOLS.forEach(x=>SCHOOL[x.id]=x);
+const schoolOf = code => (COURSE[code] && COURSE[code].school) || "stanford";
+const courseLabel = code => /\s/.test(code) ? code : code.replace(/^([A-Z]+)(\d)/,"$1 $2");
+const courseShort = code => /\s/.test(code) ? code.replace(/^\S+\s/,"") : courseLabel(code);
+// a concept's courses grouped by school, in school order: [[school, [codes]], ...]
+const taughtBy = id => SCHOOLS.map(x=>[x, (TAUGHT[id]||[]).filter(c=>schoolOf(c)===x.id)]).filter(g=>g[1].length);
 // system design questions: summaries in server mode (full text from /api/design/<id>), full objects in standalone mode
 // animated scenes: summaries for every scene (standalone DATA.scenes holds them in full; the server sends them in each read)
 const SCENES = (DATA.scenes||[]).filter(s=>N[s.concept]).map(s=>({id:s.id, concept:s.concept, title:s.title||s.id, n:s.n!==undefined?s.n:(s.steps||[]).length}));
@@ -335,7 +342,7 @@ function renderPanel(){
   if(insp.length) h += `<h3>Inspired by (analogy)</h3>` + relList(insp, e=>`<button type="button" data-sel="${e.t}"><span class="bar dash" style="--c:${lc(N[e.t].l)}"></span><span><span class="rn">${esc(N[e.t].label)}</span><span class="kind">L${N[e.t].l}</span><span class="rw">${esc(e.r)}</span></span></button>`);
   h += `<h3>Used by · ${ups.length} directly, ${upTot} in total</h3>` + (ups.length ? relList(ups, e=>`<button type="button" data-sel="${e.s}"><span class="bar${e.k==="inspired"?" dash":""}" style="--c:${lc(N[e.s].l)}"></span><span><span class="rn">${esc(N[e.s].label)}</span><span class="kind">L${N[e.s].l}</span><span class="rw">${esc(e.r)}</span></span></button>`) : `<p class="empty">Nothing in this map is built on it yet: it is a top-level product.</p>`);
   if(n.side.length) h += `<h3>Related · ${n.side.length}</h3>` + relList(n.side, s=>`<button type="button" data-sel="${s.o}"><span class="bar" style="--c:${lc(N[s.o].l)}"></span><span><span class="rn">${esc(N[s.o].label)}</span><span class="kind">${SIDE[s.t]||s.t}</span><span class="rw">${esc(s.r)}</span></span></button>`);
-  if(TAUGHT[n.id]) h += `<h3>Taught in · Stanford</h3><div class="chips">${TAUGHT[n.id].map(code=>`<button type="button" class="chip" style="--c:var(--fg)" data-course="${code}"><span class="sw"></span>${esc(courseLabel(code))} ${esc(COURSE[code].title)}</button>`).join("")}</div>`;
+  if(TAUGHT[n.id]) h += `<h3>Taught in · ${taughtBy(n.id).map(g=>esc(g[0].short)).join(", ")}</h3><div class="chips">${TAUGHT[n.id].map(code=>`<button type="button" class="chip" style="--c:var(--fg)" data-course="${esc(code)}"><span class="sw"></span>${esc(courseLabel(code))} ${esc(COURSE[code].title)}</button>`).join("")}</div>`;
   const pmc = hasPM() && (PMS().concepts||{})[n.id];
   if(pmc) h += `<h3>Problems that use this · ${(pmc[0]+pmc[1]).toLocaleString("en-US")}</h3><p class="pm-panelpin">${pmc[0]} LeetCode problem${pmc[0]===1?" is":"s are"} about it directly and ${pmc[1]} use it along the way. <button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-pmconcept="${n.id}">See them in the problem map</button></p>`;
   if(USES[n.id]) h += `<h3>Appears in design questions · ${USES[n.id].length}</h3><div class="chips">${USES[n.id].map(did=>`<button type="button" class="chip" style="--c:var(--fg)" data-design="${did}"><span class="sw"></span>${esc(DES[did].title)}</button>`).join("")}</div>`;
@@ -371,9 +378,10 @@ function renderCourses(){
   if(!prog){ $("v-courses").innerHTML = `<p class="empty">No curriculum loaded.</p>`; return; }
   const c = COURSE[state.course] || COURSE[prog.groups[0].courses[0]];
   const done = id => Store.status(id)==="read";
-  const card = code => { const k=COURSE[code]; if(!k) return ""; const d=k.concepts.filter(done).length; return `<button type="button" class="tcard" data-course="${code}" aria-pressed="${c&&c.code===code}"><span class="tt">${esc(courseLabel(code))} · ${esc(k.title)}</span><span class="ts">${k.concepts.length} concepts${d?` · ${d} read`:""}</span><span class="tl" aria-hidden="true">${k.concepts.map(id=>`<span style="--c:${lc(N[id].l)};${done(id)?"":"opacity:.45"}"></span>`).join("")}</span></button>`; };
+  const card = code => { const k=COURSE[code]; if(!k) return ""; const d=k.concepts.filter(done).length; return `<button type="button" class="tcard" data-course="${esc(code)}" aria-pressed="${c&&c.code===code}"><span class="tt">${esc(courseLabel(code))} · ${esc(k.title)}</span><span class="ts">${k.concepts.length} concepts${d?` · ${d} read`:""}</span><span class="tl" aria-hidden="true">${k.concepts.map(id=>`<span style="--c:${lc(N[id].l)};${done(id)?"":"opacity:.45"}"></span>`).join("")}</span></button>`; };
   const lays = c ? [0,1,2,3,4,5].map(l=>c.concepts.filter(id=>N[id].l===l).length) : [];
-  $("v-courses").innerHTML = `<div class="tlist"><div class="filters" role="group" aria-label="Program" style="margin:0 0 4px">${CUR.programs.map(p=>`<button type="button" data-program="${p.id}" aria-pressed="${p.id===prog.id}">${esc(p.id.toUpperCase())}</button>`).join("")}</div>
+  const progBtn = p => `<button type="button" data-program="${esc(p.id)}" aria-pressed="${p.id===prog.id}" title="${esc(p.name)}">${esc(p.short||p.id.toUpperCase())}</button>`;
+  $("v-courses").innerHTML = `<div class="tlist">${SCHOOLS.filter(x=>CUR.programs.some(p=>(p.school||"stanford")===x.id)).map(x=>`<div class="filters sch-row" role="group" aria-label="${esc(x.short)} programs" style="margin:0 0 4px"><span class="sch">${esc(x.short)}</span>${CUR.programs.filter(p=>(p.school||"stanford")===x.id).map(progBtn).join("")}</div>`).join("")}
     <p class="ts" style="font-size:12px;color:var(--muted);margin:0 0 6px">${esc(prog.name)} · ${esc(prog.year)}. ${esc(prog.summary)} <a href="${esc(prog.url)}" target="_blank" rel="noopener noreferrer" style="color:var(--muted)">Requirements ↗</a></p>
     ${prog.groups.map(g=>`<div class="cat" style="position:static;padding:8px 0 2px" title="${esc(g.note)}">${esc(g.name)}</div>${g.courses.map(card).join("")}`).join("")}</div>
   <div class="tsteps">${c?`<h2>${esc(courseLabel(c.code))}: ${esc(c.title)}</h2><p class="sub">${c.concepts.length} concepts in this map · ${esc(c.text)}${c.term&&c.term!=="—"?` · latest public term: ${esc(c.term)}`:""}${c.url?` · <a href="${esc(c.url)}" target="_blank" rel="noopener noreferrer" style="color:inherit">course site ↗</a>`:" · course site not verified"}</p>
@@ -738,7 +746,7 @@ function nodeRead(n, r, ctx){
   if(ctx) h += `<div class="rd-ctx"><b>${esc(ctx.k)}</b>${RI(ctx.t)}</div>`;
   h += ladderHTML(n);
   if(USES[n.id]) h += `<p class="ladder-cap">Appears in design questions: ${USES[n.id].map(did=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-design="${did}">${esc(DES[did].title)}</button>`).join(", ")}.</p>`;
-  if(TAUGHT[n.id]) h += `<p class="ladder-cap">Taught in Stanford ${TAUGHT[n.id].map(code=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-course="${code}">${esc(courseLabel(code))}</button>`).join(", ")}.</p>`;
+  if(TAUGHT[n.id]) h += `<p class="ladder-cap">Taught in ${taughtBy(n.id).map(([x, codes])=>`${esc(x.short)} ${codes.map(code=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-course="${esc(code)}">${esc(courseShort(code))}</button>`).join(", ")}`).join("; ")}.</p>`;
   const toc = [["value","Why it exists"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How it works"],(r.scenes||[]).length&&["watch","Watch it work"],(r.patterns||[]).length&&["apat","Architecture patterns"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],rd.tradeoffs&&["tradeoffs","It depends: trade-offs"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],rd.interview&&["interview","In the interview"],rd.quiz&&["quiz","Check yourself"],pmPins(n.id)&&["problems","Problems that use this"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
   h += `<nav class="toc" aria-label="Sections">${toc.map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
   let no=0; const NO=()=>String(++no).padStart(2,"0");

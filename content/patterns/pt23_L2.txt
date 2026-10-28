@@ -1,0 +1,903 @@
+@@ funnel
+== Retrieve, rank, re-rank funnel
+kind: two-tower-retrieval
+when: The catalog has millions of items, but a good model is too slow to score all of them for each request.
+how: Each stage uses a model that is more costly per item and sees fewer items. A candidate generator (a two-tower model with an approximate nearest neighbour index, plus rules such as "recently watched") cuts 10 million items to about 500. A ranker, often a deep network with many features, scores those 500 and keeps about 50.
+A re-ranker then works on the short list. It applies diversity, freshness, policy and business rules that are hard to learn inside a score. Top-k selection with a heap keeps each stage cheap.
+Each stage has a latency budget, for example 20 ms, 60 ms and 10 ms. Recall is the main risk: an item dropped at stage one can never come back. So teams measure recall of each stage against the final result, and often use several generators in parallel.
+used: YouTube recommendations (described in the 2016 RecSys paper); common in large search, feed and ad systems.
+avoid: When the catalog is small (a few thousand items); score everything with one model and keep it simple.
+flow:
+  App [client] -> Recs API [svc] : request for user 7 | The app asks for a page of results for one user.
+  Recs API -> Candidate generators [svc: ANN + rules] : user features | Generators run in parallel and cut 10 million items to about 500.
+  Candidate generators -> Ranker [model: heavy model] : 500 candidates | The ranker scores each candidate with many user and item features.
+  Ranker -> Re-ranker [svc: diversity and rules] : top 50 scored | The ranker keeps the best 50 and passes them on.
+  Re-ranker -> Recs API : final 20 items | The re-ranker removes near-duplicates and applies policy rules.
+  Recs API -> App : page of results | The whole funnel finishes within the latency budget.
+ref: paper | Deep Neural Networks for YouTube Recommendations | Covington, Adams & Sargin, RecSys 2016 |
+
+== Ad selection funnel under a deadline
+kind: two-tower-retrieval, rtb, timeout-deadline
+when: An ad server must pick one ad for each request within tens of milliseconds, among thousands of live campaigns.
+how: The first stage is cheap filtering. Targeting, budget, frequency caps and brand-safety rules remove most ads, using in-memory indexes. Thousands of ads fall to a few hundred.
+The second stage predicts the click or conversion chance (pCTR, pCVR) for each survivor with a model. The expected value is pCTR times bid, so the ranker sorts by that number. The last stage runs the auction and pacing: it picks the winner and the price.
+The funnel carries a deadline. If the model is slow, the server scores fewer ads or uses a simpler model, instead of missing the response time. A late answer is worth nothing in real-time bidding.
+used: Common in ad servers, DSP bidders and exchanges; the filter, then score, then auction order is standard in programmatic advertising.
+avoid: Direct-sold campaigns with fixed delivery guarantees; there a pacing and reservation system picks the ad.
+flow:
+  Ad request [client] -> Ad server [svc: 100 ms budget] : request with user id | An ad request arrives with context and a deadline.
+  Ad server -> Targeting index [cache: in memory] : eligibility query | Targeting, budget and frequency rules cut thousands of ads to about 300.
+  Targeting index -> Ad server : 300 eligible ads | Cheap filters run first because they cost almost nothing per ad.
+  Ad server -> pCTR model [model: 5 ms budget] : 300 ads, features | The model scores each ad for click chance.
+  pCTR model -> Auction [svc: pCTR x bid] : scores | The ranker multiplies pCTR by bid and sorts the ads.
+  pCTR model -x> Ad server : timeout | If scoring is late, the server falls back to a simple model or fewer ads.
+  Auction -> Ad request : winning ad | The winner and its price are returned in time.
+ref: paper | Practical Lessons from Predicting Clicks on Ads at Facebook | He et al., ADKDD 2014 |
+
+== Offline embeddings with online ANN serving
+kind: precompute, online-offline
+when: Candidate generation needs a learned similarity, but the training is too heavy to run per request.
+how: Offline, a two-tower model trains on logged clicks or watches. One tower makes an item vector, the other makes a user vector. A batch job computes vectors for all items and builds an ANN index (HNSW or IVF), which is pushed to the serving nodes.
+Online, the user tower runs once per request on fresh features. The index returns the nearest 200 to 500 item vectors in a few milliseconds. The cost of the heavy model is paid offline.
+The weak point is freshness. New items have no vectors until the next batch, so many systems add a small real-time index or a rule-based generator for new items. The index must also be rebuilt with the same model version as the user tower, or the vectors do not match.
+used: Faiss and ScaNN style indexes behind recommendation and search candidate generation; Pinterest and YouTube describe two-tower retrieval.
+avoid: When items change every minute and vectors cannot be refreshed fast enough; use rules or a streaming index.
+flow:
+  Click logs [lake] -> Trainer [svc: two-tower] : training pairs | Logged user and item pairs train the two towers each day.
+  Trainer -> Item embedder [svc: batch job] : item tower | The item tower is exported for a batch job.
+  Item embedder -> ANN index [store: HNSW] : 10M item vectors | The job writes all item vectors and builds one index file.
+  ANN index -> Retrieval service [svc: index loaded] : push new version | Serving nodes load the new index and swap it in.
+  Retrieval service -> User tower [model: online] : user features | Each request runs the user tower once.
+  User tower -> Retrieval service : user vector | The vector is used as the query.
+  Retrieval service -> ANN index : nearest 300 | The index returns the closest items in a few milliseconds.
+ref: docs | Faiss: a library for similarity search | Meta AI Research | https://github.com/facebookresearch/faiss
+
+@@ gd
+== Data-parallel SGD with all-reduce
+kind: data-parallel
+when: The model fits on one GPU, but the training data is large and one GPU takes too long.
+how: Every worker holds a full copy of the model. Each step, a worker takes its own slice of the mini-batch and computes the gradient. The workers then average gradients with all-reduce (a ring or tree exchange, for example NCCL on GPUs) and each applies the same optimizer step.
+All copies stay identical, because they start equal and apply equal updates. The effective batch size is the per-worker batch times the worker count. With larger batches, teams raise the learning rate and use a warm-up of a few hundred steps, as in the 2017 large mini-batch ImageNet work.
+Communication is the cost. Gradients for a 1 billion parameter model in 16-bit form are about 2 GB per step, so frameworks overlap all-reduce with the backward pass.
+used: PyTorch DistributedDataParallel; Horovod; the Facebook ImageNet in 1 hour result.
+avoid: When the model or its optimizer state does not fit on one device; use sharded training (FSDP, ZeRO) or model parallelism.
+flow:
+  Data loader [svc: sharded] -> Worker 1 [svc: model copy], Worker 2 [svc: model copy] : batch slices | Each worker reads a different slice of the batch.
+  Worker 1, Worker 2 -> All-reduce [svc: ring exchange] : local gradients | Each worker computes a gradient on its own slice.
+  All-reduce -> Worker 1, Worker 2 : averaged gradient | Every worker receives the same average.
+  * Worker 1: step 1001, weights equal | Both workers apply the same optimizer step and stay identical.
+  Worker 1 -> Checkpoint store [store: every 1000 steps] : save weights | Worker 1 alone writes a checkpoint so a crash does not lose the run.
+ref: paper | Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour | Goyal et al., 2017 | https://arxiv.org/abs/1706.02677
+
+== Continuous warm-start training loop
+kind: feedback-loop, online-offline
+when: The data drifts every day, such as ad clicks, and the model must follow it without a full retrain.
+how: The pipeline does not start from random weights each time. Each cycle loads the last checkpoint, including the optimizer state (for Adam, the moment estimates), and runs gradient steps on only the newest data, for example the last hour of logs.
+This is cheap and keeps the model fresh. A full retrain from scratch would take days on the whole history. The learning rate is usually small, so the model adapts and does not forget older patterns.
+Before the new checkpoint goes live, a gate compares its loss and calibration on a fresh holdout with the current model. A bad checkpoint is dropped. Teams also run a full retrain now and then, to remove accumulated drift.
+used: Click-through-rate systems that train hourly or in streaming mode, such as the online learning described for ad click prediction at Google.
+avoid: When data is stationary and small; a scheduled full retrain is simpler and easier to reproduce.
+flow:
+  Serving logs [log: clicks] -> Joiner [svc: label join] : events | Impressions are joined with clicks to make labeled examples.
+  Joiner -> Trainer [svc: warm start] : last hour of data | The trainer loads the last checkpoint and takes gradient steps on new data only.
+  Trainer -> Eval gate [svc: holdout check] : candidate checkpoint | The candidate is scored on a fresh holdout set.
+  Eval gate -> Model store [store: versions] : publish if loss improves | A checkpoint that passes is saved as a new version.
+  Eval gate -x> Trainer : reject | A checkpoint that gets worse is dropped and the old model keeps serving.
+  Model store -> Ranker [model: serving] : load version | The serving fleet loads the new weights, and its logs start the next cycle.
+ref: paper | Ad Click Prediction: a View from the Trenches | McMahan et al., KDD 2013 |
+
+== Checkpointed training with optimizer state
+kind: checkpoint-restart
+when: A training run takes days on many GPUs, and a node failure must not throw the work away.
+how: Every N steps the job saves a checkpoint: model weights, optimizer state, learning rate schedule position, data loader position and random seeds. For Adam the optimizer state is two extra tensors per weight, so the file is about 3 times the size of the weights alone.
+Writes go to fast shared storage or object storage, often in the background, so GPUs do not wait. Old checkpoints are kept for a few generations, since the newest may be corrupt or show a loss spike that needs a rollback.
+After a crash, the scheduler restarts the job and it resumes from the last checkpoint. The work between the checkpoint and the crash is lost, so the interval trades write cost against lost time. Resumption must restore the data position too, or the model sees some examples twice.
+used: PyTorch distributed checkpointing; large language model training runs, which restart many times per run.
+avoid: Short jobs of a few minutes; just rerun them.
+flow:
+  Trainer [svc: 64 GPUs] -> Checkpoint store [store: object storage] : weights + Adam state | Every 1000 steps the trainer saves weights, optimizer state and data position.
+  Trainer -x> Scheduler [svc: job manager] : node failure | One node dies and the whole job stops.
+  Scheduler -> Trainer : restart job | The scheduler restarts the job on healthy nodes.
+  Trainer -> Checkpoint store : read last checkpoint | The job loads the newest complete checkpoint.
+  * Trainer: resumed at step 41000 | Training resumes from step 41000. About 700 steps of work are redone.
+  Trainer -> Metrics [store: loss curves] : loss, step | Loss is logged so a spike or a bad checkpoint is seen early.
+ref: paper | Adam: A Method for Stochastic Optimization | Kingma & Ba, 2014 | https://arxiv.org/abs/1412.6980
+
+@@ genetic
+== Master-worker fitness evaluation
+kind: scatter-gather, thread-pool
+when: The fitness of each candidate needs a slow run, such as a simulation, and the population is large.
+how: A master process keeps the population, for example 200 candidates. Each generation, it sends every candidate to a pool of workers, which compute fitness in parallel. Selection, crossover and mutation are cheap and run on the master.
+Fitness evaluation is the cost, often more than 99 percent of the time, so adding workers speeds up the search almost linearly. The master waits for all results (synchronous) or accepts results as they come (asynchronous, steady-state), which avoids waiting for one slow worker.
+Evaluations must be pure: the same candidate gives the same score, or the noise must be handled, for example by averaging 3 runs. Failed workers need a retry or a penalty score, so a crash does not stall the generation.
+used: DEAP and similar libraries with a parallel map; evolutionary design and layout tools; hyperparameter and neural architecture search by evolution.
+avoid: When a gradient is available and cheap; use gradient descent, which is far more sample efficient.
+flow:
+  Master [svc: population 200] -> Worker 1 [svc: simulator], Worker 2 [svc: simulator], Worker 3 [svc: simulator] : candidates | The master sends a share of the 200 candidates to each worker.
+  Worker 1, Worker 2, Worker 3 -> Master : fitness scores | Workers run the slow simulation and return one score per candidate.
+  Worker 3 -x> Master : crashed | A crashed worker returns nothing, so the master retries or scores it as bad.
+  * Master: generation 12 | The master selects the best, then recombines and mutates them.
+  Master -> Results store [db: best per generation] : best candidate | The best candidate and its score are saved each generation.
+ref: docs | DEAP: Distributed Evolutionary Algorithms in Python | DEAP project | https://github.com/DEAP/deap
+
+== Island model with migration
+kind: none
+when: One population converges too early to a local optimum, and several machines are available.
+how: The population is split into islands, for example 8, each on its own machine and each running its own genetic algorithm. Islands rarely talk, so they explore different regions of the search space and keep diversity.
+Every few generations (for example 20), each island sends its best few candidates to a neighbour on a ring or in another topology. The neighbour replaces its worst candidates with them. New genes spread, but slowly.
+Migration is asynchronous and cheap: only a few candidates are sent, not the whole population. A failed island loses only its own share. The cost is tuning: migration size, interval and topology change how fast the search converges, and too much migration makes the islands one population again.
+used: Parallel genetic algorithm research and libraries (for example pygmo islands); used in engineering design search.
+avoid: When the fitness landscape is simple and one population finds the optimum fast.
+flow:
+  Island A [svc: population 50] -> Island B [svc: population 50] : best 3 candidates | Every 20 generations island A sends its best candidates to island B.
+  Island B -> Island C [svc: population 50] : best 3 candidates | The ring continues: B sends to C.
+  Island C -> Island A : best 3 candidates | The ring closes with C sending to A.
+  * Island B: worst 3 replaced | Island B replaces its worst candidates with the migrants.
+  Island A, Island B, Island C -> Archive [db: global best] : best so far | Each island reports to an archive that tracks the best candidate overall.
+ref: docs | pygmo: islands and archipelagos | pagmo/pygmo project | https://esa.github.io/pygmo2/
+
+== Population-based training of models
+kind: scheduler-agent
+when: You want good hyperparameters and a trained model in one run, and have many GPUs.
+how: Train a population of models, for example 16, each with its own hyperparameters (learning rate, dropout). Every so often, each model checks its score against the rest. A weak model copies the weights and hyperparameters of a strong one (exploit), then perturbs the hyperparameters by random factors such as 0.8 or 1.2 (explore).
+This is a genetic algorithm with selection and mutation, but it acts on running training jobs, not on finished candidates. The result is a hyperparameter schedule that changes during training, which a fixed grid search cannot give.
+A controller tracks scores and tells workers to copy and change. It costs 16 jobs at once, but there is no wasted second run to tune. DeepMind introduced it, and it was used in training game agents.
+used: DeepMind population based training (2017); Ray Tune and similar tuning libraries offer it.
+avoid: When only a few GPUs exist; use Bayesian optimization or random search with early stopping.
+flow:
+  Controller [svc: PBT scheduler] -> Trainer A [svc: lr 0.1], Trainer B [svc: lr 0.01], Trainer C [svc: lr 0.001] : start jobs | The controller starts several training jobs with different hyperparameters.
+  Trainer A, Trainer B, Trainer C -> Controller : score at step 5000 | Each job reports its validation score every few thousand steps.
+  Controller -> Trainer C : copy Trainer A | The weakest job is told to copy the best job.
+  * Trainer C: lr 0.12 | Trainer C copies weights of A and perturbs the learning rate.
+  Trainer A -> Checkpoint store [store: weights] : save weights | The best weights are saved for copying and later use.
+ref: paper | Population Based Training of Neural Networks | Jaderberg et al., DeepMind, 2017 | https://arxiv.org/abs/1711.09846
+
+@@ hmm
+== Speech decoding lattice with Viterbi search
+kind: pipes-filters
+when: A recognizer must turn audio frames into the most likely word sequence in real time.
+how: Audio is cut into 10 ms frames and turned into features (MFCC). An acoustic model gives the chance of each frame under each phone state. The states form a hidden Markov model: phones make words, and a language model gives word order scores.
+The decoder runs the Viterbi algorithm over the combined graph. For each frame it keeps only the best path into each state, so the cost grows linearly with the number of frames. Beam pruning drops paths that fall far behind the best, to keep it real time.
+Kaldi compiles the lexicon, language model and HMM into one weighted finite-state transducer (WFST) and searches it. Later systems replace the acoustic part with a neural network but often keep the HMM or WFST search.
+used: Kaldi and earlier recognizers such as HTK; hybrid neural and HMM systems before end-to-end models took over.
+avoid: When an end-to-end model (for example Whisper or a transducer) gives enough accuracy; it removes the lexicon and graph building.
+flow:
+  Audio [client: 16 kHz] -> Feature extractor [svc: MFCC] : 10 ms frames | The audio is cut into frames and turned into features.
+  Feature extractor -> Acoustic model [model: frame to state] : feature vectors | A model scores each frame against each phone state.
+  Acoustic model -> Viterbi decoder [svc: beam search] : state scores | Scores per frame enter the search.
+  Language graph [store: WFST] -> Viterbi decoder : words and phones | The graph joins phones, words and language scores into one search space.
+  Viterbi decoder -> Transcript [note: best path] : best word sequence | The decoder returns the best path and prunes weak ones along the way.
+ref: docs | Kaldi speech recognition toolkit | Kaldi project | https://kaldi-asr.org/
+
+== Map matching of GPS traces
+kind: windowed-agg
+when: Noisy GPS points from vehicles must be snapped to the road segments they actually drove on.
+how: Each GPS point has several candidate road segments nearby. The hidden state is the road segment. The emission score is higher when the point is close to the road. The transition score is higher when the route distance between two points is close to the straight distance, since cars follow roads.
+Viterbi finds the best sequence of segments for a trace. For streams, a sliding window of a few dozen points is decoded, and the older part is fixed when later points confirm it.
+The cost is the shortest-path calls for every pair of candidates between two points, so engines limit candidates to a few per point. Output feeds speed estimates, traffic maps and trip logs.
+used: Open-source engines such as Valhalla (Meili) and OSRM have HMM-based map matching; ride and fleet analytics use the same idea.
+avoid: When positions are already exact, or points are far too sparse; use direct snapping.
+flow:
+  Vehicle GPS [client: 1 point per second] -> Trace buffer [queue: window of 30 points] : lat, lon points | Points arrive and wait in a sliding window.
+  Trace buffer -> Candidate finder [svc: road index] : window | For each point, nearby road segments become candidate states.
+  Candidate finder -> Viterbi matcher [svc: HMM] : candidates per point | The matcher scores emission and transition for each candidate.
+  Router [svc: shortest path] -> Viterbi matcher : route distances | Route distance between candidates gives the transition score.
+  Viterbi matcher -> Trip store [db: matched segments] : best segment path | The oldest points in the window are fixed and saved.
+ref: docs | Valhalla Meili map matching | Valhalla project | https://valhalla.github.io/valhalla/
+
+== Offline training, online sequence tagging
+kind: online-offline
+when: A system must label each item in a sequence, such as words or sensor readings, with low latency.
+how: Offline, labeled sequences train the HMM by counting. Transition counts give the chance of one tag following another, and emission counts give the chance of a word under a tag. With unlabeled data, the Baum-Welch algorithm (expectation maximization) learns the same tables.
+Online, the service loads the small tables, a few megabytes, and decodes each sequence with Viterbi in time linear in its length. There is no GPU and no large model, so it runs in microseconds per token.
+The model cannot use long-range context, and rare words need smoothing. Teams therefore moved to CRFs and neural taggers for accuracy, and keep an HMM where size, speed or transparency matters.
+used: Part-of-speech taggers and gene finders such as GENSCAN used HMMs; HMMs are common for simple activity or regime detection.
+avoid: When accuracy matters more than size; use a CRF or a neural tagger.
+flow:
+  Labeled corpus [lake: tagged sentences] -> Trainer [svc: count tables] : sentences | The trainer counts tag transitions and word emissions.
+  Trainer -> Model store [store: small tables] : transition + emission | The probability tables are saved as a small file.
+  Tagging service [svc: Viterbi] -> Model store : load tables | The service loads the tables at start.
+  API client [client] -> Tagging service : sentence | A client sends a sentence to tag.
+  Tagging service -> API client : tags | Viterbi returns the best tag path in linear time.
+ref: paper | A tutorial on hidden Markov models and selected applications in speech recognition | Rabiner, Proc. IEEE, 1989 |
+
+@@ loss
+== Multi-task training with a combined loss
+kind: online-offline
+when: One model must predict several things, such as click and conversion, and the tasks share most features.
+how: A shared bottom network turns the input into a representation. Separate heads sit on top, one per task, such as a click head and a conversion head. Each head has its own loss, usually binary cross-entropy (log loss).
+The training loss is a weighted sum: total = w1 times click loss plus w2 times conversion loss. The weights set which task wins when they pull in different directions. Teams tune them on validation data, or scale each loss by its own noise level.
+One model replaces two, so serving is cheaper, and a rare task (conversion happens far less than click) can borrow strength from a common one. The risk is that a task with large loss values dominates the gradient. So teams log each loss separately and check that none stalls.
+used: Common in ad and recommendation ranking models (multi-task click and conversion prediction); multi-head models in vision and language.
+avoid: When tasks conflict strongly or need different data freshness; train separate models.
+flow:
+  Training logs [lake: click and buy labels] -> Shared network [model: shared layers] : features, labels | Each example carries one label per task.
+  Shared network -> Click head [model: sigmoid], Conversion head [model: sigmoid] : representation | Both heads read the same learned representation.
+  Click head -> Loss combiner [svc: weighted sum] : click log loss | The click head produces a cross-entropy loss.
+  Conversion head -> Loss combiner : conversion log loss | The conversion head produces its own loss, often with fewer positive labels.
+  Loss combiner -> Shared network : one gradient | The weighted sum gives one gradient that updates the shared layers and both heads.
+  Loss combiner -> Metrics [store: per-task loss] : each loss logged | Each loss is logged alone, so a stalled task is seen.
+ref: paper | Modeling Task Relationships in Multi-task Learning with Multi-gate Mixture-of-Experts | Ma et al., KDD 2018 |
+
+== Offline loss gate before rollout
+kind: shadow-ab, blue-green
+when: A new model version must be checked before it serves real traffic.
+how: After training, an evaluation job scores the new model and the current production model on the same fixed holdout set, in the same loss and the same metrics (log loss, AUC, calibration). The job also slices results by country, device and new users, since a model can improve on average and still get worse for one group.
+A gate compares the numbers with rules, for example "log loss must not rise by more than 0.2 percent on any large slice". If it passes, the model goes to shadow mode (scores logged, not used), then to a small canary share of traffic.
+Loss on a holdout is only a proxy. A lower log loss does not always mean more revenue, so the online test decides the final rollout. The offline gate removes bad models early and cheaply.
+used: Common in ML platforms with model registries and CI for models; standard practice in ads and ranking teams.
+avoid: When no stable holdout exists, for example when the world changes fast; lean on online tests and monitoring.
+flow:
+  Trainer [svc: new model] -> Model registry [store: versions] : candidate v43 | The trainer registers a new candidate model.
+  Model registry -> Eval job [svc: holdout scoring] : v43 and v42 | The job scores the candidate and the production model on the same data.
+  Eval job -> Gate [svc: rules] : loss by slice | Log loss and AUC per slice are compared with the rules.
+  Gate -x> Trainer : rejected, slice worse | If a slice gets worse, the candidate is sent back.
+  Gate -> Shadow serving [svc: scores logged] : v43 passes | A passing model scores live traffic but its answers are not used.
+  Shadow serving -> Canary [svc: 1 percent traffic] : promote | After the shadow check, v43 serves a small share of real traffic.
+ref: book | Designing Machine Learning Systems | Chip Huyen, O'Reilly, 2022 |
+
+== Calibration layer after log-loss training
+kind: online-offline, feedback-loop
+when: Predicted probabilities are used as numbers, such as bid = value times pCTR, so they must be accurate and not only well ordered.
+how: Cross-entropy trains a model toward true probabilities, but training tricks break this. Negative downsampling (keeping 10 percent of non-clicks) pushes predictions up by a known factor. Drift and overfitting also bend them.
+A calibration step maps raw scores to calibrated ones. It can be a simple formula for the known downsampling rate, or isotonic regression or Platt scaling fitted on a recent holdout. The model keeps its ranking order, but the numbers match the observed click rate.
+A monitor compares the mean prediction with the observed click rate per slice every hour. A gap above a threshold raises an alert or triggers a refit of the calibration map. Without this, bids drift, and spend goes wrong.
+used: Calibration is a standard step in ad click prediction (described in the 2013 Google and 2014 Facebook papers).
+avoid: When the output is only used to sort items; ranking quality is enough then.
+flow:
+  Ranker [model: log loss trained] -> Calibrator [svc: isotonic map] : raw score 0.04 | The model gives a raw score that is only roughly a probability.
+  Calibrator -> Bidder [svc: bid = value x p] : pCTR 0.021 | The calibrator returns a probability that matches the observed rate.
+  Bidder -> Outcome log [log: clicks] : prediction, click | Each prediction is logged with what really happened.
+  Outcome log -> Monitor [svc: hourly check] : mean pred vs click rate | The monitor compares predicted and observed rates per slice.
+  Monitor -> Calibrator : refit map | If the gap is too large, the map is refitted on recent data.
+ref: paper | Practical Lessons from Predicting Clicks on Ads at Facebook | He et al., ADKDD 2014 |
+
+@@ matfact
+== Nightly ALS training with factor tables served by key
+kind: precompute, online-offline
+when: A product has millions of users and items and a large rating or click matrix, and recommendations can be a day old.
+how: A batch job reads the interaction table. Alternating least squares (ALS) fixes the item factors and solves each user's factor vector exactly, then fixes the users and solves the items, and repeats for about 10 to 20 rounds. Each solve is independent, so it spreads across a cluster. Spark MLlib implements this, including a version for implicit feedback such as views.
+The job writes the factor tables (for example 64 numbers per user and item) to a key-value store. At request time, the service reads a user's vector and scores items by dot product, or serves precomputed top-k lists.
+Data is only as fresh as the last run. For a new user without history there is no vector yet, so a fallback such as popular items is needed.
+used: Spark MLlib ALS; the Netflix Prize era approach; common baseline in recommendation stacks.
+avoid: When session behaviour must change results within minutes; add a real-time model on top.
+flow:
+  Interaction table [lake: views and ratings] -> ALS job [svc: Spark MLlib] : user, item, weight | The nightly job reads all interactions.
+  * ALS job: round 15 of 15 | It alternates between solving user factors and item factors for about 15 rounds.
+  ALS job -> Factor store [db: 64 floats per id] : user and item vectors | The final factor tables are written for key lookup.
+  Rec service [svc: dot product] -> Factor store : get user 42 | At request time the service fetches one user vector.
+  Rec service -> App [client] : top 20 items | It scores candidate items with dot products and returns the best.
+ref: docs | Collaborative filtering (ALS) | Apache Spark MLlib documentation | https://spark.apache.org/docs/latest/ml-collaborative-filtering.html
+
+== Item factors as an ANN candidate index
+kind: two-tower-retrieval
+when: The catalog is too big to score all items with a dot product for every request.
+how: The learned item vectors are loaded into an approximate nearest neighbour index, such as HNSW or IVF with product quantization. The user vector is the query, and the index returns the items with the largest dot product, usually 200 to 1000, in a few milliseconds.
+Matrix factorization is a simple form of two-tower model: the user vector comes from a lookup, and the item vector too. The same serving design therefore works when the lookup is replaced by a neural network that reads fresh features.
+A ranker with richer features then re-scores the candidates. Dot product search is not a true distance, so some libraries need a small transform to turn it into cosine or Euclidean search.
+used: Faiss and ScaNN style indexes under collaborative filtering candidates; an early stage in multi-stage recommenders.
+avoid: For a catalog of a few thousand items; brute-force dot products on a GPU or CPU are exact and simple.
+flow:
+  Factor trainer [svc: ALS or SGD] -> Item vectors [store: 5M x 64] : item factors | Training produces one vector per item.
+  Item vectors -> ANN index [store: HNSW] : build index | A job builds the approximate index from the vectors.
+  Rec service [svc: retrieval] -> User vectors [db: key-value] : get user | The service fetches the user's factor vector as the query.
+  Rec service -> ANN index : nearest 500 by dot | The index returns the 500 items with the largest dot product.
+  Rec service -> Ranker [model: richer features] : 500 candidates | A heavier model re-scores the candidates before the page is shown.
+ref: docs | Faiss: a library for similarity search | Meta AI Research | https://github.com/facebookresearch/faiss
+
+== Fold-in of new users from fresh feedback
+kind: feedback-loop
+when: A new user clicks a few items, and recommendations should improve now, not after tomorrow's training.
+how: Item factors are kept fixed. When a user has new events, a small service solves only that user's vector: a regularized least squares problem over the few items that user touched. It is one small linear system, about 64 by 64, so it takes under a millisecond.
+The new vector is written to the user table, and the next request uses it. This is the same step that ALS does for users, run alone and online. Item factors still change only in the nightly batch, so new items are not covered.
+The regularization penalty matters here. With only 3 events, a weak penalty gives a vector that fits those events perfectly and is not useful. Strong shrinkage keeps the vector near the average user until more evidence arrives.
+used: A known technique for implicit-feedback recommenders and for cold start in ALS-based systems.
+avoid: When many new items appear each day; add content features or a two-tower model that reads item attributes.
+flow:
+  App [client] -> Event log [log: clicks] : user 42 clicked 3 items | A new user clicks a few items.
+  Event log -> Fold-in service [svc: ridge solve] : new events | The service reads the new events for that user.
+  Item factors [store: fixed] -> Fold-in service : vectors of 3 items | It loads the vectors of the items the user touched.
+  Fold-in service -> User vectors [db: key-value] : new vector for user 42 | It solves a small regularized system and saves the new user vector.
+  User vectors -> Rec service [svc: dot product] : fresh vector | The next request already uses the new vector.
+ref: paper | Collaborative Filtering for Implicit Feedback Datasets | Hu, Koren & Volinsky, ICDM 2008 |
+
+@@ ngram
+== Language model rescoring of n-best lists
+kind: two-tower-retrieval, pipes-filters
+when: A first system (speech, translation or spelling) gives several guesses, and a stronger language model should pick the best.
+how: The first stage is fast and returns an n-best list, for example the 50 best text hypotheses. Each hypothesis has an acoustic or translation score. A large n-gram model, built with KenLM, then scores each full sentence.
+The final score is a weighted sum of the first score and the language model log probability, often with a length bonus. The weights are tuned on a dev set. The n-gram model is a compressed file of counts, loaded with memory mapping, so one machine holds billions of n-grams.
+Look-ups are fast: about a microsecond per query for a trie with quantized values. Smoothing, usually modified Kneser-Ney, gives sensible scores to word sequences that were never seen.
+used: KenLM is used in statistical machine translation and in many speech recognizers; n-gram rescoring is common in production speech systems.
+avoid: When a neural language model fits in the latency budget; it generalizes better to rare phrases.
+flow:
+  First-pass decoder [svc: fast system] -> N-best list [queue: 50 hypotheses] : hypotheses and scores | The first stage returns 50 guesses, each with its own score.
+  N-best list -> Rescorer [svc: weighted sum] : each sentence | The rescorer sends each full sentence to the language model.
+  Rescorer -> KenLM [store: trie, memory mapped] : n-gram lookups | The model looks up counts of word sequences and smooths them.
+  KenLM -> Rescorer : log probability | It returns a log probability for each sentence.
+  Rescorer -> Output [note: best sentence] : best by combined score | The best combined score wins, and the other guesses are dropped.
+ref: docs | KenLM Language Model Toolkit | Kenneth Heafield | https://kheafield.com/code/kenlm/
+
+== Autocomplete from prefix counts
+kind: precompute, materialized-view
+when: A search box must suggest completions in a few milliseconds from past queries.
+how: A batch job counts full queries from the logs, for example over the last 30 days, and keeps those above a minimum count. It builds a trie of the queries and stores, at each prefix node, the top 10 completions with their counts. A request is then a single walk down the trie, with no sorting at request time.
+Ranking by raw count is a unigram view of whole queries. Better systems add context: an n-gram of the earlier words in the sentence, or the user's recent queries. Counts are smoothed so that a rare but plausible phrase is not scored as impossible.
+The index is rebuilt every few hours or day and pushed to the serving nodes. A small real-time layer adds breaking trends. Filters remove offensive or private strings before the build.
+used: Search engines and e-commerce sites; open-source suggesters such as Lucene's FST suggesters work like this.
+avoid: When the suggestions must be personal and semantic; use a retrieval model with embeddings.
+flow:
+  Query logs [lake: 30 days] -> Count job [svc: batch] : query strings | A batch job counts how often each query occurs.
+  Count job -> Trie builder [svc: top 10 per prefix] : counts above minimum | Rare and filtered queries are dropped, then a trie is built.
+  Trie builder -> Suggest nodes [cache: trie in memory] : push new index | The finished trie is pushed to every serving node.
+  Browser [client] -> Suggest nodes : prefix "how to" | Each keystroke sends the prefix.
+  Suggest nodes -> Browser : 10 completions | A walk down the trie returns precomputed completions in a few ms.
+ref: docs | Suggesters | Apache Lucene documentation | https://lucene.apache.org/core/
+
+== Exact n-gram counts with a suffix array index
+kind: index-table, sharding
+when: You need exact counts of any phrase in a huge text corpus, with no fixed n.
+how: A suffix array is a sorted list of positions of all suffixes of the text. Binary search on it finds how often a phrase of any length occurs, in time about log of the corpus size. It stores only integers, so the index is a few times the size of the text.
+Infini-gram (2024) built such indexes for corpora of trillions of tokens, and answers count and next-token queries through a public web API in tens of milliseconds. A classic n-gram table with a fixed n=5 would be far bigger and cannot answer a longer phrase.
+The index is split into shards. A query goes to all shards, and the counts are summed. Typical uses are checking whether a test sentence appears in the training data, and measuring how much text a model could have memorized.
+used: Infini-gram (Liu et al., 2024); data decontamination checks for language model training sets.
+avoid: When only fixed small n-grams are needed; a compact count table like KenLM is smaller and faster.
+flow:
+  Corpus [lake: trillions of tokens] -> Index builder [svc: suffix array] : tokens | A batch job sorts all suffixes of the corpus into an index.
+  Index builder -> Shard 1 [store: on SSD], Shard 2 [store: on SSD] : index parts | The index is split into shards stored on SSD.
+  Client [client] -> Query API [svc: sum counts] : phrase | A client asks how often a phrase occurs.
+  Query API -> Shard 1, Shard 2 : binary search | Each shard counts the phrase by binary search on its part.
+  Shard 1, Shard 2 -> Query API : partial counts | The shards return partial counts.
+  Query API -> Client : total count | The API adds them up and returns one number.
+ref: paper | Infini-gram: Scaling Unbounded n-gram Language Models to a Trillion Tokens | Liu et al., 2024 | https://arxiv.org/abs/2401.17377
+
+@@ pca
+== PCA before an ANN index
+kind: precompute
+when: Embedding vectors are large (768 or more numbers), and index size and search time must go down.
+how: Offline, fit PCA on a sample of vectors: compute the mean and the top-k directions of largest variance (the principal components), for example k=128. Project all vectors into that space and build the ANN index on the short vectors.
+Memory drops by 6 times, from 768 to 128 numbers, and distance computations are faster. Variance kept is checked first: if the top 128 components hold 90 percent of the variance, the loss in recall is usually small.
+At query time the same mean and matrix are applied to the query vector. The matrix must be versioned with the index, because a query projected with another matrix finds nothing useful. Faiss offers PCAMatrix as a step in its index factory strings.
+used: Faiss index pipelines (PCA then IVF or PQ); vector search services that shrink embeddings.
+avoid: When the embedding model is already trained with a small output size, or has Matryoshka-style prefixes; truncate those instead.
+flow:
+  Embedding store [lake: 768-dim vectors] -> PCA fit [svc: sample 1M vectors] : sample | A job fits PCA on a sample and keeps the top 128 directions.
+  PCA fit -> Projector [svc: matrix + mean] : transform v7 | The matrix and mean are saved as one versioned artifact.
+  Embedding store -> Projector : all vectors | The projector reduces every vector from 768 to 128 numbers.
+  Projector -> ANN index [store: 128-dim HNSW] : short vectors | The index is built on the short vectors.
+  Query service [svc: same transform] -> ANN index : projected query | A query is projected with the same matrix, then searched.
+ref: docs | Decomposition: PCA | scikit-learn documentation | https://scikit-learn.org/stable/modules/decomposition.html
+
+== Anomaly scoring by reconstruction error
+kind: online-offline
+when: You need to flag unusual metrics or sensor readings, but have few labeled failures.
+how: Offline, fit PCA on a window of normal data, for example 30 days of server metrics, and keep the top components that explain 95 percent of the variance. These capture the normal ways the metrics move together (CPU, memory and request rate rise as a group).
+Online, each new vector is projected onto the components and then rebuilt. The reconstruction error (distance between the original and the rebuild) is its anomaly score. A point that breaks the usual correlations has a large error, even if each single metric looks normal.
+The threshold is set from the error distribution on normal data, for example the 99.9th percentile. The model is refitted on a schedule, since normal behaviour drifts. PCA finds only linear structure, so strongly nonlinear systems need autoencoders.
+used: Common in network and server monitoring (the subspace method) and in sensor and fraud screening.
+avoid: When normal data is multi-modal or highly nonlinear; try an autoencoder or isolation forest.
+flow:
+  Metrics stream [log: 40 metrics] -> Scorer [svc: PCA project and rebuild] : vector at 12:01 | Each minute a metric vector enters the scorer.
+  Model store [store: components] -> Scorer : load model | The scorer holds the components fitted on normal data.
+  Scorer -> Alert rules [svc: threshold] : error 7.3 | The reconstruction error is the anomaly score.
+  Alert rules -> On-call [client: pager] : alert, error above 3.1 | An error above the threshold from normal data raises an alert.
+  Metrics stream ~> Refit job [svc: weekly] : recent normal data | A weekly job refits PCA so the baseline follows slow drift.
+  Refit job ~> Model store : new components | The new model replaces the old one.
+ref: docs | PCA | scikit-learn documentation | https://scikit-learn.org/stable/modules/decomposition.html
+
+== Fit offline, transform online in a feature pipeline
+kind: feature-store, online-offline
+when: A model was trained on PCA-reduced features, and the same reduction must be applied in serving.
+how: The training pipeline fits PCA on the training set only (never on test data, which would leak). It saves the fitted mean and component matrix together with the model, as one artifact or as part of the model graph.
+At serving, the feature step loads this artifact and applies the exact same transform to each raw feature vector. The cost is one matrix multiply, which is small. In a feature store, the reduced features can also be computed once and read by key.
+The common failure is skew: a different scaling or a refit PCA at serving gives different axes (signs and order of components can even flip), and the model sees nonsense. So the artifact is versioned and tested for equality against the training pipeline.
+used: scikit-learn pipelines saved with the model; feature stores such as Feast keep transformed features consistent between training and serving.
+avoid: When features must stay interpretable for audits; PCA components mix original features.
+flow:
+  Training data [lake] -> Pipeline fit [svc: scale + PCA] : raw features | The pipeline fits scaling and PCA on training data only.
+  Pipeline fit -> Artifact store [store: model + PCA matrix] : v12 | The fitted transform is saved together with the model version.
+  Serving API [svc: loads v12] -> Artifact store : load v12 | The serving process loads the same artifact.
+  Client [client] -> Serving API : raw features | A request arrives with raw features.
+  Serving API -> Model [model: on 20 components] : reduced features | The API applies the saved transform, then the model scores the result.
+ref: docs | Pipelines and composite estimators | scikit-learn documentation | https://scikit-learn.org/stable/modules/compose.html
+
+@@ pgm
+== Bayesian network for diagnosis with evidence
+kind: online-offline
+when: Experts know how causes link to symptoms, and the system must reason from partial evidence with uncertainty.
+how: The structure is a directed graph: causes point to effects (for example fault, then alarm, then symptom). Each node holds a small conditional probability table given its parents, so a joint distribution over 30 variables needs hundreds of numbers, not 2 to the power 30.
+Tables come from experts, from data, or both. At run time the service receives evidence (some symptoms seen, others not tested) and computes the posterior chance of each cause. Exact inference such as the junction tree algorithm works on small graphs; large ones use approximate methods.
+The result is explainable: a user can see which evidence moved the belief. The cost is maintenance of structure and tables, and wrong independence assumptions give confident but wrong answers.
+used: Medical and fault diagnosis systems; spam filters and early Microsoft troubleshooters used Bayesian networks; libraries such as pgmpy.
+avoid: When there are many raw features and plenty of labels; a plain classifier needs less modelling work.
+flow:
+  Expert and data [note: structure and tables] -> Model builder [svc: pgmpy] : graph, probability tables | Experts give the graph, and data fills the tables.
+  Model builder -> Inference service [svc: junction tree] : compiled network | The network is compiled once for fast queries.
+  Operator UI [client] -> Inference service : evidence: alarm on, fan ok | The user sends the symptoms seen so far.
+  Inference service -> Operator UI : P(cause) ranked | The service returns the posterior chance of each cause.
+  Inference service -> Operator UI : suggest next test | It also names the test that would reduce uncertainty most.
+ref: docs | pgmpy: Python library for probabilistic graphical models | pgmpy project | https://pgmpy.org/
+
+== Hierarchical Bayesian model fitted with MCMC
+kind: precompute
+when: Many groups have few data points each (stores, campaigns, regions), and estimates must borrow strength across groups.
+how: The model has a graph with levels: a group-level parameter for each group, drawn from a shared distribution whose parameters are also unknown. The graph makes the structure plain, and a tool such as Stan or NumPyro turns it into a sampler.
+A batch job runs MCMC (Hamiltonian Monte Carlo) to draw posterior samples, for example 4 chains of 1000 draws. Groups with little data are pulled toward the overall mean (shrinkage), and groups with much data keep their own values.
+The job writes summaries, such as the mean and 90 percent interval per group, to a table. Dashboards and decision systems read the table. Sampling can take minutes to hours, so results are precomputed on a schedule, and convergence is checked before they are published.
+used: Stan and PyMC models for A/B test analysis, marketing mix models and sports ratings.
+avoid: When latency matters or data is huge; use variational inference or a simpler pooled estimate.
+flow:
+  Warehouse [lake: group data] -> Model job [svc: Stan or NumPyro] : counts per group | A scheduled job reads data for each group.
+  Model job -> Sampler [svc: 4 chains] : model and data | The graph is compiled and sampled with MCMC.
+  Sampler -> Model job : 4000 posterior draws | The draws are checked for convergence (R-hat near 1).
+  Model job -> Results table [db: mean and interval] : estimate per group | Summaries are written for each group.
+  Dashboard [client] -> Results table : read estimates | Readers see shrunk estimates with honest uncertainty.
+ref: docs | Stan documentation | Stan Development Team | https://mc-stan.org/
+
+== Online Bayesian click model with message passing
+kind: feedback-loop, online-offline
+when: A model must learn from a stream of clicks, and also report how unsure it is for each feature.
+how: Each feature weight is a Gaussian with a mean and a variance. A factor graph links the weights of the active features to the click outcome. When an impression and its click label arrive, expectation propagation passes messages through the graph and updates the means and variances of the involved weights.
+Microsoft's adPredictor, used for Bing sponsored search, works this way. The model needs a single pass over each event, so it learns online. The variances tell how unsure a prediction is, which helps to explore new ads, since uncertain ads get a bonus.
+The weights are stored in a key-value table, one entry per feature value, and updated by workers. Weak points are the Gaussian assumption and the need for a careful message design.
+used: adPredictor in Microsoft Bing ads (2010 paper); the ideas appear in other Bayesian online learners.
+avoid: When deep models with many interacting features are needed; use neural networks with calibrated outputs.
+flow:
+  Ad server [svc] -> Event log [log: labeled events] : labeled event | Each impression is logged with its click label.
+  Event log -> Updater [svc: expectation propagation] : features and label | The updater reads one event at a time.
+  Updater -> Weight store [db: mean, variance] : read weights | It loads the Gaussian weights of the active features.
+  Updater -> Weight store : updated beliefs | Messages through the factor graph give new means and smaller variances.
+  Weight store -> Ad server : weights for scoring | The ad server scores ads with these weights and adds a bonus for uncertain ones.
+ref: paper | Web-Scale Bayesian Click-Through Rate Prediction for Sponsored Search Advertising in Microsoft's Bing Search Engine | Graepel et al., ICML 2010 |
+
+@@ regression
+== Online logistic regression for CTR with hashed features
+kind: online-offline, feedback-loop
+when: An ad or feed system has billions of sparse features and must update its click model many times a day.
+how: Each example is a set of categorical values (site, ad id, device, hour). Instead of a dictionary, the feature hashing trick maps each value to one of 2 to the power 24 or so weight slots. The model is a logistic regression: a weighted sum of the active slots, then a sigmoid, giving a click probability.
+Training uses an online optimizer, such as FTRL-Proximal, which updates only the weights of the active features and keeps many exactly at zero with L1 regularization. This keeps the model small and sparse. Vowpal Wabbit is a common open-source implementation.
+The model is cheap and fast, can be read by humans (each weight is a clear effect), and its output is a well-calibrated probability. Its weakness is no automatic feature interaction, so teams cross features by hand.
+used: Google's ad click prediction (McMahan et al., 2013) and Criteo-style CTR systems began here; Vowpal Wabbit is widely used.
+avoid: When feature interactions are rich and data is large; use factorization machines or deep CTR models.
+flow:
+  Impression log [log: click labels] -> Hasher [svc: 2^24 slots] : site=a, ad=17, hour=9 | Each example is turned into hashed feature slots.
+  Hasher -> FTRL learner [svc: online update] : slot ids and label | The learner reads one example at a time.
+  FTRL learner -> Weight table [db: sparse weights] : update active weights | Only the weights of active features change.
+  Weight table -> Scoring service [svc: sigmoid of sum] : weights pushed every 5 min | Fresh weights are pushed to serving.
+  Scoring service -> Impression log : predictions logged | The new predictions and outcomes feed the next updates.
+ref: paper | Ad Click Prediction: a View from the Trenches | McMahan et al., KDD 2013 |
+
+== Simple model as champion and fallback
+kind: shadow-ab, circuit-breaker
+when: A complex model is hard to trust or to run, and a safe, fast baseline is wanted next to it.
+how: Keep a regression model beside the complex one. It scores the same requests, but its output is only logged (shadow mode). Its quality gives a baseline: if the deep model does not beat it by a clear margin in an online test, the extra cost is not justified.
+The linear model also acts as a fallback. If the main model times out or its feature fetch fails, a circuit breaker routes the request to the linear model. It needs few features, runs in microseconds and has no GPU dependency.
+Coefficients also help debugging. When the complex model gives a strange answer, the linear score and its largest coefficient terms show whether the inputs look wrong.
+used: Common in ranking, fraud and pricing systems that keep a logistic regression as a baseline and safety net.
+avoid: When there is no cost reason or risk reason for a second model; maintenance of two paths is real work.
+flow:
+  Request [client] -> Router [svc: circuit breaker] : score request | The router sends each request to the main model.
+  Router -> Deep model [model: main] : features | The deep model gives the normal score.
+  Router -> Linear model [model: shadow] : same features | The linear model also scores it, only for comparison.
+  Deep model -x> Router : timeout | If the deep model is slow, the breaker opens.
+  Router -> Linear model : fallback traffic | While open, requests go to the linear model, so users still get an answer.
+  Linear model -> Request : score | The linear score is returned in microseconds.
+ref: book | Designing Machine Learning Systems | Chip Huyen, O'Reilly, 2022 |
+
+== Linear scoring inside a latency-bound bidder
+kind: rtb, precompute
+when: A bidder has a few milliseconds to price each bid request and cannot call a remote model service.
+how: Weights of a logistic regression are trained offline and shipped to each bidder instance as a compact table in memory. For each bid request the bidder looks up the weights of the request's feature values and adds them. Then it applies a sigmoid to get pCTR and multiplies by the value of a click to set the bid price.
+This is a hash lookup and a few dozen additions, so it takes microseconds and needs no network call. The bidder can price tens of thousands of requests per second per core.
+The price is slower learning. Weights are updated by a new push, for example every 15 minutes, not per event. Bidders also need a default for unseen feature values, and a version check, so all instances use a consistent table.
+used: Common in RTB bidders and DSPs, where simple models are often kept in memory for speed.
+avoid: When interactions among features drive value; use a deeper model on a separate inference tier, with a deadline.
+flow:
+  Training job [svc: logistic regression] -> Weight store [store: versioned table] : weights v88 | A job trains weights and publishes a versioned table.
+  Weight store -> Bidder [svc: in-memory table] : push v88 | Each bidder loads the table into memory.
+  Exchange [client: SSP] -> Bidder : bid request | A bid request arrives with 100 ms of total budget.
+  * Bidder: pCTR 0.02 in 20 us | The bidder looks up and adds weights, then applies a sigmoid, in microseconds.
+  Bidder -> Exchange : bid = value x pCTR | It answers with the price, well inside the deadline.
+ref: spec | OpenRTB 2.6 | IAB Tech Lab |
+
+@@ regularization
+== Cross-validated search for the penalty strength
+kind: scatter-gather, fork-join
+when: The strength of the penalty (lambda, dropout rate, weight decay) must be chosen from data, and each fit is cheap enough to run many times.
+how: Pick a grid or random set of values, for example 8 values of lambda on a log scale from 0.0001 to 10. Split the training data into 5 folds. Each pair of value and fold is a small job: fit on 4 folds and score on the held-out fold.
+The jobs are independent, so a scheduler fans out 40 jobs to workers and gathers the scores. The mean score across folds is computed for each value. Too small a lambda overfits and too large underfits, so the curve has a best region.
+Pick the best value, or the largest lambda within one standard error of the best (the one-standard-error rule), which prefers a simpler model. Then refit once on all training data. The test set is used only once at the end.
+used: scikit-learn GridSearchCV and LogisticRegressionCV; glmnet; Optuna and Ray Tune for larger searches.
+avoid: When one fit takes days; use a single validation set with early stopping, or a model-based search.
+flow:
+  Tuner [svc: grid of 8 lambdas] -> Worker 1 [svc: fit one fold], Worker 2 [svc: fit one fold], Worker 3 [svc: fit one fold] : 40 fit jobs | The tuner turns 8 values times 5 folds into 40 independent jobs.
+  Worker 1, Worker 2, Worker 3 -> Score table [db: lambda by fold] : validation loss | Each job writes the loss on its held-out fold.
+  Score table -> Tuner : mean loss per lambda | The tuner averages across folds for each value.
+  * Tuner: best lambda 0.1 | The curve has its lowest point near lambda 0.1.
+  Tuner -> Final fit [svc: all train data] : lambda 0.1 | One last fit uses all training data with the chosen penalty.
+  Final fit -> Test set [note: used once] : final score | The held-out test set is scored once, for the report.
+ref: docs | Cross-validation: evaluating estimator performance | scikit-learn documentation | https://scikit-learn.org/stable/modules/cross_validation.html
+
+== Early stopping with a validation gate
+kind: checkpoint-restart, feedback-loop
+when: A neural network trains for many epochs and starts to memorize the training data after some point.
+how: Training loss falls all the time, but validation loss falls and then rises when the model begins to overfit. The pipeline evaluates on a validation set at the end of each epoch, or every few thousand steps, and saves a checkpoint when validation loss improves.
+A patience counter ends training when there is no improvement for N evaluations, for example 5. The saved best checkpoint, not the last one, is the result. This limits effective model complexity, like a penalty, and costs nothing in model size.
+It also saves compute. Weight decay is usually set beside it: in AdamW the decay is decoupled from the gradient step, which makes it behave as a real penalty. Early stopping on a noisy validation set may stop too early, so patience is set from the observed noise.
+used: Built into Keras, PyTorch Lightning and XGBoost callbacks; standard in deep learning training pipelines.
+avoid: When the validation set is tiny or not like production data; the stop point will be random.
+flow:
+  Trainer [svc: epoch 12] -> Validation set [lake: held out] : evaluate weights | After each epoch the trainer scores the validation set.
+  Validation set -> Early stop monitor [svc: patience 5] : validation loss 0.31 | The monitor tracks the best loss seen so far.
+  Early stop monitor -> Checkpoint store [store: best weights] : save best | A new best loss saves a checkpoint.
+  Early stop monitor -> Trainer : continue | The trainer continues while the loss improves.
+  * Early stop monitor: no gain for 5 evals | Validation loss has not improved for 5 checks.
+  Early stop monitor -> Trainer : stop | Training ends and the best checkpoint is used, not the last.
+ref: paper | Decoupled Weight Decay Regularization | Loshchilov & Hutter, ICLR 2019 | https://arxiv.org/abs/1711.05101
+
+== Dropout at train time and Monte Carlo dropout at serve time
+kind: scatter-gather
+when: A network needs less overfitting, and, for some uses, a rough measure of how unsure it is.
+how: During training, dropout sets each hidden unit to zero with probability p (for example 0.1 to 0.5) and scales the others. Each step trains a different thinned network, which stops units from relying on each other. This lowers overfitting.
+At serving time dropout is normally turned off, so the output is a single deterministic pass. That is the usual path and it is cheap. A frequent bug is leaving the model in training mode in the serving code, which makes answers random.
+For uncertainty, a service can keep dropout on and run the same input 20 times in a batch. The mean is the prediction and the spread is a rough uncertainty. Requests with a wide spread are sent to a human or a bigger model. This costs 20 times the compute for those requests.
+used: Dropout is standard in deep nets since Hinton et al. (2012); Monte Carlo dropout (Gal & Ghahramani, 2016) is used for uncertainty in some risk-sensitive systems.
+avoid: When latency is tight and uncertainty is not needed; one pass with dropout off is enough.
+flow:
+  Request [client] -> Inference service [svc: dropout on] : input x | A request arrives for a risk-sensitive prediction.
+  Inference service -> Passes [model: 20 stochastic passes] : same input x20 | The same input runs 20 times with random units dropped.
+  Passes -> Inference service : 20 outputs | Each pass gives a slightly different output.
+  Inference service -> Review queue [queue: human review] : spread is high | A wide spread sends the case to review.
+  Inference service -> Request : mean and spread | A narrow spread returns the mean answer with its uncertainty.
+ref: paper | Dropout: Improving neural networks by preventing co-adaptation of feature detectors | Hinton et al., 2012 | https://arxiv.org/abs/1207.0580
+
+@@ svm
+== Linear SVM on hashed text features
+kind: online-offline
+when: A text classifier (spam, topic, abuse) must be fast, cheap and strong on very high-dimensional sparse data.
+how: Text becomes a sparse vector of word and n-gram counts, often with TF-IDF weights, or hashed into a fixed number of slots. In such spaces, classes are usually close to linearly separable, so a linear SVM with a hinge loss is accurate. Liblinear trains it in minutes on millions of documents.
+The model is a single weight vector. Scoring a message is a sparse dot product, so it takes microseconds with no GPU, and the weight file is small. The margin of the score tells how sure the model is, so low-margin items can go to review.
+Retraining is a nightly or weekly batch job, with a check on a holdout set before the new weights are shipped. SVM scores are not probabilities, so calibrate them if a probability is needed.
+used: Liblinear and scikit-learn LinearSVC; classic spam and document classifiers; strong baseline before neural text models.
+avoid: When meaning depends on word order or context; use a fine-tuned transformer.
+flow:
+  Labeled text [lake: spam and ham] -> Vectorizer [svc: TF-IDF or hashing] : documents | Messages become sparse feature vectors.
+  Vectorizer -> Liblinear trainer [svc: hinge loss] : sparse vectors | The trainer fits one weight vector in minutes.
+  Liblinear trainer -> Model store [store: weights file] : weights v5 | A small weight file is published after a holdout check.
+  Mail gateway [svc: loads v5] -> Model store : load weights | The scoring service loads the weights.
+  Mail gateway -> Review queue [queue: low margin] : score near 0 | Messages near the boundary go to human review.
+ref: docs | LIBLINEAR: A Library for Large Linear Classification | Fan et al., National Taiwan University | https://www.csie.ntu.edu.tw/~cjlin/liblinear/
+
+== Detector with SVM verifier and hard-negative mining
+kind: two-tower-retrieval, feedback-loop
+when: An object must be found in an image or signal by scanning many windows, and most windows are background.
+how: The classic HOG plus SVM pedestrian detector slides a window across the image at several scales. For each window it computes gradient histogram features (HOG) and scores them with a linear SVM. Windows above a threshold are merged by non-maximum suppression.
+Training uses hard-negative mining. First, train on positives and random background windows. Then run the detector on images with no objects. Every false alarm is a hard negative. Add them to the training set and retrain. Repeat 2 or 3 rounds. This focuses the margin on the cases that matter.
+A cascade also helps: a cheap test removes most windows before the SVM. Deep detectors now do this job in most products, but the same loop of mining false positives and retraining remains useful.
+used: Dalal and Triggs HOG plus SVM detector (2005); OpenCV's HOGDescriptor people detector; hard-negative mining is common in detection.
+avoid: When a modern convolutional detector is allowed; it is more accurate on cluttered scenes.
+flow:
+  Image [client: video frame] -> Window scanner [svc: multi-scale] : thousands of windows | The scanner cuts the frame into windows at several sizes.
+  Window scanner -> HOG extractor [svc: gradient histograms] : window pixels | Each window becomes a HOG feature vector.
+  HOG extractor -> SVM scorer [model: linear SVM] : feature vector | A linear SVM scores each window.
+  SVM scorer -> Merger [svc: non-max suppression] : windows above threshold | Overlapping hits are merged into single boxes.
+  Merger -x> Mining set [store: false alarms] : false alarm on empty image | On images with no object, each hit is a hard negative.
+  Mining set ~> SVM scorer : retrain with negatives | The SVM is retrained with the new negatives to cut false alarms.
+ref: paper | Histograms of Oriented Gradients for Human Detection | Dalal & Triggs, CVPR 2005 |
+
+== One-class SVM as an input gate
+kind: dead-letter
+when: A downstream model should only see inputs like its training data, and bad or strange inputs must be set aside.
+how: A one-class SVM is fitted offline on normal data only. With an RBF kernel it learns a boundary around the region where the normal data lives, and a parameter nu sets the share of training points allowed outside (for example 1 percent).
+At ingestion each record gets a decision score. Inside the boundary, the record goes on to the main model. Outside, it goes to a quarantine queue for review, with its score, so people can fix the source or decide that the model must be retrained.
+The method needs scaled features and a good kernel width, and it slows when there are more than about 100,000 training points, because kernel methods grow faster than linearly. Teams then use a sample, or switch to isolation forests.
+used: scikit-learn OneClassSVM; novelty checks on sensor and log data.
+avoid: When there are labeled anomalies; train a normal classifier. For very large data use isolation forest.
+flow:
+  Data source [svc: sensors] -> Input gate [svc: one-class SVM] : record | Each record is scored before it reaches the main model.
+  Input gate -> Main model [model: downstream] : inside boundary | Records similar to training data go on.
+  Input gate -x> Quarantine queue [queue: for review] : outside boundary | Strange records are set aside with their score.
+  Quarantine queue -> Analyst [user] : review batch | An analyst checks whether the source is broken or the world changed.
+  Analyst ~> Input gate : refit on new normal | If the world changed, the gate is refitted on new normal data.
+ref: docs | Novelty and outlier detection | scikit-learn documentation | https://scikit-learn.org/stable/modules/outlier_detection.html
+
+@@ varinf
+== Amortized inference with an encoder network
+kind: online-offline
+when: Posterior inference must run in milliseconds for each new input, and fitting a model per input is too slow.
+how: Instead of optimizing a separate approximate posterior for every data point, one encoder network is trained to output the posterior parameters (a mean and a variance) from the input. Training maximizes the ELBO with stochastic gradient descent and the reparameterization trick.
+After training, inference is one forward pass. A variational autoencoder is the standard case: the encoder gives a latent vector, the decoder generates data. Applications use the encoder alone, for example to make compact latent embeddings for search, anomaly scores or the latent space of an image generator.
+The cost is an amortization gap: the encoder's posterior is a bit worse than a per-input optimized one. Common fixes are a few extra optimization steps per input or a richer posterior family.
+used: VAEs (Kingma & Welling, 2013); the autoencoder that makes the latent space of latent diffusion models such as Stable Diffusion.
+avoid: When a small, exact posterior (a conjugate model) is available; compute it in closed form.
+flow:
+  Training data [lake: images] -> Trainer [svc: maximize ELBO] : mini-batches | The trainer runs stochastic gradient descent on the ELBO.
+  Trainer -> Encoder [model: mean and variance] : trained weights | The encoder learns to give posterior parameters directly.
+  Client [client] -> Encoder : new input x | At serve time a new input arrives.
+  Encoder -> Latent sampler [svc: reparameterize] : mean and variance | One forward pass gives the approximate posterior.
+  Latent sampler -> Client : latent vector z | A latent sample, or the mean, is returned as the embedding.
+ref: paper | Auto-Encoding Variational Bayes | Kingma & Welling, 2013 | https://arxiv.org/abs/1312.6114
+
+== Stochastic variational inference over mini-batches
+kind: batching, map-reduce
+when: A probabilistic model, such as a topic model, must be fitted on a corpus too large for a full pass per update.
+how: The model has local variables (for each document) and global variables (the topics). Each step samples a mini-batch of documents, computes the best local variables for them, then makes a noisy but unbiased estimate of the global update, as if the whole corpus looked like the batch.
+The global parameters move a small step toward it, with a step size that decays. This is stochastic gradient ascent on the ELBO, and it needs only one pass over the data, in streaming form. Workers can compute the local step for different documents in parallel and a coordinator merges the updates.
+Online LDA in Gensim and scikit-learn works this way. The price is tuning: batch size and decay affect results, and the solution is a local optimum.
+used: Online LDA in Gensim and scikit-learn; the Hoffman et al. stochastic variational inference paper (2013).
+avoid: When the dataset is small; MCMC gives more accurate posteriors and the full pass is cheap.
+flow:
+  Corpus stream [log: documents] -> Batcher [svc: 1000 docs] : mini-batch | The batcher samples a mini-batch from the corpus.
+  Batcher -> Local step workers [svc: per document] : documents | Workers compute the best local variables for each document in parallel.
+  Local step workers -> Global updater [svc: step size decays] : sufficient statistics | Workers send summary statistics, not full data.
+  Global updater -> Topic store [db: global parameters] : small step toward estimate | The global topics move a small step toward the batch estimate.
+  Topic store -> Local step workers : new topics | The next mini-batch uses the improved topics.
+ref: paper | Stochastic Variational Inference | Hoffman et al., JMLR 2013 |
+
+== Posterior samples for Thompson sampling
+kind: feedback-loop, precompute
+when: A system must choose among options (ads, layouts) and explore the uncertain ones, with a model that gives uncertainty.
+how: A Bayesian model, fitted by variational inference with Pyro or NumPyro, keeps a posterior over each option's reward rate. A batch or streaming job refits it as new results come in, and writes posterior parameters to a store.
+At decision time the service draws one sample from each option's posterior and picks the option with the highest sample. This is Thompson sampling. Options with high uncertainty sometimes win, so they get explored, and as data grows, the posterior narrows and the system exploits the best option.
+Variational inference makes the refit fast, in seconds or minutes, but it often underestimates uncertainty. Teams check against MCMC on small cases or add a floor to the exploration.
+used: Common in ad and content bandits; Pyro and NumPyro are tools to build such models.
+avoid: When there are few options and plenty of traffic; a standard A/B test is simpler to explain.
+flow:
+  Outcome log [log: shows and clicks] -> Fit job [svc: Pyro or NumPyro] : new results | A job reads recent outcomes for each option.
+  Fit job -> Posterior store [db: per-option parameters] : updated posteriors | The job fits variational posteriors and saves their parameters.
+  Decision service [svc: Thompson sampling] -> Posterior store : read posteriors | The service reads the parameters for each option.
+  Decision service -> Page [client] : option with best draw | One draw per option is taken and the highest wins.
+  Page -> Outcome log : shown, clicked | The result is logged and the loop repeats.
+ref: docs | Pyro: deep universal probabilistic programming | Pyro project | https://pyro.ai/
+
+@@ abr
+== Client-side buffer-based rate selection
+kind: control-loop, cdn-edge
+when: Viewers have changing network speed, and the video must not stall while quality stays as high as possible.
+how: The video is encoded into a ladder of renditions (for example 6 levels from 400 kbps to 8 Mbps) cut into 2 to 6 second segments, all listed in an HLS or DASH manifest. The player requests one segment at a time from a CDN and picks the rendition of the next one itself.
+The player measures throughput from each download and watches its buffer in seconds. A throughput rule picks the highest rendition below the estimated speed. A buffer rule, such as BBA or BOLA, picks by buffer level: low buffer means a low rendition, a full buffer allows a high one. Many players combine both, as in dash.js.
+Cutting steps down is safe, but a switch up must be careful to avoid flapping. The server needs no state, so the CDN simply caches segments, which scales to millions of viewers.
+used: dash.js, hls.js, Shaka Player and the HLS players on Apple devices; BOLA (2016) is in the dash.js reference player.
+avoid: For low-latency live with 1 to 2 second buffers; use rules tuned for short buffers and consider WebRTC.
+flow:
+  Player [client: buffer 12 s] -> CDN edge [cache: segments] : GET segment 41 at 3 Mbps | The player requests the next 4-second segment at a chosen level.
+  CDN edge -> Player : segment bytes | The segment arrives and the player measures the download speed.
+  * Player: speed 2.1 Mbps, buffer 9 s | The buffer shrank, because the download was slower than playback.
+  Player -> CDN edge : GET segment 42 at 1.5 Mbps | The rule picks a lower level so the buffer will not run dry.
+  CDN edge -x> Origin [store: packaged ladder] : cache miss | On a cache miss the edge fetches the segment from the origin.
+  Manifest [note: HLS or DASH] -> Player : list of levels | The manifest lists every level and segment, so the player can choose.
+ref: paper | BOLA: Near-Optimal Bitrate Adaptation for Online Videos | Spiteri, Urgaonkar & Sitaraman, 2016 | https://arxiv.org/abs/1601.06748
+
+== Player reports and CDN steering
+kind: control-data-plane, feedback-loop
+when: An operator wants to guide many players, such as moving them between CDNs, using what the players observe.
+how: The player sends small data with each request, using Common Media Client Data (CMCD): its buffer length, its current bitrate and whether it is starving. CMCD travels in headers or query arguments. The CDN and the analytics system log it.
+This data lets the operator see the quality in real time, per CDN and region. A steering service, using DASH content steering or an HLS steering manifest, tells the players which CDN to use next. The players still pick the rendition, but the operator decides the path.
+The control part is small and slower, while the data part (segment delivery) remains simple and cached. If the steering service fails, players keep using their last instruction, so a failure there does not stop playback.
+used: CMCD (CTA-5004) is supported by dash.js and other players; DASH content steering and HLS content steering exist for multi-CDN delivery.
+avoid: With a single CDN and a small audience; the player alone is enough.
+flow:
+  Player [client: dash.js] -> CDN A [cache: edge] : segment request + CMCD | Each request carries buffer length and bitrate.
+  CDN A -> Log pipeline [log: CMCD records] : request log | The CDN logs requests with the player data.
+  Log pipeline -> Steering service [svc: control plane] : quality per CDN | The service sees that CDN A has many low-buffer players.
+  Steering service -> Player : steering: prefer CDN B | The service tells players to use CDN B next.
+  Player -> CDN B [cache: edge] : segment request | Players move to CDN B and quality recovers.
+  Player ~> Steering service : poll steering manifest | Players poll again after the time-to-live; on error they keep their last choice.
+ref: docs | HTTP Live Streaming 2nd edition (RFC 8216 and updates) | IETF and Apple | https://www.rfc-editor.org/rfc/rfc8216
+
+== Learned ABR trained in a simulator
+kind: online-offline, shadow-ab
+when: Hand-made rate rules do not give the best result across all networks, and logs of real sessions exist.
+how: Train a policy offline, with logs of real network traces and a simulator of the buffer. In Pensieve, a neural network chooses the next bitrate and is trained by reinforcement learning, with a reward that gives credit for quality and penalty for stalls and big quality jumps (the quality of experience score).
+The Puffer project at Stanford instead trained a predictor of segment transmission time from real data, and fed it into a planning step (Fugu). It ran live as a randomized trial with real viewers, which compared algorithms fairly and showed that a simulator can be wrong about the real network.
+In production the policy runs in the client, or on the server for each session, and starts as a small share of traffic against the old rule. Only a clear gain in stall time or quality moves it to all viewers.
+used: Pensieve (MIT, 2017) and Puffer and Fugu (Stanford, 2020) are published research systems; production use of learned ABR is reported by some services.
+avoid: When the team cannot run careful A/B tests; a tuned buffer-based rule is safer.
+flow:
+  Session logs [lake: throughput traces] -> Simulator [svc: buffer model] : real traces | Logged network traces drive a simulation of playback.
+  Simulator -> Trainer [model: policy or predictor] : reward: quality - stalls | The trainer learns from quality and stall results.
+  Trainer -> Model registry [store: versions] : policy v3 | The best policy is saved after a check on held-out traces.
+  Model registry -> Player [client: 10 percent of sessions] : ship policy v3 | A small share of players use the new policy.
+  Player -> Experiment log [log: stalls] : session results | Each session logs stalls and quality.
+  Experiment log -> Trainer : compare with control | A clear win over the old rule leads to wider rollout, and new data trains the next version.
+ref: paper | Learning in situ: a randomized experiment in video streaming | Yan et al., NSDI 2020 |
+
+@@ dct
+== Transform, quantize, entropy-code pipeline
+kind: pipes-filters
+when: Images or video residuals must be made many times smaller, and small losses that the eye does not notice are acceptable.
+how: The picture is converted to luma and chroma, with chroma often reduced to half resolution in each direction. It is cut into 8x8 blocks (video codecs use blocks from 4x4 up to 32x32 with integer transforms). Each block goes through a DCT, which moves most of the energy into a few low-frequency coefficients.
+Quantization divides each coefficient by a step from a table and rounds. High frequencies get large steps, so most become zero. This is the only lossy step, and the quality setting controls it. The coefficients are then read in zigzag order, so zeros come in long runs, and entropy coding (Huffman in JPEG, arithmetic coding in modern codecs) writes them in few bits.
+Decoding runs the stages backwards. The stages are independent, so each can be tuned, or run in hardware.
+used: JPEG (ITU T.81); the transforms inside H.264, HEVC and AV1; libjpeg-turbo.
+avoid: For lossless needs such as medical archives or screenshots with sharp text; use lossless formats (PNG, lossless WebP).
+flow:
+  Image [client: 4000 x 3000] -> Color converter [svc: YCbCr 4:2:0] : RGB pixels | Pixels become luma and chroma, and chroma is halved in size.
+  Color converter -> DCT stage [svc: 8x8 blocks] : blocks | Each block becomes 64 frequency coefficients.
+  DCT stage -> Quantizer [svc: step table] : coefficients | Large steps for high frequencies turn most values into zero.
+  Quantizer -> Entropy coder [svc: Huffman] : mostly zeros | Zigzag order makes long zero runs that are cheap to code.
+  Entropy coder -> JPEG file [store: 10x smaller] : bitstream | The result is often 10 times smaller than raw pixels.
+ref: spec | ITU-T T.81: JPEG Digital compression and coding of continuous-tone still images | ITU-T, 1992 | https://www.w3.org/Graphics/JPEG/itu-t81.pdf
+
+== Scaled decoding for thumbnails
+kind: precompute, cdn-edge
+when: A site must make many small previews of large JPEG files, and the decode time dominates.
+how: A JPEG stores each 8x8 block as DCT coefficients. A decoder that wants an image at 1/8 size needs only the first (DC) coefficient of each block, which is the block's average. libjpeg and libjpeg-turbo can decode at scale 1/2, 1/4 or 1/8 by using fewer coefficients, which skips most of the inverse DCT and color work.
+An upload service uses this to build thumbnails quickly: it asks the decoder for a size just above the target, then resizes the small picture to the exact size with a good filter. This can be several times faster than decoding the full picture.
+Results are written to object storage and served through a CDN, so each thumbnail is made once. The method works only for JPEG, and the quality of the shortcut is a little lower than a full decode and resize.
+used: libjpeg-turbo scaled decoding; image resizing services and tools such as libvips use JPEG shrink-on-load.
+avoid: When the exact quality of the thumbnail matters most, or the source is PNG or WebP; decode fully.
+flow:
+  Uploader [client] -> Upload service [svc: 12 MP JPEG] : photo | A user uploads a large JPEG photo.
+  Upload service -> JPEG decoder [svc: scale 1/8] : DC coefficients only | The decoder reads one coefficient per block and skips the full inverse DCT.
+  JPEG decoder -> Resizer [svc: fine resize] : 500 x 375 image | The resizer makes the exact thumbnail size from the small image.
+  Resizer -> Object store [store: thumbnails] : thumb.jpg | The thumbnail is stored once.
+  Browser [client] -> CDN [cache: edge] : GET thumb.jpg | Readers get the thumbnail from a CDN cache close to them.
+  CDN -> Object store : miss only | Only a cache miss reaches the origin store.
+ref: docs | libjpeg-turbo | libjpeg-turbo project | https://libjpeg-turbo.org/
+
+== DCT as a feature extractor
+kind: pipes-filters, precompute
+when: A system needs a compact, stable description of a signal, such as speech or an image, for matching or learning.
+how: The DCT packs energy into few coefficients, so keeping the first ones gives a short summary. In speech, MFCC features take the log of mel-band energies for each 10 ms frame and apply a DCT. The first 13 coefficients describe the shape of the spectrum and are almost uncorrelated, which suits simple models.
+In perceptual hashing (pHash), an image is reduced to 32x32 gray, a DCT is applied, and the low-frequency 8x8 corner is kept. Each coefficient is compared with the median to give 1 bit, so a 64-bit hash results.
+The step is cheap and fixed, so it runs at ingest time and the features are stored for later use. The features lose detail by design, so they cannot rebuild the signal.
+used: MFCC front ends in classic speech recognizers (Kaldi); pHash in image deduplication tools; keyframe and audio fingerprint systems.
+avoid: When a neural network can learn better features from raw data and plenty of labels exist.
+flow:
+  Raw signal [lake: audio or images] -> Preprocessor [svc: frames or 32x32 gray] : samples | The signal is cut into frames or reduced to a small image.
+  Preprocessor -> DCT stage [svc: keep low frequencies] : spectrum or pixels | A DCT turns each frame into coefficients.
+  DCT stage -> Feature store [db: 13 floats or 64 bits] : short feature vector | Only the first coefficients are kept as the feature.
+  Feature store -> Matcher or model [model] : features by key | Later stages read the short features instead of raw data.
+ref: docs | Kaldi feature extraction (MFCC) | Kaldi project | https://kaldi-asr.org/
+
+@@ fingerprint
+== Landmark hash index with offset voting
+kind: index-table, scatter-gather
+when: A short, noisy audio clip must be matched to one song in a catalog of tens of millions of tracks.
+how: The method of Wang (2003), used by Shazam, finds peaks in the spectrogram, which survive noise and compression. Pairs of nearby peaks form a hash from the two frequencies and the time gap between them. Each hash is stored with the song id and the time of the first peak in an inverted index.
+A query clip is turned into hashes in the same way. Each hash finds the stored entries. For each candidate song, the system counts how many hashes agree on the same time offset between the query and the song. A real match gives a sharp peak in this count, while chance matches are spread out.
+The client can compute hashes on the phone, so only a few kilobytes are sent. The index is large and sharded by hash. Matching takes a few seconds of audio.
+used: Shazam (described in the 2003 paper); Chromaprint and AcoustID for open music identification.
+avoid: For cover versions or humming; they change the peaks. Use melody or embedding methods.
+flow:
+  Phone [client: 10 s clip] -> Fingerprinter [svc: spectrogram peaks] : audio | The phone finds spectrogram peaks and pairs them.
+  Fingerprinter -> Match service [svc: offset voting] : about 500 hashes | Only the hashes are sent, not the audio.
+  Match service -> Hash index [store: hash to song and time] : lookup each hash | Each hash returns songs and times where it occurs.
+  Hash index -> Match service : candidates | Many weak candidates come back, mostly by chance.
+  * Match service: song 77, 60 votes at +41.3 s | One song has many hashes that agree on the same time offset.
+  Match service -> Phone : song 77 | The service returns the song with the highest agreeing votes.
+ref: paper | An Industrial-Strength Audio Search Algorithm | Wang, ISMIR 2003 |
+ref: docs | Chromaprint: audio fingerprinting library | AcoustID project | https://acoustid.org/chromaprint
+
+== Upload-time fingerprint match for rights management
+kind: event-driven, pipes-filters
+when: A platform with user uploads must find copyrighted audio or video and apply the owner's rule (block, monetize or track).
+how: Rights owners supply reference files. The platform fingerprints each reference and stores it in an index, with the owner's policy. When a user uploads a video, a job fingerprints the new file and queries the index for overlaps. A match records the time ranges and the matched reference.
+The policy engine then applies the owner's rule: mute, block, or keep it up and give the revenue to the owner. Matches below a confidence level go to a review queue, because false positives hurt creators.
+The work is asynchronous: the upload is accepted at once, and matching runs in the background, as an event consumer. New references must be matched also against the existing library, so the system reruns lookups on its archive. YouTube Content ID works at this scale, but its internals are not public.
+used: YouTube Content ID and similar rights systems (details not public); third-party services use audio and video fingerprints.
+avoid: When the platform has no reference data or a legal duty; simple takedown handling is enough.
+flow:
+  Uploader [client] -> Upload API [svc: accept at once] : video file | The platform accepts the upload and does not wait for matching.
+  Upload API -> Upload events [log: new uploads] : VideoUploaded | An event starts the fingerprint job.
+  Upload events -> Fingerprint job [svc: audio and frames] : video id | A worker fingerprints the audio and video.
+  Fingerprint job -> Reference index [store: owner fingerprints] : query hashes | The index returns matches with time ranges.
+  Fingerprint job -> Policy engine [svc: owner rules] : match 40 s to 95 s | The engine applies the rule of the rights owner.
+  Policy engine -> Review queue [queue: low confidence] : uncertain match | Weak matches go to people before any action.
+ref: docs | Chromaprint: audio fingerprinting library | AcoustID project | https://acoustid.org/chromaprint
+
+== Live reference ingest for TV content recognition
+kind: stream-table-join, sharding
+when: A TV viewing service must say which program or ad a device is showing, now, and the reference is a live broadcast.
+how: Capture systems receive live channels and ads. They fingerprint each channel continuously, often several times per second, and write the hashes with channel id and timestamp into a sharded index, which keeps only a short window, for example the last few minutes plus the ad library.
+A smart TV samples what is on screen or in the audio, makes a fingerprint on the device and sends it, in small batches, to a matching service. The service looks up the hashes, picks the channel and time offset with the most agreement, and returns the match. The result is joined with household data to measure viewing and ad exposure.
+Freshness is the hard part: the index must be fed within seconds of broadcast, or the device would be ahead of the reference. Privacy rules and user consent control what a TV may send.
+used: Automatic content recognition (ACR) on smart TVs, used by measurement and advertising companies.
+avoid: For on-demand content with a known timeline; use player data or watermarks instead.
+flow:
+  Broadcast feeds [log: live channels] -> Capture and hash [svc: per channel] : video and audio | Capture nodes fingerprint each live channel without a pause.
+  Capture and hash -> Live index [store: sharded] : hashes and time | Hashes are written with a channel id and time, and old ones expire.
+  Smart TV [client: on-device hashing] -> Match service [svc: vote] : fingerprint batch | The TV sends a small batch of hashes, not the picture.
+  Match service -> Live index : lookup | Each hash finds channel and time entries.
+  Match service -> Viewing events [log: channel and time] : channel 5, offset 4 s | The best channel is recorded as a viewing event.
+
+@@ motioncomp
+== Closed-loop prediction with reference frames
+kind: none
+when: A video encoder must code each frame as a small difference from earlier frames, and the decoder must produce exactly the same pictures.
+how: For each block of the current frame, the encoder searches the reference frames for the best match (motion search), and stores a motion vector. It then codes only the residual: the current block minus the predicted block, through transform and quantization.
+The key point is that the encoder predicts from its own reconstruction of earlier frames, not from the original frames. It runs a decoder inside its loop. If it used the originals, the encoder and decoder would predict from different pictures, and errors would grow from frame to frame (drift).
+The reconstruction goes into a decoded picture buffer. Later frames can refer to it, and B frames may refer to frames before and after. The loop is the same in H.264, HEVC and AV1, with finer block sizes and more precise vectors in newer ones.
+used: H.264, HEVC and AV1 encoders such as x264, x265 and libaom.
+avoid: For intra-only workflows, such as editing proxies, where every frame stands alone and random access matters more than size.
+flow:
+  Current frame [client: original] -> Motion search [svc: per block] : block | The encoder searches reference frames for the best matching block.
+  Reference buffer [store: decoded frames] -> Motion search : reconstructed frames | The search uses the decoder-side reconstruction, not the original.
+  Motion search -> Residual coder [svc: transform + quantize] : vector and difference | Only the vector and the small difference are coded.
+  Residual coder -> Bitstream [store: compressed] : bits | The vectors and residual are written, using few bits.
+  Residual coder -> Reconstructor [svc: decoder in loop] : quantized residual | The encoder rebuilds the frame as the decoder will.
+  Reconstructor -> Reference buffer : new reference frame | The rebuilt frame becomes a reference for later frames.
+ref: paper | Overview of the H.264/AVC Video Coding Standard | Wiegand et al., IEEE TCSVT, 2003 |
+
+== GOP structure and keyframes as restart points
+kind: checkpoint-restart, batching
+when: Viewers must be able to seek, join live streams and switch quality, but inter prediction makes each frame depend on earlier ones.
+how: The encoder periodically inserts an intra-coded keyframe (I frame, or IDR in H.264) that has no references. The frames between two keyframes form a group of pictures (GOP), typically 1 to 4 seconds. Inside a GOP, P and B frames use motion compensation and are much smaller.
+To decode from the middle of a stream, a player must start from a keyframe, so keyframes are restart points like checkpoints. Streaming packagers cut segments at keyframes, with each segment starting with one, so a player can switch renditions at any segment boundary.
+The trade-off is size. A keyframe can cost 5 to 10 times a P frame. Short GOPs allow fast seek and quick quality switches but raise the bitrate. All renditions in a ladder must use aligned GOPs, or switching shows glitches.
+used: HLS and DASH packaging with aligned keyframes; live encoders that set keyframe interval to match segment length.
+avoid: For offline archives with no seeking; very long GOPs give the best compression.
+flow:
+  Encoder [svc: GOP 2 s] -> Packager [svc: cut at keyframes] : stream with I frames | The encoder emits a keyframe every 2 seconds in all renditions.
+  Packager -> CDN [cache: segments] : 2 s segments | Each segment starts with a keyframe, so it can be decoded on its own.
+  Player [client: seek to 1:03] -> CDN : request segment 31 | A seek jumps to the segment that holds the target time.
+  CDN -> Player : segment from keyframe | The player decodes from the keyframe, then forward to the exact frame.
+  * Player: switched to 720p | At a segment boundary the player may change rendition, because both start with aligned keyframes.
+ref: spec | HTTP Live Streaming (RFC 8216) | IETF and Apple, 2017 | https://www.rfc-editor.org/rfc/rfc8216
+
+== Hardware offload of motion estimation
+kind: offload-accelerator
+when: Encoding at large scale is too costly on CPUs, because motion search is the most expensive part.
+how: Motion estimation tests many candidate vectors for each block. It is simple, regular and parallel, so it fits dedicated hardware. GPU encoders such as NVIDIA NVENC have fixed hardware blocks for it. Large video services have built their own chips: Google's Argos VCU and Meta's MSVP are published designs.
+The host CPU demuxes, decodes, scales and schedules the work. It sends frames to the encoder block, which returns a compressed stream. Many sessions share a card, so a scheduler packs jobs by resolution and codec.
+The cost is quality per bit: fixed hardware usually gives a little lower compression than the best software presets (such as x264 slow), so services use hardware for the live and popular ladders at scale, and software where size matters most.
+used: NVENC in live streaming and cloud gaming; Google's Argos VCU for YouTube transcoding (described in 2021).
+avoid: For low volume, or when the best compression at a given bitrate matters most; software encoders are more flexible.
+flow:
+  Job scheduler [svc: packs sessions] -> CPU host [svc: demux, scale] : transcode job | The scheduler picks a host with free encoder capacity.
+  CPU host -> Encoder chip [svc: motion search in hardware] : raw frames | The host sends scaled frames to the hardware encoder.
+  Encoder chip -> CPU host : compressed stream | The chip does motion search and residual coding, and returns bits.
+  CPU host -> Object store [store: renditions] : segments | The host packages and stores each rendition.
+  CPU host -x> Job scheduler : chip error | If a chip fails, the job is rescheduled on another host.
+ref: paper | Warehouse-Scale Video Acceleration: Co-design and Deployment in the Wild | Ranganathan et al., ASPLOS 2021 |
+
+@@ perceptualhash
+== Near-duplicate search with Hamming distance
+kind: index-table
+when: You must find images that are copies of a given image, even after resizing, recompression or small edits.
+how: Each image gets a 64-bit perceptual hash (for example pHash from a DCT of a small gray version). Similar images have hashes with a small Hamming distance, the number of differing bits, for example 10 or fewer. Exact hash equality is not enough, since a small edit flips a few bits.
+To search 100 million hashes, a system cannot compare against all. Multi-index hashing splits the 64 bits into 4 pieces of 16 bits. If two hashes differ in at most 3 bits, at least one piece is identical, so lookup by each piece in a table finds candidates. Candidates are then checked with the full distance.
+A BK-tree is another index for small data. The method suits crops and compression, but not heavy edits or rotations. The threshold trades missed copies against false matches and is tuned on labeled pairs.
+used: Image deduplication and reverse image search tools (the imagehash library, pHash); dedupe steps in content pipelines.
+avoid: For semantic similarity ("pictures of dogs"); use embeddings with an ANN index.
+flow:
+  New image [client] -> Hasher [svc: pHash 64 bit] : pixels | The image is hashed after being reduced to 32x32 gray.
+  Hasher -> Index tables [store: 4 tables x 16 bits] : each 16-bit piece | Each piece looks up one table to find candidate hashes.
+  Index tables -> Verifier [svc: Hamming check] : candidates | Candidates come back from the 4 lookups.
+  * Verifier: distance 6 of 64 | The verifier counts differing bits for each candidate.
+  Verifier -> Caller [note: near duplicate] : distance 10 or less | A candidate within the threshold is a near duplicate.
+ref: docs | imagehash: image hashing library for Python | imagehash project | https://github.com/JohannesBuchner/imagehash
+
+== Known-content check at upload with human review
+kind: async-request-reply, priority-queue
+when: A platform must stop known harmful images, such as abuse material, from being posted again, with few false positives.
+how: Trusted organizations keep lists of hashes of known illegal images. Microsoft PhotoDNA is a perceptual hash made for this, and the platform matches uploads against the hash list, not the images. The list holds hashes only, so the platform never stores the content itself.
+At upload, the image is hashed in a few milliseconds and looked up. A match above the threshold blocks the post, and the case goes to a review queue. Matches are reviewed by trained staff first, and legal reporting rules apply. Items with a high match score go ahead of lower ones in the queue.
+The hash is built to resist resizing and recompression, not a determined attacker. Tuning the threshold balances missed images against wrongly blocked ones, so reviews and appeals are part of the design.
+used: PhotoDNA at many platforms; NCMEC and StopNCII hash lists; the same design is used for terrorist content hash sharing.
+avoid: For new, unseen harmful content; a hash list cannot know it. Use classifiers and human reports.
+flow:
+  Upload [client] -> Upload API [svc: hash at upload] : image | The image is hashed within a few milliseconds.
+  Upload API -> Hash list [store: known hashes] : lookup | The hash is looked up in the shared list of known hashes.
+  Hash list -> Upload API : match, distance 3 | A close match is found.
+  Upload API -x> Upload [client] : post blocked | The post is held and the user gets a pending notice.
+  Upload API -> Review queue [queue: by match score] : case | The case waits for trained reviewers, with high scores first.
+  Review queue -> Reviewer [user] : case | A person confirms or releases it, and decisions are logged for appeals.
+ref: docs | Microsoft PhotoDNA | Microsoft | https://www.microsoft.com/en-us/photodna
+
+== Deduplication in an asset ingest pipeline
+kind: idempotent-consumer, pipes-filters
+when: A pipeline ingests many images (crawled pages, ad creatives, user photos), and near-identical copies waste storage, review time or model training.
+how: After download, each image goes through a hash stage. The pipeline computes a perceptual hash and looks it up in a store of hashes seen before. If there is a close match, the new image is linked to the existing group, and later stages (moderation, classification, thumbnailing) run only once per group.
+Groups are tracked with a canonical id, and the hash store is updated with the new member. The lookup uses a near-neighbour index, as in the Hamming search pattern, so cost does not grow with the whole set.
+This saves compute and removes repeated samples from training sets, which lowers the risk of memorized content. Thresholds must be strict for ad creatives, where a small change, such as a different price, makes a different ad.
+used: Common in crawlers, ad creative review and training data cleaning; large image datasets are deduplicated with perceptual hashes or embeddings.
+avoid: When each copy has its own legal or business meaning, such as separate ad creatives with different offers; keep all and group them for review only.
+flow:
+  Ingest queue [queue: image URLs] -> Downloader [svc: fetch image] : URL | Workers fetch images from the queue.
+  Downloader -> Hash stage [svc: pHash] : image bytes | Each image gets a perceptual hash.
+  Hash stage -> Hash store [db: seen hashes] : near-neighbor lookup | The store returns a close known hash, if there is one.
+  Hash stage -> Group table [db: canonical ids] : link to group 4412 | A duplicate is linked to the existing group, and the hash store is updated.
+  Hash stage -> Moderation [svc: once per group] : new groups only | Expensive stages run once per group, not per copy.
+ref: docs | imagehash: image hashing library for Python | imagehash project | https://github.com/JohannesBuchner/imagehash

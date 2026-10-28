@@ -1,0 +1,827 @@
+# Architecture patterns, batch pt11_L1. Spec: content/patterns/README.md
+
+@@ reasoningmodels
+== Router: cheap model first, reasoning model on escalation
+kind: llm-workflow, shadow-ab
+when: Most requests are easy, but a few need deep reasoning, and thinking tokens cost real money and seconds of delay.
+how: A small router (a rule set or a small classifier model) looks at each request. Simple questions go to a fast chat model that answers in about one second. Hard ones, such as multi-step maths, code with tests or planning, go to a reasoning model with a set thinking budget, for example 8,000 tokens.
+The reasoning model's thinking tokens are billed as output tokens, so one hard answer can cost 10 to 50 times more than a plain answer. The router keeps that cost on the small share of traffic that needs it. Some APIs expose the budget as a parameter, so the gateway can also lower it under load.
+Quality is checked by sampling: a share of routed traffic is also sent to the reasoning model in shadow mode, and a judge compares the answers. This shows whether the router sends too few hard cases up.
+used: Common in LLM gateways and AI products that offer both fast and thinking modes; several hosted model APIs expose an adjustable thinking budget.
+avoid: When every request is hard (use the reasoning model directly), or when response time must be under a second (use a fast model and retrieval).
+flow:
+  App [client] -> Router [svc: classifier] : user request | The app sends every request to the router first.
+  Router -> Fast model [model: low latency] : easy question | Easy requests go to the fast model, which answers in about a second.
+  Router -> Reasoning model [model: thinks first] : hard problem, budget 8k | Hard requests go to the reasoning model with a token budget for thinking.
+  Reasoning model -> App : answer after thinking | The model writes a long hidden chain of thought, then the short final answer.
+  Router ~> Judge [model: LLM judge] : shadow copy, 2% | A small share of easy traffic is also copied to the reasoning model and compared offline.
+  * Router: 6% escalated | The judge finds few missed hard cases, so the router rule stays as it is.
+ref: paper | Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters | Snell et al., 2024 | https://arxiv.org/abs/2408.03314
+
+== Parallel samples with a verifier (best-of-N)
+kind: llm-workflow, scatter-gather
+when: A task has an answer that can be checked, such as code with tests or a maths result, and one try is not reliable enough.
+how: Instead of one long chain of thought, the system asks the model for N independent answers in parallel, for example N = 16 with temperature above zero. Each answer is scored by a verifier. The verifier can be a unit-test runner, a maths checker or a trained reward model.
+The best-scoring answer is returned. When no checker exists, majority vote (self-consistency) over the final answers is used. Accuracy rises with N but with falling returns, and cost grows linearly with N.
+The parallel calls hide latency: 16 samples take about as long as one. Many reasoning systems combine this with a long chain of thought inside each sample.
+used: Code-generation evaluation harnesses that run unit tests on many samples; maths benchmarks that report majority-vote results; research systems on verifier-guided search.
+avoid: When there is no cheap way to check answers and answers are free text; use one reasoning pass or human review.
+flow:
+  Orchestrator [svc] -> Sample 1, Sample 2, Sample N [model: temp 0.8] : same prompt | The orchestrator sends the same prompt N times in parallel, with random sampling.
+  Sample 1, Sample 2, Sample N -> Verifier [svc: tests or reward model] : N candidates | Every candidate answer goes to the verifier.
+  Verifier -> Orchestrator : scores | The verifier returns a score for each candidate, such as tests passed.
+  Orchestrator -x> Sample 2 : drop failing answer | Candidates that fail the checks are thrown away.
+  Orchestrator -> User [user] : best answer | The highest-scoring candidate is returned.
+ref: paper | Self-Consistency Improves Chain of Thought Reasoning in Language Models | Wang et al., 2022 | https://arxiv.org/abs/2203.11171
+ref: paper | Training Verifiers to Solve Math Word Problems | Cobbe et al., OpenAI, 2021 | https://arxiv.org/abs/2110.14168
+
+== Reinforcement learning with verifiable rewards
+kind: feedback-loop, data-parallel
+when: You want to train a model to reason better, and answers can be checked by a program instead of a human.
+how: The training loop picks a batch of problems with known checkers, such as maths with a final answer or code with tests. The current model samples several long reasoning attempts for each problem. A verifier gives each attempt a reward, usually 1 for correct and 0 for wrong, plus a small format reward.
+A policy-gradient step (for example PPO or GRPO) raises the probability of attempts that scored above the group average and lowers the others. Over many steps the model learns to check its work, back up and try again, because those habits raise reward.
+Sampling dominates the cost, so rollout servers (an inference engine such as vLLM) are separate from the training GPUs, and new weights are pushed to them after each step.
+used: DeepSeek-R1 reported this approach with rule-based rewards; open-source trainers such as TRL and verl implement GRPO-style loops.
+avoid: For tasks with no automatic check (style, helpfulness); use a learned reward model from human preferences instead.
+flow:
+  Problem set [store: maths and code] -> Rollout servers [svc: vLLM] : batch of prompts | Prompts with known checkers are sent to the sampling servers.
+  Rollout servers -> Verifier [svc: answer checker + tests] : 8 attempts per prompt | Each prompt gets several long reasoning attempts, and each is sent to the verifier.
+  Verifier -> Trainer [svc: GRPO + many GPUs] : rewards 0 or 1 | Rewards are compared inside each group of attempts to get an advantage.
+  Trainer -> Policy weights [store: checkpoint] : gradient step | The trainer updates the model from the advantages.
+  Policy weights ~> Rollout servers : new weights | New weights are pushed to the rollout servers, so the next batch uses the better model.
+ref: paper | DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning | DeepSeek-AI, 2025 | https://arxiv.org/abs/2501.12948
+
+@@ recsys
+== Retrieve, rank, re-rank funnel
+kind: two-tower-retrieval, precompute
+when: The catalog has millions of items, but a page must show 20 items in under 200 ms.
+how: Scoring every item with a big model is too slow, so the work is split into stages. Retrieval uses a two-tower model: one tower makes a user vector, the other makes item vectors in advance. An ANN index (HNSW or IVF) returns the 500 to 1,000 nearest items in a few milliseconds.
+A ranking model then scores those candidates with rich features, such as predicted click and watch time. A last re-ranking stage applies business rules and diversity, for example no more than 3 items from one creator.
+Item vectors are rebuilt offline on a schedule and loaded into the index. User vectors are computed at request time, or cached for a short time.
+used: Common in YouTube, Pinterest and TikTok-style feeds; the YouTube deep neural network paper describes candidate generation followed by ranking.
+avoid: When the catalog has fewer than a few thousand items; score them all directly with one model.
+flow:
+  App [client] -> Recommender API [svc] : user id, context | The app asks for 20 items for this user.
+  Recommender API -> Retrieval [svc: user tower] : user vector | The user tower turns the user and context into one vector.
+  Retrieval -> ANN index [store: item vectors + 10M] : top 500 by dot product | The index returns the 500 closest item vectors in a few milliseconds.
+  Retrieval -> Ranker [model: GBDT or DNN] : 500 candidates | The ranker scores each candidate with many features, such as predicted click.
+  Ranker -> Re-ranker [svc: rules + diversity] : scored list | The last stage removes duplicates, caps one creator at 3 items and fills ad slots.
+  Re-ranker -> App : 20 items | The ranked page returns to the app within the time limit.
+ref: paper | Deep Neural Networks for YouTube Recommendations | Covington, Adams & Sargin, RecSys 2016 |
+
+== Feature store for training and serving
+kind: feature-store, online-offline
+when: The ranking model uses hundreds of user and item features, and training must see the same values that serving sees.
+how: Feature values are computed once, from event streams and batch jobs, and written to two places. The offline store (a lake or warehouse) keeps every value with its timestamp. The online store (Redis or a similar key-value store) keeps only the latest value per user or item for lookups in a few milliseconds.
+For training, the feature store joins labels with feature values as of each event's time, called a point-in-time join. This avoids leaking future data into training. At serving time, the ranker reads the same feature definitions from the online store.
+The main risk is training-serving skew, where the two paths compute a feature in different ways. One shared definition reduces it.
+used: Feast (open source), Tecton and Databricks feature tables; Uber Michelangelo and similar internal platforms.
+avoid: With a handful of simple features that one service can compute on its own.
+flow:
+  Event stream [log: clicks + views] -> Feature pipeline [svc: Flink or Spark] : raw events | One pipeline computes features such as clicks in the last 7 days.
+  Feature pipeline -> Offline store [lake: all values + time] : append values | Every value is stored with its timestamp, for training.
+  Feature pipeline -> Online store [cache: latest per key] : upsert latest | Only the newest value per key is kept for fast reads.
+  Offline store -> Training job [svc: point-in-time join] : features as of event time | Training joins each label with the values that were known at that time.
+  Training job -> Ranker [model: new version] : deploy | The trained model is deployed to serving.
+  Ranker -> Online store : get features by user id | At request time the ranker reads fresh features in a few milliseconds.
+ref: docs | Feast documentation | Feast project | https://docs.feast.dev/
+
+== Impression logging with exploration
+kind: feedback-loop, shadow-ab
+when: The model is trained on what users clicked, but users only click what they were shown, which biases the data.
+how: Every response logs which items were shown, in which position, with which model version and score. When the user clicks or skips, that event is joined to the impression log. The joined rows become tomorrow's training data.
+Without care, the model only learns about items it already shows. So a small share of traffic, for example 1% to 5%, gets exploration: random items or items picked by a bandit. The system logs the probability of showing each item, called the propensity. Training can then weight examples by one over the propensity to remove position and selection bias.
+A new model first runs in shadow mode, and then in an A/B test, before it takes all traffic.
+used: Common in large feeds and ad ranking; Netflix and Spotify have written about logging for off-policy evaluation and bandit exploration.
+avoid: When there is no feedback signal, or when exploring random items would harm users or break safety rules.
+flow:
+  Ranker [model: v12] -> Impression log [log: item + rank + propensity] : shown items | Every shown item is logged with its position and its show probability.
+  App [client] -> Event log [log: click + skip] : user actions | Clicks and skips are sent back as events.
+  Impression log, Event log -> Joiner [svc: stream join] : join by request id | The joiner matches each impression to the later user action.
+  Joiner -> Training data [lake: labeled rows] : rows with propensity | Labeled rows are stored with their propensity.
+  Training data -> Trainer [svc: nightly] : weighted examples | Training weights rows by one over propensity.
+  Trainer -> Ranker : v13 in 5% A/B | The new model first takes 5% of traffic and is compared with v12.
+ref: paper | Unbiased Learning-to-Rank with Biased Feedback | Joachims, Swaminathan & Schnabel, WSDM 2017 | https://arxiv.org/abs/1608.04468
+
+@@ rl
+== Distributed actors and a central learner
+kind: producer-consumer, data-parallel
+when: An agent needs billions of environment steps, and one process cannot generate them fast enough.
+how: Many actor processes, each with its own copy of the environment (a simulator or game), run the current policy and record experience: state, action, reward and next state. They put this experience into a replay buffer or a queue.
+One learner, often on GPUs, samples batches from the buffer and takes gradient steps. It sends new weights back to the actors every few seconds or every few hundred steps. Actors use slightly old weights, so the data is a little off-policy. Methods such as V-trace in IMPALA correct for this.
+The split is cheap and scales well: simulators run on many CPU machines, while the learner uses a few accelerators. The limit is the learner's speed and the age of the experience.
+used: Ape-X and IMPALA from DeepMind; large game-playing agents such as OpenAI Five and AlphaStar used this style; open-source RLlib and Sample Factory.
+avoid: When the environment is expensive or cannot be copied, such as a real robot; use sample-efficient or offline methods.
+flow:
+  Actor 1, Actor 2, Actor N [svc: env + policy] -> Replay buffer [queue: recent experience] : transitions | Each actor plays its own environment copy and pushes transitions.
+  Replay buffer -> Learner [svc: GPU] : sampled batch | The learner pulls random batches from the buffer.
+  Learner -> Weight server [store: policy weights] : new weights | After each batch of gradient steps the learner publishes new weights.
+  Weight server ~> Actor 1, Actor 2, Actor N : pull weights | Actors fetch new weights now and then, so they use a slightly old policy.
+  * Learner: step 50,000 | Learning continues while actors keep producing data.
+ref: paper | IMPALA: Scalable Distributed Deep-RL with Importance Weighted Actor-Learner Architectures | Espeholt et al., 2018 | https://arxiv.org/abs/1802.01561
+
+== RLHF loop with a reward model
+kind: feedback-loop, shadow-ab
+when: You want a language model to follow human taste, and there is no program that can score the answers.
+how: First, people compare pairs of model answers and pick the better one. A reward model is trained on these choices to predict a score. Then the policy (the language model) writes answers to prompts, the reward model scores them, and PPO updates the policy to raise the score.
+A frozen copy of the starting model is kept as a reference. A penalty (KL divergence) punishes answers that drift far from the reference. Without it, the policy learns to exploit weaknesses in the reward model and writes odd text that scores high.
+Direct preference methods such as DPO skip the reward model and the sampling loop, and train on the pairs directly. They are simpler, but online RL can still do better on some tasks.
+used: InstructGPT and later chat models from major labs; open-source TRL and OpenRLHF.
+avoid: When a program can check answers; use verifiable rewards. When you only need a simple style change, supervised fine-tuning is enough.
+flow:
+  Annotators [user] -> Preference data [store: A better than B] : pairwise choices | People choose the better of two answers.
+  Preference data -> Reward model [model: scores answers] : train | The reward model learns to predict which answer people prefer.
+  Policy [model: LLM] -> Reward model : sampled answer | The policy writes answers to prompts, and the reward model scores each one.
+  Reward model -> PPO trainer [svc: PPO] : reward | PPO receives the scores.
+  Reference model [model: frozen copy] -> PPO trainer : KL penalty | The trainer subtracts a penalty when the policy drifts from the reference.
+  PPO trainer -> Policy : weight update | The policy improves toward human taste without drifting too far.
+ref: paper | Training language models to follow instructions with human feedback | Ouyang et al., OpenAI, 2022 | https://arxiv.org/abs/2203.02155
+
+== Offline training with off-policy evaluation
+kind: online-offline, shadow-ab
+when: Trying a bad policy on real users or machines is costly or unsafe, but you have logs of an older policy's behaviour.
+how: The current system logs state, action, reward and the probability it chose that action. A new policy is trained from this log without any live interaction. This is offline RL, and it must avoid actions that the log never covers, for example with conservative value estimates.
+Before launch, the team estimates the new policy's value from the same logs. Importance sampling weights each logged reward by the ratio of new to old action probability. This is off-policy evaluation. The estimate has high variance when the policies differ a lot.
+If the estimate looks good, the policy runs in shadow mode, then in a small canary or A/B test with a safety guard that falls back to the old policy.
+used: Recommendation and ad-bidding teams; data-centre cooling and robotics research; open-source libraries such as d3rlpy and Open Bandit Pipeline.
+avoid: When logs lack action probabilities or cover too little behaviour; collect exploration data first.
+flow:
+  Production policy [svc: v1] -> Decision log [log: s + a + r + prob] : logged decisions | Each decision is logged with its action probability.
+  Decision log -> Offline trainer [svc: conservative RL] : batch | The trainer learns a policy from the fixed log, without trying actions live.
+  Offline trainer -> Evaluator [svc: off-policy estimate] : candidate policy | The evaluator estimates the candidate's reward from the old logs using importance weights.
+  Evaluator -x> Offline trainer : estimate too uncertain | If the estimate has too much variance, the candidate is rejected.
+  Evaluator -> Canary [svc: 1% traffic + guard] : approved candidate | A good candidate gets a small live test with a rollback guard.
+  Canary -> Production policy : promote | If real reward matches the estimate, it becomes the new production policy.
+ref: paper | Offline Reinforcement Learning: Tutorial, Review, and Perspectives on Open Problems | Levine et al., 2020 | https://arxiv.org/abs/2005.01643
+
+@@ speech
+== Streaming recognition with partial results
+kind: pipes-filters, event-driven
+when: Users speak and expect words to appear while they are still talking, such as live captions or a voice search box.
+how: The client captures microphone audio in small chunks, for example 20 to 100 ms, and sends them over a WebSocket or gRPC stream. A voice activity detector (VAD) drops silence and finds the end of an utterance.
+A streaming model (a transducer or a chunked encoder) turns each chunk into acoustic features and updates a hypothesis. The server sends back partial results, which can still change, and then a final result when the speaker pauses. The latency target is often a few hundred milliseconds.
+Streaming models see less future audio than offline ones, so they are a little less accurate. Some systems fix the final text with a second, slower pass over the whole utterance.
+used: Google Cloud Speech-to-Text streaming, Amazon Transcribe streaming, Deepgram and open-source toolkits such as NVIDIA NeMo and Vosk.
+avoid: When the audio is a finished file; use batch transcription with a larger model for better accuracy.
+flow:
+  Mic client [client: 100 ms chunks] -> VAD [svc: voice detector] : audio frames | The client sends short audio frames to the detector.
+  VAD -x> Mic client : silence dropped | Silent frames are removed, which saves compute.
+  VAD -> Streaming ASR [model: transducer] : speech frames | Only frames with speech reach the recognizer.
+  Streaming ASR -> Mic client : partial: "turn on the" | Partial text is sent at once, and later frames may change it.
+  Streaming ASR -> Mic client : final: full sentence | When the speaker pauses, the final text is sent.
+  Streaming ASR ~> Rescorer [model: language model] : n-best list | An optional second pass rescoring fixes rare words in the final text.
+ref: paper | Streaming End-to-end Speech Recognition for Mobile Devices | He et al., ICASSP 2019 | https://arxiv.org/abs/1811.06621
+
+== Voice assistant cascade with on-device wake word
+kind: pipes-filters, llm-workflow
+when: A device must listen all the time, but private audio and server cost must stay small.
+how: A tiny wake-word model runs on the device, using little power, and listens for one phrase. Audio never leaves the device until the phrase is heard. Then the device streams the following audio to the cloud, where speech recognition produces text.
+The text goes to a language understanding step, today often an LLM with tools, which decides the action: answer, play music or call a smart-home API. The reply text goes to a text-to-speech model, and a vocoder turns predicted frames into a waveform that streams back to the speaker.
+Each stage adds delay, so systems stream between stages: TTS starts on the first sentence while the LLM writes the next one. Newer end-to-end speech models skip the text step, but cascades remain common because each stage can be tested alone.
+used: Alexa, Google Assistant and Siri follow this shape; open-source pipelines in Home Assistant and Pipecat use the same stages.
+avoid: When latency must be near human turn-taking and you can use a speech-to-speech model; or when no audio may leave the device.
+flow:
+  Smart speaker [client: wake word on device] -> ASR [model: speech to text] : audio after wake word | After the wake word, the device streams audio to the recognizer.
+  ASR -> LLM agent [model: intent + tools] : transcript | The text is sent to the language model.
+  LLM agent -> Home API [svc: smart-home] : set lights off | The model calls a tool to do the action.
+  LLM agent -> TTS [model: text to speech] : reply sentence | Reply sentences are sent to speech synthesis as soon as they are ready.
+  TTS -> Vocoder [model: frames to audio] : mel frames | The TTS model predicts spectrogram frames.
+  Vocoder -> Smart speaker : audio stream | The vocoder makes the waveform and streams it to the speaker.
+ref: docs | Pipecat documentation | Pipecat project | https://docs.pipecat.ai/
+
+== Long audio chunking and merge
+kind: scatter-gather, map-reduce
+when: Hours of recorded audio, such as calls or meetings, must be transcribed in bulk at low cost.
+how: A batch job first decodes the file and runs VAD to find speech regions. It cuts them into windows of about 30 seconds, because Whisper models are trained on 30-second inputs, with a small overlap. Windows from many files are put into a queue.
+GPU workers take batches of windows and decode them in parallel. A batch of 16 to 64 windows keeps the GPU busy. Each result has timestamps relative to its window.
+A merge step shifts the timestamps by the window offset, removes text repeated in the overlap, and joins the pieces. A diarization model can add speaker labels. Lost or failed windows are retried alone, not the whole file.
+used: Bulk transcription services and call-analytics pipelines; open-source Whisper variants such as faster-whisper and WhisperX.
+avoid: For live audio, where chunk waiting adds delay; use streaming recognition.
+flow:
+  Audio store [store: recordings] -> Splitter [svc: VAD + 30 s windows] : file | The splitter decodes a file and cuts it at silences into 30-second windows.
+  Splitter -> Window queue [queue: windows] : 400 windows | Windows from many files wait in one queue.
+  Window queue -> GPU worker 1, GPU worker 2 [svc: batch of 32] : batches | Workers pull batches, so the GPUs stay busy.
+  GPU worker 1, GPU worker 2 -> Merger [svc: offsets + dedupe] : text with timestamps | Each result carries timestamps relative to its own window.
+  GPU worker 2 -x> Window queue : decode failed | A failed window goes back to the queue and is retried alone.
+  Merger -> Transcript store [db] : full transcript | The merger shifts timestamps, removes overlap text and saves the full transcript.
+ref: paper | Robust Speech Recognition via Large-Scale Weak Supervision | Radford et al., OpenAI, 2022 | https://arxiv.org/abs/2212.04356
+
+@@ vectorsearch
+== Sharded ANN index with scatter-gather query
+kind: sharding, scatter-gather
+when: The vector set is too big for one machine's memory, or queries per second are higher than one node can serve.
+how: The vectors are split into shards, for example by hash of the document id, and each shard holds its own ANN index (HNSW or IVF). A query router sends the query vector to every shard. Each shard returns its local top-k, with distances. The router merges these lists and keeps the global top-k.
+Each shard must return k results, not k divided by the number of shards, or true neighbours could be missed. Replicas of each shard add read throughput and survive node failure.
+Memory is the main cost. 100 million vectors of 768 float32 values need about 300 GB before index overhead. Quantization (product or scalar) can cut this by 4 to 32 times, with a small loss of recall. A rerank step with full vectors on disk can win the recall back.
+used: Milvus, Elasticsearch and OpenSearch k-NN, Vespa and Pinecone all split indexes across nodes and merge results.
+avoid: When the data fits on one node (even a few million vectors); a single HNSW index or pgvector is simpler.
+flow:
+  App [client] -> Query router [svc] : query vector, k=10 | The app sends one query vector to the router.
+  Query router -> Shard A, Shard B, Shard C [store: HNSW index] : search k=10 | The router sends the same query to every shard.
+  Shard A, Shard B, Shard C -> Query router : local top 10 | Each shard returns its own ten nearest items with distances.
+  * Shard B: replica 2 answered | Replicas of one shard share the load, so any copy can answer.
+  Query router -> App : global top 10 | The router merges 30 candidates and returns the best 10.
+ref: paper | Billion-scale similarity search with GPUs | Johnson, Douze & Jegou, 2017 | https://arxiv.org/abs/1702.08734
+
+== Hybrid search: keyword plus vector, then rerank
+kind: scatter-gather, two-tower-retrieval
+when: Pure vector search misses exact terms such as product codes, names or error numbers, and pure keyword search misses meaning.
+how: The query runs on two indexes in parallel. A keyword index (BM25 over an inverted index) finds documents by exact words. A vector index finds documents whose embedding is close to the query embedding.
+The two ranked lists use different score scales, so they are merged by rank, not by score. Reciprocal rank fusion gives each document the sum of 1 divided by (60 plus its rank) over the lists. The top 100 fused documents go to a cross-encoder reranker, which reads the query and document together and orders them better, but is too slow for the whole corpus.
+This is the standard first stage for retrieval-augmented generation, because the model only sees the top few passages.
+used: Elasticsearch and OpenSearch hybrid queries, Weaviate and Vespa hybrid search, and many RAG stacks.
+avoid: When queries are only IDs and exact terms (use keyword search), or when latency cannot afford a reranker.
+flow:
+  Search API [svc] -> Embedder [model: query to vector] : query text | The API turns the query text into a vector.
+  Search API -> BM25 index [store: inverted index] : query text | The same text also goes to the keyword index.
+  Embedder -> Vector index [store: HNSW] : query vector | The vector index returns the nearest documents by meaning.
+  BM25 index, Vector index -> Fusion [svc: RRF] : two ranked lists | Fusion merges the two lists by rank, not by score.
+  Fusion -> Reranker [model: cross-encoder] : top 100 | The reranker scores each query and document pair together.
+  Reranker -> Search API : top 10 | The best ten results return to the caller.
+ref: paper | Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods | Cormack, Clarke & Buettcher, SIGIR 2009 |
+
+== Immutable segments with a live write buffer
+kind: lsm-compaction, tiered-storage
+when: Vectors are added and deleted all day, but ANN indexes are slow to build and cannot change easily in place.
+how: New vectors go first to a small in-memory buffer (a growing segment) that is searched by brute force. When it reaches a size such as 1 million vectors, it is sealed, and a full ANN index is built in the background. Sealed segments are immutable files on object storage.
+A query searches all sealed segments and the buffer, then merges the results. Deletes are marked in a deletion list and applied when segments are merged. A background compaction job merges small segments into larger ones and rebuilds their index, so the segment count stays low.
+This gives new data searchable in seconds, while old data keeps a high-quality index. The price is write amplification from rebuilds and some extra read cost per segment.
+used: Milvus (growing and sealed segments), Lucene-based engines (Elasticsearch, OpenSearch) with segment merges, and turbopuffer-style object-storage designs.
+avoid: For a static corpus that is rebuilt once a day; build one index offline and swap it in.
+flow:
+  Writer [client] -> Write buffer [store: 1M vectors max] : insert vectors | New vectors are written to the buffer and are searchable at once by brute force.
+  Write buffer -> Index builder [svc: HNSW build] : sealed segment | When the buffer is full it is sealed, and the index is built in the background.
+  Index builder -> Segment store [lake: object storage] : immutable segment | The built segment is stored as an immutable file.
+  Reader [client] -> Segment store, Write buffer : search all segments | A query searches every sealed segment and the buffer.
+  Compactor [svc: background] -> Segment store : merge small segments | Small segments are merged, deleted rows are dropped and the index is rebuilt.
+ref: paper | Milvus: A Purpose-Built Vector Data Management System | Wang et al., SIGMOD 2021 |
+
+@@ adtech
+== Real-time bidding auction under a deadline
+kind: rtb, timeout-deadline, scatter-gather
+when: A page or app has an ad slot, and the best price must be found among many buyers in about 100 milliseconds.
+how: The publisher's page asks its supply-side platform (SSP) for an ad. The SSP or exchange builds an OpenRTB bid request: site, device, ad size, floor price and consent string. It sends the request to many demand-side platforms (DSPs) at once.
+Each DSP has about 100 ms in total. It picks a campaign, predicts click or conversion chance, and replies with a bid and an ad. Bids that arrive late are ignored. The exchange runs the auction, often with a second-price or first-price rule (first-price is now the norm), and returns the winner's ad markup.
+Exchanges drop slow bidders and DSPs drop requests they cannot value, which protects the deadline. A busy exchange handles hundreds of thousands of requests per second.
+used: Google Ad Manager, Magnite, PubMatic and Index Exchange on the sell side; The Trade Desk and Google DV360 on the buy side; the OpenRTB protocol connects them.
+avoid: When a direct deal guarantees a fixed price and volume; use a guaranteed or programmatic-guaranteed deal.
+flow:
+  Page [client: ad slot] -> SSP [svc: exchange] : ad request | The page asks the exchange to fill one slot.
+  SSP -> DSP A, DSP B, DSP C [svc: bidder] : OpenRTB bid request | The exchange sends the request to many bidders at the same time.
+  DSP A, DSP B -> SSP : bid 2.10 and 1.80 CPM | Bidders reply with a price and an ad within the time limit.
+  DSP C -x> SSP : timeout at 100 ms | A late bid is ignored, so a slow bidder cannot delay the page.
+  * SSP: auction won by 2.10 | The exchange picks the highest valid bid above the floor price.
+  SSP -> Page : winning ad markup | The page shows the winner's ad and then fires its tracking pixels.
+ref: spec | OpenRTB specification | IAB Tech Lab | https://iabtechlab.com/standards/openrtb/
+
+== Budget pacing control loop
+kind: control-loop, feedback-loop
+when: A campaign has a daily budget, and spending it all in the first hour wastes the day's audience.
+how: Each campaign has a target spend curve over the day. Every minute or so, a pacing service reads actual spend from the billing stream and compares it with the target. If a campaign is behind, it raises a pacing multiplier, such as the share of auctions it enters or its bid scale. If it is ahead, it lowers the multiplier.
+The bidders read the multiplier from a fast key-value store or an in-memory cache and apply it in each auction, so there is no network call to the pacing service in the 100 ms path. This is a control loop with feedback: measure, compare, adjust.
+Spend data arrives late, so the loop uses small steps and sometimes a controller such as PID to avoid swings. Winning bids can also be reserved in advance, because many wins are not yet billed.
+used: Described in papers from Google, Yahoo and LinkedIn on budget pacing; built into DSPs and in-house ad platforms.
+avoid: When a campaign wants to buy as fast as possible (for example a short sale); use an unpaced "ASAP" delivery.
+flow:
+  Bidder [svc: 100 ms path] -> Win log [log: spend events] : won impression, price | Each won auction writes the price to a log.
+  Win log -> Pacing service [svc: control loop] : spend per campaign | Every minute the service sums actual spend per campaign.
+  * Pacing service: ahead by 12% | It compares actual spend with the target curve for this minute and finds campaign 17 ahead.
+  Pacing service -> Multiplier cache [cache: per campaign] : set 0.7 | A campaign that is ahead gets a lower multiplier.
+  Bidder -> Multiplier cache : read multiplier | The bidder reads the multiplier in memory, with no extra network hop to the pacing service.
+  * Multiplier cache: campaign 17 = 0.7 | The campaign now enters fewer auctions, so spend flattens.
+ref: paper | Smart Pacing for Effective Online Ad Campaign Optimization | Xu et al., KDD 2015 | https://arxiv.org/abs/1506.05851
+
+== Impression log fan-out for billing and reports
+kind: pubsub, windowed-agg
+when: One stream of impression and click events must feed billing, pacing, fraud checks and reporting, each with different needs.
+how: Ad servers and tracking pixels write every impression, click and conversion to a Kafka topic, keyed by campaign or auction id. Independent consumers read it at their own speed.
+A stream job (Flink or Spark Structured Streaming) removes duplicates and counts events in event-time windows, such as one-minute windows with a few minutes of allowed lateness. Its output feeds the pacing store and a real-time analytics store (Druid, Pinot or ClickHouse) for dashboards. A second consumer writes raw events to a lake for the daily billing batch, which is the source of truth for money.
+Real-time numbers can differ a little from billing, because of late events and invalid-traffic filtering. Billing batches fix the final count.
+used: Common in ad platforms; Druid was created at Metamarkets for ad analytics, and Kafka, Flink and ClickHouse are widely used for this.
+avoid: For a small ad network with a few thousand events a day; a single database with a nightly job is enough.
+flow:
+  Ad server [svc] -> Events topic [log: impressions + clicks] : impression event | The ad server and pixels append events keyed by auction id.
+  Events topic -> Stream job [svc: dedupe + 1 min windows] : poll | The stream job removes duplicates and counts events per window.
+  Stream job -> Analytics store [db: Druid or Pinot] : window counts | Fresh counts go to the real-time analytics store for dashboards.
+  Stream job -> Pacing store [cache: spend per campaign] : spend | Spend per campaign is stored for the pacing loop.
+  Events topic -> Lake loader [svc: batch files] : poll | A separate consumer writes raw events to the lake.
+  Lake loader -> Billing batch [svc: daily Spark] : final counts | The daily batch applies fraud filters and produces the numbers used on invoices.
+ref: paper | Druid: A Real-time Analytical Data Store | Yang et al., SIGMOD 2014 |
+
+@@ attribution
+== Conversion-to-exposure stream join
+kind: stream-table-join, windowed-agg
+when: Advertisers want to know within minutes which ad exposures came before a purchase.
+how: Exposure events (impressions and clicks) and conversion events (purchases, installs) flow through two Kafka topics, both carrying an identifier such as a hashed ID or device ID. The stream job keeps recent exposures in keyed state, for example the last 30 days per ID, with a time to live.
+When a conversion arrives, the job looks up that ID's exposures inside the lookback window and applies a credit rule: last touch gives all credit to the latest exposure, and multi-touch splits it. The result row goes to a reporting store.
+Events arrive late and out of order, so the job uses event time and watermarks, and it can send a correction when a late exposure appears. State size is the main cost: 30 days of exposures per user is large, so exposures are often compacted per campaign.
+used: Common in measurement platforms of ad networks and TV measurement firms; Flink or Spark Structured Streaming implement the join.
+avoid: When daily reports are enough and IDs are not stable in real time; run a batch join once a day.
+flow:
+  Exposure topic [log: impressions + clicks] -> Attribution job [svc: keyed state] : exposure per ID | The job stores each exposure under its ID with a time to live.
+  Conversion topic [log: purchases] -> Attribution job : conversion per ID | Conversions arrive on a second topic with the same ID type.
+  * Attribution job: 3 exposures in 30 d | On a conversion, the job reads that ID's exposures from state.
+  Attribution job -> Credit table [db: conversion + campaign] : last touch credit | The job writes the credited campaign for each conversion.
+  Exposure topic ~> Attribution job : late exposure | A late exposure triggers a corrected credit row.
+  Credit table -> Report [client: dashboard] : credit per campaign | The dashboard reads credit totals per campaign.
+ref: docs | Flink: Joins (interval joins) | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/joining/
+
+== Daily batch attribution with backfill
+kind: backfill-replay, medallion
+when: The credit rules change, or a data provider sends corrected IDs days later, and past results must be recomputed.
+how: Raw exposures and conversions land in the lake as bronze tables, partitioned by date. A nightly Spark job cleans them (silver), applies the ID graph to map devices to people or households, and joins conversions to exposures in the lookback window. The output is a gold table of credited conversions per day.
+Because every step reads fixed partitions and overwrites its output partition, the job is idempotent. To change the rule, you run the job again for the last 30 or 90 days and replace those partitions. The old and new results can be compared before the switch.
+Late conversion data is common, such as offline sales sent a week later. A rolling recompute of the last N days covers it, and reports mark recent days as provisional.
+used: Common in advertisers' data warehouses and measurement vendors; Spark or SQL on BigQuery, Snowflake or Databricks.
+avoid: When campaign owners need decisions within minutes; add a streaming layer for fresh numbers.
+flow:
+  Raw events [lake: bronze by date] -> Clean job [svc: Spark] : read day partition | The job reads raw exposures and conversions for one day.
+  Clean job -> Silver tables [lake: deduped] : clean rows | It removes duplicates and bad rows.
+  ID graph [store: device to person] -> Attribution job [svc: join] : id map | The graph maps devices to one person or household.
+  Silver tables -> Attribution job : exposures + conversions | The job joins conversions to exposures in the lookback window.
+  Attribution job -> Gold credit [lake: per day] : overwrite partition | The result replaces that day's partition, so a rerun gives the same output.
+  Scheduler [svc: Airflow] -> Attribution job : backfill last 30 days | A rule change triggers a rerun for old dates.
+ref: docs | Medallion architecture | Databricks documentation | https://docs.databricks.com/aws/en/lakehouse/medallion
+
+== Holdout lift test with a clean room
+kind: shadow-ab, privacy-clean-room
+when: Attribution says ads work, but many of those buyers would have bought anyway, and you need proof of incremental effect.
+how: Before the campaign, a random share of the audience, for example 10%, is held out and never shown the ad. The test group sees ads as normal. Exposure is logged for both groups, and conversions are measured for both.
+Incrementality is the conversion rate of the test group minus that of the holdout, divided by the holdout rate. A significance test (for example a two-proportion z-test) tells if the gap is real. Because assignment is random, this is a causal estimate, which attribution rules alone cannot give.
+When the advertiser's sales data and the publisher's exposure data cannot be shared, both load them into a clean room. The room joins them on hashed IDs and only releases aggregate results.
+used: Meta conversion lift studies, Google conversion lift, and clean rooms such as AWS Clean Rooms, Snowflake and LiveRamp.
+avoid: When the audience is too small for the test to detect a difference; use a longer test or geo experiments.
+flow:
+  Audience [store: hashed IDs] -> Splitter [svc: random 90 / 10] : all eligible IDs | A random split gives a test group and a holdout group.
+  Splitter -> Ad server [svc] : test group IDs | Only the test group is eligible for the ads.
+  Ad server -> Exposure log [log: who saw the ad] : impressions | Exposures are logged for the test group.
+  Advertiser sales [db: purchases] -> Clean room [svc: hashed ID join] : sales data | The advertiser loads its sales into the clean room.
+  Exposure log, Splitter -> Clean room : exposure + group labels | The publisher loads exposure and group labels.
+  Clean room -> Analyst [user] : lift +4.2%, p 0.01 | The room only releases aggregate lift and significance, never rows.
+ref: book | Trustworthy Online Controlled Experiments | Kohavi, Tang & Xu, 2020 |
+
+@@ consent
+== Consent string travels with the ad request
+kind: none
+when: Many companies handle one user's request, and each must know what the user allowed before it uses any data.
+how: A consent management platform (CMP) on the page asks the user for choices and stores them as a compact encoded string. The IAB Transparency and Consent Framework (TCF) and the Global Privacy Platform (GPP) define this string. It records the purposes allowed and which vendors may act.
+The page passes the string to the ad stack. Prebid adds it to each bid request, and OpenRTB carries it in the regs and user objects. Each exchange and bidder decodes the string. If a purpose or vendor is not allowed, it must not use the ID, skip personalised bidding or drop out.
+The string is metadata, so each company must enforce it in code. Some stacks add a gate service that rejects calls without a valid string. TCF v2.3 has been required since 28 February 2026.
+used: Prebid.js consent modules; OpenRTB bid requests; CMPs such as OneTrust, Didomi and Sourcepoint.
+avoid: Not a replacement for legal advice. It is not enough alone when laws need a separate opt-out signal, such as Global Privacy Control; read both signals.
+flow:
+  User [user] -> CMP [svc: consent banner] : accepts purposes 1 and 3 | The user chooses which purposes to allow.
+  CMP -> Page [client: Prebid] : TCF string | The CMP gives the page a consent string.
+  Page -> SSP [svc: exchange] : bid request + string | The string travels in the bid request.
+  SSP -> Consent gate [svc: decode + check] : string | The exchange decodes the string and checks each purpose and vendor.
+  Consent gate -x> DSP B [svc: no consent] : request blocked | A bidder without consent for the vendor does not get the user's IDs.
+  Consent gate -> DSP A [svc: allowed] : request + user id | A bidder with consent gets the full request.
+ref: spec | IAB Europe Transparency and Consent Framework | IAB Europe | https://iabeurope.eu/transparency-consent-framework/
+
+== Right-to-delete fan-out
+kind: pubsub, scheduler-agent
+when: A person asks for their data to be deleted, and all copies in many stores must be found and removed within a legal deadline.
+how: The request enters a privacy portal and is checked against the user's identity. It becomes an event on a topic, with the person's identifiers, taken from the identity graph (cookies, device IDs, hashed emails).
+Each data owner has a worker that subscribes to the topic. The warehouse worker runs DELETE on lake tables. On Delta Lake or Iceberg this marks rows as deleted, and a later VACUUM or compaction removes the files. Search, cache and ML feature stores have their own workers. Backups expire by retention.
+A tracker records an acknowledgement from each worker and retries failures. It reports completion before the deadline, which is one month under GDPR and 45 days under CCPA. Deletion jobs must be idempotent, because events are delivered at least once.
+used: Common in large data platforms; Delta Lake DELETE with deletion vectors, Iceberg row-level deletes, and privacy tools such as OneTrust and Ketch.
+avoid: For systems with one database; run a single transaction. Never rely on this for data in unmanaged copies.
+flow:
+  Privacy portal [svc: verifies identity] -> Delete topic [log: requests] : delete user 123 | A verified request becomes an event with all known IDs.
+  Delete topic -> Lake worker, Search worker, Feature store worker [svc: per owner] : request event | Each store owner has its own worker on the topic.
+  Lake worker -> Delta table [lake: deletion vectors] : DELETE WHERE user | The lake worker marks the user's rows as deleted.
+  Lake worker, Search worker, Feature store worker -> Tracker [db: acks + deadline] : done ack | Each worker reports back when it has finished.
+  Search worker -x> Delete topic : failed - retry | A failed delete is retried, so deletes must be safe to repeat.
+  Tracker -> Privacy portal : all acks in 9 days | When every ack is in, the request is closed before the deadline.
+ref: docs | Delta Lake deletion vectors | Delta Lake documentation | https://docs.delta.io/latest/delta-deletion-vectors.html
+
+== Crypto-shredding with per-user keys
+kind: envelope-encryption
+when: A person's data is spread over backups, logs and archives that cannot be edited, but it must still become unreadable on request.
+how: Each user has a data key, kept in a key management service (KMS). Personal fields are encrypted with this key before they are written to the log, the lake or the backup. Other fields, such as aggregates, stay in clear text.
+To read the data, a service asks the key service for the user's key, decrypts the field and uses it. This is envelope encryption: the data key is itself wrapped by a master key.
+On a deletion request, the key service destroys the user's data key. All copies of the encrypted fields, in every backup and file, are now unreadable. No scan is needed. The cost is one key lookup per read, and a key table that must be backed up carefully until deletion. Regulators generally accept strong encryption with key destruction, but check with your legal team.
+used: Used in event-sourced systems and Kafka-based platforms that cannot edit logs; supported by cloud KMS services such as AWS KMS and Google Cloud KMS.
+avoid: When data must be searched or joined in clear text on that field; use tokenization or delete the rows directly.
+flow:
+  Service [svc: event writer] -> Key service [svc: KMS] : get key for user 123 | The writer asks for the user's data key.
+  Service -> Event log [log: encrypted fields] : ciphertext event | Personal fields are written encrypted, other fields in clear.
+  Event log ~> Backup [lake: cold archive] : copy | The encrypted log is copied to long-term backup.
+  Reader [svc: analytics] -> Key service : get key | A reader fetches the key to decrypt fields.
+  Privacy portal [svc] -> Key service : delete key 123 | A deletion request destroys the user's key.
+  Reader -x> Key service : key not found | Later reads fail, so every copy of the data is unreadable.
+ref: docs | Envelope encryption | Google Cloud KMS documentation | https://cloud.google.com/kms/docs/envelope-encryption
+
+@@ identity
+== Batch identity graph with connected components
+kind: identity-graph, map-reduce
+when: One person shows up as many cookies, device IDs and hashed emails, and you need one profile ID for all of them.
+how: Every login, purchase or pixel fire that shows two IDs together gives an edge, for example cookie C1 with hashed email H7. A daily batch job collects these edges into a graph with billions of nodes. A connected-components algorithm, run in Spark or GraphFrames, groups IDs that are linked, and each group gets one person ID.
+Deterministic edges (a shared login) are trusted. Probabilistic edges (same IP and similar behaviour) are scored by a model and used only above a threshold, because a wrong link merges two people. Large groups, such as a shared office IP with 5,000 IDs, are cut or split by rules.
+The result is a table that maps every ID to a person or household ID, and a changelog of merges and splits. Downstream jobs join on it.
+used: LiveRamp RampID, Adobe and Experian identity services, and in-house graphs at large publishers and retailers; common in customer data platforms.
+avoid: When you only have first-party logins and few devices; a simple user table with a merge key is enough.
+flow:
+  Login and pixel logs [lake: ID pairs] -> Edge builder [svc: Spark] : cookie + email pairs | A job extracts pairs of IDs seen together.
+  Edge builder -> Link scorer [model: probabilistic edges] : weak edges | Weak links get a match score, and low scores are dropped.
+  Link scorer -> Component job [svc: connected components] : edges above threshold | Strong and scored edges form one large graph.
+  Edge builder -> Component job : deterministic edges | Shared logins are always kept as edges.
+  Component job -> ID map [store: id to person id] : person id per ID | Each group of linked IDs gets one person ID.
+  * Component job: 3.1B IDs to 1.4B persons | The run ends with a merged graph that downstream jobs can join on.
+ref: docs | GraphFrames: connected components | GraphFrames project | https://graphframes.io/
+
+== Online profile lookup and cookie sync
+kind: identity-graph, cache-aside
+when: A bidder has about 10 ms to decide, but needs the user's segments and linked IDs for a request that carries only one ID.
+how: Each partner has its own ID for a browser. A cookie sync, run through redirects and pixels, tells partner A that its ID a1 and partner B's ID b9 belong to the same browser. The match is stored in a table on each side.
+At request time, the bidder gets a bid request with its own ID. It reads the profile from a key-value store (Aerospike, Redis or DynamoDB), which holds the person ID and the audience segments built by batch jobs. A local cache keeps hot keys.
+If the key is missing, the bidder bids without audience data, because it cannot wait. Segment updates arrive from the graph job or a stream. The store needs a TTL, since stale segments cost money and violate consent rules.
+used: Common in DSPs and DMPs; Aerospike is widely used for ad profile stores; Prebid supports user ID modules and cookie sync.
+avoid: When third-party cookies are unavailable, such as in Safari or Firefox; use first-party IDs, contextual signals or clean rooms.
+flow:
+  SSP [svc: exchange] -> Bidder [svc: DSP] : bid request, ID a1 | The bid request carries only the bidder's own ID for this browser.
+  Bidder -> Profile cache [cache: in memory] : get a1 | The bidder checks its local cache first.
+  Bidder -> Profile store [db: key-value] : get a1 on miss | On a miss it reads the profile store within about 3 ms.
+  Profile store -> Bidder : person 88 + segments | The profile has the person ID and the audience segments.
+  Bidder -x> SSP : no profile - bid generic | If the store is slow, the bidder bids without audience data.
+  Graph job [svc: batch] ~> Profile store : daily segment update | A batch job refreshes segments and ID links with a TTL.
+ref: spec | Cookie Sync and user ID modules | Prebid documentation | https://docs.prebid.org/dev-docs/modules/userId.html
+
+== Clean room audience match
+kind: privacy-clean-room, identity-graph
+when: Two companies want to find shared customers or measure results, but neither may hand over raw customer lists.
+how: Each party hashes its identifiers, usually emails or phone numbers, with an agreed method such as SHA-256 on normalized values. Both load the hashed tables into a clean room. The room runs on a cloud platform (for example AWS Clean Rooms, Snowflake or BigQuery) and is governed by rules both parties accept.
+Only approved queries can run. Each query must meet minimum group sizes, for example 100 users, and may add noise (differential privacy). Results are aggregates such as overlap size, or an audience segment that stays inside the platform for activation.
+Hashing is not full anonymity, because common emails can be guessed, so the room's access controls matter more than the hash. Clean rooms are common now because third-party cookies are fading.
+used: AWS Clean Rooms, Snowflake Data Clean Rooms, Google Ads Data Hub and LiveRamp Safe Haven.
+avoid: When both sides trust each other and a normal data-sharing contract is enough; or when the audience is too small to pass minimum group sizes.
+flow:
+  Advertiser [svc: customer list] -> Clean room [svc: governed workspace] : hashed emails | The advertiser uploads hashed emails and never sends raw ones.
+  Publisher [svc: logged-in users] -> Clean room : hashed emails + segments | The publisher uploads hashed emails with their audience labels.
+  Analyst [user] -> Clean room : approved overlap query | The analyst can only run query templates both sides approved.
+  * Clean room: result group 41 | The room checks the group size of each result before it releases it.
+  Clean room -x> Analyst : group under 100 blocked | Small groups are blocked, because they could expose one person.
+  Clean room -> Ad platform [svc: activation] : matched segment | An approved segment is sent for ad targeting without row-level data leaving.
+ref: docs | AWS Clean Rooms User Guide | Amazon Web Services | https://docs.aws.amazon.com/clean-rooms/latest/userguide/what-is.html
+
+@@ experimentation
+== Hash-based assignment with a flag service
+kind: feature-flags, consistent-hashing
+when: Every request must show the same variant to the same user, with no stored per-user state and almost no delay.
+how: The experiment has a name, a salt and traffic splits, such as 50% control and 50% treatment. To assign a user, the SDK computes a hash of the salt and the user ID, takes it modulo 10,000, and maps the bucket to a variant. The same input always gives the same answer, so the user sees one variant across sessions and servers.
+The salt is different for each experiment, which keeps assignments independent between experiments. The rules come from a config service and are cached in the SDK, so assignment runs locally in microseconds.
+Different layers or namespaces allow many experiments to run together on non-overlapping traffic. Ramping from 5% to 50% keeps earlier users in their variant, as long as the bucket ranges only grow.
+used: Statsig, Optimizely, LaunchDarkly, GrowthBook, Eppo and the overlapping experiment infrastructure described in Google's papers.
+avoid: When the unit is not a stable ID (anonymous traffic that clears cookies); use session-level assignment and accept the loss of power.
+flow:
+  Experiment config [store: salt + splits] -> Flag service [svc: rules + rollout] : publish rules | The experiment owner publishes salt and split rules.
+  Flag service ~> App SDK [client: local cache] : rules, every 30 s | SDKs poll for rule changes and cache them.
+  User [user] -> App SDK : request, user 42 | A request arrives with a stable user ID.
+  * App SDK: hash(salt+42) mod 10000 = 7312 | The SDK computes the bucket on the server, in microseconds.
+  App SDK -> App [svc: variant B] : treatment | Bucket 7312 is in the treatment range, so the user gets variant B.
+  App SDK -> Exposure log [log: user + variant] : exposure event | The SDK logs one exposure event the first time the user sees the variant.
+ref: paper | Overlapping Experiment Infrastructure: More, Better, Faster Experimentation | Tang et al., Google, KDD 2010 |
+
+== Exposure logs to metrics to decision
+kind: etl-elt, star-schema
+when: You must turn raw events into a trusted answer on whether a change moved the goals, for hundreds of experiments at once.
+how: Assignment exposures and product events (clicks, purchases, latency) go to a stream and then to a warehouse. A pipeline joins each exposed user to later events inside the analysis window and computes metrics per user and per variant.
+A stats engine runs on per-user metrics. It checks for sample ratio mismatch, which signals a bug in assignment, compares means with a t-test or a sequential test, and applies variance reduction such as CUPED, which uses pre-experiment data to shrink noise. It also corrects for many metrics at once.
+The scorecard shows lift, confidence interval and guardrail metrics (such as crash rate and latency). Metric definitions are kept in one shared catalog, so every team computes revenue per user in the same way.
+used: Experimentation platforms at Microsoft (ExP), Netflix, Booking.com and Airbnb; commercial and open-source platforms such as Statsig, Eppo and GrowthBook.
+avoid: For tests with very few users; use qualitative research. For one-off checks, a simple notebook is enough.
+flow:
+  App [client] -> Event stream [log: exposures + events] : exposure and click events | The app logs which variant each user saw and what they did.
+  Event stream -> Warehouse [db: raw events] : load | Events land in the warehouse in a few minutes.
+  Warehouse -> Metric pipeline [svc: per-user metrics] : join exposure to events | Each exposed user is joined to later events in the window.
+  Metric pipeline -> Stats engine [svc: SRM + CUPED + t-test] : metrics per user | The engine checks assignment health and computes lift.
+  Stats engine -x> Experiment owner [user] : SRM alert | A sample ratio mismatch warns that assignment is broken, so the result cannot be trusted.
+  Stats engine -> Scorecard [client: lift and guardrails] : lift +1.8%, CI | The scorecard shows lift, interval and guardrail checks.
+ref: book | Trustworthy Online Controlled Experiments | Kohavi, Tang & Xu, 2020 |
+ref: paper | Improving the Sensitivity of Online Controlled Experiments by Utilizing Pre-Experiment Data (CUPED) | Deng et al., Microsoft, WSDM 2013 |
+
+== Staged rollout with guardrail auto-stop
+kind: blue-green, shadow-ab
+when: A risky change must reach all users, but must stop fast if it harms crash rate, latency or revenue.
+how: The release goes out in steps, such as 1%, 5%, 25% and 50%, controlled by a flag or a canary. At each step, the system compares the treated group with the control group on guardrail metrics. These are metrics that must not get worse, such as errors per request and page load time.
+A monitor runs a sequential test, which stays valid when you look at the data many times. If a guardrail is hurt beyond a set limit, the flag is turned off automatically and the owner is paged. If all guardrails hold for the set time, the rollout moves to the next step.
+This catches harm in minutes on small traffic, instead of after a full launch. Success metrics are judged later, in a clean A/B test at a fixed sample size.
+used: Common in large web companies; Microsoft's safe deployment and Statsig, LaunchDarkly and Argo Rollouts support metric-based gates.
+avoid: For changes that cannot be split by user, such as pricing across a marketplace; use geo or switchback tests instead.
+flow:
+  Release owner [user] -> Flag service [svc: percent rollout] : ramp to 5% | The owner sets the new version to 5% of traffic.
+  Flag service -> Treatment app [svc: new version] : 5% of requests | A small share of users sees the new version.
+  Treatment app, Control app [svc: old version] -> Metrics store [db: errors + latency] : guardrail metrics | Both groups send error and latency metrics.
+  Metrics store -> Monitor [svc: sequential test] : compare groups | The monitor compares treatment with control all the time.
+  Monitor -x> Flag service : latency +18% - stop | A guardrail breach turns the flag off by itself.
+  Monitor -> Flag service : healthy 30 min - ramp 25% | If all guardrails hold, the rollout moves to the next step.
+ref: paper | Online Controlled Experiments at Large Scale | Kohavi et al., KDD 2013 |
+
+@@ olap
+== Star schema in a columnar warehouse
+kind: star-schema, etl-elt
+when: Analysts ask many different questions over billions of rows and expect answers in seconds.
+how: Data is modelled as one big fact table (orders, events, impressions) with keys to small dimension tables (customer, product, date). A query joins the fact table to the dimensions it needs, filters, groups and sums.
+The warehouse stores each column separately and compressed (dictionary and run-length encoding). A query that reads 4 columns of a 200-column table reads about 2% of the bytes. Min and max values per block (zone maps) let the engine skip blocks that cannot match, and vectorized operators process thousands of values at a time.
+Raw data is loaded first and then transformed inside the warehouse with SQL (ELT), often with dbt. BI tools read the final tables.
+used: Snowflake, BigQuery, Amazon Redshift, Databricks SQL and ClickHouse; Kimball-style modelling is the usual guide.
+avoid: For single-row lookups and updates (use an OLTP database), or for very wide sparse data that is better in a document store.
+flow:
+  Source systems [db: OLTP + SaaS] -> Loader [svc: Fivetran or Airbyte] : raw tables | A loader copies source tables as they are into the warehouse.
+  Loader -> Warehouse [db: columnar storage] : raw layer | Raw data lands in a staging area.
+  Warehouse -> dbt [svc: SQL transforms] : run models | dbt builds clean dimension and fact tables with SQL inside the warehouse.
+  dbt -> Warehouse : fact_orders + dim_customer | The star schema is written back as new tables.
+  BI tool [client: dashboards] -> Warehouse : SELECT sum by month | A query joins the fact table to dimensions.
+  Warehouse -> BI tool : 4 columns read of 200 | Only the needed columns are read, so the scan stays small.
+ref: book | The Data Warehouse Toolkit | Kimball & Ross, 3rd ed., 2013 |
+
+== Offload analytics from OLTP with CDC
+kind: cdc, polyglot-persistence
+when: Heavy reports slow down the production database, and the business needs reports that are only minutes old.
+how: The OLTP database (Postgres or MySQL) keeps serving transactions. A CDC tool such as Debezium reads its write-ahead log and sends each insert, update and delete to Kafka. A sink writes the changes into an analytics store, for example ClickHouse, a lakehouse table or a warehouse.
+In the analytics store, changes are applied as upserts by primary key, or kept as an append-only history. Queries then scan columns without touching the production database.
+The result is a copy that is a few seconds to minutes behind. Schema changes at the source must be handled, and deletes must be applied. A one-time snapshot starts the copy, then the stream takes over.
+used: Debezium into Kafka; managed CDC services such as AWS DMS, Fivetran and Datastream; ClickHouse and Snowflake ingestion from CDC streams.
+avoid: When reports can run on a read replica and are small enough; a replica is simpler.
+flow:
+  App [svc: OLTP service] -> Postgres [db: primary] : INSERT, UPDATE | The app writes transactions to the primary database.
+  Postgres -> Debezium [svc: reads WAL] : change records | The connector reads committed changes from the log, not from tables.
+  Debezium -> Changes topic [log: Kafka] : row changes | Every change becomes an event keyed by the primary key.
+  Changes topic -> Sink [svc: upsert writer] : batches | The sink applies changes in batches.
+  Sink -> Analytics store [db: columnar] : upsert by key | The analytics store holds a copy that is seconds behind.
+  Analyst [user] -> Analytics store : heavy report | Big scans run here and never touch the production database.
+ref: docs | Debezium architecture | Debezium documentation | https://debezium.io/documentation/reference/stable/architecture.html
+
+== Lakehouse scans with pruning
+kind: open-table-format, data-locality
+when: Data lives as files on cheap object storage, and many engines must query it without copying it into a warehouse.
+how: Data is stored as Parquet files, which are columnar, grouped in a table format (Iceberg, Delta Lake or Hudi). The table format keeps a metadata log with the list of files and min and max statistics for each column.
+A query engine (Trino, Spark, DuckDB or a warehouse) reads the metadata first. It skips whole partitions and files whose statistics cannot match the filter, for example a date range. This is pruning. Then it reads only the needed column chunks from the remaining files, using range requests on S3.
+Parquet's row groups also hold statistics, so more data is skipped inside a file. Good partitioning and file sizes of 128 MB to 1 GB matter, because many small files cause slow metadata work.
+used: Apache Iceberg with Trino and Spark; Delta Lake with Databricks; DuckDB reading Parquet on S3.
+avoid: For sub-second dashboards with many concurrent users; use a real-time OLAP store or serve from a warehouse.
+flow:
+  Engine [svc: Trino or Spark] -> Table metadata [store: manifests + stats] : read snapshot | The engine reads the table's file list and column statistics.
+  Table metadata -> Engine : 8,000 files, 40 match | Statistics show that only 40 files can match the date filter.
+  Engine -> Object storage [lake: Parquet on S3] : range read of 3 columns | The engine reads only the needed columns from those files.
+  Object storage -> Engine : column chunks | Data returns as compressed column chunks.
+  Engine -> Analyst [user] : result | The engine aggregates in parallel and returns the answer.
+ref: docs | Apache Iceberg table spec | Apache Iceberg | https://iceberg.apache.org/spec/
+
+@@ rtanalytics
+== Hybrid real-time and offline tables
+kind: lambda-arch, tiered-storage
+when: Dashboards must show events from seconds ago and also years of history, with the same query.
+how: Events go to Kafka. Real-time servers in Pinot or Druid read the topic and build small columnar segments in memory, which are queryable within about one to two seconds. When a segment is full or old enough, it is sealed and written to deep storage on S3.
+Batch jobs can also rebuild older data into larger, better-compressed offline segments and replace the real-time ones. A broker splits a query by time: the recent range goes to real-time servers, the older range to offline servers, and the results are merged.
+This keeps fresh data and cheap history in one table. Late or corrected events are fixed by the next offline rebuild. The cost is two ingest paths to run.
+used: Apache Pinot hybrid tables, Apache Druid with real-time tasks and compaction, ClickHouse with Kafka engine tables; LinkedIn and Uber have described Pinot use, and Netflix has described Druid use.
+avoid: When data is only a few hours old and small; a single table with streaming ingestion is simpler.
+flow:
+  Events topic [log: Kafka] -> Real-time server [svc: consuming segment] : consume | Real-time servers read the topic and build in-memory segments.
+  Real-time server -> Deep store [lake: S3 segments] : seal segment | A full segment is sealed and saved to deep storage.
+  Batch job [svc: Spark] -> Deep store : offline segments | A batch job writes better-compressed segments for older days.
+  Deep store -> Offline server [svc: loaded segments] : load | Offline servers load these segments for fast scans.
+  Broker [svc: query router] -> Real-time server, Offline server : split by time | The broker sends recent time ranges to one group and old ranges to the other.
+  Real-time server, Offline server -> Broker : partial results | Partial results are merged into one answer.
+ref: docs | Pinot hybrid tables | Apache Pinot documentation | https://docs.pinot.apache.org/
+
+== User-facing analytics API with scatter-gather
+kind: scatter-gather, precompute
+when: Thousands of end users each open a dashboard, and every click must return in under 100 ms.
+how: The product's API turns a click into one SQL or native query, for example the views of one creator over the last 7 days. A broker sends it to all segments that hold the needed time range. Each server scans its segments and returns partial aggregates.
+Speed comes from several tricks. An inverted index turns a filter on creator_id into a small bitmap. A star-tree index stores pre-aggregated totals for common group-by columns, so the server reads a few nodes instead of millions of rows. Data is partitioned by key, so one creator's data sits on few servers.
+The broker merges the partial sums and returns the result. High concurrency, meaning thousands of queries per second, is a design goal, unlike in classic warehouses.
+used: LinkedIn "Who viewed your profile" on Pinot; Uber Eats restaurant dashboards run on Pinot; Druid and ClickHouse serve similar needs.
+avoid: For ad hoc exploration with complex multi-table joins; use a warehouse or an MPP engine.
+flow:
+  Web app [client: creator dashboard] -> Analytics API [svc] : views for creator 17 | A user opens a dashboard page.
+  Analytics API -> Broker [svc: Pinot broker] : group by day, 7 days | The API sends one query with a time range and filter.
+  Broker -> Server 1, Server 2 [svc: segments + indexes] : sub-queries | The broker sends the query to servers that hold matching segments.
+  Server 1, Server 2 -> Broker : partial sums | Each server uses inverted and star-tree indexes, and returns small partial results.
+  Broker -> Analytics API : merged result | The broker merges partial sums into one table.
+  Analytics API -> Web app : JSON in 60 ms | The page shows the numbers fast enough for a user.
+ref: paper | Pinot: Realtime OLAP for 530 Million Users | Im et al., SIGMOD 2018 |
+
+== Upsert tables for current state
+kind: cdc, materialized-view
+when: A dashboard must show the latest state of each entity, such as order status, not every past event.
+how: Events or CDC records carry a primary key, such as the order id, and a version or timestamp. All records for one key must reach the same server, so the topic is partitioned by that key.
+Each server keeps an in-memory map from key to the row's location in its segments. When a newer record for the key arrives, the map moves to point at the new row, and the old row is hidden from queries. Pinot calls this upsert; ClickHouse uses ReplacingMergeTree, which merges old versions away in the background.
+Queries then see one row per key. The cost is memory for the key map, and rules on late or out-of-order records: records with an older version are ignored.
+used: Apache Pinot upsert tables; ClickHouse ReplacingMergeTree; used for order tracking, ride status and fleet dashboards.
+avoid: When history matters more than current state; keep an append-only table and compute the latest row in the query.
+flow:
+  Orders DB [db: OLTP] -> CDC topic [log: keyed by order id] : change events | Order changes are published, keyed by order id.
+  CDC topic -> Server 1 [svc: key map in memory] : orders 1 to 500 | Server 1 reads the partitions with its keys, so all changes for one order meet here.
+  * Server 1: order 17 now shipped | A newer record for order 17 updates the key map to the new row.
+  Server 1 -> Server 1 segment [store: 2 rows of order 17] : append row | Both versions of order 17 exist on disk, but only the new one is valid.
+  Dashboard [client] -> Broker [svc] : count orders by status | A query asks for the current status counts.
+  Broker -> Dashboard : one row per order | The broker returns one row per order, using only valid rows.
+ref: docs | Pinot stream ingestion with upsert | Apache Pinot documentation | https://docs.pinot.apache.org/
+
+@@ batchproc
+== Scheduled DAG of idempotent partition jobs
+kind: etl-elt, checkpoint-restart
+when: Reports and models need fresh tables every night, built from several steps that depend on each other.
+how: An orchestrator (Airflow, Dagster or Argo Workflows) holds a DAG of tasks. Each task is a batch job, for example a Spark job, that reads input partitions for one date and writes one output partition. A task starts only when the tasks it depends on have succeeded.
+Each task is idempotent: it overwrites its output partition, so running it twice gives the same result. This makes retries safe. When a task fails, the orchestrator retries it with a delay, and then alerts a person. Only failed tasks and tasks after them are rerun, not the whole night's work.
+Sensors or dataset triggers wait for input data to arrive, since upstream files can be late. Run dates are passed as parameters, which makes backfills possible.
+used: Apache Airflow with Spark or dbt at many companies; Dagster and Prefect as alternatives; Argo Workflows on Kubernetes.
+avoid: For continuous low-latency results; use stream processing. For one small script, a cron job is enough.
+flow:
+  Scheduler [svc: Airflow] -> Extract job [svc: Spark + date D] : run for 2026-10-27 | At 02:00 the scheduler starts the first task for one date.
+  Extract job -> Raw table [lake: partition D] : overwrite partition | The job overwrites its partition, so a retry gives the same data.
+  Raw table -> Transform job [svc: Spark] : read partition D | The next task starts only after the first one has succeeded.
+  Transform job -x> Scheduler : task failed | A task fails, for example from a lost executor.
+  Scheduler -> Transform job : retry in 10 min | The scheduler retries only this task, and nothing upstream runs again.
+  Transform job -> Report table [db: daily] : overwrite partition D | The last task writes the final table that dashboards read.
+ref: docs | Airflow: DAGs | Apache Airflow documentation | https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html
+
+== Shuffle join with skew handling
+kind: map-reduce, data-locality
+when: Two tables, each many terabytes, must be joined or grouped by a key, and no machine can hold them.
+how: Each map task reads one input split, ideally on the node that holds it. It sends each row to a partition chosen by the hash of the join key. This move across the network is the shuffle. Each reduce task receives all rows for its keys, sorts or hashes them and joins them.
+The shuffle is the costly step: it writes to disk and reads over the network. A small table can avoid it by being broadcast to all workers, so the big table is not moved.
+Skew is a common failure: if one key (a null value or a very popular user) holds 30% of the rows, one task runs for hours. Fixes are salting the hot key into several sub-keys, splitting hot keys to a broadcast join, or letting adaptive query execution split large partitions.
+used: Hadoop MapReduce, Spark and Hive jobs; Google MapReduce described the model.
+avoid: When one table is small (use a broadcast join) or when data is already partitioned and sorted by the key (use a bucketed join).
+flow:
+  Orders [lake: 8 TB] -> Map tasks [svc: read splits] : read local splits | Map tasks read splits, ideally on the node that stores them.
+  Users [lake: 2 TB] -> Map tasks : read local splits | The second table is read the same way.
+  Map tasks -> Reduce task 1, Reduce task 2 [svc: join by key] : rows by hash of key | The shuffle sends all rows of one key to one reduce task.
+  * Reduce task 2: hot key, 30% of rows | One task gets a very popular key, and it runs much longer than the others.
+  Reduce task 2 ~> Map tasks : rerun with salted key | A fix adds a random salt, so the hot key is spread over 8 tasks.
+  Reduce task 1, Reduce task 2 -> Joined table [lake: Parquet] : write output | Each task writes its part of the result.
+ref: paper | MapReduce: Simplified Data Processing on Large Clusters | Dean & Ghemawat, OSDI 2004 | https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/
+
+== Backfill by rerunning date partitions
+kind: backfill-replay, lambda-arch
+when: A bug is found in last month's logic, and the affected tables must be recomputed without stopping daily runs.
+how: Raw data stays in the lake and is never changed, and each derived table is partitioned by date. The fix is deployed as a new version of the job. The orchestrator then creates a backfill run for each date in the range, for example 30 days, with a limited number running in parallel, for example 5.
+Each run reads the raw partition for its date and overwrites the derived partition. Table formats such as Iceberg and Delta make the overwrite atomic, so readers see the old or the new version, never half of each. The run can write to a shadow table first, to compare totals before the switch.
+Downstream tables that depend on the fixed one are rerun after it, in order. Cost is the main limit, since 30 days of reprocessing can take as much compute as a month of normal runs.
+used: Airflow backfill and Dagster partitions; Spark jobs on Iceberg, Delta and Hudi; the batch layer of a Lambda design.
+avoid: When raw data was not kept; fix forward and document the gap.
+flow:
+  Engineer [user] -> Orchestrator [svc: Airflow] : backfill 30 days, max 5 | The engineer asks for a rerun for 30 dates, at most 5 at once.
+  Orchestrator -> Job v2 [svc: Spark] : date 2026-09-28 | Each date is a separate run of the fixed job.
+  Raw lake [lake: immutable logs] -> Job v2 : read raw partition | The job reads the unchanged raw data for that date.
+  Job v2 -> Shadow table [lake: Iceberg] : write new partition | New results go to a shadow table first.
+  Shadow table -> Engineer : totals compared | The engineer compares totals with the old table.
+  Shadow table -> Prod table [lake: Iceberg] : atomic swap | An atomic commit replaces the old partitions, and readers never see a mix.
+ref: docs | Airflow: Backfill | Apache Airflow documentation | https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dag-run.html
+
+@@ mpp
+== Coordinator and workers with exchange stages
+kind: scatter-gather, data-locality
+when: One SQL query must scan terabytes and finish in seconds by using hundreds of cores.
+how: A client sends SQL to a coordinator. The coordinator parses it, the optimizer picks join order and join types using table statistics, and the plan is cut into stages at points where data must move. Each stage is run by many workers, each on its own slice of data.
+Early stages scan files or table partitions, apply filters and projections (pushdown), and do partial aggregation. Between stages, an exchange moves rows over the network by hash of key, or to a single worker for the final merge. Pipelines inside a worker are vectorized or compiled.
+Results are pulled back to the coordinator and returned. The slowest worker decides the query time, so splits are handed out in small pieces, and a busy node gets less.
+used: Trino and Presto, Spark SQL, Amazon Redshift, Snowflake and BigQuery all follow this shape in their own way.
+avoid: For queries that touch a few rows by key (use an OLTP database) or for sub-100 ms dashboards (use a real-time OLAP store).
+flow:
+  Client [client: SQL] -> Coordinator [svc: parse + plan] : SELECT ... GROUP BY | The client sends SQL, and the coordinator makes a distributed plan.
+  Coordinator -> Worker 1, Worker 2, Worker 3 [svc: scan + filter] : stage 1 splits | Each worker gets file splits to scan, filter and partly aggregate.
+  Worker 1, Worker 2 -> Worker 3 : exchange by hash of key | Stage 2 receives rows for its keys from all stage 1 workers over the network.
+  Worker 3 -> Coordinator : final merge | One worker combines the partial results.
+  * Worker 2: slow, 2 splits left | The slowest worker decides the total time, so splits are given out in small pieces.
+  Coordinator -> Client : result rows | The coordinator returns the final rows.
+ref: paper | Presto: SQL on Everything | Sethi et al., ICDE 2019 |
+
+== Broadcast or shuffle join by table size
+kind: data-locality, scatter-gather
+when: A fact table with billions of rows joins small and large dimension tables, and moving the wrong one wastes the network.
+how: The optimizer reads statistics for each table, such as row counts and size. If one side is small, for example under 100 MB, it picks a broadcast join. The small table is sent to every worker, and each worker joins it with its local slice of the big table. The big table is not moved.
+If both sides are large, it picks a partitioned (shuffle) hash join. Both tables are repartitioned by the join key, so matching keys land on the same worker. This moves both tables once over the network.
+Statistics can be wrong. Adaptive query execution looks at the real size of a stage's output at runtime and can change the plan, for example by switching a shuffle join to a broadcast join, or by splitting a skewed partition.
+used: Spark SQL broadcast hash join and adaptive query execution; Trino automatic join distribution; Snowflake and Redshift choose distribution the same way.
+avoid: When the "small" table is in fact large and does not fit in worker memory; force a shuffle join or filter it first.
+flow:
+  Optimizer [svc: cost-based] -> Plan [note: broadcast dim_country] : table sizes | The optimizer reads statistics and sees a 40 MB dimension table.
+  Plan -> Worker 1, Worker 2 [svc: holds fact splits] : send small table | The small table is copied to every worker.
+  Worker 1, Worker 2 -> Join output [lake: result] : local hash join | Each worker joins its own slice of the big table, with no big shuffle.
+  * Optimizer: estimate wrong, 5 GB | At runtime, the real size of the other side turns out far bigger than expected.
+  Optimizer -x> Plan : switch to shuffle join | Adaptive execution drops the broadcast plan and re-partitions by key.
+ref: docs | Adaptive Query Execution | Apache Spark documentation | https://spark.apache.org/docs/latest/sql-performance-tuning.html
+
+== Federated query through connectors
+kind: plugin-arch, polyglot-persistence
+when: Data lives in several systems, such as a lake, Postgres and Kafka, and analysts want one SQL query over all of them.
+how: The engine, for example Trino, has a connector for each source. A connector tells the engine the tables and columns of the source, how to split a table into parallel reads, and how to read the data. The coordinator plans one query that spans several catalogs, for example hive.sales joined with postgres.customers.
+The optimizer pushes filters and projections into each connector, so Postgres only sends the rows that match. Large parts of the join still run in the engine's workers, after the data is pulled over the network.
+This avoids copying data first, and it is useful for exploration and migration. The cost is that the slowest source decides the speed, and heavy queries can overload an operational database. Usually repeated workloads are moved to the lake.
+used: Trino and Presto connectors (Hive, Iceberg, Delta, Postgres, MySQL, Kafka); Starburst and Athena Federated Query.
+avoid: For repeated heavy reports on live production databases; copy the data into the lake or warehouse.
+flow:
+  Analyst [user] -> Coordinator [svc: Trino] : join lake and Postgres | One query refers to two different systems.
+  Coordinator -> Iceberg connector [svc: lake catalog], Postgres connector [svc: JDBC catalog] : plan fragments | The coordinator asks each connector for splits and pushes filters down.
+  Iceberg connector -> Worker [svc: join + aggregate] : Parquet rows | Workers read the lake files in parallel.
+  Postgres connector -> Worker : only matching rows | The filter ran inside Postgres, so only needed rows cross the network.
+  Worker -> Analyst : joined result | The engine joins the rows from both systems and returns the answer.
+ref: docs | Trino connectors | Trino documentation | https://trino.io/docs/current/connector.html
+
+@@ streamproc
+== Keyed windows with checkpoints and transactional sink
+kind: windowed-agg, checkpoint-restart
+when: You need correct counts over time windows of an endless stream, even when machines fail.
+how: The stream is partitioned by key, such as the campaign id, so each key's state lives in one task. Events are put into event-time windows, for example one minute. A watermark tells the job how far event time has passed, so it knows when a window is complete and may emit its result. Late events within an allowed lateness update the result again.
+Every few seconds or minutes, the job takes a distributed snapshot of all operator state and source offsets, with barriers that flow through the graph (the Chandy-Lamport idea in Flink). If a machine fails, the job restores the last snapshot and replays from the saved offsets.
+To write results exactly once, the sink joins the snapshot: a Kafka sink uses transactions that commit when the snapshot completes. Readers set isolation to read committed.
+used: Apache Flink with Kafka; Spark Structured Streaming with checkpoints; Kafka Streams with changelog topics.
+avoid: When results need only approximate counts and simple code is enough; or when events are few, and a small consumer with a database is easier.
+flow:
+  Events topic [log: Kafka] -> Window task 1, Window task 2 [svc: keyed state] : events by key | Events are partitioned by key, so each key's counts live in one task.
+  Window task 1, Window task 2 -> Output topic [log: committed counts] : window result at watermark | A window emits when the watermark passes its end time.
+  Coordinator [svc: checkpoint] ~> Window task 1, Window task 2 : barrier, checkpoint 41 | Every minute, barriers flow through the job and each task saves its state.
+  Window task 2 -x> Coordinator : task lost | A machine fails.
+  Coordinator -> Window task 2 : restore checkpoint 41 | The job restores state and replays from the saved offsets.
+  * Output topic: transaction 41 committed | The transactional sink commits only when the checkpoint is complete, so no duplicate results appear.
+ref: paper | Lightweight Asynchronous Snapshots for Distributed Dataflows | Carbone et al., 2015 | https://arxiv.org/abs/1506.08603
+
+== Enrich a stream with a changing table
+kind: stream-table-join, cdc
+when: Events carry only ids, such as user_id, and each one must be joined with the latest user attributes before it is stored.
+how: The job reads the event stream, and also a changelog topic with the dimension table, for example CDC records from the users table. The changelog is turned into keyed state in the job, a local table that always holds the newest row per key.
+Each event does a lookup by key in this state, with no network call per event. Both streams are partitioned by the same key, so matching rows meet in the same task. The enriched event is written downstream.
+Care is needed with time. If an event arrives before its dimension row, it may find nothing. Temporal joins match the event to the version of the row valid at the event's time. Where the table is too big for state, a lookup to an external cache is used with async IO.
+used: Flink temporal table joins; Kafka Streams KStream-KTable joins; ksqlDB.
+avoid: When the dimension is tiny and rarely changes; load it at start up as a broadcast side input.
+flow:
+  Users DB [db: OLTP] -> Users changelog [log: CDC + keyed by user id] : row changes | Changes to the users table are published as a keyed stream.
+  Users changelog -> Join task [svc: state per key] : upsert state | The join task keeps the newest row per user in local state.
+  Clicks topic [log: events with user id] -> Join task : click event | Click events arrive with only a user id.
+  Join task -> Join task state [store: RocksDB] : lookup user 7 | The task reads the user's row from local state, with no network call.
+  Join task -> Enriched topic [log: click + user plan] : enriched click | The enriched event goes downstream to analytics.
+  * Join task: user 7 plan = pro | A later change to the user row updates state for the next clicks.
+ref: docs | Joins in Flink SQL, temporal joins | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/sql/queries/joins/
+
+== Late data, side output and backpressure
+kind: dead-letter, load-shedding
+when: Real streams have late, malformed or bursty events, and the job must neither crash nor lose them silently.
+how: Records that cannot be parsed go to a dead-letter topic with the error and the raw bytes, so someone can fix and replay them. Events that arrive after the allowed lateness of their window go to a late-data side output, and are counted and sent to a correction path, for example a batch job that fixes totals the next day.
+When a sink is slow, backpressure flows upstream. Each operator has bounded buffers, and when they are full it stops reading, so slowness reaches the source. The consumer then falls behind in the Kafka topic, which stores the backlog on disk. This is safer than growing memory until the job dies.
+The team watches consumer lag and watermark delay. If lag keeps growing, they add parallelism, or for low-value data they drop or sample events.
+used: Flink side outputs and its backpressure monitoring; Kafka Streams with dead-letter topics; Spark Structured Streaming withWatermark and drop of too-late rows.
+avoid: When every late event must change the result; use a long allowed lateness or reprocess in batch.
+flow:
+  Events topic [log: Kafka] -> Parser [svc: validate] : raw events | The job reads raw events and checks their format.
+  Parser -x> Dead-letter topic [log: bad records] : malformed event + error | A bad record is kept with its error and is not dropped.
+  Parser -> Window [svc: 1 min windows] : good events | Valid events enter the windows.
+  Window ~> Late side output [log: too late] : event after lateness | An event after the allowed lateness is routed here, not silently dropped.
+  Window -> Sink DB [db: slow] : window results | Results are written to a database.
+  * Sink DB: slow, buffers full | A slow sink fills buffers, so operators stop reading, and lag grows in Kafka instead of in memory.
+ref: docs | Flink: Side Outputs and backpressure | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/side_output/
+
+@@ graphics
+== Deferred shading render pipeline
+kind: pipes-filters, pipeline-stages
+when: A scene has many lights, and shading every object once per light would cost too much for 60 frames per second.
+how: In the first pass, the GPU rasterizes all geometry into several screen-size textures, called the G-buffer. They store per pixel: depth, normal, base color and material values such as roughness. No lighting is done yet, and a z-buffer keeps only the nearest surface for each pixel.
+In the second pass, a full-screen shader reads the G-buffer and computes lighting once per pixel. Lights are grouped by screen tile or 3D cluster, so each pixel only loops over the few lights that touch it. Hundreds of lights become affordable.
+Post-processing then runs on the finished image: bloom, tone mapping and anti-aliasing. The cost is memory bandwidth for the G-buffer, and problems with transparency, which is drawn in a separate forward pass.
+used: Many game engines, such as Unreal Engine and Unity (HDRP), use deferred or clustered paths; the Killzone 2 renderer made deferred shading popular in games.
+avoid: On mobile or VR with strict bandwidth limits; use forward or forward-plus rendering with few lights.
+flow:
+  Scene [store: meshes + materials] -> Geometry pass [svc: raster + z-buffer] : draw calls | The CPU sends draw calls for all visible meshes.
+  Geometry pass -> G-buffer [store: depth + normal + color] : write per pixel | The pass stores the surface data of the nearest surface for each pixel.
+  G-buffer -> Lighting pass [svc: tiled lights] : read textures | A full-screen shader reads the G-buffer and loops over only the lights near each pixel.
+  Lights [store: 500 point lights] -> Lighting pass : light list per tile | A culling step gives each screen tile the short list of lights.
+  Lighting pass -> Post-processing [svc: bloom + tone map] : HDR image | The lit image is passed on.
+  Post-processing -> Display [client: 60 Hz] : final frame | The final frame goes to the screen.
+ref: docs | Learn OpenGL: Deferred Shading | Joey de Vries, learnopengl.com | https://learnopengl.com/Advanced-Lighting/Deferred-Shading
+
+== CPU records commands, GPU runs frames in flight
+kind: producer-consumer, offload-accelerator
+when: The CPU and GPU must both stay busy, so neither waits for the other in a real-time frame loop.
+how: Modern APIs such as Vulkan, Metal, DirectX 12 and WebGPU let the CPU record command buffers: lists of draw and compute calls. Several CPU threads can record in parallel. The commands are submitted to a GPU queue, and the GPU runs them on its own timeline.
+The app keeps 2 or 3 frames in flight. While the GPU draws frame N, the CPU already records frame N+1. Each frame has its own copy of data that changes, such as uniform buffers, so the CPU never overwrites data the GPU still reads. Fences and semaphores tell each side when the other has finished.
+The queue is a bounded buffer. If the CPU gets too far ahead, it waits on a fence, which also limits input delay. Too few frames in flight leave the GPU idle; too many add latency.
+used: Game engines on Vulkan and DirectX 12; browser compositors with GPU rasterization; WebGPU in browsers.
+avoid: For simple 2D UI, where a high-level API or the browser's own compositor is enough.
+flow:
+  CPU thread 1, CPU thread 2 [svc: record commands] -> Command buffers [queue: frame N+1] : draw calls | Threads record commands for the next frame in parallel.
+  Command buffers -> GPU queue [queue: submitted] : submit | The finished buffers are submitted to the GPU queue.
+  GPU queue -> GPU [svc: runs frame N] : execute | The GPU runs the commands on its own timeline.
+  GPU -> CPU thread 1 : fence signaled | A fence tells the CPU that frame N has finished, so its buffers can be reused.
+  * CPU thread 1: waiting on fence | If the CPU is 3 frames ahead, it waits, which also keeps input delay low.
+  GPU -> Display [client] : present frame N | The GPU presents the finished frame.
+ref: docs | Vulkan Tutorial: Frames in flight | Khronos community tutorial | https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Frames_in_flight
+
+== Offline path tracing on a render farm
+kind: scatter-gather, data-parallel
+when: A film frame needs minutes or hours of ray tracing, and a whole sequence of thousands of frames must be done in days.
+how: A scene is built in a tool such as Maya or Houdini and exported with its textures and geometry to shared storage. A render manager (for example Deadline or OpenCue) splits the job: each frame is one task, and very large frames can also be split into tiles.
+Farm workers, CPU or GPU machines, take tasks from the queue. A path tracer (such as Arnold, RenderMan or Cycles) shoots many rays per pixel. A bounding volume hierarchy (BVH) lets each ray find the objects it hits without testing every triangle. Many samples per pixel reduce noise, and often a denoiser cleans the rest.
+Frames are independent, so scaling is almost linear. Failed tasks are requeued. Output goes to shared storage as EXR images, then compositing and encoding finish the shot.
+used: Pixar RenderMan, Autodesk Arnold, Blender Cycles; render managers such as OpenCue (open source) and Deadline; cloud render farms.
+avoid: For interactive viewing and games, which need 16 ms frames; use rasterization, with hybrid ray tracing for reflections.
+flow:
+  Artist [user] -> Render manager [svc: job queue] : submit shot, 2,400 frames | The artist submits a shot, and each frame becomes one task.
+  Scene store [store: geometry + textures] -> Worker 1, Worker 2 [svc: path tracer] : load scene | Workers load the same scene data from shared storage.
+  Render manager -> Worker 1, Worker 2 : frame 101, frame 102 | Each worker takes the next free frame from the queue.
+  Worker 2 -x> Render manager : crashed, requeue 102 | A failed frame goes back to the queue.
+  Worker 1 -> Frame store [lake: EXR images] : frame 101, 64 spp | Each worker writes its finished image, rendered with many samples per pixel.
+  Frame store -> Compositor [svc: denoise + comp] : all frames | After all frames are done, compositing and encoding finish the shot.
+ref: book | Physically Based Rendering: From Theory to Implementation | Pharr, Jakob & Humphreys, 4th ed., 2023 | https://www.pbr-book.org/

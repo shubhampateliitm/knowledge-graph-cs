@@ -1,0 +1,852 @@
+@@ datamesh
+== Domain data product with a published contract
+kind: data-mesh
+when: A central data team is a bottleneck, and the teams that create the data should own its quality and its interface.
+how: A domain team, for example ad serving, treats a table as a product. It publishes the table with an owner, a schema, a freshness target (say, updated within 15 minutes) and a version. These together are the data contract.
+Consumers in other domains read the product through the catalog and the contract, never from the producer's internal tables. The producer may change its internals freely. It may change the contract only by publishing a new version and keeping the old one alive for a notice period, for example 90 days.
+The platform team does not own the data. It only supplies the tools: storage, pipelines, the catalog and access control. The cost is that every domain needs engineers who can run data products, and small companies often do not have them.
+used: Thoughtworks' data mesh idea from Zhamak Dehghani; large retail and bank programs; Databricks Unity Catalog and Delta Sharing are often used to publish products.
+avoid: In a small company with one data team and few sources; a central warehouse is simpler and cheaper.
+flow:
+  Ad serving team [svc: domain owner] -> impressions product [store: contract v2] : publish | The domain team publishes a table with schema, owner and a 15 minute freshness target.
+  impressions product -> Data catalog [svc: discovery] : register v2 | The product is registered with its contract version, so other teams can find it.
+  Finance team [svc: consumer] -> Data catalog : search | Finance looks up the product by name and reads its contract and owner.
+  Data catalog -> Finance team : address + schema | The catalog returns the location and the exact schema of the current version.
+  Finance team -> impressions product : read v2 | Finance reads the published table, not the producer's internal tables.
+  Ad serving team -x> impressions product : breaking change | A change that breaks the contract is rejected until a new version is published.
+ref: blog | Data Mesh Principles and Logical Architecture | Zhamak Dehghani, martinfowler.com, 2020 | https://martinfowler.com/articles/data-mesh-principles.html
+
+== Self-serve platform with federated governance
+kind: data-mesh, control-data-plane
+when: Many domain teams publish data products, and the company needs common rules without a central team doing the work.
+how: A small platform team builds paved roads: a template that creates a pipeline, a storage location, a catalog entry and default access rules in one step. A domain team asks for a new data product and gets all of it in minutes, not weeks.
+Governance is federated. A council of domain owners agrees on a few global rules, such as every product has an owner, personal data columns are tagged, and retention is declared. The platform turns these rules into code that runs at publish time. A product that breaks a rule cannot be published.
+The control plane (templates, policies, catalog) is small and slow to change. The data plane (the pipelines and tables) belongs to the domains and runs on its own.
+used: Companies that build an internal data platform on Databricks Unity Catalog, Snowflake or AWS Lake Formation with tag-based policies; the Thoughtworks mesh model.
+avoid: When no team can staff a platform; shared rules then stay on paper only.
+flow:
+  Domain team [user] -> Platform template [svc: self-serve] : create product | A domain team asks for a new data product using the standard template.
+  Platform template -> Pipeline + storage [lake: provisioned] : provision | The template creates storage, a pipeline and a catalog entry in one step.
+  Platform template -> Policy engine [svc: global rules] : check rules | Owner, PII tags and retention are checked before the product goes live.
+  Policy engine -x> Platform template : missing PII tag | A product without PII tags is rejected with a clear message.
+  Domain team -> Platform template : fix and retry | The team adds the tags and tries again.
+  Policy engine -> Data catalog [svc: discovery] : approved, publish | The product appears in the catalog with its policies attached.
+ref: book | Data Mesh | Zhamak Dehghani, O'Reilly, 2022 |
+
+== Contract check in CI before a producer ships
+kind: data-mesh, anti-corruption
+when: A producer changes a table often, and each change must not break the teams that read it.
+how: The data contract lives in Git next to the producer's pipeline code. It lists column names, types, nullability and rules, such as "price is not negative".
+When the producer opens a pull request, CI compares the new schema with the contract using compatibility rules: adding an optional column is fine; removing or retyping a column is a breaking change. CI also runs the pipeline on sample data and checks the rules. A breaking change must ship as a new major version, and consumers move on their own time.
+Registered consumers can add their own tests, for example "I need column user_id". Then the producer sees who would break before merging, and not after dashboards go wrong.
+used: Teams that use data contracts with schema registries (Avro or Protobuf compatibility checks), dbt model contracts, and the open Data Contract Specification.
+avoid: For one-off exploratory tables with no consumers; the checks cost more than they save.
+flow:
+  Producer dev [user] -> Git repo [store: contract + code] : open pull request | The developer changes the pipeline and the contract file in one pull request.
+  Git repo -> CI job [svc: contract check] : trigger | CI starts on every pull request.
+  CI job -> Schema registry [svc: compat rules] : compare schemas | CI asks whether the new schema is compatible with version 3.
+  Schema registry -x> CI job : column removed | Dropping a column is a breaking change, so the check fails.
+  CI job -> Git repo : block merge | The pull request cannot merge until the change ships as version 4.
+  Git repo ~> Consumer team [svc: dashboards] : notice of v4 | Consumers are told about version 4 and migrate while version 3 still runs.
+ref: docs | Data Contract Specification | datacontract.com |
+
+@@ dimmodel
+== Star schema with conformed dimensions
+kind: star-schema
+when: Analysts ask many questions across several business processes, and queries must be simple and fast.
+how: Each business process gets one fact table with one row per event at a fixed grain, for example one row per ad impression. The fact holds numbers (cost, clicks) and foreign keys. Small dimension tables, such as date, campaign and device, hold the descriptions.
+A query joins the big fact table to a few small dimensions and groups by their columns. Engines are tuned for this shape: they scan the fact table in columns and broadcast the small dimensions to every node.
+Dimensions are conformed when they are shared. The same campaign dimension serves the impressions fact and the billing fact, so numbers from both can be put side by side. Without this, each report defines "campaign" in its own way.
+used: Kimball-style warehouses on Snowflake, BigQuery, Redshift and Databricks SQL; most dbt marts.
+avoid: For free-form event exploration with unknown questions, or for transaction processing; use a wide event table or a normalized OLTP schema.
+flow:
+  Impression facts [db: 1 row per impression] -> Star join [svc: warehouse engine] : scan 2 columns | The engine reads only the needed fact columns, such as cost and campaign key.
+  Date dim [store: small] -> Star join : broadcast | The small date dimension is copied to every worker node.
+  Campaign dim [store: shared] -> Star join : broadcast | The campaign dimension is shared with the billing fact (it is conformed).
+  Star join -> BI dashboard [client] : cost by week and campaign | The result is grouped by dimension columns and returned fast.
+  Billing facts [db: 1 row per invoice] -> Star join : same campaign key | Billing joins the same campaign dimension, so both reports agree on campaign names.
+ref: book | The Data Warehouse Toolkit, 3rd ed. | Ralph Kimball & Margy Ross, Wiley, 2013 |
+
+== Type 2 dimension with surrogate keys
+kind: star-schema, cdc
+when: Attributes of a dimension change over time, and old facts must keep the value that was true when they happened.
+how: Each dimension row gets a surrogate key, a number made by the warehouse, and not the business key. When a customer moves from the "free" plan to the "pro" plan, the pipeline does not update the row. It closes the old row by setting valid_to, and inserts a new row with a new surrogate key, valid_from and a current flag.
+Fact rows load with the surrogate key that was current at the event time. So last year's revenue still reports under last year's plan, with no special query.
+The dimension grows with every change. A fast-changing attribute, such as a score that changes daily, should go to its own mini dimension or into the fact table.
+used: Kimball slowly changing dimension type 2; dbt snapshots; Delta Lake MERGE and Spark Declarative Pipelines AUTO CDC with SCD type 2.
+avoid: When only the current value matters; type 1 (overwrite) is simpler.
+flow:
+  CRM change feed [log: customer changes] -> Dimension loader [svc: MERGE job] : plan free to pro | The loader receives a change for customer 42.
+  Dimension loader -> Customer dim [db: SCD type 2] : close row sk=7 | The old row gets valid_to set to today and the current flag turned off.
+  Dimension loader -> Customer dim : insert row sk=19 | A new row is inserted with a new surrogate key and the pro plan.
+  Order events [log] -> Fact loader [svc: lookup by time] : order at day 3 | The fact loader finds the dimension row that was valid on the order date.
+  Fact loader -> Order facts [db: stores sk] : write sk=7 | The order keeps sk 7, so it still reports under the free plan.
+ref: book | The Data Warehouse Toolkit, 3rd ed. | Ralph Kimball & Margy Ross, Wiley, 2013 |
+
+== Aggregate fact tables for dashboards
+kind: pre-aggregation, star-schema
+when: Dashboards run the same group-by on billions of fact rows, and the raw scan is too slow or too costly.
+how: Keep the atomic fact table, with one row per event, as the source of truth. Build a second fact table at a coarser grain, for example one row per campaign per day. It has the same dimension keys but fewer of them.
+A scheduled job refreshes only the new days, for example every hour for the last 3 days, because late events change recent days only. Dashboards read the small table: 10 billion impressions a day may shrink to a few million rows.
+The aggregate must be additive. Sums and counts are safe. Distinct counts are not, so store a sketch (HyperLogLog) or recompute from the atomic table.
+used: Warehouse summary tables and dbt incremental models; ad reporting stacks with hourly and daily rollups; BigQuery and Snowflake materialized views.
+avoid: When users need ad hoc drill down to single events; keep access to the atomic table.
+flow:
+  Atomic facts [db: 10B rows per day] -> Rollup job [svc: hourly job] : read new partitions | The job reads only partitions that late events could have changed.
+  Rollup job -> Daily campaign agg [db: few million rows] : upsert | Rows per campaign and day are replaced with fresh sums.
+  Dashboard [client] -> Daily campaign agg : weekly spend | The dashboard reads the small table and answers in milliseconds to seconds.
+  Analyst [user] -> Atomic facts : drill into one event | For rare detail questions the analyst goes to the atomic table.
+ref: book | The Data Warehouse Toolkit, 3rd ed. | Ralph Kimball & Margy Ross, Wiley, 2013 |
+
+@@ eventsourcing
+== Event store with optimistic concurrency
+kind: event-sourcing
+when: You need a full history of every change, with correct state under concurrent writers.
+how: Each aggregate, such as one order, has its own stream of events: OrderPlaced, ItemAdded, OrderPaid. The current state is not stored. It is computed by applying the events in order.
+To handle a command, the service loads the stream, rebuilds the state, checks the business rules and appends new events. The append states the version it expects, for example "append at version 12". If another writer has already added event 12, the store rejects the append. The service reloads and decides again.
+Long streams are slow to load. So the service saves a snapshot every N events, for example every 100, and loads from the snapshot plus the later events.
+Events are facts about the past. They are never edited. Fixes are new events, such as OrderCorrected.
+used: EventStoreDB (KurrentDB), Axon Framework, banking and ledger systems; Marten on PostgreSQL.
+avoid: For simple CRUD data where nobody needs the history; a plain table is much easier.
+flow:
+  Command handler [svc] -> Event store [log: stream order-7] : load events 1 to 12 | The handler reads the stream, or the last snapshot plus later events.
+  * Command handler: state rebuilt | State is a fold over the events: items, total, paid or not.
+  Command handler -> Event store : append at version 12 | The handler appends OrderPaid and states that it expects the stream to be at version 12.
+  Event store -x> Command handler : version conflict | A second writer already wrote event 12, so this append is rejected.
+  Command handler -> Event store : reload and retry | The handler reloads the stream, applies the rules again and appends at version 13.
+  Event store -> Snapshot store [store: every 100 events] : save snapshot | A snapshot lets the next load skip the early events.
+ref: blog | Event Sourcing | Martin Fowler, 2005 | https://martinfowler.com/eaaDev/EventSourcing.html
+
+== CQRS read model built by a projection
+kind: cqrs, materialized-view
+when: Reads need a different shape from the event stream, and reads far outnumber writes.
+how: The write side only appends events. A projection process reads the event stream in order and updates a read model that fits one query: a row per order in a SQL table, a document in a search index, a counter in Redis.
+The projection saves the position of the last event it applied, in the same transaction as the update. After a crash it resumes from that position. This keeps the read model correct even if the same event is delivered twice.
+The read model is eventually consistent. For some milliseconds to seconds, a user may not see their own write. Common fixes are to return the new version from the command and let the UI wait for it, or to read from the write side for that one screen.
+used: Axon, EventStoreDB subscriptions, Marten projections; Kafka consumers that build search indexes and caches from event topics.
+avoid: When users must always read their own write at once and the system is small; one database with joins is enough.
+flow:
+  Client [client] -> Command API [svc] : PlaceOrder | A command arrives on the write side.
+  Command API -> Event store [log: source of truth] : append OrderPlaced #88 | The API appends one event; this is the only write.
+  Event store -> Projection [svc: pos 87] : stream events | The projection reads events in order from its saved position.
+  Projection -> Orders read DB [db: row per order] : upsert + save pos 88 | One transaction updates the row and the saved position together.
+  Client -> Orders read DB : GET /orders/42 | Queries read the table directly; they never touch the event store.
+  * Projection: pos 88 | The projection is now up to date; before this a read could show old data.
+ref: blog | CQRS | Martin Fowler, 2011 | https://martinfowler.com/bliki/CQRS.html
+
+== Rebuild a projection by replaying all events
+kind: event-sourcing, backfill-replay
+when: A read model has a bug, or a new screen needs data that was never projected, and the history still exists.
+how: Because the event log is the source of truth, any read model is disposable. To fix a projection, deploy version 2 of the projector beside version 1. It reads the whole stream from event 0 and writes into a new table or index.
+Replay runs faster than live traffic by batching writes, for example 5,000 events per batch. While it runs, version 1 still serves users. When version 2 reaches the head of the log, readers switch to the new table, and the old one is dropped.
+This only works if old events are still understood. So events need versions and upcasters, small functions that turn an old event shape into the current one. Events that contained personal data are a problem for deletion rules, so many teams encrypt them per user and delete the key.
+used: Axon replay of tracking event processors; EventStoreDB catch-up subscriptions; Kafka consumers started with a new group id.
+avoid: When the log is huge and the rebuild would take days; use snapshots of the read model, or keep stream length small by closing old streams.
+flow:
+  Event store [log: 40M events] -> Projector v1 [svc: live] : head of log | Version 1 keeps serving the live read table.
+  Event store -> Projector v2 [svc: replaying] : from event 0 | Version 2 starts at event 0 and reads in large batches.
+  Projector v2 -> Read table v2 [db] : batch of 5,000 | Version 2 writes into a new table, so users are not affected.
+  * Projector v2: caught up | Version 2 has reached the head of the log.
+  App [client] -> Read table v2 : switch reads | The app reads from table v2, and version 1 and its table are removed.
+ref: book | Versioning in an Event Sourced System | Greg Young, Leanpub, 2017 |
+@@ lambdakappa
+== Lambda: batch layer, speed layer, merged at query time
+kind: lambda-arch
+when: You need exact results over all history and also fresh results for the last few minutes, and your stream engine alone is not trusted for exactness.
+how: Every event goes to an immutable master dataset (files on HDFS or S3) and, at the same time, to a stream. The batch layer recomputes views from all the data, for example every 6 hours, with a job such as Spark. These views are exact.
+The speed layer processes only the events since the last batch run and keeps small, approximate views, for example in Redis or Cassandra. When the next batch finishes, the speed layer drops the data that the batch has now covered.
+A serving layer answers a query by merging the batch view and the speed view. The cost is two code bases for the same logic. They drift apart, and bugs show as numbers that differ between old and new data.
+used: Nathan Marz's original design at Twitter and BackType; many ad-reporting systems before streaming engines became exact.
+avoid: When one streaming engine with exactly-once state can serve both needs; use Kappa to keep one code path.
+flow:
+  Event source [svc] -> Master dataset [lake: immutable files] : append | Every event is appended to the master dataset, which is never edited.
+  Event source -> Speed job [svc: Flink or Storm] : stream | The same events also go to the stream job.
+  Master dataset -> Batch job [svc: every 6 hours] : read all history | The batch job recomputes the exact view from all data.
+  Batch job -> Batch view [db: exact] : write view | Batch results replace the old batch view.
+  Speed job -> Realtime view [cache: last 6 hours] : incremental update | Recent events update a small approximate view.
+  Dashboard [client] -> Batch view, Realtime view : query and merge | The query merges the exact old part with the fresh recent part.
+ref: book | Big Data: Principles and best practices of scalable realtime data systems | Nathan Marz & James Warren, Manning, 2015 |
+
+== Stream estimates corrected by a nightly batch
+kind: lambda-arch, backfill-replay
+when: Late or duplicate events change yesterday's totals, and money reports must end up exact.
+how: Ad impressions and clicks can arrive hours late from devices and partners. A streaming job counts what it sees now and publishes estimates with a small time delay. These feed pacing and live dashboards.
+A nightly batch job reads all raw events for the day, removes duplicates by event id, applies late data and writes final numbers to a day partition. Billing and finance read only the final numbers.
+When the final partition is written, it replaces the estimate for that day. Users may see a number change by a small percent. Teams should say so in the dashboard, for example by marking today as "preliminary".
+The batch job must be idempotent, so that a rerun for a day gives the same result and a failed run is simply started again.
+used: Ad tech reporting pipelines with hourly estimates and a daily reconciled table; payment platforms with a stream view and a settled ledger.
+avoid: When the stream job already handles late data with watermarks and all consumers accept a short correction window.
+flow:
+  Raw events [lake: all arrivals] -> Stream job [svc: low latency] : read now | The stream job counts events as they arrive and does not wait for late ones.
+  Stream job -> Live table [db: preliminary] : hourly estimates | Pacing and dashboards read this table.
+  Raw events -> Nightly batch [svc: dedup + late data] : read full day | After midnight the batch job reads every event of the day, late ones too.
+  Nightly batch -> Final table [db: day partition] : overwrite day | The day partition is replaced with exact numbers; a rerun gives the same result.
+  Billing [svc] -> Final table : read final | Billing uses only final numbers, never the estimates.
+  * Live table: replaced by final | For that day, readers now see the exact numbers.
+ref: blog | Questioning the Lambda Architecture | Jay Kreps, O'Reilly Radar, 2014 | https://www.oreilly.com/radar/questioning-the-lambda-architecture/
+
+== Kappa cutover with a dual-run check
+kind: kappa-arch, blue-green
+when: You replace a streaming job with a new version and want proof that the new output is right before users move.
+how: In a Kappa system the log is the only source. So a new version of the job starts as a new consumer group at an earlier offset and writes to a new output table. The old version keeps running.
+Before the cutover, a comparison job reads both outputs for the same closed windows, for example the last 24 complete hours. It counts rows that differ and the total difference. A rule such as "less than 0.1 percent of windows differ" decides the cutover.
+Then the readers are pointed at the new table, which is a blue-green switch of data. The old job and table are kept for a few days to allow a fast rollback.
+The cost is that you run two jobs and two tables at the same time, and the log must keep enough history to rebuild the state.
+used: Flink and Kafka Streams teams that redeploy jobs with a new application id; analytics teams that migrate a pipeline from Spark Streaming to Flink.
+avoid: When the output cannot be compared, for example a model with random sampling; use canary traffic and metrics instead.
+flow:
+  Event log [log: retained 14 days] -> Job v1 [svc: serving] : head of log | Version 1 serves all readers from the head of the log.
+  Event log -> Job v2 [svc: shadow] : from 3 days ago | Version 2 starts at an earlier offset and writes to its own table.
+  Job v1 -> Table v1 [db] : results | Version 1 keeps writing its table.
+  Job v2 -> Table v2 [db] : results | Version 2 writes the new table in parallel.
+  Table v1, Table v2 -> Diff checker [svc: closed windows] : compare 24 hours | The checker compares complete windows and counts the differences.
+  Diff checker -> Dashboard [client] : 0.02 percent differ | The difference is under the limit, so readers switch to table v2.
+ref: blog | Questioning the Lambda Architecture | Jay Kreps, O'Reilly Radar, 2014 | https://www.oreilly.com/radar/questioning-the-lambda-architecture/
+
+@@ medallion
+== Bronze, silver, gold tables on a lakehouse
+kind: medallion, open-table-format
+when: Raw data from many sources must become trusted business tables, and each step should be repeatable and easy to check.
+how: Bronze holds the data as it arrived: same columns, plus load time and source file. Nothing is dropped. Silver cleans it: it removes duplicates, fixes types, applies rules and joins to reference data. Gold holds business tables, such as daily revenue by campaign.
+Each layer is a set of tables in an open table format such as Delta Lake or Apache Iceberg, so every step has ACID writes and time travel. Each layer reads only from the layer before it.
+Bronze is the safety net. If a rule in silver was wrong, you fix the code and rebuild from bronze, with no need to ask the source again. The cost is storage for three copies and some delay at each step.
+used: Databricks lakehouse guidance (the term medallion comes from there); Delta Lake and Iceberg lakehouses on S3, ADLS and GCS.
+avoid: For a small dataset with one consumer; one cleaned table is enough.
+flow:
+  Source files [lake: CSV and JSON] -> Bronze table [lake: raw + load time] : ingest as is | Raw rows are appended with the file name and the load time.
+  Bronze table -> Silver table [lake: cleaned] : dedup and cast | The job removes duplicates by key and fixes the column types.
+  Silver table -> Gold table [lake: daily revenue] : aggregate | Business logic builds one table per use, such as daily revenue.
+  Gold table -> BI dashboard [client] : SQL | Analysts read only gold, and never see raw data.
+  Silver table -> ML features [svc: training job] : read | Data scientists often read silver, because it has the detail.
+ref: docs | What is the medallion lakehouse architecture? | Databricks documentation | https://docs.databricks.com/aws/en/lakehouse/medallion
+
+== Quarantine of bad rows between layers
+kind: medallion, dead-letter
+when: Some rows break the rules, and one bad row must not stop a pipeline or silently vanish.
+how: The silver job checks every bronze row against rules, such as "user id is not null" and "price is at least 0". Valid rows go to the silver table. Invalid rows go to a quarantine table, together with the rule they broke and the bronze row id.
+Because the failed rows are kept, a person can look at them. Often the cause is one source change, for example a new date format. After the fix, the team replays the quarantined rows into silver.
+The job also counts rejects. If more than a set limit fails, for example 2 percent of a batch, the job stops and alerts, because this is no longer one bad row but a broken source.
+The limit is a business choice. A strict limit stops often. A loose limit lets quality drift down without notice.
+used: Databricks pipeline expectations with drop and fail actions; Great Expectations and dbt tests with a store-failures option; Spark jobs with a bad-records path.
+avoid: When any bad row must stop the load at once, for example a financial close; fail the job instead.
+flow:
+  Bronze table [lake: raw] -> Silver job [svc: rules] : read batch | The job reads a new batch of raw rows.
+  Silver job -> Silver table [lake: valid rows] : 49,000 valid rows | Rows that pass every rule are written to silver.
+  Silver job -x> Quarantine table [lake: rejected + reason] : 1,000 failed rows | Failed rows are kept with the rule name and bronze row id.
+  Silver job -> Alert [svc: on-call] : 2 percent rejected | The reject rate equals the limit, so the team is told at once.
+  Data engineer [user] -> Quarantine table : inspect | The engineer finds one source sending a new date format.
+  Quarantine table ~> Silver table : replay after fix | After the code fix the rejected rows are reprocessed into silver.
+ref: docs | Manage data quality with pipeline expectations | Databricks documentation | https://docs.databricks.com/aws/en/dlt/expectations
+
+== Rebuild silver and gold from bronze
+kind: backfill-replay, medallion
+when: A transformation rule was wrong, or the business changed a definition, and old data must be recomputed.
+how: Bronze keeps the raw input, so silver and gold are functions of bronze. To fix a bug, the team corrects the code and reruns the pipeline over the affected dates.
+Each run writes by date partition and replaces that partition. A second run gives the same answer. This is what idempotent means here, and it makes backfills safe to retry.
+Rebuilds run at the layer that needs it. A bug in gold only needs gold rebuilt from silver, which is cheaper. A bug in silver needs silver and gold rebuilt.
+Table formats help: Delta or Iceberg write the new files and then switch the table in one commit. Readers see old data until the switch and new data after it, never a mix. Time travel lets the team compare before and after.
+used: Databricks and Spark lakehouses; dbt full refresh with partition overwrite; Airflow backfill by date range.
+avoid: When bronze was not kept, or when the source holds the only copy and deletes it; then history cannot be rebuilt.
+flow:
+  Engineer [user] -> Silver job [svc: fixed code] : backfill May 1-7 | After fixing the rule, the engineer starts the job for one week.
+  Bronze table [lake: raw] -> Silver job : read 7 partitions | Raw rows for those days are read again.
+  Silver job -> Silver table [lake: partition overwrite] : replace 7 days | Seven day partitions are replaced in one atomic commit.
+  Silver table -> Gold job [svc: aggregates] : changed days | Gold is recomputed only for the days that changed.
+  Gold job -> Gold table [lake] : replace 7 days | Readers see the old numbers until the commit and the new ones after it.
+  Gold table -> BI dashboard [client] : corrected numbers | The dashboard shows the corrected week without any change on its side.
+ref: docs | Delta Lake: time travel and table history | Delta Lake documentation | https://docs.delta.io/latest/delta-batch.html
+
+@@ dataquality
+== Expectations gate inside the pipeline
+kind: pipes-filters, dead-letter
+when: Bad data must be caught where it enters a table, not by a user a week later.
+how: Each pipeline step ends with checks written as code: not null, unique key, value ranges, accepted values, and foreign keys. The checks run with the step, on the data that was just produced.
+Each check has an action. Warn only records the failure. Drop removes the bad rows and keeps them in a side table. Fail stops the pipeline so that bad data never reaches the next table.
+Pick the action by cost. A failed check on a revenue table should fail the run. A failed check on an optional field can just warn.
+Checks should be few and chosen on purpose. Hundreds of checks that nobody reads become noise. Start with keys, nulls on required columns, and one rule per business fact.
+used: dbt tests, Great Expectations, Soda, Databricks pipeline expectations, Deequ on Spark.
+avoid: When data is free-form and has no stable shape; use profiling and monitoring there, and not hard gates.
+flow:
+  Raw table [lake] -> Transform step [svc: model run] : read | The step reads its input table and builds the new table.
+  Transform step -> Check suite [svc: dbt tests] : not null, unique, range | The checks run on the new table right after the build.
+  Check suite -> Next table [lake: trusted] : pass | If all checks pass, the table is used by the next step.
+  Check suite -x> Pipeline run [svc: orchestrator] : unique key failed | A failed check on a required rule stops the run.
+  Check suite ~> Reject table [lake: failed rows] : rows kept | With a drop action, the bad rows go to a side table.
+  Pipeline run -> On-call [user] : page with check name | The owner sees which rule failed, so the fix is fast.
+ref: docs | Data tests | dbt documentation | https://docs.getdbt.com/docs/build/data-tests
+
+== Write, audit, publish
+kind: none
+when: Readers must never see a table that has not passed its checks.
+how: The pipeline writes new data to a hidden place: a staging table, a branch, or a new table version that no reader uses. It then runs the audit checks on that hidden copy. Only if they pass does it publish, by one atomic step such as a partition swap, a table rename or a branch merge.
+If a check fails, nothing is published. Readers keep the last good version, and the failed copy stays for the team to inspect. No clean-up of bad data in the main table is needed.
+This is stricter than checks after the load. After-the-load checks find bad data that users could already read. Write-audit-publish costs extra storage and a short delay for the audit.
+Table formats make it cheap: Iceberg branches and Delta clone create the hidden copy without copying all the files.
+used: Apache Iceberg branches and tags; lakeFS and Project Nessie branches; dbt runs that swap tables after the tests pass.
+avoid: For low-value tables where a short period of bad data is harmless.
+flow:
+  Pipeline [svc: nightly run] -> Staging branch [lake: not visible] : write new data | The new data goes to a branch that readers do not use.
+  Pipeline -> Audit checks [svc: counts and nulls] : run on staging | The checks run on the staging copy.
+  Audit checks -x> Pipeline : count dropped 40 percent | A big drop in row count fails the audit.
+  Pipeline -> On-call [user] : not published | The team is told and inspects the staging copy.
+  Pipeline -> Main table [lake: readers use this] : merge branch | After a fix and a pass, one atomic merge publishes the data.
+  BI dashboard [client] -> Main table : read | Readers always see a version that passed its audit.
+ref: docs | Branching and tagging | Apache Iceberg documentation | https://iceberg.apache.org/docs/latest/branching/
+
+== Freshness and volume monitors with alerts
+kind: observability-pipeline
+when: Tables look fine to checks but data stops arriving, or the volume or shape changes slowly.
+how: A monitor reads metadata, not full data: the last update time, the row count per day and the null rate per column. It stores these numbers as a time series.
+Rules and simple models compare each new value with its past. Freshness: "the table must update within 2 hours". Volume: "today's row count must be within 3 standard deviations of the same weekday in the last 8 weeks". Distribution: "the share of null countries must not jump".
+A breach opens an alert that names the table, the owner and the downstream tables that use it. This lineage helps an engineer judge the damage fast.
+Alert fatigue is the main risk. Tune the limits, group alerts by root cause and route them to the table owner, not to one shared channel.
+used: Monte Carlo, Soda, Elementary for dbt, Databricks data quality monitoring; common in teams that run hundreds of tables.
+avoid: For a few tables with stable loads; simple freshness tests in the orchestrator are enough.
+flow:
+  Warehouse [db: system tables] -> Monitor [svc: reads metadata] : last update, row count | The monitor reads counts and update times, not the data itself.
+  Monitor -> Metrics store [db: history by day] : save today | Each day's numbers are added to the history.
+  Metrics store -> Monitor : same weekday, 8 weeks | The monitor compares today with the usual range for this weekday.
+  Monitor -> Alert router [svc: owner + lineage] : volume down 60 percent | A big drop is sent with the table name and the owner.
+  Alert router -> Table owner [user] : page + affected dashboards | The owner learns which downstream dashboards are at risk.
+ref: book | Data Quality Fundamentals | Barr Moses, Lior Gavish & Molly Vorwerck, O'Reilly, 2022 |
+
+@@ declpipelines
+== Declared tables as an incremental dependency graph
+kind: materialized-view, medallion
+when: A pipeline has many tables that depend on each other, and you want the engine to order, refresh and recover them.
+how: You declare each table as a query on other tables, for example "silver_orders is a select from bronze_orders". You do not write the order of runs or the update code. The engine reads the references and builds a dependency graph.
+On each update the engine runs tables in graph order, in parallel where it can. Streaming tables read only new input and keep their progress in a checkpoint, so they continue after a failure. Materialized views refresh by processing only the changes in their inputs when the query allows it, and by a full recompute when it does not.
+Because a table is a function of its inputs, a refresh can be repeated safely. The price is less control: you give up custom update code, and some queries (for example, with non-deterministic functions) cannot refresh incrementally.
+used: Spark Declarative Pipelines (new in Spark 4.1); Databricks Lakeflow Declarative Pipelines (formerly Delta Live Tables); Materialize and dbt for similar models.
+avoid: When you need fine control of each write or unusual side effects; use a normal job with an orchestrator.
+flow:
+  Pipeline code [store: table definitions] -> Pipeline engine [svc: builds the graph] : bronze, silver, gold | The engine reads the table definitions and finds that gold depends on silver.
+  Pipeline engine -> Bronze stream [lake: streaming table] : read new files | The streaming table reads only files that are new since the checkpoint.
+  Bronze stream -> Silver stream [lake: streaming table] : new rows only | Only the new rows move to the next table.
+  Silver stream -> Gold view [lake: materialized view] : changed rows | The view updates from changes and does not scan all of silver.
+  * Gold view: refreshed | The view is now up to date with the latest silver data.
+  Pipeline engine -x> Silver stream : task failed | A failed task is retried from its checkpoint, with no duplicates.
+ref: docs | Spark Declarative Pipelines Programming Guide | Apache Spark documentation | https://spark.apache.org/docs/latest/declarative-pipelines-programming-guide.html
+
+== Change feed to a history table with AUTO CDC
+kind: cdc, materialized-view
+when: A source sends inserts, updates and deletes, possibly out of order, and you need the current table or its full history.
+how: The source database streams row changes into a bronze table. Each change has a key, an operation and a sequence number (for example the log position). You declare a target table with the key and the sequence column, and say whether to keep only the latest row (SCD type 1) or all versions (type 2).
+The engine applies each change by key and orders them by the sequence number, not by arrival time. A late change with an older sequence number does not overwrite a newer row. A delete marks the row deleted, or removes it.
+You do not write MERGE statements and no custom ordering logic. The engine also handles retries, because applying the same change twice gives the same result.
+Type 2 doubles as a history table: each version gets start and end columns, so you can ask what the data looked like last month.
+used: Lakeflow Declarative Pipelines AUTO CDC (the former APPLY CHANGES INTO) and Spark Declarative Pipelines; Debezium or Kafka as the source feed.
+avoid: When the source gives no key or no sequence value; then ordering cannot be trusted, and a full snapshot compare is safer.
+flow:
+  Source DB [db: orders] -> Change feed [log: key, op, seq] : insert, update, delete | Row changes are streamed with a key, an operation and a sequence number.
+  Change feed -> Bronze changes [lake: raw feed] : append | The feed is stored as it arrived.
+  Bronze changes -> AUTO CDC flow [svc: order by seq] : read new changes | The flow reads the new changes and sorts them by sequence number.
+  AUTO CDC flow -> Orders current [lake: SCD type 1] : upsert by key | The latest version of each key is kept.
+  AUTO CDC flow -> Orders history [lake: SCD type 2] : close and open rows | Each change closes the old row and opens a new one.
+  Bronze changes -x> AUTO CDC flow : late change seq 12 | A change older than the stored one is ignored for the current table.
+ref: docs | The AUTO CDC APIs: simplify change data capture | Databricks documentation | https://docs.databricks.com/aws/en/dlt/cdc
+
+== dbt models as a build-ordered DAG of SELECTs
+kind: etl-elt, pipes-filters
+when: Your data is already in a warehouse, and analysts should build and test transformations as SQL in version control.
+how: Each model is one SELECT statement in a file. Models refer to each other with ref('other_model'). dbt reads these references and builds the dependency graph, then runs models in order, each as a table, a view or an incremental model.
+An incremental model processes only new rows, for example where event_time is later than the largest time already in the table. A full refresh rebuilds it from scratch.
+Tests and documentation live next to the models. A CI run builds only the models that changed and their children, so a pull request is checked in minutes.
+dbt does the transform step only. Loading raw data and scheduling are done by other tools, such as Fivetran, Airbyte, Airflow or dbt's own scheduler.
+used: Most analytics teams on Snowflake, BigQuery, Redshift, Databricks and Postgres; dbt Core is open source.
+avoid: For streaming or sub-minute freshness; use a streaming engine or declarative streaming tables.
+flow:
+  Model files [store: SELECT + ref] -> dbt [svc: builds graph] : parse refs | dbt finds that mart_revenue depends on stg_orders.
+  dbt -> Warehouse [db: SQL engine] : run stg_orders | The first model runs inside the warehouse as one SQL statement.
+  dbt -> Warehouse : run mart_revenue | The next model runs after its parents are finished.
+  Warehouse -> dbt : rows written | The warehouse reports success, and dbt runs the tests on the new tables.
+  dbt -x> CI job [svc: pull request] : test failed | A failed test marks the pull request as broken before it can merge.
+ref: docs | About dbt models | dbt documentation | https://docs.getdbt.com/docs/build/models
+@@ cdc
+== Log-based CDC feeding a search index
+kind: cdc, polyglot-persistence
+when: Another system, such as a search index or a cache, must follow a database without slowing it and without changes to the application.
+how: A CDC tool such as Debezium reads the database's own change log: the WAL in PostgreSQL, the binlog in MySQL. It turns every committed insert, update and delete into an event with the key, the old row, the new row and the log position.
+The events go to a Kafka topic, one topic per table. A sink connector or a small consumer reads the topic and updates Elasticsearch or OpenSearch. Delete events remove documents.
+The tool saves the log position, so after a restart it continues where it stopped. Delivery is at least once. The consumer should write by key, so that a duplicate has no effect.
+The source database pays only a small read cost. It must keep log files until the connector has read them. If a connector is down too long, the log grows and can fill the disk.
+used: Debezium with Kafka Connect; AWS DMS; Maxwell for MySQL; common for search, cache and data warehouse sync.
+avoid: When the application can publish its own events in the same transaction (the outbox pattern gives richer business events).
+flow:
+  Postgres [db: orders table] -> Debezium [svc: reads WAL] : committed row change | Debezium reads the log of committed changes, not the table.
+  Debezium -> orders.changes [log: key = order id] : before, after, LSN | Each change becomes an event with the old row, the new row and the log position.
+  orders.changes -> Index sink [svc: upsert by key] : poll | The sink reads events in order for each key.
+  Index sink -> Search index [store: one doc per order] : upsert doc 42 | The document is written by key, so a duplicate does no harm.
+  Postgres -x> Debezium : connector down 2 hours | While Debezium is down, Postgres keeps the WAL files it has not yet read.
+  Debezium -> orders.changes : resume from saved LSN | The connector resumes from its saved position and catches up.
+ref: docs | Debezium architecture | Debezium documentation | https://debezium.io/documentation/reference/stable/architecture.html
+
+== CDC into a lake: changelog, then merge
+kind: cdc, medallion
+when: You want a current copy of operational tables in the lake for analytics, with history and no heavy queries on the source.
+how: CDC events land first in a bronze changelog table, as append-only rows with key, operation, commit time and log position. Nothing is changed in place, so the full history of changes is kept.
+A periodic job, for example every 5 to 15 minutes, takes the new changes. For each key it keeps the latest change by log position and runs a MERGE into the silver table: insert, update or delete. Delta Lake, Apache Iceberg and Apache Hudi support MERGE.
+Silver is a current-state copy of the source table. Because bronze keeps every change, you can rebuild silver or ask for the state at a past time.
+Pitfalls: schema changes in the source must be handled, deletes must be applied, and small files pile up if the merge runs too often.
+used: Debezium to Kafka to Delta, Iceberg or Hudi; Databricks and Snowflake ingestion tools; Flink CDC.
+avoid: When daily snapshots are enough; a full copy each night is simpler and has no merge logic.
+flow:
+  MySQL [db: binlog] -> CDC connector [svc: Debezium or Flink CDC] : row changes | The connector reads binlog events as they commit.
+  CDC connector -> Bronze changelog [lake: append only] : key, op, position | Every change is appended as a new row.
+  Bronze changelog -> Merge job [svc: every 10 minutes] : latest per key | The job keeps only the last change for each key by log position.
+  Merge job -> Silver table [lake: current state] : MERGE changes | One atomic commit applies the changes to the silver table.
+  BI tool [client] -> Silver table : SQL | Analysts query a table that is minutes behind the source.
+ref: docs | Debezium documentation | Debezium project | https://debezium.io/documentation/reference/stable/
+
+== Snapshot, then stream, with no stop-the-world
+kind: cdc, backfill-replay
+when: You add CDC to a table that already holds millions of rows, or you need to refill a table, and writes must not stop.
+how: The log holds only recent changes, so a new consumer needs the old rows too. The simple way is a lock and a full copy, but that blocks writes. Modern tools read the table in chunks, for example 10,000 rows ordered by primary key, while the log is still being read.
+To keep the result correct, the tool uses watermarks. It writes a low mark into the log, reads a chunk, writes a high mark, and then drops any chunk row whose key changed between the marks in the log, because the log event is newer.
+Chunks are small, so each reads for milliseconds, and the tool can pause and resume from the last key. A new chunk run can also be started at any time to repair a target.
+used: Debezium incremental snapshots; Netflix DBLog, which introduced the watermark idea; Flink CDC 3.x incremental snapshot.
+avoid: For tiny tables; a one-time dump is enough.
+flow:
+  Snapshot reader [svc: chunked reads] -> Source DB [db: 50M rows] : SELECT id 1..10000 | The reader selects one small chunk by primary key.
+  Snapshot reader -> Source DB : write low mark | A mark is written to the log before the chunk is read.
+  Source DB -> Event stream [log: changes + chunks] : log events | Live changes keep flowing to the stream at the same time.
+  Snapshot reader -> Event stream : chunk rows + high mark | The chunk rows and a high mark are added to the stream.
+  Snapshot reader -x> Event stream : drop row id 7 | Row 7 changed between the marks, so the log event wins over the chunk row.
+  Event stream -> Target table [db] : ordered apply | The target applies one ordered stream of snapshot rows and changes.
+ref: paper | DBLog: A Watermark Based Change-Data-Capture Framework | Andreakis & Papapanagiotou, Netflix, 2020 | https://arxiv.org/abs/2010.12597
+
+@@ commitlog
+== Replicated partition with in-sync replicas
+kind: leader-follower, wal
+when: An append-only log must survive broker failures without losing acknowledged records.
+how: Each partition has one leader and several followers on other brokers, for example replication factor 3. Producers send to the leader. The leader appends to its log and followers fetch the new records.
+The set of followers that are fully caught up is the in-sync replica set (ISR). With acks=all, the leader replies only when every ISR member has the record. Setting min.insync.replicas=2 means a write fails if fewer than 2 replicas are in sync, so you never get an acknowledged write on a single machine.
+If the leader fails, the controller picks a new leader from the ISR. Records that were acknowledged exist on every ISR member, so none is lost.
+The trade: acks=all and a larger ISR add latency, and a small ISR makes writes fail when brokers are down.
+used: Apache Kafka, Redpanda (uses Raft for each partition), and Pulsar (uses BookKeeper quorum writes); the same idea in AWS Kinesis.
+avoid: For data you can lose, such as debug metrics; acks=1 is faster and cheaper.
+flow:
+  Producer [client: acks=all] -> Leader broker [log: partition 0] : produce batch | The producer sends a batch to the leader of partition 0.
+  Leader broker -> Follower A [log: ISR], Follower B [log: ISR] : fetch records | Both followers pull the new records from the leader.
+  Follower A -> Leader broker : caught up | Follower A confirms that it has the batch.
+  Follower B -> Leader broker : caught up | Follower B also confirms.
+  Leader broker -> Producer : ack | The leader acknowledges only now, after all ISR members have it.
+  Leader broker -x> Follower A : broker crash | The leader fails.
+  * Follower B: new leader | The controller chooses follower B from the ISR; no acknowledged record is lost.
+ref: docs | Kafka design: replication | Apache Kafka documentation | https://kafka.apache.org/documentation/#replication
+
+== Compacted topic as a table changelog
+kind: lsm-compaction, materialized-view
+when: A service needs the latest value per key, such as user settings, rebuilt quickly after a restart, and a full history is not needed.
+how: A topic with cleanup.policy=compact keeps at least the last record for each key. A background cleaner rewrites old segment files and drops older records of the same key. A record with a null value (a tombstone) means delete, and it is removed after a delay.
+The log is now a changelog of a table. A consumer that reads it from the start gets the latest value for every key, and keeps reading to stay current. The log is as large as the number of keys, and not the number of changes.
+Kafka Streams uses this to back its local state stores. If an instance dies, a new one reads the compacted changelog topic and rebuilds the store.
+Order within a key is kept, but old values are gone. Compaction runs in the background, so readers may still see several records for one key for a while.
+used: Kafka Streams changelog topics and ksqlDB tables; the Kafka __consumer_offsets topic; Kafka Connect storing its configs and offsets.
+avoid: When the full history of changes is needed; use time-based retention or keep the history in a lake.
+flow:
+  Writer [svc] -> user-settings topic [log: compacted] : key=u1, theme=dark | The writer sends the latest value for key u1.
+  Writer -> user-settings topic : key=u1, theme=light | A newer record for the same key arrives.
+  user-settings topic -> Cleaner [svc: background] : old segments | The cleaner finds old segments with older values for the same key.
+  Cleaner -> user-settings topic : keep only theme=light | The old record for u1 is dropped.
+  New service instance [svc: cold start] -> user-settings topic : read from offset 0 | A new instance reads the topic from the start.
+  New service instance -> Local store [db: RocksDB] : latest per key | It rebuilds its table, one row per key.
+ref: docs | Kafka design: log compaction | Apache Kafka documentation | https://kafka.apache.org/documentation/#compaction
+
+== Tiered storage for long retention
+kind: tiered-storage
+when: Consumers need weeks or months of history in the log, and keeping all of it on broker disks is too costly.
+how: Each partition is a list of segment files. Only the active segment is written. A broker keeps the recent segments on local disks (the hot tier), for example the last 2 days. Older closed segments are copied to object storage such as S3 (the remote tier) and then removed from local disk.
+Consumers do not change. A consumer that reads recent data is served from the page cache or local disk. A consumer that starts at an old offset triggers a read from S3 through the broker, which is slower but works.
+Brokers become small and quick to replace, because less data must be copied on a failure. Retention is limited by object storage cost and not by disk size. For example, 100 TB for 90 days costs far less on S3 than on replicated broker SSDs.
+used: Apache Kafka tiered storage (KIP-405, production ready since Kafka 3.9); Confluent Cloud; Redpanda tiered storage; Pulsar offloaders.
+avoid: When all consumers read only the last few minutes; local disks alone are simpler.
+flow:
+  Producer [client] -> Broker [log: hot tier 2 days] : append | New records go to the active segment on local disk.
+  Broker -> Object store [lake: remote tier] : copy closed segments | Closed segments older than the local limit are uploaded.
+  * Broker: local copy deleted | After the upload the local file is deleted to free the disk.
+  Live consumer [client] -> Broker : fetch recent offset | A live consumer reads from the page cache or local disk.
+  Replay job [svc] -> Broker : fetch old offset | A replay job asks for old data.
+  Broker -> Object store : read remote segment | The broker reads the old segment from object storage and serves it to the job.
+ref: docs | Kafka tiered storage | Apache Kafka documentation | https://kafka.apache.org/documentation/#tiered_storage
+
+@@ graphdb
+== Graph store as a read model for relationship queries
+kind: cqrs, cdc, polyglot-persistence
+when: Questions follow links through many hops, such as friends of friends or shared devices, and joins in the main database are too slow.
+how: The system of record stays in a relational or document database. A CDC stream or an event consumer copies the entities and links into a graph database such as Neo4j: users and devices become nodes, "uses" and "paid with" become edges.
+A query starts at a node and follows edges. With index-free adjacency, each node holds direct references to its neighbours, so the cost depends on the part of the graph visited and not on the total size. A 4 hop search in SQL needs four self-joins that grow fast.
+The graph is a derived copy. It can lag by seconds and can be rebuilt from the source if lost. Writes go to the source only.
+The cost is a second system to run, and graph queries that touch a large share of the graph (very popular nodes) are still slow.
+used: Neo4j and Amazon Neptune for fraud rings, recommendations and network maps; LinkedIn and Meta use their own graph stores at larger scale.
+avoid: When queries are simple lookups or aggregates; a relational database with indexes is cheaper to run.
+flow:
+  App [svc] -> Orders DB [db: system of record] : write order | All writes go to the main database.
+  Orders DB -> Sync job [svc: CDC consumer] : row changes | A CDC consumer reads the changes.
+  Sync job -> Graph DB [db: nodes + edges] : MERGE nodes, edges | The consumer creates or updates nodes and edges by key.
+  Fraud service [svc] -> Graph DB : MATCH 3 hops from card | The query follows card to device to other cards.
+  Graph DB -> Fraud service : 14 linked accounts | The result lists accounts that share a device with the card.
+  * Graph DB: lag 2 s | The graph is a copy, so it can be a few seconds behind the source.
+ref: book | Graph Databases, 2nd ed. | Robinson, Webber & Eifrem, O'Reilly, 2015 |
+
+== Knowledge graph behind retrieval for an LLM
+kind: rag, polyglot-persistence
+when: An LLM must answer questions that depend on how facts connect, and plain vector search returns pieces that miss the links.
+how: Documents are split and passed to an extractor, often an LLM, that finds entities and relations. These are stored as nodes and edges, and the chunks are stored with vector embeddings.
+At question time the system finds the entities in the question, uses vector search to find start nodes, and then expands a few hops in the graph to collect connected facts and chunks. This context is placed into the prompt, so the model can answer, for example, "which suppliers are affected by this port closing".
+Some designs also build summaries of graph communities, so broad questions such as "what are the main themes" can be answered.
+Costs: extraction is expensive and may create wrong edges, and the graph must be updated when documents change. Always return the source chunks so answers can be checked.
+used: Microsoft GraphRAG (open source); Neo4j GraphRAG tooling; knowledge graphs in enterprise search and product catalogs.
+avoid: When questions are about one passage; normal vector RAG is cheaper and simpler.
+flow:
+  Documents [lake: PDFs and pages] -> Extractor [svc: LLM] : chunks | The extractor reads chunks and finds entities and relations.
+  Extractor -> Graph DB [db: nodes + edges + vectors] : write triples + embeddings | Entities become nodes; relations become edges; chunks keep embeddings.
+  User [user] -> Retriever [svc: graph and vector] : question | A user asks a question that depends on links.
+  Retriever -> Graph DB : vector match, then 2 hops | The retriever finds start nodes and walks two hops to related facts.
+  Retriever -> LLM [model] : question + linked facts | The prompt contains the connected facts and source chunks.
+  LLM -> User : answer with sources | The answer cites the chunks, so a person can check it.
+ref: paper | From Local to Global: A Graph RAG Approach to Query-Focused Summarization | Edge et al., Microsoft Research, 2024 | https://arxiv.org/abs/2404.16130
+
+== Identity graph for resolving users and households
+kind: identity-graph
+when: One person or home appears under many ids, such as cookies, phones and TV devices, and you need one profile for ads or reports.
+how: Each identifier is a node. Each observed link, for example "this phone and this TV used the same login", is an edge with a source, a time and a confidence. Deterministic links come from logins and are strong. Probabilistic links, such as the same home IP address, are weaker.
+A job finds connected components, the groups of nodes that are linked, usually with Spark or a graph engine. Every group gets one entity id. Only edges above a confidence limit count, because one wrong strong edge can join two strangers into one huge group.
+The result is stored for lookup: device id to household id. Ad servers read it with a key lookup in a few milliseconds. The graph itself is rebuilt on a schedule or updated as new edges come.
+Privacy rules decide which links may be used. Opt-outs must delete nodes and edges.
+used: Ad tech and CTV identity vendors, and retailers' customer profile systems; built on Spark GraphFrames, Neo4j or in-house graph engines.
+avoid: When you have a single stable first-party id for every user; a plain key is enough.
+flow:
+  Login events [log] -> Edge builder [svc: scores links] : phone + TV same login | Shared logins create strong edges between devices.
+  IP logs [log] -> Edge builder : same home IP | Shared IP addresses create weaker edges with a lower score.
+  Edge builder -> Identity graph [db: nodes + edges] : edges above 0.8 | Only edges above the confidence limit are kept.
+  Identity graph -> Component job [svc: Spark] : connected groups | The job finds groups of linked ids.
+  Component job -> Lookup store [cache: device to household] : household 77 | Each device id is stored with its household id for fast lookup.
+  Ad server [svc] -> Lookup store : device id | The ad server reads the household id in a few milliseconds.
+ref: docs | GraphFrames documentation | GraphFrames project | https://graphframes.io/
+
+@@ newsql
+== Range-partitioned data with a Raft group per range
+kind: consensus-log, sharding, leader-follower
+when: A SQL database must scale past one machine, survive node loss and stay strongly consistent.
+how: Tables are split into ranges by primary key, each a few hundred MB. Every range is a Raft group of 3 or 5 replicas on different nodes. The group has one leader, called the leaseholder in CockroachDB, that serves reads and proposes writes.
+A write is accepted when a majority of replicas have it in their log. With 3 replicas, one node can fail and writes continue. If the leader dies, the others elect a new one in seconds.
+Ranges split when they grow and move between nodes for balance. A router layer looks up which node holds a key. Any node can accept a SQL connection and forwards each request to the right leaseholder.
+The cost: every write pays at least one round trip to a majority, so cross-region writes take tens to hundreds of milliseconds.
+used: CockroachDB ranges, TiDB with TiKV regions, YugabyteDB tablets; Google Spanner uses Paxos groups called splits.
+avoid: For a single-node workload that fits one PostgreSQL machine; the plain database is faster and cheaper.
+flow:
+  SQL client [client] -> Gateway node [svc: SQL layer] : INSERT order 9001 | Any node accepts the SQL and plans it.
+  Gateway node -> Range 17 leader [svc: leaseholder] : write key 9001 | The gateway finds the range that owns the key and sends the write.
+  Range 17 leader -> Replica B [log: follower], Replica C [log: follower] : append entry | The leader sends the log entry to its two followers.
+  Replica B -> Range 17 leader : ack | One follower acknowledges, which gives a majority of 2 out of 3.
+  Range 17 leader -> SQL client : committed | The write is committed with a majority copy, so losing one node is safe.
+  Range 17 leader -x> Replica C : node down | Replica C fails, but the range keeps working with 2 replicas.
+ref: paper | CockroachDB: The Resilient Geo-Distributed SQL Database | Taft et al., SIGMOD 2020 |
+
+== Distributed transaction across ranges with 2PC
+kind: two-phase-commit, consensus-log
+when: One transaction changes rows in different ranges or nodes, and it must be atomic and serializable.
+how: The transaction gets a timestamp and writes its changes as provisional intents on each range. Each range replicates its intents with Raft, so they survive failures.
+One range holds a transaction record. To commit, the coordinator marks the record committed. This one write is the commit point. Then the intents on the other ranges are resolved to normal values, often in the background. Because every record is replicated by Raft or Paxos, a node crash does not leave the transaction stuck, as it could in classic two-phase commit.
+Readers see a consistent snapshot by timestamp (MVCC). If a reader meets an intent from an older transaction, it waits or pushes it. Spanner uses TrueTime and waits out a few milliseconds of clock uncertainty (commit wait). CockroachDB uses hybrid logical clocks and may restart a transaction on a conflict.
+used: Google Spanner, CockroachDB, TiDB (Percolator-style) and YugabyteDB; FoundationDB uses a different, resolver-based design.
+avoid: When most transactions touch one row or one range; keep related rows in one range by key design to avoid the cross-range cost.
+flow:
+  App [client] -> Coordinator [svc: txn timestamp] : BEGIN; move 50 | The transaction starts with a timestamp.
+  Coordinator -> Range A [log: debit], Range B [log: credit] : write intents | Each range stores a provisional write, replicated by Raft.
+  Coordinator -> Txn record [log: on range A] : mark COMMITTED | One replicated write makes the whole transaction committed.
+  Coordinator -> App : commit ok | The app gets the answer after the commit point is durable.
+  Txn record ~> Range B : resolve intent | In the background the intent becomes a normal value.
+  Reader [client] -> Range B : read at older timestamp | A reader before the commit time sees the old value, with no locks.
+ref: paper | Spanner: Google's Globally-Distributed Database | Corbett et al., OSDI 2012 |
+
+== Geo-partitioned rows for data residency and local latency
+kind: multi-region, sharding
+when: Users live in several regions, and each user's data must stay in their region for law or for speed.
+how: A table gets a region column, and the database places each row's replicas by it. In CockroachDB this is REGIONAL BY ROW. A German user's row has its leader and replicas in European nodes, and a US user's row stays in the US.
+Reads and writes of a user's own data stay in the home region, so they take a few milliseconds and not a cross-ocean trip. The data does not leave the legal area.
+Tables that are read everywhere, such as a product catalog, can use a global setting. Reads are then local in every region, and writes are slower because they wait to reach all regions.
+Survival goals are a choice. Surviving the loss of one zone needs 3 replicas in a region. Surviving the loss of a whole region needs replicas in at least 3 regions, which makes writes slower.
+used: CockroachDB multi-region SQL; Spanner placement and leader settings; TiDB placement rules; YugabyteDB geo-partitioning.
+avoid: When users move often between regions or most queries cross regions; the join cost then cancels the gain.
+flow:
+  EU user [user] -> EU gateway [svc: eu-west] : read profile | A European user connects to a nearby node.
+  EU gateway -> EU range [db: region = EU] : local read | The row's leader is in Europe, so the read stays there.
+  EU range -> EU user : 5 ms | The answer is fast and the data never left the EU.
+  US user [user] -> US gateway [svc: us-east] : read profile | A US user connects to a US node.
+  US gateway -> US range [db: region = US] : local read | The US row is served in the US.
+  EU gateway -x> US range : cross-region read | A read of another region's row pays a round trip of about 80 ms or more.
+ref: docs | Multi-region capabilities overview | CockroachDB documentation | https://www.cockroachlabs.com/docs/stable/multiregion-overview
+@@ nosql
+== Leaderless ring with tunable quorums
+kind: consistent-hashing, quorum, gossip
+when: A store must stay writable during node failures and spread huge write volume over many machines, and can accept eventual consistency.
+how: Nodes sit on a hash ring. The hash of a key picks a coordinator node and the next N-1 nodes on the ring hold the copies, for example N=3. There is no single leader. Any node can take a request and act as coordinator.
+The client chooses how many replicas must answer. With N=3, a write to W=2 and a read from R=2 gives R+W>N, so a read sees the latest acknowledged write. W=1 and R=1 is fastest but may read old data.
+Nodes find each other and detect failures by gossip. If a replica is down, another node keeps a hint and hands it over when the replica returns. Read repair and background anti-entropy fix replicas that still differ.
+Concurrent writes to one key are resolved by last-write-wins timestamps (Cassandra) or by version vectors (the original Dynamo design).
+used: Amazon Dynamo (the 2007 paper); Apache Cassandra and ScyllaDB; Riak; Amazon DynamoDB uses a different, leader-based design but a similar model.
+avoid: When you need multi-row transactions or strict ordering; use a distributed SQL database.
+flow:
+  Client [client] -> Coordinator [svc: any node] : write key u7, W=2 | Any node can coordinate; it hashes the key to find the 3 replicas.
+  Coordinator -> Replica 1 [store], Replica 2 [store], Replica 3 [store] : write | The coordinator sends the write to all three replicas.
+  Replica 1 -> Coordinator : ack | The first replica confirms.
+  Replica 2 -> Coordinator : ack | The second replica confirms, so W=2 is met.
+  Coordinator -> Client : success | The client is told the write succeeded, before replica 3 answers.
+  Replica 3 -x> Coordinator : node down | Replica 3 is down, so its copy waits as a hint on another node.
+  * Replica 3: repaired | When it is back, hinted handoff and read repair bring it up to date.
+ref: paper | Dynamo: Amazon's Highly Available Key-value Store | DeCandia et al., SOSP 2007 |
+
+== Query-first denormalized tables
+kind: index-table, materialized-view
+when: The access patterns are known and fixed, and each must be served by one partition read with no join.
+how: There are no joins and no ad hoc secondary lookups at scale. So you design one table per query. For "recent orders of a user", the partition key is user_id and the clustering key is order time descending. For "orders of a store today", you make a second table with another key.
+The application writes the same fact into each table, often in one batch. The data is duplicated on purpose. Storage is cheap, and a read of one partition is a fast, single-node operation.
+Each table has to be kept in sync. Cassandra logged batches or a stream consumer keep them aligned, and the app must handle partial failures. Materialized views and secondary indexes exist, but the duplicate-table design is the safe default at large scale.
+When a new question comes, you add a new table and fill it from existing data. The cost is write work and a design done up front.
+used: Cassandra data modeling guides; DynamoDB single-table design with global secondary indexes; this style is common in large Cassandra deployments.
+avoid: When queries change every week; a relational database or a search engine adapts more easily.
+flow:
+  App [svc] -> orders_by_user [db: pk user_id] : INSERT order | The app writes the order into the table made for user queries.
+  App -> orders_by_store [db: pk store + day] : INSERT same order | The same order is written into a table made for store queries.
+  Web client [client] -> orders_by_user : recent orders of u7 | One partition read returns the user's newest orders in order.
+  Store dashboard [client] -> orders_by_store : orders today for store 3 | A different question uses its own table; no join is needed.
+  App -x> orders_by_store : write failed | If one write fails, the app retries or repairs it, or the tables disagree.
+ref: docs | Cassandra data modeling | Apache Cassandra documentation | https://cassandra.apache.org/doc/latest/cassandra/developing/data-modeling/intro.html
+
+== Bucketed partition keys against hot partitions
+kind: sharding
+when: Many writes go to a few keys, such as one popular item or the current hour, and one partition becomes the bottleneck.
+how: A partition lives on one set of replicas, and it has a limit on throughput and size. If you use "sensor_id" or "today" as the key, all writes for it go to the same node, and it overloads while others are idle.
+Add a bucket to the key: the partition key becomes (sensor_id, day) or (item_id, random 0 to 15). The writes spread over 16 partitions. The cost moves to reads: to read an item you query all 16 buckets and merge the results, or you add a time bucket and read only the recent ones.
+For time series, the time bucket also keeps partitions at a bounded size, for example under 100 MB, and old buckets can be dropped whole.
+Choose the number of buckets from measured load. Too few keep the hotspot; too many make reads costly.
+used: Cassandra time-bucketed tables; DynamoDB write sharding with a random suffix; HBase row key salting for monotonically increasing keys.
+avoid: When load is already spread by a high-cardinality key; extra buckets only make reads slower.
+flow:
+  Writers [client: 50k writes/s] -x> Node A [store: key item-9] : all writes, one key | One hot key sends all writes to a single node, which overloads.
+  Writers -> Bucket router [svc: item + random 0-15] : write item-9 | The writer adds a random bucket number to the key.
+  Bucket router -> Node A, Node B, Node C : item-9#3, #7, #12 | The writes now spread over many partitions and nodes.
+  Reader [client] -> Bucket router : read item-9 | A read must look at every bucket of the item.
+  Bucket router -> Reader : merged result | The router queries the 16 buckets in parallel and merges the answers.
+ref: docs | Best practices for designing partition keys | Amazon DynamoDB documentation | https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html
+
+@@ storageengine
+== LSM write path under a database
+kind: lsm-compaction, wal
+when: A workload writes much more than it reads, and writes must be fast on SSDs while data stays durable.
+how: A write goes first to the write-ahead log, an append to a file, so it survives a crash. Then it goes to the memtable, a sorted structure in memory. The write is done; no random disk write was needed.
+When the memtable is full, for example 64 MB, it is written to disk as an immutable sorted file (an SSTable) at level 0. Background compaction merges files into larger levels and removes overwritten and deleted keys.
+A read checks the memtable and then the files from newest to oldest. A Bloom filter in each file lets the engine skip files that cannot hold the key, so most reads touch one or two files. Range scans merge sorted iterators.
+The costs are write amplification (data is rewritten at each level, often 10 to 30 times) and read amplification. Compaction also uses CPU and I/O, and a fast writer can outrun it, so the engine slows writes to protect reads.
+used: RocksDB and LevelDB; the engine inside CockroachDB (Pebble), TiKV, Cassandra, and ScyllaDB (own implementation); MyRocks for MySQL.
+avoid: For read-heavy loads with random point reads and in-place updates; a B-tree engine has lower read cost.
+flow:
+  Writer [client] -> WAL [log: append only] : put k=v | The record is appended to the log first, so a crash cannot lose it.
+  Writer -> Memtable [cache: sorted] : insert | The record is then inserted into the sorted in-memory table.
+  Memtable -> L0 SSTable [store: immutable file] : flush when full | A full memtable is written as one sorted file.
+  L0 SSTable -> L1 files [store: merged] : compaction | Background merging combines files and drops old versions.
+  Reader [client] -> Memtable : get k | A read looks in memory first.
+  Memtable -> L1 files : Bloom filter, then read | If not found, filters skip files without the key, and one file is read.
+ref: paper | The Log-Structured Merge-Tree (LSM-Tree) | O'Neil, Cheng, Gawlick & O'Neil, Acta Informatica, 1996 |
+
+== Embedded engine as local state for a stream job
+kind: checkpoint-restart, stream-table-join
+when: A stream job keeps large state per key, such as counters or a join table, and a remote database call per event would be too slow.
+how: The job embeds RocksDB in each worker process. State lives on local disk, with a small part cached in memory. A read or update is a local call of microseconds, with no network.
+The state is more than memory can hold, so RocksDB's disk layout matters: the LSM tree accepts a high rate of small updates.
+To survive failure, the state is also saved elsewhere. Kafka Streams writes every update to a compacted changelog topic. Flink takes periodic checkpoints, copying SST files to object storage like S3; incremental checkpoints upload only new files.
+After a crash the new worker loads the checkpoint or replays the changelog, and then continues. Restore time grows with state size, so large jobs keep standby copies.
+used: Kafka Streams state stores; Apache Flink RocksDB state backend; Apache Samza; ksqlDB.
+avoid: When state is small enough for heap memory, or when many jobs must share and query the state; use an external store such as Redis or a database.
+flow:
+  Input topic [log: partition 3] -> Stream task [svc: embeds RocksDB] : event key u7 | One task owns partition 3 and all state for its keys.
+  Stream task -> Local RocksDB [db: on local SSD] : get and put count | The count is read and updated locally, with no network call.
+  Stream task -> Changelog topic [log: compacted] : u7 = 41 | Every update is also written to a compacted changelog topic.
+  Local RocksDB -x> Stream task : worker crashed | The worker dies and its local disk is lost.
+  Changelog topic -> New task [svc: rebuilding] : replay latest per key | A new worker replays the changelog to rebuild the state.
+  New task -> Input topic : resume at saved offset | The job continues from the saved input offset.
+ref: docs | Kafka Streams architecture: state | Apache Kafka documentation | https://kafka.apache.org/documentation/streams/architecture
+
+== B-tree engine with buffer pool and WAL
+kind: wal, memory-tiering
+when: A single-node database serves many point reads, range scans and in-place updates with full ACID.
+how: Data is in fixed-size pages, for example 8 or 16 KB, arranged as a B+tree. A lookup reads a few pages from root to leaf, usually 3 to 4 levels even for billions of rows. Leaves are linked, so a range scan walks them in order.
+Pages are cached in a buffer pool in memory. A hit costs nanoseconds, a miss costs a disk read. Changes happen in the cached page, which is then dirty.
+Before the change is acknowledged, the engine appends a record to the write-ahead log and flushes it. Dirty pages are written to disk later, in the background, at checkpoints. After a crash the engine replays the log from the last checkpoint.
+Updates are in place, so reads are cheap, but random page writes and page splits cost more than LSM appends on write-heavy loads.
+used: InnoDB in MySQL, PostgreSQL heap and indexes, SQLite, WiredTiger in MongoDB, LMDB.
+avoid: For sustained heavy ingestion of small writes; an LSM engine absorbs them better.
+flow:
+  Query [client] -> Buffer pool [cache: pages in RAM] : read key 8841 | The engine first looks for the leaf page in memory.
+  Buffer pool -> B+tree file [store: 16 KB pages] : miss, read 3 pages | On a miss it reads the root, an inner page and the leaf.
+  Query -> Buffer pool : UPDATE row | The change is applied to the cached page, which becomes dirty.
+  Buffer pool -> WAL [log: flushed at commit] : log record | The change is logged and flushed before commit is acknowledged.
+  Buffer pool ~> B+tree file : write dirty pages | At a checkpoint the dirty pages are written in the background.
+  WAL -> Buffer pool : replay after crash | After a crash the log is replayed to redo changes not yet on disk.
+ref: book | Database Internals | Alex Petrov, O'Reilly, 2019 |
+
+@@ tsdb
+== Head block, WAL and compacted blocks
+kind: wal, lsm-compaction
+when: Metrics arrive at a high rate, mostly appended in time order, and recent data is queried more than old data.
+how: Each series (metric name plus labels) gets an in-memory chunk in the head block. Samples are appended there. Every append also goes to a write-ahead log, so a restart can rebuild the head.
+Compression is strong. Timestamps are stored as delta of delta, and values are XOR-encoded against the previous value (the Gorilla method). A sample often takes about 1.4 bytes instead of 16.
+Every 2 hours the head is written to disk as an immutable block with its own index. Background compaction merges small blocks into larger ones. A query uses the label index to find the matching series, and then reads only the blocks that overlap the time range.
+Old blocks are deleted whole when retention ends, for example after 15 days. Deleting a file is cheap compared to deleting rows.
+The main risk is high cardinality: a label with millions of values, such as user id, creates millions of series and exhausts memory.
+used: Prometheus TSDB; the design follows Facebook's Gorilla paper; similar encodings appear in VictoriaMetrics and InfluxDB.
+avoid: For event data with many distinct dimensions; use a column store such as ClickHouse or Druid.
+flow:
+  Exporter [svc: /metrics] -> Prometheus [svc: scrapes every 15 s] : scrape samples | Prometheus pulls current values from each target.
+  Prometheus -> WAL [log: append only] : append samples | Each batch of samples is logged first for crash safety.
+  Prometheus -> Head block [cache: last 2 hours] : append to chunks | Samples are compressed into per-series chunks in memory.
+  Head block -> Disk block [store: immutable + index] : cut every 2 hours | The head is written as a block with a label index.
+  * Disk block: compacted | Small blocks are merged into larger ones in the background.
+  Grafana [client] -> Prometheus : PromQL query | The query finds series by labels and reads only blocks in the time range.
+ref: paper | Gorilla: A Fast, Scalable, In-Memory Time Series Database | Pelkonen et al., VLDB 2015 |
+
+== Downsampling and retention tiers
+kind: tiered-storage, pre-aggregation
+when: You must keep metrics for a year or more, but full resolution for old data costs too much and is rarely needed.
+how: Raw samples, for example one every 15 seconds, are kept for a short time such as 30 days. A background job reads old blocks and writes lower-resolution copies: one sample per 5 minutes, then one per hour. Each point holds several aggregates, such as min, max, sum and count, so averages stay correct.
+Retention is set per resolution: raw for 30 days, 5 minute data for 6 months, 1 hour data for 3 years. A year-long graph reads the hourly data, 240 times fewer points than raw, and loads fast.
+Old data usually moves to object storage, so cost per month is low. The price is a loss of detail: you cannot zoom into one spike from last year.
+Pick the aggregates before you downsample. Percentiles cannot be rebuilt from averages, so store histograms if you need them.
+used: Thanos compactor with 5m and 1h downsampling; InfluxDB tasks and continuous queries; Grafana Mimir, and VictoriaMetrics enterprise downsampling.
+avoid: When regulations or debugging need raw data for the full period; pay for the storage instead.
+flow:
+  Raw blocks [store: 15 s samples] -> Compactor [svc: downsampler] : read old blocks | The compactor reads raw blocks older than 30 days.
+  Compactor -> Coarse blocks [lake: min max sum count] : 5 min, then 1 h points | Each coarse point keeps four aggregates; hourly points come from 5 minute ones.
+  Compactor -x> Raw blocks : delete after 30 days | Raw blocks are removed when their retention ends.
+  Dashboard [client] -> Query layer [svc: picks resolution] : last 12 months | The query layer picks the hourly data for a long range.
+  Query layer -> Coarse blocks : read 8,760 points | A year of hourly data is small and quick to read.
+ref: docs | Thanos: downsampling and resolution | Thanos documentation | https://thanos.io/tip/components/compact.md/
+
+== Remote write to a long-term, horizontally scaled store
+kind: observability-pipeline, sharding
+when: One Prometheus per cluster is not enough: you need a global view, long retention and a store that survives the loss of a server.
+how: Each Prometheus keeps recent data locally for fast alerts, and also sends every sample with remote write to a central system such as Grafana Mimir, Thanos Receive, Cortex or VictoriaMetrics.
+The central system splits series by a hash of their labels over many ingesters. Each series is stored on 3 ingesters, so losing one is safe. Ingesters keep recent data in memory and in a WAL, then upload blocks to object storage. Queriers read both ingesters and storage, and merge the results.
+A query can use data from many clusters at once. Limits per tenant, such as maximum active series, protect the system from a cardinality explosion by one team.
+The cost is a larger system to run, and the remote write path adds a few seconds of delay.
+used: Grafana Mimir and Cortex, Thanos Receive, VictoriaMetrics cluster, and managed services such as Amazon Managed Service for Prometheus.
+avoid: For a single small cluster; one Prometheus with some retention is easier.
+flow:
+  Prometheus A [svc: cluster 1] -> Distributor [svc: hash by labels] : remote write | Each Prometheus sends its samples to a distributor.
+  Prometheus B [svc: cluster 2] -> Distributor : remote write | A second cluster sends samples to the same system.
+  Distributor -> Ingester 1 [store: WAL + memory], Ingester 2 [store: WAL + memory], Ingester 3 [store: WAL + memory] : write 3 copies | Each series is written to three ingesters.
+  Ingester 1 ~> Object storage [lake: blocks] : upload blocks | Ingesters upload finished blocks to object storage.
+  Grafana [client] -> Querier [svc: merges] : query both clusters | One query reads data from both clusters.
+  Querier -> Ingester 1 : recent data | The querier reads recent samples from ingesters and old ones from storage.
+ref: docs | Grafana Mimir architecture | Grafana Labs documentation | https://grafana.com/docs/mimir/latest/get-started/about-grafana-mimir-architecture/
+
+@@ blockchain
+== Replicated state machine with block finality
+kind: consensus-log
+when: Many parties who do not trust each other must agree on one ordered history of transactions, with no central operator.
+how: Every node holds the full chain of blocks and the same state, such as account balances. Users send signed transactions to the network. Nodes pass them on by peer-to-peer gossip and keep them in a pool.
+In each round, one node is chosen to propose a block: by work in Bitcoin, or by stake in Ethereum. The block lists transactions in order. Each node checks the signatures and rules and runs the transactions to get the new state. A block that breaks a rule is rejected.
+Finality tells when a block cannot be undone. In Bitcoin it is probabilistic: more blocks on top make a reversal very unlikely, and 6 blocks (about an hour) is a common rule. In Ethereum, validators vote and a block is finalized after about two epochs, roughly 13 minutes.
+The price is low throughput (tens of transactions a second on the base layer) and high cost per transaction, in return for no trusted party.
+used: Bitcoin, Ethereum, and permissioned chains such as Hyperledger Fabric that use a different voting protocol among known members.
+avoid: When one organization can run the database; a normal database is faster, cheaper and easier to change.
+flow:
+  Wallet [client] -> Mempool [queue: pending txs] : signed transfer | A user signs a transfer and sends it to a node.
+  Mempool -> Proposer [svc: chosen by stake] : pick transactions | The chosen proposer orders pending transactions into a block.
+  Proposer -> Validator 1 [svc], Validator 2 [svc] : block 1000 | The block is sent to all other nodes.
+  Validator 1 -> Chain state [db: replicated] : verify and apply | Each node checks signatures and rules and updates its own state.
+  Validator 2 -x> Proposer : invalid block rejected | A block with a bad signature is rejected by honest nodes.
+  Validator 1 -> Wallet : finalized | After votes from validators, the block is final and cannot be undone.
+ref: paper | Bitcoin: A Peer-to-Peer Electronic Cash System | Satoshi Nakamoto, 2008 | https://bitcoin.org/bitcoin.pdf
+
+== Rollup: execute off-chain, post data and proof on-chain
+kind: batching
+when: The base chain is too slow and costly for your users, but you still want its security.
+how: A layer 2 network, called a rollup, takes user transactions and runs them on its own servers (a sequencer). Users get a quick answer, in under a second.
+The sequencer groups thousands of transactions into a batch. It posts the compressed batch data and the new state root to the base chain (layer 1). The fixed cost of the layer 1 transaction is shared by all of them, so each user pays a small fee.
+The base chain must also be able to check the result. An optimistic rollup assumes it is valid and allows a challenge period, usually about 7 days, in which anyone can show a fraud proof. A ZK rollup posts a zero-knowledge proof that the batch is valid, and layer 1 verifies it. Funds can then leave after the proof is accepted.
+Because the data is on layer 1, anyone can rebuild the rollup state. The risk is in the sequencer: it can censor or stop, so rollups add escape routes.
+used: Optimistic rollups such as Arbitrum and OP Mainnet; ZK rollups such as zkSync and Starknet; Ethereum's blob space is used for posting rollup data.
+avoid: When the application needs the strongest base layer finality at once for every action; use layer 1 directly.
+flow:
+  Users [user] -> Sequencer [svc: rollup server] : 5,000 transfers | Users send transfers to the rollup and get a fast answer.
+  Sequencer -> Rollup state [db: off-chain] : execute in order | The sequencer runs the transfers and updates its own state.
+  Sequencer -> L1 contract [svc: base chain] : batch + state root | A compressed batch and the state root are posted to layer 1.
+  Prover [svc: ZK rollups only] -> L1 contract : validity proof | A ZK rollup also sends a proof that the batch was valid.
+  Challenger [svc: optimistic rollups] -x> L1 contract : fraud proof in 7 days | In an optimistic rollup a wrong batch can be challenged for about a week.
+  L1 contract -> Users : withdrawals unlock | After the proof or the challenge period, funds can leave the rollup.
+ref: docs | Rollups | ethereum.org documentation | https://ethereum.org/en/developers/docs/scaling/
+
+== Merkle proof for a light client
+kind: none
+when: A phone or a small service must check that a transaction is in a block without downloading the whole chain.
+how: The transactions of a block are hashed in pairs, and the hashes are hashed again, up to one root hash. This is the Merkle root. It is stored in the block header, and consensus covers the header.
+A light client keeps only headers, which are about 80 bytes each in Bitcoin. To check a payment, it asks a full node for the transaction and a Merkle proof: the sibling hashes along the path to the root. For a block with 4,000 transactions, the path has about 12 hashes.
+The client hashes the transaction with the siblings step by step and compares the result with the root in the header. If it matches, the transaction is in the block. If one bit was changed, the result differs.
+The limits: the proof shows inclusion in a block, not that the block is valid. The light client trusts the chain with the most work or stake, and it must get headers from honest peers.
+used: Bitcoin SPV wallets; Ethereum light clients and bridges between chains; Certificate Transparency logs use the same idea.
+avoid: When you need to check the full rules of the chain yourself; run a full node.
+flow:
+  Light wallet [client: headers only] -> Full node [svc: full chain] : is tx T in block 800? | The wallet asks a full node about one transaction.
+  Full node -> Light wallet : tx + 12 sibling hashes | The node returns the transaction and the sibling hashes along its path.
+  * Light wallet: hashes up the path | The wallet combines the hashes step by step to get a root.
+  Light wallet -> Block header [store: Merkle root] : compare root | It compares the computed root with the root in the header it already has.
+  Full node -x> Light wallet : forged proof | A forged proof gives a different root, so the wallet rejects it.
+ref: paper | Bitcoin: A Peer-to-Peer Electronic Cash System | Satoshi Nakamoto, 2008 | https://bitcoin.org/bitcoin.pdf
+
+@@ hci
+== Optimistic UI with rollback
+kind: none
+when: An action goes to a server, and users must feel an instant response even when the network is slow.
+how: Users see a reaction as instant if it comes within about 100 ms. A server round trip often takes 200 ms or more, and more on mobile. So the interface shows the result at once, as if the server had agreed, and sends the request in the background.
+The client keeps the old state. If the server confirms, nothing visible changes, and the temporary item is replaced by the real one, for example with its real id. If the server rejects the request or the network fails, the interface rolls back and tells the user with a short message and a retry button.
+It works best for actions that rarely fail, such as a like, a reorder in a list or a sent message. For payments and deletions, a clear waiting state is safer.
+Take care of order: if the user does two quick actions, the client must apply server answers in the right order, or use a request queue.
+used: Likes and comments in social apps; React 19 useOptimistic and TanStack Query optimistic updates.
+avoid: For actions that fail often or cannot be undone, such as payments; show progress and confirm the result.
+flow:
+  User [user] -> UI [client: local state] : tap Like | The user taps a button.
+  UI -> UI state [cache: likes = 41] : show 41 at once | The count changes in under 100 ms, before any network call.
+  UI ~> API [svc] : POST /like | The request goes to the server in the background.
+  API -> UI : 200 OK | The server confirms, and the screen already shows the right state.
+  API -x> UI : 500 error | On failure the server rejects the change.
+  * UI state: likes = 40 | The UI rolls back to the old count and shows a short retry message.
+ref: docs | Response Times: The 3 Important Limits | Jakob Nielsen, Nielsen Norman Group, 1993 | https://www.nngroup.com/articles/response-times-3-important-limits/
+
+== Design system with accessibility checks in CI
+kind: none
+when: Many teams build screens for the same product, and they must look and act the same and be usable by everyone.
+how: A design system is a shared library of tokens (colors, spacing, type sizes) and components (button, form field, dialog). Designers keep them in a design tool, and engineers publish the same components as a package that each app installs.
+Each component is built with accessibility in it: keyboard focus, labels for screen readers, a minimum touch target (44 by 44 points on Apple platforms, 48 dp on Android), and color contrast of at least 4.5 to 1 for body text, as WCAG asks.
+CI helps keep this true. Unit tests render each component, and tools such as axe check for rules that can be tested by machine. Visual tests compare screenshots to catch accidental changes. A failing check blocks the release of the package.
+Automatic tools find only part of the problems, often under half. Real tests with screen reader users and keyboard-only users are still needed.
+used: Material Design, Apple Human Interface Guidelines, GOV.UK Design System, IBM Carbon; Storybook for component review; axe-core in CI.
+avoid: For a single small product with one team; a shared stylesheet is enough at first.
+flow:
+  Designer [user] -> Design tokens [store] : update tokens | The design team changes a token, such as the primary color.
+  Design tokens -> Component library [svc] : build | The components are rebuilt from the tokens.
+  Component library -> CI checks [svc: axe + visual tests] : run on every change | CI tests keyboard focus, labels, contrast and screenshots.
+  CI checks -x> Component library : contrast 3.1 to 1 | A color pair below 4.5 to 1 fails the build.
+  CI checks -> Package registry [store: versioned] : publish v2.4 | A passing build is published as a new version.
+  Product apps [client] -> Package registry : upgrade | Apps take the new version and all screens get the same fix.
+ref: spec | Web Content Accessibility Guidelines (WCAG) 2.2 | W3C, 2023 | https://www.w3.org/TR/WCAG22/
+
+== Staged rollout with an A/B test of a design change
+kind: feature-flags, shadow-ab
+when: A design change might help or hurt, and the team wants evidence from real users before everyone gets it.
+how: The new design is shipped behind a feature flag. A service assigns each user to a group by hashing the user id, so a person always sees the same version. At first 5 percent get the new design, and 95 percent keep the old one.
+The app logs an exposure event, with the group, when a user sees the screen, and outcome events such as task completed, time to finish, errors and rage clicks. Before the start, the team picks one main metric and the sample size needed, to avoid reading noise as a result.
+After enough users and time, often one or two full weeks to cover weekday habits, the team compares the groups with a statistical test. If the new design wins and guard metrics (such as errors and support contacts) are not worse, the flag moves to 100 percent. Otherwise it is switched off in seconds.
+Numbers do not say why. Pair the test with a few moderated usability sessions to find the reason.
+used: Experiment platforms such as Optimizely, Statsig, LaunchDarkly experimentation and GrowthBook; large web companies run thousands of tests a year.
+avoid: With very little traffic, where a test would take months; run moderated usability tests with 5 to 8 users instead.
+flow:
+  User [user] -> App [client] : open checkout | A user opens the screen.
+  App -> Flag service [svc: hash of user id] : which variant? | The service hashes the user id and picks a group.
+  Flag service -> App : new design, 5 percent | This user is in the new design group.
+  App ~> Event log [log: exposure + outcomes] : exposure and outcomes | The app logs which design was seen and what the user did.
+  Event log -> Analysis job [svc: stats test] : compare groups | After two weeks the job compares the main metric and the guard metrics.
+  Analysis job -> Flag service : raise to 100 percent | The new design wins, so the flag is raised to everyone.
+ref: book | Trustworthy Online Controlled Experiments | Kohavi, Tang & Xu, Cambridge University Press, 2020 |

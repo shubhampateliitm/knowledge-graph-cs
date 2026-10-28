@@ -1,0 +1,759 @@
+@@ quantilesketch
+== Per-host sketches merged at a collector
+kind: pre-aggregation, observability-pipeline
+when: Latency percentiles must be correct across thousands of hosts, and you cannot ship every raw value.
+how: Each host keeps one small sketch per metric, for example a DDSketch of a few kilobytes. Every request latency is added to it in constant time. Every 10 seconds the host sends the sketch, not the raw values, to a collector.
+The collector merges the sketches of all hosts into one sketch. Merging keeps the error bound: the result is as good as one sketch that saw all the values. Then it reads p50, p99 and p99.9 from the merged sketch.
+Averaging per-host p99 values is wrong. A host with 10 requests counts as much as a host with 10 million. Merging sketches weights every request equally.
+The error is bounded and set in advance. DDSketch guarantees a relative error such as 1 percent on every quantile; a latency of 200 ms is reported within 2 ms.
+used: Datadog distribution metrics (DDSketch is from Datadog); Prometheus native histograms use a similar bucket idea; OpenTelemetry exponential histograms.
+avoid: When you need exact values for audits or billing; keep raw data. For a single process, a plain histogram is enough.
+flow:
+  Host A [svc: sketch 2 KB], Host B [svc: sketch 2 KB] -> Collector [svc: merges sketches] : sketch, not values | Each host sends one small sketch every 10 seconds instead of millions of latency values.
+  * Collector: merged 2 sketches | The collector merges the sketches. The result equals one sketch over all requests.
+  Collector -> Metrics store [db: one sketch per minute] : merged sketch | The store keeps one sketch per metric per minute, which is a few KB.
+  Dashboard [client] -> Metrics store : p99 last hour | A query merges 60 minute-sketches and reads the p99.
+  Metrics store -> Dashboard : p99 = 212 ms | The answer has a known relative error, for example 1 percent.
+  Host A -x> Dashboard : average of host p99s | Averaging per-host percentiles is wrong, because it ignores how many requests each host served.
+ref: paper | DDSketch: A Fast and Fully-Mergeable Quantile Sketch with Relative-Error Guarantees | Masson, Rim & Lee, VLDB 2019 | https://arxiv.org/abs/1908.10693
+
+== Rollup tables with mergeable sketch state
+kind: materialized-view, pre-aggregation
+when: Users ask for percentiles over any time range and any filter, and raw events are too many to scan each time.
+how: At ingest, a rollup job groups events by minute and by a few labels such as service and region. For each group it stores the sketch state (for example a t-digest or KLL sketch) as a binary column, not a single p99 number.
+A query for "p99 of checkout in Europe over the last 7 days" reads the 10,080 minute rows that match, merges their sketches and then asks for the 0.99 quantile. Only one sketch value per row is read, instead of billions of raw events.
+A stored p99 number could not be combined. A stored sketch can be combined across time and across labels, so one rollup serves many queries. The price is bounded error and a fixed set of label columns.
+ClickHouse shows this with quantileTDigestState and quantileTDigestMerge in an AggregatingMergeTree table. Druid offers a DataSketches quantiles extension for the same job.
+used: ClickHouse AggregatingMergeTree with quantile states; Apache Druid DataSketches extension; Elasticsearch percentiles aggregation uses t-digest by default.
+avoid: When the label combinations are not known ahead of time and the data is small; query raw data directly.
+flow:
+  Event stream [log: latency events] -> Rollup job [svc: group by minute] : raw events | The job reads raw latency events and groups them by minute, service and region.
+  Rollup job -> Rollup table [db: sketch per row] : quantile state | Each row stores a sketch state as bytes, not a final percentile.
+  Dashboard [client] -> Query engine [svc] : p99, 7 days, EU | The user asks for one percentile over a long range.
+  Query engine -> Rollup table : read 10,080 rows | The engine reads only the matching minute rows.
+  * Query engine: merged 10,080 sketches | It merges the sketches into one. Merging does not need the raw data.
+  Query engine -> Dashboard : p99 = 340 ms | The reply is fast because the work was done at ingest and at merge.
+ref: paper | Computing Extremely Accurate Quantiles Using t-Digests | Dunning & Ertl, 2019 | https://arxiv.org/abs/1902.04023
+ref: paper | Optimal Quantile Approximation in Streams | Karnin, Lang & Liberty, FOCS 2016 | https://arxiv.org/abs/1603.05346
+
+@@ aqe
+== Re-plan at shuffle stage boundaries
+kind: control-loop, map-reduce
+when: Table statistics are missing or stale, so the first plan has wrong size estimates and the job is slow.
+how: The engine splits the plan into stages at each shuffle. A shuffle writes its output to disk, so the engine knows the exact size of every partition before the next stage starts. This is a safe point to think again.
+At that point the optimizer re-runs on the rest of the plan with real numbers. Spark 3 does this in adaptive query execution (AQE). If a join side turns out to be under the broadcast threshold (10 MB by default), a sort-merge join becomes a broadcast join.
+The cost of a wrong estimate is paid once, in the first stage. The rest of the query is planned from facts. AQE needs a shuffle to learn from, so a query with no shuffle cannot adapt.
+used: Apache Spark SQL (on by default since Spark 3.2); similar runtime re-planning exists in other MPP engines.
+avoid: When statistics are fresh and the plan is already right; AQE adds small planning cost at every stage. For very short queries, turn it off.
+flow:
+  Spark driver [svc: AQE planner] -> Stage 1 [svc: scan and filter] : launch stage | The driver runs the first stage with the plan from the estimates.
+  Stage 1 -> Shuffle files [store: exact sizes] : write partitions | The stage writes shuffle output and reports the exact bytes of each partition.
+  Shuffle files -> Spark driver : orders side = 3 MB | The driver learns that the filtered orders table is only 3 MB, not 2 GB as estimated.
+  * Spark driver: re-plan | It re-runs the optimizer on the remaining plan with the real sizes.
+  Spark driver -> Stage 2 [svc: broadcast join] : switch to broadcast | The sort-merge join becomes a broadcast join, so the big table is not shuffled.
+  Stage 2 -> Result [store] : joined rows | The join finishes without a second big shuffle.
+ref: docs | Adaptive Query Execution | Apache Spark documentation | https://spark.apache.org/docs/latest/sql-performance-tuning.html
+
+== Coalesce small partitions and split skewed ones
+kind: control-loop, batching
+when: A shuffle uses a fixed number of partitions, so some tasks are tiny and others are huge.
+how: Spark sets 200 shuffle partitions by default. For a small result, that is 200 tiny tasks with high scheduling cost. For skewed keys, one partition may hold most of the data and one task runs for an hour.
+AQE reads the partition sizes from the finished map stage. It merges small neighbouring partitions until each is near an advisory size (64 MB by default). It also finds partitions much larger than the median and splits them into several tasks, each reading part of the map output.
+Skew handling works for sort-merge joins: the large side is split, and the matching rows of the other side are read once per split. Both fixes need no change in the query.
+used: Apache Spark 3 and later (coalesce and skew-join features); common in Databricks and EMR jobs.
+avoid: When skew comes from one extreme hot key that must be handled by salting; or when the join type does not allow splitting that side.
+flow:
+  Map stage [svc: 200 partitions] -> Shuffle stats [store: size per partition] : partition sizes | After the map stage, the engine knows the byte size of all 200 partitions.
+  Shuffle stats -> AQE rule [svc: coalesce and split] : sizes | A rule looks for many tiny partitions and for a few giant ones.
+  AQE rule -> Reduce task 1 [svc: 60 MB], Reduce task 2 [svc: 60 MB] : merged small partitions | Small partitions are merged, so 150 tiny tasks become a few normal tasks.
+  AQE rule -> Skew split A [svc: 3 GB part 1], Skew split B [svc: 3 GB part 2] : split 6 GB partition | A 6 GB partition is split in two, so the work runs in parallel.
+  * AQE rule: tasks balanced | Task sizes are now close to each other, so the stage ends sooner.
+ref: docs | Coalescing post shuffle partitions and skew join | Apache Spark documentation | https://spark.apache.org/docs/latest/sql-performance-tuning.html
+
+@@ codegen
+== Fuse a pipeline into one generated loop
+kind: interpreter-compiler, pipeline-stages
+when: An analytic query spends most of its CPU time in per-row function calls, not in real work.
+how: A scan, a filter and a projection can run without writing rows to memory between them. The engine finds a chain of operators with no pipeline break (a join build or an aggregation boundary ends a chain). It generates one source code function for the whole chain.
+The generated code is a tight loop: read a value, test it, compute the result, write it. Values stay in CPU registers. There is no virtual call to next() for each row and no row object to allocate. The code is compiled at run time (Spark uses the Janino compiler to make JVM bytecode).
+This often gives several times the speed of an interpreted row-at-a-time plan on simple, CPU-bound queries. The cost is compile time (tens of milliseconds) and harder debugging. Very wide plans can exceed the JVM limit of 64 KB per method, and Spark then falls back to the normal path.
+used: Spark SQL whole-stage code generation (Project Tungsten); HyPer and Umbra compile queries to machine code through LLVM; Apache Impala compiles with LLVM.
+avoid: When queries are short and compile time dominates, or when the plan is mostly I/O bound. Vectorized execution (DuckDB, ClickHouse) is the other common answer and avoids the compile step.
+flow:
+  Optimized plan [note: scan filter project] -> Codegen [svc: finds a pipeline] : physical plan | The code generator walks the plan and groups operators that need no break between them.
+  Codegen -> Java source [note: one fused loop] : generate code | It writes one function with a single loop for the scan, filter and project.
+  Java source -> Janino compiler [svc: JVM bytecode] : compile | The source is compiled in memory, in tens of milliseconds.
+  Janino compiler -> Executor [svc: runs the loop] : class | The executor loads the new class and runs it on each data partition.
+  Executor -> Output rows [store] : filtered, projected | Each row passes all three steps in registers, with no call between operators.
+  Codegen -x> Executor : method over 64 KB | If the code is too large, Spark falls back to the interpreted path.
+ref: blog | Project Tungsten: Bringing Apache Spark Closer to Bare Metal | Databricks, 2015 | https://www.databricks.com/blog/2015/04/28/project-tungsten-bringing-spark-closer-to-bare-metal.html
+ref: paper | Efficiently Compiling Efficient Query Plans for Modern Hardware | Thomas Neumann, VLDB 2011 |
+
+== Compile once, reuse for many queries
+kind: interpreter-compiler, cache-aside
+when: The same parameterized query runs many times, so one compile can be shared by all runs.
+how: Compiling a query costs time, from a few milliseconds to hundreds of milliseconds for a big plan. This is only worth it if the compiled code runs for a long time or runs many times.
+The engine builds a cache key from the plan shape with parameters replaced by placeholders. On the first run it generates and compiles the code, then stores it under that key. The next run with different parameter values finds the code in the cache and skips compilation.
+Some engines go further. Umbra starts running the query with a fast interpreter and compiles in the background; it switches to compiled code when ready. This hides the compile delay for short queries and gives full speed for long ones.
+used: Umbra adaptive execution (research system from TU Munich); PostgreSQL JIT with LLVM uses cost thresholds to decide when to compile.
+avoid: For ad hoc queries that never repeat and run for under a second; the plain interpreter or vectorized path is cheaper.
+flow:
+  Client [client] -> Query engine [svc: plan and cache key] : SELECT ... WHERE id = ? | A parameterized query arrives.
+  Query engine -> Code cache [cache: compiled plans] : lookup plan shape | The engine looks up the plan shape, with parameters as placeholders.
+  Code cache -x> Query engine : miss | The first time, the code is not in the cache.
+  Query engine -> Compiler [svc: LLVM or Janino] : generate and compile | The engine compiles the fused code once.
+  Compiler -> Code cache : store machine code | The result is saved under the plan shape.
+  Query engine -> Client : result | Later runs with new values hit the cache and skip the compile step.
+ref: docs | JIT in PostgreSQL | PostgreSQL documentation | https://www.postgresql.org/docs/current/jit-reason.html
+
+@@ joins
+== Broadcast join for a small dimension table
+kind: data-locality, star-schema
+when: A very large fact table joins a small dimension table, and shuffling the fact table would be costly.
+how: The engine sends a full copy of the small table to every worker node. Each worker builds an in-memory hash table on it. Then each worker streams its own part of the big table and probes the hash table. The big table never moves over the network.
+For a 2 TB fact table and a 50 MB dimension, a shuffle join would move about 2 TB. A broadcast join moves 50 MB times the number of workers, which is 5 GB for 100 workers. That is much less.
+The limit is memory. The small side must fit in memory on every worker. Spark has a broadcast threshold of 10 MB by default; engines like Trino, StarRocks and Snowflake choose it from cost estimates. If the estimate is wrong, a "small" table that is large can fail the query.
+used: Spark broadcast hash join; Trino broadcast distribution; star joins in Snowflake, BigQuery and Redshift data warehouses.
+avoid: When both tables are large; use a shuffle hash join or sort-merge join instead.
+flow:
+  Optimizer [svc: sees dim = 50 MB] -> Driver [svc: schedules] : broadcast plan | The optimizer sees that the dimension table is small and picks a broadcast join.
+  Driver -> Worker 1 [svc: hash table 50 MB], Worker 2 [svc: hash table 50 MB] : dimension rows | A full copy of the dimension table goes to each worker, which builds a hash table.
+  Fact shard 1 [lake: 1 TB] -> Worker 1 : stream rows | Worker 1 reads its local part of the fact table and probes the hash table.
+  Fact shard 2 [lake: 1 TB] -> Worker 2 : stream rows | Worker 2 does the same with its own part. No fact row crosses the network.
+  Worker 1, Worker 2 -> Result [store] : joined rows | Each worker writes its output; there is no global sort or shuffle.
+ref: docs | Join strategy hints and broadcast | Apache Spark documentation | https://spark.apache.org/docs/latest/sql-performance-tuning.html
+
+== Shuffle hash or sort-merge join for two large tables
+kind: map-reduce, data-locality
+when: Both tables are too big for any single node's memory, and the join key is not the table's partition key.
+how: Both inputs are repartitioned by a hash of the join key, so rows with the same key land on the same worker. This is a shuffle of both tables. Each worker then joins its partition locally.
+Locally there are two choices. A hash join builds a table on the smaller partition and probes it with the other; it is fast but needs the build side in memory. A sort-merge join sorts both partitions by key and walks them together with two pointers. It uses little memory because sort can spill to disk, and it works well when data is already sorted.
+Spark prefers sort-merge join by default for large tables, because it is robust. If the tables are already bucketed and sorted on the join key in storage, the shuffle and sort can be skipped.
+used: Spark sort-merge join (default for large equi-joins); Hive and Presto/Trino partitioned joins; Snowflake and BigQuery partitioned hash joins.
+avoid: Skewed keys: one hot key sends most rows to one worker. Use salting, skew-join handling or broadcast of the hot keys.
+flow:
+  Orders [lake: 5 TB] -> Shuffle by key [svc: hash(user_id)] : partition by user_id | Orders are repartitioned by the hash of the join key.
+  Users [lake: 3 TB] -> Shuffle by key : partition by user_id | Users are repartitioned by the same hash, so equal keys meet.
+  Shuffle by key -> Worker A [svc: partitions 0-99], Worker B [svc: partitions 100-199] : matching partitions | Each worker receives both sides of its key range.
+  Worker A -> Sorted run A [store: sorted by key] : sort both sides | Each side is sorted, spilling to disk if the data is larger than memory.
+  Sorted run A -> Result [store] : merge walk | Two pointers move over the sorted sides and emit each matching pair once.
+  Worker B -> Result : merge walk | Worker B does the same on its partitions.
+ref: paper | Join Processing in Database Systems with Large Main Memories | Shapiro, ACM TODS 1986 |
+
+@@ pushdown
+== Row-group skipping with Parquet statistics
+kind: data-locality, open-table-format
+when: A query filters a large columnar file set, and most of the data cannot match the filter.
+how: A Parquet file is split into row groups of about 128 MB. The file footer stores the min and max of every column in each row group. Dictionary pages and Bloom filters can give extra hints.
+The engine pushes the filter, for example event_date = '2026-10-01' AND country = 'IN', into the scan. The scan reads the footer first, which is small. It skips every row group whose min and max range cannot contain the value. Only the surviving row groups are read from disk or object storage.
+Column pruning works the same way: only the needed columns are read. On S3, skipped row groups mean skipped range requests, so both bytes and cost fall. The gain depends on the data layout. If the file is sorted or clustered by the filtered column, almost all groups are skipped. If values are spread randomly, min and max cover everything and nothing is skipped.
+used: Spark, Trino, DuckDB and Athena on Parquet; ORC has similar stripe statistics.
+avoid: When the filter column is random in every file; sort or cluster the data by it, or add an index.
+flow:
+  Query engine [svc: pushes filter] -> Parquet footer [store: min/max per group] : read footer | The scan first reads the small footer of each file.
+  Parquet footer -> Query engine : stats for 80 groups | The footer lists min and max for every column of every row group.
+  * Query engine: 77 groups skipped | The engine compares the filter with the ranges and drops 77 of 80 groups.
+  Query engine -> Object store [lake: S3 files] : range GET: 3 groups | Only the 3 surviving groups and the 2 needed columns are fetched.
+  Object store -> Query engine : 40 MB | About 40 MB is read instead of 10 GB.
+  Query engine -> Client [client] : result rows | The remaining rows are filtered exactly and returned.
+ref: docs | Parquet file format: metadata and page index | Apache Parquet documentation | https://parquet.apache.org/docs/file-format/
+
+== Push the filter into a remote database
+kind: data-locality, anti-corruption
+when: A query engine reads from an operational database or another remote source, and most rows are not needed.
+how: The connector turns part of the plan into the source's own language, such as SQL for Postgres. The filter, the needed columns and sometimes a LIMIT or a simple aggregate are sent to the source. The source uses its own indexes to find the rows.
+Without pushdown, the engine would pull the whole table over the network and filter it itself. For a 500 million row table and a filter that matches 1,000 rows, the difference is 500 million rows against 1,000.
+The engine keeps the part it cannot push, for example a function the source does not know. The connector must be careful: if the source compares text with a different collation, a pushed filter can return different rows than the engine would. Good connectors push only what is safe.
+used: Trino and Presto connectors for PostgreSQL and MySQL; Spark JDBC source; Postgres foreign data wrappers (postgres_fdw).
+avoid: When the source is a busy production database and the pushed query is heavy; read from a replica or copy the data first.
+flow:
+  Analyst [user] -> Trino [svc: planner] : SELECT ... WHERE id = 42 | An analyst runs a query on a table that lives in Postgres.
+  Trino -> Postgres connector [svc: rewrites plan] : plan fragment | The planner hands the scan with its filter to the connector.
+  Postgres connector -> Postgres [db: 500M rows] : SELECT a, b WHERE id = 42 | The connector sends SQL with the filter and only two columns.
+  Postgres -> Postgres connector : 1,000 rows | The database uses an index and returns a few rows.
+  Postgres connector -> Trino : 1,000 rows | Only the matching rows travel to the engine.
+  Trino -> Analyst : result | The engine finishes joins and functions it could not push.
+ref: docs | Pushdown | Trino documentation | https://trino.io/docs/current/optimizer/pushdown.html
+
+== Dynamic filters from a join build side
+kind: data-locality, scatter-gather
+when: A big fact table joins a small filtered table, and the join key values of the small side can filter the big scan.
+how: The engine runs the small (build) side of a hash join first. While it builds the hash table, it collects the set of join key values, or their min and max. This summary is the dynamic filter.
+The filter is sent to the scan of the big (probe) table, which is still waiting. The scan uses it like a normal predicate: it skips partitions, files and row groups that cannot match, and filters rows early. A static plan cannot do this, because the values are only known at run time.
+Example: join sales (10 billion rows) to stores where region = 'EU'. The build side finds 40 store ids. The sales scan then reads only the rows for those 40 stores. The scan must wait a short time for the filter, so engines set a timeout.
+used: Trino dynamic filtering; Spark dynamic partition pruning; Impala runtime filters.
+avoid: When the build side is large or covers most keys, so the filter removes almost nothing.
+flow:
+  Build scan [svc: EU stores] -> Hash join [svc: build then probe] : 40 store ids | The small side is read first and sent to the join, which builds a hash table.
+  Hash join -> Dynamic filter [note: store_id in 40 values] : collect key set | While building, the join collects the set of keys it has seen.
+  Dynamic filter -> Probe scan [svc: sales table] : push filter | The filter is sent to the scan of the large table.
+  * Probe scan: skipping partitions | The scan now skips files and row groups that hold other stores.
+  Probe scan -> Hash join : 4% of rows | Only the rows that can match reach the join.
+  Hash join -> Client [client] : joined rows | The join result is the same, but much less data was read.
+ref: docs | Dynamic filtering | Trino documentation | https://trino.io/docs/current/admin/dynamic-filtering.html
+
+@@ queryopt
+== Parse, rewrite, cost, then pick the plan
+kind: interpreter-compiler, control-loop
+when: A declarative query can be run in many ways, and the best way depends on data sizes.
+how: The parser turns SQL into a logical plan, a tree of relational operators. Rewrite rules then apply changes that keep the result the same: push filters below joins, remove unused columns, fold constants.
+Next the cost-based part chooses the join order and the algorithms. The optimizer lists alternative plans and gives each a cost from row-count estimates. Estimates come from statistics: row counts, distinct values and histograms. For up to about 10 to 12 tables it can use dynamic programming over subsets of tables, as System R did in 1979. For more tables it uses heuristics, because the best order is a hard search problem.
+The cheapest plan becomes a physical plan with concrete choices: hash join or merge join, index scan or full scan. Wrong estimates are the main failure. The cost can be wrong by 1000 times when columns are correlated.
+used: PostgreSQL planner; Oracle and SQL Server cost-based optimizers; Spark Catalyst; Trino cost-based optimizer.
+avoid: For simple key lookups, a fixed plan is enough. When statistics are wrong, use hints or fix the statistics (ANALYZE) first.
+flow:
+  SQL query [client] -> Parser [svc: SQL to logical plan] : text | The parser builds a logical plan tree from the SQL text.
+  Parser -> Rewriter [svc: rule-based] : logical plan | Rules push filters down and drop unused columns. The result stays the same.
+  Rewriter -> Cost optimizer [svc: join order search] : simplified plan | The optimizer tries join orders and algorithms.
+  Statistics [db: histograms] -> Cost optimizer : row estimates | Statistics tell the optimizer how many rows each step may return.
+  Cost optimizer -> Executor [svc: physical plan] : cheapest plan | The lowest-cost physical plan is sent to the executor.
+  Executor -x> Cost optimizer : estimate was 1000x off | If the estimate was wrong, the chosen plan can be very slow.
+ref: paper | Access Path Selection in a Relational Database Management System | Selinger et al., SIGMOD 1979 |
+ref: docs | Using EXPLAIN | PostgreSQL documentation | https://www.postgresql.org/docs/current/using-explain.html
+
+== Pluggable optimizer framework inside an engine
+kind: plugin-arch, interpreter-compiler
+when: A new data system needs SQL planning, but writing a full optimizer would take years.
+how: The team embeds a planner library such as Apache Calcite. The system supplies a parser hook, a catalog of its tables, a set of its own rules and a cost model. The library supplies relational algebra, a rule engine and a memo-based search in the Volcano and Cascades style.
+The planner keeps equivalent plans in one memo and prunes by cost. Each system adds rules that match its own strengths: a rule that turns an aggregate into a call to a sketch index, or a rule that pushes a filter into its storage. The output is a physical plan in the system's own operators.
+The trade-off is control. The default cost model knows nothing about the storage engine, so good plans need good statistics and custom cost functions from the host system.
+used: Apache Calcite is used by Hive, Flink SQL, Druid and Apache Drill; Spark has its own Catalyst optimizer, and SQL Server and Greenplum (GPORCA) use Cascades-style search.
+avoid: When the engine has a small, fixed query set; a hand-written planner is simpler.
+flow:
+  SQL text [client] -> Calcite parser [svc: SQL to RelNode] : SELECT ... | The framework parses SQL and validates it against the host catalog.
+  Calcite parser -> Rule engine [svc: memo search] : logical plan | The plan is put in a memo that holds many equal plans.
+  Host rules [note: engine-specific] -> Rule engine : custom rules and costs | The host adds its own rules, such as pushing a filter into storage.
+  Rule engine -> Physical plan [note: engine operators] : cheapest by cost | The search picks the cheapest plan using the host cost model.
+  Physical plan -> Host executor [svc: Flink or Druid] : run | The host system runs the plan with its own operators.
+ref: docs | Apache Calcite: Algebra and Planner | Apache Calcite documentation | https://calcite.apache.org/docs/algebra.html
+ref: paper | The Cascades Framework for Query Optimization | Goetz Graefe, IEEE Data Eng. Bulletin, 1995 |
+
+@@ scattergather
+== Search shards: query phase, then fetch phase
+kind: scatter-gather, sharding
+when: An index is split across many shards, and each query must find the global top results.
+how: The client sends the query to any node, called the coordinator. In the query phase, the coordinator sends the query to one copy of every shard in parallel. Each shard finds its own top 10 by score and returns only document ids and scores.
+The coordinator merges these small lists into the global top 10. In the fetch phase, it asks only the shards that own those 10 documents for the full content. This keeps network traffic small: 10 documents are fetched, not 10 per shard.
+Deep paging is costly. Page 1,000 with 10 results per page needs the top 10,010 from every shard. The latency is set by the slowest shard, so one slow node slows the whole query.
+used: Elasticsearch and OpenSearch query-then-fetch; Solr distributed search; Lucene-based search at e-commerce sites.
+avoid: For key lookups, route to the one shard that owns the key instead of asking all of them.
+flow:
+  Client [client] -> Coordinator [svc: any node] : search "red shoes" | The client sends the search to any node.
+  Coordinator -> Shard 1 [svc: top 10], Shard 2 [svc: top 10], Shard 3 [svc: top 10] : query | The coordinator sends the query to one copy of each shard in parallel.
+  Shard 1, Shard 2, Shard 3 -> Coordinator : ids and scores | Each shard returns only ids and scores, not documents.
+  * Coordinator: merged 30 into top 10 | It sorts the 30 candidates and keeps the global top 10.
+  Coordinator -> Shard 2 : fetch 6 docs | Only the shards that own winning documents are asked for the content.
+  Coordinator -> Client : 10 hits | The client gets the page of results.
+ref: docs | Search shard routing and query phases | Elasticsearch documentation | https://www.elastic.co/docs/deploy-manage/distributed-architecture/reading-and-writing-documents
+
+== Broker merges partial aggregates
+kind: scatter-gather, pre-aggregation
+when: An analytics query groups data that lives in many segments on many servers, and users expect an answer in under a second.
+how: A broker receives the SQL query. It uses segment metadata to find which servers hold the needed time range. It prunes the rest, then sends the query to each remaining server.
+Each server aggregates its own segments and returns a small partial result, for example the sum and count per group. The broker merges the partial results. Sums add up, counts add up, and an average is computed from the merged sum and count, not by averaging averages.
+Approximate functions fit here too: each server returns a sketch and the broker merges the sketches. Latency equals the slowest server plus the merge. Many groups make the partial results large, so engines cap the number of groups per server.
+used: Apache Pinot (broker and servers); Apache Druid (broker, historicals); ClickHouse distributed tables.
+avoid: When the query needs a large join between shards; the partial results become too big to merge in one broker.
+flow:
+  Dashboard [client] -> Broker [svc: prunes segments] : GROUP BY country, 7 days | The dashboard sends one aggregation query to the broker.
+  Broker -> Server A [svc: segments 1-40], Server B [svc: segments 41-80] : sub-query | The broker sends the query to the servers whose segments match the time range.
+  Server A, Server B -> Broker : partial sums and counts | Each server returns one row per country, not raw events.
+  * Broker: merged partials | The broker adds sums and counts and then computes averages.
+  Broker -> Dashboard : 195 rows | The merged answer is returned in a few hundred milliseconds.
+  Server B -x> Broker : timeout | If one server is too slow, the broker returns an error or a flagged partial result.
+ref: docs | Pinot broker | Apache Pinot documentation | https://docs.pinot.apache.org/basics/components/broker
+
+== Deadline with partial results and hedging
+kind: scatter-gather, hedged-requests, timeout-deadline
+when: A fan-out request has to meet a strict latency target, and one slow shard must not spoil it.
+how: If a query fans out to 100 shards and each is slow 1 percent of the time, about 63 percent of queries hit at least one slow shard. The slowest response sets the latency. This is the tail-at-scale problem.
+The coordinator sets a deadline, such as 100 ms, and passes the remaining time to each shard. It sends a hedged copy of a request to another replica when the first reply is later than the 95th percentile. It takes the first answer and cancels the other.
+When the deadline passes, the coordinator returns what it has and marks the result as partial, for example "98 of 100 shards answered". Good fits are search and recommendation, where a slightly smaller result is better than a late one. It is a bad fit for exact money totals.
+used: Described in Google's The Tail at Scale; common in web search and large retrieval services.
+avoid: When the answer must be complete and exact; wait, retry or fail loudly instead.
+flow:
+  Client [client] -> Coordinator [svc: deadline 100 ms] : query | The coordinator starts a 100 ms deadline.
+  Coordinator -> Shard 1 [svc: replica a], Shard 2 [svc: replica a] : query + budget | Each shard gets the query and the time that is left.
+  Shard 1 -> Coordinator : results at 30 ms | Shard 1 answers quickly.
+  Coordinator -> Shard 2b [svc: replica b] : hedged copy at 60 ms | Shard 2 is slower than usual, so a second copy goes to another replica.
+  Shard 2b -> Coordinator : results at 75 ms | The faster copy wins and the slower one is cancelled.
+  * Coordinator: 2 of 2 shards | All shards answered before the deadline.
+  Coordinator -> Client : full result | If a shard had missed the deadline, the result would be marked partial.
+ref: paper | The Tail at Scale | Dean & Barroso, CACM 2013 | https://research.google/pubs/the-tail-at-scale/
+
+@@ shuffle
+== Map-side shuffle files, reduce-side fetch
+kind: map-reduce, data-locality
+when: A wide operation such as groupBy or join needs all rows with the same key on one worker.
+how: Each map task hashes the key of every output row to pick a reduce partition. It writes one file per task with the rows sorted by partition id, and an index file that gives the byte range of each partition. Files go to the local disk of the executor.
+When the map stage finishes, each reduce task fetches its byte range from every map task's file over the network. With M map tasks and R reduce tasks, that is M times R small fetches. At 10,000 maps and 10,000 reduces it is 100 million fetches, which is the main cost.
+Local disk files give fault tolerance. If a reduce task fails, it fetches the same blocks again. If a node is lost, the map tasks that wrote there are rerun. Map-side combine reduces the data first: a sum over keys sends one partial sum per key per map task.
+used: Spark sort-based shuffle; Hadoop MapReduce shuffle; Hive on Tez; the original design in the 2004 MapReduce paper.
+avoid: When data is already partitioned by the key (use a bucketed layout) or when one side is small (use a broadcast).
+flow:
+  Map task 1 [svc: sorts by partition], Map task 2 [svc: sorts by partition] -> Local disk [store: shuffle files + index] : write partitioned file | Each map task writes one sorted file and an index of byte ranges.
+  Local disk -> Reduce task 0 [svc: partition 0], Reduce task 1 [svc: partition 1] : fetch byte ranges | Each reduce task reads its own range from every map file over the network.
+  * Reduce task 0: merging 2 blocks | It merges the blocks and groups the rows by key.
+  Reduce task 0, Reduce task 1 -> Output [store] : aggregated rows | Every key now sits in exactly one reduce task, so the result is complete.
+  Local disk -x> Reduce task 1 : fetch failed | If a node is lost, the missing map tasks are rerun and the fetch repeats.
+ref: paper | MapReduce: Simplified Data Processing on Large Clusters | Dean & Ghemawat, OSDI 2004 | https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/
+ref: docs | Shuffle operations | Apache Spark documentation | https://spark.apache.org/docs/latest/rdd-programming-guide.html
+
+== Remote shuffle service
+kind: map-reduce, batching
+when: Shuffle data on executor disks makes autoscaling hard and large shuffles slow or unreliable.
+how: A separate shuffle service runs on its own nodes. Map tasks push their partition data to it, instead of keeping files on local disk. The service merges the pushed data for each reduce partition into large files, with replicas for safety.
+A reduce task then makes one sequential read per partition, not thousands of small random reads from every mapper. This turns M times R small fetches into about R large reads.
+Executors become disposable. They can be removed during a stage without losing shuffle data, which suits autoscaling and spot instances. The price is an extra service to run and an extra network hop in the write path.
+Spark has an external shuffle service on each node, and since version 3.2 it supports push-based shuffle, which merges blocks on the reducer side. Apache Celeborn and Apache Uniffle are separate remote shuffle services.
+used: Apache Celeborn and Apache Uniffle for Spark and Flink; Spark push-based shuffle on YARN.
+avoid: For small jobs with small shuffles; local disk is simpler and fast enough.
+flow:
+  Map tasks [svc: spot executors] -> Shuffle service [svc: Celeborn workers] : push partition data | Map tasks push each partition's data to the service as soon as it is ready.
+  Shuffle service -> Merged files [store: one per partition] : merge and replicate | The service merges the blocks of each partition into one large file and keeps replicas.
+  * Map tasks: executors removed | The cluster removes idle executors. Their shuffle data is not lost.
+  Reduce tasks [svc: new executors] -> Merged files : one sequential read | Each reduce task reads one big file for its partition.
+  Reduce tasks -> Output [store] : aggregated rows | The stage ends with fewer, larger reads.
+ref: docs | Apache Celeborn documentation | Apache Celeborn | https://celeborn.apache.org/docs/latest/
+
+== Repartition by key in a stream job
+kind: sharding, stream-table-join
+when: A stream job keeps state per key, and all events of a key must reach the same task.
+how: In Flink, keyBy hashes the key of every event and sends the event over the network to the task that owns that key range. Kafka Streams does the same through a repartition topic: the job writes the rekeyed events to a topic and reads them back.
+After the shuffle, every event for user 42 reaches the same task. That task keeps a counter, a window or a join table for user 42 in local state, so no remote lookup is needed. State is stored by key groups, which can be moved when the job is rescaled.
+Shuffling is the costly step of a stream job. All events cross the network, and a hot key overloads one task while others are idle. Keep the number of shuffles low and combine locally before the shuffle where you can.
+used: Flink keyBy; Kafka Streams repartition topics; Spark Structured Streaming stateful aggregations.
+avoid: When the input is already keyed correctly (Kafka messages keyed by the same field); then no extra shuffle is needed.
+flow:
+  Source [svc: reads events] -> keyBy [svc: hash key] : event, key = user 42 | Each event is hashed by its key.
+  keyBy -> Task 1 [svc: keys 0-63], Task 2 [svc: keys 64-127] : network send | Events travel to the task that owns the key range.
+  Task 2 -> State [db: local RocksDB] : update count of user 42 | The owner updates state in local storage with no remote call.
+  Task 2 -> Sink [store: results] : count = 17 | The task emits the new result downstream.
+  * Task 2: hot key user 42 | One very busy key can overload a single task while other tasks stay idle.
+ref: docs | Flink DataStream: keyed state | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/fault-tolerance/state/
+
+@@ vectorized
+== Batch-at-a-time operator pipeline
+kind: pipes-filters, batching
+when: An analytic engine scans billions of values, and per-row overhead wastes most of the CPU time.
+how: Each operator passes a batch of column values to the next one, not one row. The batch is a vector of about 1,000 to 2,000 values in DuckDB (2,048) and MonetDB/X100 (1,024). ClickHouse uses larger blocks, often about 65,000 rows.
+The batch size is chosen so the working set fits in the L1 or L2 cache. A filter operator runs one tight loop over the vector. The loop has no virtual call per row, so the compiler can use SIMD instructions (AVX2 handles 8 32-bit values at once). The loop writes a selection vector: the positions of the rows that passed. The next operator reads only those positions.
+The cost of one virtual call per operator is shared by 2,048 rows, so it almost disappears. Compared with row-at-a-time execution, this often gives 10 times or more on scan-heavy queries.
+The price is that intermediate vectors use memory and that operators must be written as batch kernels. This is also why vectorized engines need no run-time code generator.
+used: DuckDB; ClickHouse; MonetDB/X100 (the research origin); Snowflake and Databricks Photon use vectorized execution.
+avoid: For point lookups and row-oriented OLTP; one row at a time is natural there.
+flow:
+  Parquet scan [svc: decode columns] -> Filter [svc: SIMD loop] : vector of 2,048 | The scan decodes a vector of 2,048 values for each column.
+  Filter -> Projection [svc: batch kernel] : selection vector | The filter writes the positions of passing rows, not copies of rows.
+  Projection -> Hash aggregate [svc: batch update] : vector, 410 rows | The next operator works on the surviving 410 rows in one loop.
+  * Hash aggregate: 1 call per vector | One function call covers 2,048 rows, so call overhead is small.
+  Hash aggregate -> Result [store] : groups | When the input ends, the groups are written out.
+ref: paper | MonetDB/X100: Hyper-Pipelining Query Execution | Boncz, Zukowski & Nes, CIDR 2005 |
+ref: docs | Execution format: vectors | DuckDB documentation | https://duckdb.org/docs/stable/internals/vector.html
+
+== Shared vectorized library under many engines
+kind: plugin-arch, layered-arch
+when: Several engines each rebuild the same fast operators and column formats, and the work is repeated.
+how: The team puts the execution layer in a shared C++ library with batch kernels for scan, filter, join and aggregation. Each query engine keeps its own parser and optimizer, then hands a physical plan to the library.
+Meta's Velox is one example. Presto (as Prestissimo) and Spark (through the Gluten plugin) can run plans on Velox. Data moves in a columnar format, so different engines and a library can share buffers. Apache Arrow is the common in-memory format, and DataFusion is an engine built from Arrow-based parts.
+The gain is one tuned implementation of each operator with SIMD kernels, for all engines. The risk is mismatch: if the library lacks a function of the host engine, that query falls back to the old slow path. Results must also match exactly, for example in null and overflow rules.
+used: Velox under Presto and Spark (Gluten); Apache Arrow and DataFusion; Databricks Photon is a vectorized C++ engine under Spark APIs.
+avoid: When one engine already has a mature vectorized core and the integration cost is not justified.
+flow:
+  SQL query [client] -> Spark planner [svc: parse and optimize] : SQL | The host engine parses and optimizes the query as before.
+  Spark planner -> Gluten plugin [svc: plan translator] : physical plan | The plugin converts the plan to the shared library format.
+  Gluten plugin -> Velox [svc: SIMD kernels] : native plan | The library runs scan, filter and aggregation with SIMD kernels.
+  Gluten plugin -x> Spark planner : unsupported function | If the library lacks a function, that part falls back to the host engine.
+  Velox -> Result [store: Arrow-style batches] : columnar batches | Results are returned in a column format with little copying.
+ref: docs | Velox: Meta's unified execution engine | Velox project | https://velox-lib.io/
+ref: docs | Apache Arrow columnar format | Apache Arrow documentation | https://arrow.apache.org/docs/format/Columnar.html
+
+@@ volcano
+== Pull-based operator tree
+kind: pipes-filters, layered-arch
+when: A database must run any SQL plan from a small set of reusable operators, with low memory use.
+how: Every operator has the same interface: open(), next() and close(). A plan is a tree of operators. The root calls next() on its child, which calls next() on its own child, down to the scan. The scan returns one row, and the row moves up the tree.
+Rows are produced only when the parent asks for them. This is lazy evaluation. A LIMIT 10 at the root stops the pull after 10 rows, so the scan reads very little. No operator needs to store its whole input, except operators that must (sort, hash build, aggregate).
+The design is simple and composable: a new operator works with all others. The cost is one virtual call per row per operator. At 100 million rows and 5 operators, that is 500 million indirect calls, which the CPU predicts badly and which stop inlining. This is why modern analytic engines use vectorized or compiled execution instead.
+used: PostgreSQL, MySQL and SQLite executors; the model from Graefe's Volcano system (1994).
+avoid: For heavy analytic scans; use vectorized or compiled execution. It remains good for OLTP, where queries touch few rows.
+flow:
+  Client [client] -> Limit [svc: LIMIT 10] : SELECT ... LIMIT 10 | The root operator is a limit. The client reads rows from it.
+  Limit -> Filter [svc: price > 100] : next() | The limit calls next() on its child.
+  Filter -> Scan [svc: table scan] : next() | The filter calls next() on the scan.
+  Scan -> Filter : row 1 | The scan returns one row.
+  Filter -> Limit : row 1 passes | The row matches the filter and moves up the tree.
+  Limit -> Client : 10 rows, then stop | After 10 rows the limit stops calling next(), so the scan stops too.
+ref: paper | Volcano: An Extensible and Parallel Query Evaluation System | Goetz Graefe, IEEE TKDE 1994 |
+ref: docs | Overview of PostgreSQL internals: executor | PostgreSQL documentation | https://www.postgresql.org/docs/current/executor.html
+
+== Exchange operator for parallel queries
+kind: producer-consumer, fork-join
+when: One query should use many CPU cores or many nodes without rewriting each operator.
+how: The Volcano paper adds one special operator, exchange. It sits in the tree like any other operator and has the same next() interface. Under it, several copies of the sub-plan run in parallel on different partitions of the data.
+Each producer copy pushes its rows into a bounded buffer. The exchange above reads from these buffers and feeds its parent, so the parent still sees a normal stream of rows. Exchange can also repartition rows by a hash of the key, which sends equal keys to the same consumer for a parallel join.
+Because only one operator knows about parallelism, all the others stay single-threaded and simple. PostgreSQL uses this idea in its Gather node: worker processes run the lower part of the plan, and Gather merges their rows. Distributed engines use the same idea over the network as a shuffle.
+used: PostgreSQL parallel query (Gather and Gather Merge); the exchange operator in SQL Server; shuffle stages in MPP engines.
+avoid: For small queries, where the cost of starting workers is more than the gain.
+flow:
+  Gather [svc: exchange] -> Worker 1 [svc: scan part 1], Worker 2 [svc: scan part 2], Worker 3 [svc: scan part 3] : start workers | The exchange starts three workers, each running the same sub-plan on part of the table.
+  Worker 1, Worker 2, Worker 3 -> Row buffer [queue: bounded] : filtered rows | Each worker puts its rows into a bounded buffer.
+  Row buffer -> Gather : rows | The exchange reads rows from the buffers as the parent asks for them.
+  * Gather: 3 workers active | The parent operator sees one normal stream of rows.
+  Gather -> Aggregate [svc: final sum] : next() | The aggregate above pulls rows with the usual next() call.
+  Row buffer -x> Worker 1 : buffer full | When the buffer is full, workers wait. This is backpressure.
+ref: paper | Volcano: An Extensible and Parallel Query Evaluation System | Goetz Graefe, IEEE TKDE 1994 |
+ref: docs | Parallel query | PostgreSQL documentation | https://www.postgresql.org/docs/current/parallel-query.html
+
+@@ bandits
+== Thompson sampling for ad creatives
+kind: none
+when: Several versions of an ad or button exist, and you want traffic to move to the best one while the test runs.
+how: For each creative the service keeps a Beta(clicks + 1, non-clicks + 1) belief about its click rate. For each request, it draws one random sample from each creative's Beta and shows the creative with the highest sample.
+A creative with few views has a wide belief, so it sometimes draws a high number and gets traffic. This is exploration. A creative with a high proven rate draws high most of the time. This is exploitation. As data arrives, beliefs narrow and traffic moves to the winner without a manual switch.
+Feedback is delayed. Clicks come seconds to days after the impression, so the update job reads an event stream and recomputes the counts every few minutes. Keep a small share of random traffic to guard against drift. Regret, the reward lost against the best choice, grows only as the logarithm of time.
+used: Common in ad creative and bid optimization; Netflix has described contextual bandits for choosing artwork; Thompson sampling is in many experimentation platforms.
+avoid: When a clean, fixed-split A/B test is needed to measure effects with strict statistics; or when rewards are rare and very delayed.
+flow:
+  Ad request [client] -> Bandit service [svc: Thompson sampling] : slot, user context | An ad slot needs a creative to show.
+  Bandit service -> Posterior store [cache: Beta per creative] : read counts | The service reads clicks and non-clicks of each creative.
+  * Bandit service: sampled A=0.04, B=0.07 | It draws one sample from each Beta. B has the higher sample, so B is shown.
+  Bandit service -> Ad request : show creative B | The chosen creative is returned within a few milliseconds.
+  Ad request ~> Event stream [log: clicks] : impression, click | The ad server logs the impression and any later click.
+  Event stream ~> Posterior store : update counts | A job adds the new counts every few minutes, and beliefs become narrower.
+ref: paper | A Tutorial on Thompson Sampling | Russo, Van Roy, Kazerouni, Osband & Wen, 2018 | https://arxiv.org/abs/1707.02038
+
+== Contextual bandit with logged propensities
+kind: feedback-loop, online-offline
+when: The best choice depends on the user or context, and you want to learn it from live traffic and test new policies on logs.
+how: A contextual bandit sees features of the user and of each item, then picks one item. LinUCB, from the Yahoo news study, fits a linear reward model per item and adds an upper confidence bonus to uncertain items. Yahoo reported a gain of about 12.5 percent clicks over a context-free bandit in that study.
+The key log field is the propensity: the probability with which the live policy chose the shown item. It is written next to the context, the action and the reward. With propensities, you can estimate the value of a new policy from old logs, by inverse propensity weighting, before it serves any user.
+Without exploration, the logs only contain what the old policy chose, and new policies cannot be judged. A small, tracked amount of randomness gives the logs coverage.
+used: Yahoo news article recommendation (LinUCB study); contextual bandit services such as Vowpal Wabbit-based systems; Netflix artwork personalization.
+avoid: When actions change long-term state, such as a user's future habits; then a full reinforcement learning formulation is needed.
+flow:
+  Recommender API [svc: bandit policy] -> Feature store [store: user + item features] : fetch context | The policy reads features of the user and the candidate items.
+  Recommender API -> User [user] : item 7 shown | It picks item 7 and logs that it chose item 7 with probability 0.2.
+  User ~> Event log [log: ctx, p, reward] : click | The click or non-click is stored with the propensity.
+  Event log ~> Trainer [svc: weekly fit] : logged tuples | The trainer fits a new policy on the logged data.
+  Trainer -> Offline evaluator [svc: IPS estimate] : candidate policy | The new policy is scored on the old logs with inverse propensity weighting.
+  Offline evaluator -> Recommender API : promote if better | A policy with a better estimate goes to a small live share.
+ref: paper | A Contextual-Bandit Approach to Personalized News Article Recommendation | Li, Chu, Langford & Schapire, WWW 2010 | https://arxiv.org/abs/1003.0146
+
+@@ mcts
+== Select, expand, simulate, back up
+kind: none
+when: A game or planning problem has a huge tree of moves and no good hand-made evaluation function.
+how: Each loop of MCTS has four steps. Select: walk down the tree from the root, picking at each node the child with the highest UCT score (win rate plus a bonus for rarely tried moves). Expand: add one new child node. Simulate: play the game to the end with random moves (a rollout). Back up: add the result to every node on the path.
+Run this loop thousands of times within the time limit. The root child with the most visits is the move to play. The tree grows deeper along good lines, so the search focuses itself, and it needs no domain knowledge except the rules.
+MCTS can stop at any time and return the best move so far. It works well when the branching factor is large, as in Go (about 250 moves) where alpha-beta search struggled. Random rollouts are noisy, so strong programs add domain heuristics.
+used: Go programs before AlphaGo (Crazy Stone, MoGo); general game playing; planning in some video-game AI.
+avoid: When a precise evaluation function exists and the branching is small (use alpha-beta), or when the world is not simulable.
+flow:
+  Game state [note: root position] -> Tree [svc: statistics per node] : start search | Each search starts with the current position as the root.
+  Tree -> Leaf [svc: selected node] : select by UCT | The search walks down the tree, balancing win rate and rarely tried moves.
+  Leaf -> Rollout [svc: random playout] : expand, then simulate | The leaf gets a new child. A random game is played from it to the end.
+  Rollout -> Tree : result: win | The result is added to the visit and win counts on the path to the root.
+  * Tree: 10,000 simulations | After many loops the visit counts show which move is best.
+  Tree -> Game state : play most visited move | The most visited child of the root is played.
+ref: paper | A Survey of Monte Carlo Tree Search Methods | Browne et al., IEEE TCIAIG 2012 |
+
+== Neural network guided search with self-play
+kind: feedback-loop, offload-accelerator
+when: You can simulate a game perfectly and want a system that improves with its own play.
+how: AlphaZero replaces random rollouts with a neural network. For each position, the network gives a prior probability for each move and a value, which is the chance to win. The search uses the priors to choose which moves to try first and the value instead of a rollout at the leaves.
+The search runs for hundreds of simulations per move, so the visit counts are a better policy than the raw network output. Self-play games record these visit counts and the final result. A training job updates the network so that its priors match the visit counts and its value matches the result. The better network then plays the next games.
+The network calls are batched on GPUs or TPUs, because many searches run at the same time. The loop needs many self-play workers. It reached top play in Go, chess and shogi from the rules alone.
+used: AlphaGo Zero and AlphaZero (DeepMind); open-source clones such as Leela Zero.
+avoid: When no fast and exact simulator exists. Learned world models are then needed and are harder.
+flow:
+  Self-play worker [svc: runs MCTS] -> Inference server [svc: GPU batches] : positions to evaluate | The search sends leaf positions to a shared GPU server in batches.
+  Inference server -> Self-play worker : priors and value | The network returns move priors and a win estimate for each position.
+  Self-play worker -> Game buffer [store: games] : finished game | Each finished game is stored with the visit counts and the winner.
+  Game buffer -> Trainer [svc: SGD on GPUs] : training batches | The trainer samples positions from recent games.
+  Trainer -> Inference server : new weights | The new network is deployed, and the next games are stronger.
+  * Inference server: network v2 | Self-play now uses the improved network.
+ref: paper | Mastering Chess and Shogi by Self-Play with a General Reinforcement Learning Algorithm | Silver et al., 2017 | https://arxiv.org/abs/1712.01815
+
+@@ policygrad
+== PPO loop for LLM post-training
+kind: feedback-loop, online-offline
+when: A language model must be tuned toward a goal that you can score but not write as training text, such as human preference.
+how: The loop has four models. The policy is the language model being trained. A frozen reference copy keeps it close to its starting point. A reward model scores each full answer. A value model (critic) predicts the expected reward, to reduce noise.
+Per step, a batch of prompts goes to the policy, which samples answers. The reward model scores them, and a penalty on the KL divergence from the reference stops the policy from drifting into odd text that games the reward. The advantage of each token is the reward minus the critic's estimate.
+PPO then runs a few epochs of updates on this batch. It clips the ratio between the new and old probability of each token to the range 0.8 to 1.2, so one batch cannot change the policy too much. Then new samples are drawn from the new policy. The expensive part is generation, which needs inference engines next to the trainers.
+used: InstructGPT-style RLHF pipelines; open-source libraries such as TRL and OpenRLHF implement the loop.
+avoid: When preference pairs are enough and a simple supervised loss works; use DPO, which needs no sampling loop.
+flow:
+  Prompt batch [store: 512 prompts] -> Policy [model: LLM being trained] : prompts | A batch of prompts is sent to the current policy.
+  Policy -> Reward model [model: scores answers] : sampled answers | The policy generates answers, and the reward model scores each one.
+  Reference model [model: frozen copy] -> Policy : KL penalty | A penalty keeps the policy close to the reference, so it cannot game the reward.
+  Reward model -> PPO trainer [svc: clipped updates] : reward minus baseline | The trainer computes advantages and runs a few clipped update steps.
+  PPO trainer -> Policy : new weights | The policy gets the updated weights, and new answers are sampled from it.
+  * Policy: iteration 2 | The next batch is sampled from the improved policy.
+ref: paper | Proximal Policy Optimization Algorithms | Schulman et al., 2017 | https://arxiv.org/abs/1707.06347
+ref: paper | Training language models to follow instructions with human feedback | Ouyang et al., 2022 | https://arxiv.org/abs/2203.02155
+
+== Distributed actors and one learner
+kind: producer-consumer, data-parallel
+when: Training a policy needs millions of simulated episodes, and one machine cannot produce them fast enough.
+how: Many rollout workers each run a copy of the simulator and the current policy. Each worker plays episodes and writes trajectories: states, actions, rewards and the log probability of each action. A queue sends them to the learner.
+The learner groups trajectories into a batch, computes advantages and runs PPO updates on GPUs. With several GPUs, gradients are averaged with all-reduce. After each update, new weights are sent to the workers.
+Policy gradient needs data from a policy close to the current one. So the system either waits for all workers (synchronous) or tolerates a small lag and corrects it with the stored probabilities (asynchronous). OpenAI Five trained a Dota 2 agent this way on a very large CPU and GPU cluster.
+used: OpenAI Five (PPO at large scale); Ray RLlib; Isaac Gym style robot training with thousands of parallel simulations on one GPU.
+avoid: When simulation is slow or costly and data must be reused many times; consider off-policy methods such as Q-learning variants.
+flow:
+  Rollout worker 1 [svc: simulator + policy], Rollout worker 2 [svc: simulator + policy] -> Trajectory queue [queue: episodes] : states, actions, rewards | Each worker plays episodes and sends trajectories with the action probabilities.
+  Trajectory queue -> Learner [svc: PPO on GPUs] : batch of 64,000 steps | The learner takes a large batch of steps.
+  * Learner: update 1,200 | It computes advantages and does clipped updates for a few epochs.
+  Learner -> Weight store [store: policy version] : new weights v1201 | The learner publishes the new weights.
+  Weight store ~> Rollout worker 1, Rollout worker 2 : pull weights | Workers refresh their policy before the next episodes.
+  Rollout worker 1 -x> Learner : stale data from v1195 | Data from a much older policy is dropped or down-weighted.
+ref: paper | Dota 2 with Large Scale Deep Reinforcement Learning | OpenAI et al., 2019 | https://arxiv.org/abs/1912.06680
+
+== Group-relative updates with checkable rewards
+kind: feedback-loop, online-offline
+when: Answers can be checked by a program, such as a math result or a unit test, and a separate reward model and critic are too costly.
+how: For each prompt, the policy samples a group of answers, for example 16. A checker gives each answer a reward: 1 if the final result or the tests pass, 0 if not. There is no learned reward model, so there is less reward hacking.
+GRPO takes the mean and standard deviation of rewards inside the group. An answer's advantage is its reward minus the group mean, divided by the standard deviation. This replaces the critic, so one large model fewer is held in memory. The update uses the same clipped objective as PPO, often with a small KL term.
+If all answers of a prompt are right or all wrong, the advantage is zero and the prompt teaches nothing, so prompts of medium difficulty are most useful.
+used: DeepSeek-R1 and DeepSeekMath trained with GRPO; open-source recipes in TRL and other libraries.
+avoid: When no automatic checker exists and quality is subjective; a reward model or preference method is needed.
+flow:
+  Prompt set [store: math and code] -> Policy [model: LLM] : one prompt | A prompt is taken from a set of tasks that have checkers.
+  Policy -> Checker [svc: tests, answer match] : 16 sampled answers | The policy writes a group of 16 answers.
+  Checker -> Trainer [svc: GRPO update] : rewards 1 or 0 | The checker marks each answer right or wrong with a program.
+  * Trainer: advantage = reward - group mean | Each answer is compared with its own group, so no critic is needed.
+  Trainer -> Policy : new weights | The clipped update raises the probability of the answers that passed.
+ref: paper | DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models | Shao et al., 2024 | https://arxiv.org/abs/2402.03300
+
+@@ qlearning
+== DQN with replay buffer and target network
+kind: producer-consumer, feedback-loop
+when: The state is too large for a table, such as game pixels, and a network must estimate the value of each action.
+how: An agent acts in the environment with an epsilon-greedy rule: it takes the action with the highest Q value, but with probability epsilon a random one. Each step produces a transition (state, action, reward, next state), which is stored in a replay buffer, for example the last 1 million transitions.
+The learner samples random mini-batches of 32 transitions from the buffer. Random sampling breaks the strong link between consecutive frames and makes training stable. The target for each sample is reward plus gamma times the maximum Q value of the next state.
+That maximum is computed by a separate target network, which is a copy of the online network updated only every few thousand steps. Without it, the network chases its own moving target and can diverge. The loop reached human-level play in many Atari games from raw pixels.
+used: DeepMind's DQN on Atari; Dopamine and Stable-Baselines3 implementations.
+avoid: Continuous actions, such as robot torques, where taking a maximum over actions is hard; use actor-critic methods.
+flow:
+  Agent [svc: epsilon-greedy] -> Environment [svc: Atari game] : action | The agent takes the best known action or, sometimes, a random one.
+  Environment -> Replay buffer [store: 1M transitions] : state, reward, next state | Every step is stored as a transition.
+  Replay buffer -> Learner [svc: SGD on Q network] : random batch of 32 | The learner samples old transitions in random order.
+  Target network [model: frozen copy] -> Learner : max Q of next state | The target values come from a slowly updated copy of the network.
+  Learner -> Agent : new Q network | The agent receives the improved Q network.
+  * Target network: synced every 10,000 steps | The copy is refreshed only now and then, which keeps the targets steady.
+ref: paper | Human-level control through deep reinforcement learning | Mnih et al., Nature 2015 | https://www.nature.com/articles/nature14236
+ref: paper | Playing Atari with Deep Reinforcement Learning | Mnih et al., 2013 | https://arxiv.org/abs/1312.5602
+
+== Offline Q-learning from logged data
+kind: online-offline, feedback-loop
+when: You have a large log of past decisions and outcomes, and trying new actions live is costly or unsafe.
+how: The learner trains only on a fixed dataset of logged transitions. It never interacts with the live system while it trains. The logs come from an existing policy, such as rules written by people or an older model.
+Plain Q-learning fails here. It may pick actions that never appear in the logs and trust their wrongly high value estimates. Offline methods such as Conservative Q-Learning (CQL) lower the Q value of unseen actions, so the learned policy stays inside the data.
+Before launch, the policy is scored by off-policy evaluation on held-out logs. Only a policy that looks better is released, usually to a small share of traffic first. Its new logs then join the dataset for the next round.
+used: Research and pilots in recommendation, healthcare treatment, and data-centre control; common in robot learning from demonstration logs.
+avoid: When the logs cover few actions or are biased, so no safe estimate exists; collect more exploration data first.
+flow:
+  Production system [svc: old policy] -> Decision log [lake: logged data] : transitions | The live system writes each decision with its outcome.
+  Decision log -> Offline trainer [svc: conservative Q-learning] : fixed dataset | The trainer learns from the log with no live interaction.
+  * Offline trainer: Q lowered on unseen actions | The penalty keeps the policy near the actions found in the data.
+  Offline trainer -> Off-policy evaluator [svc: held-out logs] : candidate policy | The candidate is scored on logs it did not train on.
+  Off-policy evaluator -> Production system : release to 5% | If the estimate beats the old policy, 5 percent of traffic is switched.
+  Off-policy evaluator -x> Offline trainer : estimate too low | If not, the policy is not released and the team gets more data.
+ref: paper | Offline Reinforcement Learning: Tutorial, Review, and Perspectives on Open Problems | Levine, Kumar, Tucker & Fu, 2020 | https://arxiv.org/abs/2005.01643
+
+@@ kalman
+== Fuse fast IMU with slow GPS
+kind: none
+when: A vehicle or phone needs a smooth position at 100 Hz or more, but GPS gives only 1 to 10 fixes per second and is noisy.
+how: The filter keeps a state: position, velocity and orientation, with a covariance matrix that says how uncertain each part is. The inertial sensor (IMU) reports acceleration and rotation 100 to 400 times per second. At each IMU sample the filter predicts: it moves the state forward with the motion model, and the uncertainty grows.
+When a GPS fix arrives, the filter does an update. It compares the measured position with the predicted position. The Kalman gain weights the difference by how much each source is trusted: a poor GPS (large noise) gets a small weight, a drifting IMU gets a large uncertainty. The state moves a little toward the GPS, and the uncertainty shrinks.
+The output is smooth like the IMU and does not drift like the IMU. For non-linear motion, systems use the extended or error-state Kalman filter. If GPS drops in a tunnel, the filter keeps predicting, and uncertainty grows until a fix returns.
+used: Navigation systems in aircraft and phones; open-source autopilots PX4 and ArduPilot use extended Kalman filters; the Apollo guidance computer used Kalman filtering.
+avoid: When the noise is far from Gaussian or the state is multi-modal; use a particle filter.
+flow:
+  IMU [svc: 200 Hz] -> Kalman filter [svc: state + covariance] : acceleration, rotation | The IMU sends motion data very often.
+  * Kalman filter: predict, uncertainty grows | Each IMU sample moves the state forward, and the uncertainty increases.
+  GPS [svc: 5 Hz] -> Kalman filter : position fix | A GPS position arrives a few times per second.
+  * Kalman filter: update, uncertainty shrinks | The filter blends the fix with the prediction by the Kalman gain.
+  Kalman filter -> Autopilot [svc: control] : pose and speed at 200 Hz | The controller always receives a smooth state estimate.
+  GPS -x> Kalman filter : no fix in tunnel | Without GPS the filter only predicts, so uncertainty grows until a fix returns.
+ref: paper | A New Approach to Linear Filtering and Prediction Problems | R. E. Kalman, Journal of Basic Engineering, 1960 |
+ref: docs | PX4 state estimation (EKF2) | PX4 documentation | https://docs.px4.io/main/en/advanced_config/tuning_the_ecl_ekf.html
+
+== Track objects across video frames
+kind: none, pipes-filters
+when: A detector finds objects in each frame, but you need stable identities over time, even when a detection is missed.
+how: Each tracked object has its own Kalman filter, with the state of box center, size and their velocity. For every new frame, each track predicts where its box should be now.
+The detector then gives new boxes. The tracker matches predictions and detections by overlap (intersection over union), solving the assignment with the Hungarian algorithm. A matched track does a Kalman update. An unmatched detection starts a new track. A track with no match for a few frames is deleted.
+Because of the prediction step, a track survives a short miss: the filter keeps moving the box with the last velocity. Simple trackers such as SORT run in thousands of frames per second on CPU after detection.
+used: SORT and DeepSORT; ByteTrack; many video analytics and driver-assistance trackers use Kalman prediction with a matching step.
+avoid: With crowded scenes and heavy occlusion, add appearance features (re-identification) to the matching.
+flow:
+  Video frame [client] -> Detector [model: object detector] : frame t | Each frame goes to the object detector.
+  Detector -> Matcher [svc: IoU + Hungarian] : boxes | The detector returns boxes with scores.
+  Track filters [svc: one Kalman per track] -> Matcher : predicted boxes | Every track predicts its box for frame t.
+  Matcher -> Track filters : matched pairs | A matched detection updates its Kalman filter.
+  * Track filters: new track 7 | A detection with no match starts a new track.
+  Matcher -> Output [store: track ids] : boxes with ids | The output has stable ids over time.
+  Matcher -x> Track filters : missed 5 frames | A track with no match for 5 frames is removed.
+ref: paper | Simple Online and Realtime Tracking | Bewley et al., ICIP 2016 | https://arxiv.org/abs/1602.00763
+
+== Particle filter for robot localization
+kind: none
+when: A robot must find its position on a known map, and the belief may have several peaks, so a single Gaussian does not fit.
+how: The filter keeps hundreds to thousands of particles, each a guess of the robot pose. First the motion step: every particle is moved by the wheel odometry plus random noise. Then the measurement step: each particle gets a weight from how well the laser scan fits the map from that pose.
+Then comes resampling: new particles are drawn in proportion to the weights. Good guesses are copied and bad ones die. At the start, particles are spread over the whole map. After the robot moves along a corridor, only a few clusters remain, and then one.
+The cost grows with the number of particles and with the size of the state. Adaptive versions change the number of particles with the uncertainty. The method handles the kidnapped robot problem, where the robot is moved without notice.
+used: Monte Carlo localization in ROS (AMCL package); robot vacuum and warehouse robot localization.
+avoid: When the state is high dimensional (particles are too few to cover it) and the posterior is near Gaussian; use a Kalman filter.
+flow:
+  Odometry [svc: wheel encoders] -> Particle set [svc: 1,000 poses] : motion | Each particle is moved by the odometry plus noise.
+  Laser scan [client] -> Weighting [svc: scan vs map] : 360 ranges | The scan is compared with the map from every particle pose.
+  Particle set -> Weighting : pose guesses | Each particle gets a weight from how well the scan fits.
+  Weighting -> Resampler [svc: draw by weight] : weights | New particles are drawn in proportion to weight.
+  Resampler -> Particle set : new set | Good guesses are copied. Poor ones are dropped.
+  * Particle set: one cluster left | After several moves the cloud collapses onto the true pose.
+ref: book | Probabilistic Robotics | Thrun, Burgard & Fox, MIT Press, 2005 |
+
+@@ motionplan
+== Sampling-based planner in a robot stack
+kind: pipes-filters, interpreter-compiler
+when: A robot arm with 6 or more joints must move among obstacles, and a grid search is too large.
+how: The planner works in configuration space: one point is one set of joint angles. A collision checker answers whether a point is free, by testing the robot geometry against a 3D model of the scene (from a depth camera).
+RRT grows a tree from the start. It picks a random configuration, finds the nearest tree node, and steps a short distance toward it. If the step is free of collision, a new node is added. Now and then it aims at the goal itself. When a node is close to the goal, the path is read back through the tree.
+The raw path is jagged, so a smoothing step shortcuts it and a time parameterization adds speeds within joint limits. The result is sent to the controller. RRT is probabilistically complete but not optimal. RRT* and similar variants improve the path with more time.
+used: MoveIt with OMPL planners (RRT, RRT-Connect, PRM and others) in ROS; industrial arm planning.
+avoid: For a mobile robot in a 2D grid, A* or a lattice planner is simpler. For narrow passages, add specialized sampling.
+flow:
+  Depth camera [client] -> Scene model [store: 3D obstacles] : point cloud | The camera updates the 3D model of the obstacles.
+  Task [client: pick up part] -> Planner [svc: RRT-Connect] : start and goal | The task gives start and goal joint angles.
+  Planner -> Collision checker [svc: geometry tests] : candidate configuration | Each new tree node is tested against the scene.
+  Collision checker -> Planner : free or in collision | Only free nodes join the tree.
+  Planner -> Smoother [svc: shortcut + timing] : jagged path | The path is shortened and given speeds within joint limits.
+  Smoother -> Controller [svc: arm driver] : trajectory | The controller follows the trajectory.
+ref: docs | The Open Motion Planning Library | OMPL | https://ompl.kavrakilab.org/
+ref: paper | Rapidly-Exploring Random Trees: A New Tool for Path Planning | LaValle, 1998 |
+
+== Layered planner: route, local trajectory, controller
+kind: layered-arch, control-loop
+when: A vehicle must go far, through a changing world, and replan many times per second.
+how: The system splits planning by time scale. A global planner searches a road or grid graph with A* and gives a route of many kilometres. It runs rarely: at the start and when the road is blocked.
+A local planner runs about 10 times per second. It takes the next part of the route and the tracked objects around it. It generates many candidate trajectories, scores each one by safety, comfort and progress, and keeps the best one that does not hit anything.
+A low-level controller follows the chosen trajectory at 50 to 100 Hz, using feedback on steering and speed. Each layer uses a simpler view of the world than the one above. A failure in the local layer, such as no safe path, falls back to a stop, not to a risky guess.
+used: Autonomous vehicle stacks such as Autoware and Apollo, and the ROS navigation stack (global and local planner with costmaps).
+avoid: When the world is static and small; one planner is enough.
+flow:
+  Navigation goal [client] -> Global planner [svc: A* on road graph] : destination | The global planner finds a long route on a map graph.
+  Global planner -> Local planner [svc: 10 Hz] : route segment | The local planner gets the next part of the route.
+  Perception [svc: tracked objects] -> Local planner : obstacles and tracks | The local planner also sees moving objects.
+  Local planner -> Controller [svc: 100 Hz feedback] : best trajectory | It picks the safest low-cost trajectory.
+  Controller -> Vehicle [svc: steering, throttle] : commands | The controller turns the trajectory into commands.
+  Local planner -x> Global planner : road blocked | If the road is blocked, the global planner computes a new route.
+ref: docs | ROS 2 Navigation (Nav2) | Open Navigation, Nav2 documentation | https://docs.nav2.org/
+
+== Precomputed roadmap, many fast queries
+kind: precompute
+when: The robot works in the same static space many times, such as a factory cell, and each plan must be fast.
+how: The probabilistic roadmap (PRM) separates work in two phases. In the learning phase, the planner samples thousands of random free configurations and connects nearby pairs by a straight local path if it is collision free. The result is a graph, the roadmap.
+In the query phase, the planner connects the start and goal to nearby nodes in the roadmap and runs A* or Dijkstra on the graph. This takes milliseconds, as no new collision checks are needed except for the two connections.
+The roadmap is valid only while the environment is the same. If a new obstacle appears, the edges that hit it must be removed or checked again. This is the same idea as an index: do the costly work once and answer many queries.
+used: OMPL PRM planners in MoveIt; repeated tasks in static cells such as bin picking.
+avoid: When obstacles move or the layout changes often; use RRT-style single-query planning.
+flow:
+  Static scene model [store] -> Roadmap builder [svc: samples configs] : free-space checks | Offline, the builder samples many configurations and tests them for collisions.
+  Roadmap builder -> Roadmap [db: 5,000 nodes] : nodes and edges | Nearby free configurations are joined by collision-free edges.
+  Task A [client] -> Query planner [svc: A* on roadmap] : start, goal | A task asks for a path between two poses.
+  Query planner -> Roadmap : connect and search | The planner links start and goal to nearby nodes and runs A*.
+  Query planner -> Task A : path in 5 ms | The answer is a short graph search, so it is fast.
+  Roadmap -x> Query planner : edge blocked | If an obstacle appears, affected edges are removed and checked again.
+ref: paper | Probabilistic Roadmaps for Path Planning in High-Dimensional Configuration Spaces | Kavraki et al., IEEE T-RA 1996 |
+
+@@ pid
+== Feedback throttle for budget pacing
+kind: control-loop, rate-limit
+when: An ad campaign must spend its daily budget evenly over the day, not in the first hour.
+how: The target is a spend curve over the day, for example a straight line from 0 to 10,000 dollars. A pacing service measures actual spend every minute and computes the error: target minus actual.
+A PID controller turns the error into a change of the throttle, the share of auction opportunities the campaign enters (or a bid multiplier). The proportional part reacts to the current gap. The integral part removes a steady gap that remains for a long time. The derivative part reduces overshoot when spend speeds up.
+The integral must have a limit (anti-windup). Otherwise during an outage it grows large and the campaign overspends when the system comes back. Tune slowly, because the loop has delay: a bid placed now shows in spend reports minutes later.
+used: Common in budget pacing at ad platforms and DSPs; the same loop style is used in thermostats, cruise control and some autoscalers.
+avoid: When spend data is very delayed or very noisy; use a model of traffic with a forecast, and use feedback only for small corrections.
+flow:
+  Pacing target [note: 10k per day] -> PID controller [svc: Kp Ki Kd] : target spend now | The target curve gives the planned spend at this minute.
+  Spend counter [store: actual spend] -> PID controller : actual spend | The counter reports spend so far, with a delay of a minute.
+  * PID controller: error = -300 dollars | Spend is behind plan by 300 dollars, so the throttle must go up.
+  PID controller -> Bidder [svc: throttle 0.62] : new throttle | The controller raises the share of auctions the bidder enters.
+  Bidder -> Spend counter : wins and spend | The bidder wins auctions and the spend grows.
+  PID controller -x> Bidder : integral windup | Without a limit on the integral term, a long outage causes a big overshoot later.
+ref: book | Feedback Systems: An Introduction for Scientists and Engineers | Åström & Murray, Princeton University Press, 2nd ed., 2021 | https://fbswiki.org/
+
+== Cascaded loops in a drone or motor drive
+kind: control-loop, layered-arch
+when: A system has fast inner dynamics and slow outer dynamics, such as a drone that must hold a position.
+how: The controller is built in layers. The outer loop compares the wanted position with the measured one and outputs a wanted velocity or tilt angle. The next loop compares that with the measured angle and outputs a wanted rotation rate. The inner loop compares the rate with the gyro and outputs motor commands.
+Each loop runs faster than the one outside it: for example position at 10 to 50 Hz, attitude at 250 Hz and rate at 1 kHz or more. The inner loop must settle before the outer loop sees its effect. Each loop is a simple PID that is easy to tune one by one, starting from the inside.
+The sensor data come from a state estimator such as a Kalman filter. Limits on each output protect the hardware: a maximum tilt and a maximum motor command.
+used: PX4 and ArduPilot multicopter controllers (cascaded P and PID loops); servo and motor drives in industry (current, speed and position loops).
+avoid: When the plant is strongly coupled or has long dead time; consider model predictive control.
+flow:
+  Position setpoint [client] -> Position loop [svc: P 20 Hz] : wanted position | The outer loop turns a position error into a wanted velocity.
+  Position loop -> Attitude loop [svc: PID 250 Hz] : wanted tilt | The next loop turns that into a wanted tilt angle.
+  Attitude loop -> Rate loop [svc: PID 1 kHz] : wanted rotation rate | The rate loop is the fastest one.
+  Rate loop -> Motors [svc: ESC and rotors] : motor commands | The inner loop sets the speed of each motor.
+  Gyro and IMU [svc: sensors] -> Rate loop : measured rate | The gyro feeds back the real rotation rate.
+  * Rate loop: saturated | If the output reaches its maximum, the integral is frozen to avoid windup.
+ref: docs | PX4 multicopter controller diagrams | PX4 documentation | https://docs.px4.io/main/en/flight_stack/controller_diagrams.html
+
+@@ bitmap
+== Combine filters with bitwise AND and OR
+kind: index-table, materialized-view
+when: Users filter on several low-cardinality columns at once, such as country, device and campaign, and need counts fast.
+how: For each distinct value of each column, the index keeps a bitmap. Bit i is set if row i has that value. The bitmap for country = IN has a 1 for every row where the country is India.
+A query like country = IN AND device = mobile AND NOT bot is answered by AND and ANDNOT on three bitmaps. The result is a bitmap of matching rows. Counting its set bits gives COUNT(*) without reading any row data. A CPU instruction processes 64 bits at once, and SIMD processes 256 or 512.
+Plain bitmaps are large for sparse data, so Roaring splits the row range into chunks of 65,536 and stores each chunk as a sorted array, a bitset or run lengths, whichever is smaller. This keeps AND and OR fast and the size low.
+used: Apache Druid and Apache Pinot inverted indexes use Roaring bitmaps; Lucene-based search engines cache filters as compact doc id sets; ClickHouse and others use bitmap functions.
+avoid: For high-cardinality columns such as user id, one bitmap per value is wasteful; use a B-tree or hash index.
+flow:
+  Dashboard [client] -> Query engine [svc: parses filters] : country=IN AND mobile | The user asks for the count of mobile traffic from India.
+  Query engine -> Bitmap index [store: Roaring per value] : get bitmaps | The engine loads the bitmap for each value in the filter.
+  Bitmap index -> Query engine : 2 bitmaps | Each bitmap is small and compressed.
+  * Query engine: AND of 2 bitmaps | One bitwise AND gives the rows that match both filters.
+  Query engine -> Column store [lake: column data] : read rows of the matches | Only the matching row positions are read, if values are needed.
+  Query engine -> Dashboard : count = 8.4M | A count needs only the number of set bits.
+ref: paper | Better bitmap performance with Roaring bitmaps | Chambi, Lemire, Kaser & Godin, 2016 | https://arxiv.org/abs/1402.6407
+ref: docs | Roaring bitmaps | RoaringBitmap project | https://roaringbitmap.org/
+
+== Audience segments as bitmaps of user ids
+kind: precompute, pre-aggregation
+when: Marketers define audiences by rules and ask for the reach of unions and overlaps of many segments.
+how: Each audience segment is stored as a Roaring bitmap of internal integer user ids. Each user id is mapped to a dense integer, so bitmaps stay compact. A segment of 50 million users takes tens of megabytes, not the 800 MB of a list of 16-byte ids.
+Reach and overlap are set operations. "In market for cars OR for trucks, AND NOT already a customer" is two bitmap ORs and an ANDNOT. The cardinality of the result is the audience size, and it takes milliseconds.
+Segments are rebuilt by a batch job when new events arrive and are loaded into the serving store. The id mapping must be stable. For counts over huge sets where small error is fine, a sketch such as HyperLogLog is smaller, but it cannot list members.
+used: Common in audience segmentation and campaign planning tools; databases built on bitmaps such as FeatureBase (Pilosa) target this use.
+avoid: When only approximate reach is needed and the sets are huge; sketches are smaller. Or when ids are sparse strings that cannot be mapped to integers.
+flow:
+  Event lake [lake: user events] -> Segment builder [svc: daily job] : events | A daily job applies the segment rules to the event data.
+  Segment builder -> Segment store [store: Roaring per segment] : bitmap per segment | Each segment is saved as a compressed bitmap of integer user ids.
+  Planner UI [client] -> Reach service [svc: set algebra] : cars OR trucks, NOT cust | A marketer asks for the size of a combined audience.
+  Reach service -> Segment store : load 3 bitmaps | The service loads the three needed bitmaps.
+  * Reach service: OR, then ANDNOT | Two set operations produce the final bitmap.
+  Reach service -> Planner UI : 12.3M users | The set size is returned in milliseconds.
+ref: docs | Roaring bitmaps | RoaringBitmap project | https://roaringbitmap.org/
+
+== Deletion vectors for lakehouse tables
+kind: open-table-format, copy-on-write
+when: A few rows in large immutable Parquet files must be deleted or updated without rewriting the whole file.
+how: A deletion vector is a bitmap stored next to a data file. Bit i is set if row i of that file is deleted. The delete command writes only this small bitmap, not a new 1 GB file. The table's transaction log records the vector as part of the new table version.
+A reader opens the data file, loads its bitmap and skips the rows with set bits. This is called merge on read. A background job later compacts the table: it rewrites files with many deleted rows and drops the vectors.
+Delta Lake stores deletion vectors as Roaring bitmaps, and the Iceberg table format version 3 adds deletion vectors in the same style. The trade is faster deletes and updates against a small extra cost on every read until compaction.
+used: Delta Lake deletion vectors (and Databricks Photon predictive IO); Apache Iceberg v3 deletion vectors.
+avoid: When most rows of a file are deleted or reads must be as fast as possible; rewrite the file (copy on write).
+flow:
+  DELETE statement [client] -> Table engine [svc: Delta or Iceberg] : DELETE WHERE id = 7 | A user deletes a few rows.
+  Table engine -> Parquet file [lake: 1 GB] : find rows | The engine finds the row positions in the existing data file.
+  Table engine -> Deletion vector [store: Roaring bitmap] : write bitmap | It writes a small bitmap of deleted row positions.
+  Table engine -> Transaction log [log: table versions] : commit version 42 | The log gets a new version that links the file and its vector.
+  Reader [client] -> Parquet file : scan | A later query reads the data file.
+  Reader -> Deletion vector : skip set bits | The reader skips the rows that are marked deleted.
+ref: docs | Deletion vectors | Delta Lake documentation | https://docs.delta.io/latest/delta-deletion-vectors.html

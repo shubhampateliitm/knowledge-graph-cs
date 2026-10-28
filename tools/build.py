@@ -38,9 +38,11 @@ CREATE INDEX edges_dst ON edges(dst);
 CREATE TABLE side_links (a TEXT NOT NULL REFERENCES nodes(id), b TEXT NOT NULL REFERENCES nodes(id), type TEXT NOT NULL, reason TEXT NOT NULL);
 CREATE TABLE tours (id INTEGER PRIMARY KEY, title TEXT NOT NULL, subtitle TEXT NOT NULL);
 CREATE TABLE tour_steps (tour_id INTEGER NOT NULL REFERENCES tours(id), ord INTEGER NOT NULL, node_id TEXT NOT NULL REFERENCES nodes(id), note TEXT NOT NULL, PRIMARY KEY (tour_id, ord));
-CREATE TABLE programs (id TEXT PRIMARY KEY, name TEXT NOT NULL, year TEXT NOT NULL, url TEXT NOT NULL, summary TEXT NOT NULL);
+-- schools (content/curriculum/*.txt "@school" lines); programs and courses name theirs
+CREATE TABLE schools (id TEXT PRIMARY KEY, short TEXT NOT NULL, name TEXT NOT NULL, url TEXT NOT NULL, ord INTEGER NOT NULL);
+CREATE TABLE programs (id TEXT PRIMARY KEY, name TEXT NOT NULL, year TEXT NOT NULL, url TEXT NOT NULL, summary TEXT NOT NULL, short TEXT NOT NULL, school TEXT NOT NULL REFERENCES schools(id));
 CREATE TABLE program_groups (program_id TEXT NOT NULL REFERENCES programs(id), ord INTEGER NOT NULL, name TEXT NOT NULL, note TEXT NOT NULL, courses TEXT NOT NULL, PRIMARY KEY (program_id, ord));
-CREATE TABLE courses (code TEXT PRIMARY KEY, title TEXT NOT NULL, url TEXT NOT NULL, term TEXT NOT NULL, material TEXT NOT NULL, ord INTEGER NOT NULL);
+CREATE TABLE courses (code TEXT PRIMARY KEY, title TEXT NOT NULL, url TEXT NOT NULL, term TEXT NOT NULL, material TEXT NOT NULL, ord INTEGER NOT NULL, school TEXT NOT NULL REFERENCES schools(id));
 CREATE TABLE course_concepts (code TEXT NOT NULL REFERENCES courses(code), ord INTEGER NOT NULL, node_id TEXT NOT NULL REFERENCES nodes(id), PRIMARY KEY (code, ord));
 CREATE INDEX course_concepts_node ON course_concepts(node_id);
 CREATE TABLE designs (id TEXT PRIMARY KEY, title TEXT NOT NULL, category TEXT NOT NULL, level TEXT NOT NULL, concepts TEXT NOT NULL,
@@ -102,11 +104,12 @@ def write_db(data, path):
         db.execute("INSERT INTO tours VALUES (?,?,?)", (i, t["title"], t["sub"]))
         db.executemany("INSERT INTO tour_steps VALUES (?,?,?,?)", [(i, j, s[0], s[1]) for j, s in enumerate(t["steps"])])
     cur = data["curriculum"]
+    db.executemany("INSERT INTO schools VALUES (?,?,?,?,?)", [(x["id"], x["short"], x["name"], x["url"], i) for i, x in enumerate(cur.get("schools", []))])
     for p in cur["programs"]:
-        db.execute("INSERT INTO programs VALUES (?,?,?,?,?)", (p["id"], p["name"], p["year"], p["url"], p["summary"]))
+        db.execute("INSERT INTO programs VALUES (?,?,?,?,?,?,?)", (p["id"], p["name"], p["year"], p["url"], p["summary"], p["short"], p["school"]))
         db.executemany("INSERT INTO program_groups VALUES (?,?,?,?,?)", [(p["id"], i, g["name"], g["note"], ",".join(g["courses"])) for i, g in enumerate(p["groups"])])
     for i, c in enumerate(cur["courses"]):
-        db.execute("INSERT INTO courses VALUES (?,?,?,?,?,?)", (c["code"], c["title"], c["url"], c["term"], c["text"], i))
+        db.execute("INSERT INTO courses VALUES (?,?,?,?,?,?,?)", (c["code"], c["title"], c["url"], c["term"], c["text"], i, c["school"]))
         db.executemany("INSERT INTO course_concepts VALUES (?,?,?)", [(c["code"], j, n) for j, n in enumerate(c["concepts"])])
     for i, d in enumerate(data["designs"]):
         db.execute("INSERT INTO designs VALUES (?,?,?,?,?,?,?,?)", (d["id"], d["title"], d["category"], d["level"], ",".join(d["concepts"]), d["w"], d["rm"], i))
