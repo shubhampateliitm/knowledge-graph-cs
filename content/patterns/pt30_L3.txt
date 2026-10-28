@@ -337,7 +337,7 @@ flow:
 
 @@ sorting
 == External merge sort for data larger than memory
-kind: none
+kind: external-sort
 when: A query or job must sort more data than fits in RAM, such as ORDER BY on 500 GB with 8 GB of memory.
 how: Phase 1 makes sorted runs. Read as much as fits in memory, sort it with an in-memory sort, and write it to disk as one sorted run. Repeat until all input is read. With 8 GB of memory and 500 GB of data, that gives about 63 runs.
 Phase 2 merges runs. Open all runs together (a k-way merge), keep one buffer per run, and repeatedly take the smallest head item with a min-heap. Write it to the output. If there are too many runs to open together, merge in several passes.
@@ -386,7 +386,7 @@ flow:
 ref: paper | HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm | Flajolet, Fusy, Gandouet & Meunier, 2007 |
 
 == Reservoir sample for debugging and monitoring
-kind: none
+kind: reservoir-sampling
 when: A stream is too large to keep, and you want a fair, fixed-size sample for inspection, offline checks or model monitoring.
 how: Reservoir sampling keeps k items so that every item seen so far has the same chance, k/n, to be in the sample. Keep the first k items. For item number n after that, pick a random integer from 1 to n. If it is at most k, replace a random slot in the reservoir with the new item.
 The reservoir uses O(k) memory and one pass, and it needs no knowledge of the stream length. At any time, you can read it out as an unbiased sample. It can be sampled per key as well, so that rare customers still get entries.
@@ -403,7 +403,7 @@ flow:
 
 @@ stringmatch
 == Content-defined chunking for deduplicated backups
-kind: none
+kind: content-addressing
 when: Backups or file sync must store only new data when a file changes slightly, even when bytes are inserted in the middle.
 how: Fixed-size blocks fail when one byte is inserted: every later block shifts, and all of them look new. Content-defined chunking picks block borders from the data itself.
 A rolling hash is computed over a sliding window of, say, 48 bytes. It is updated in O(1) per byte: remove the oldest byte, add the new one. When the low 20 bits of the hash are zero, the position is a chunk border. This gives an average chunk size of 1 MB, with limits on minimum and maximum size. An insert changes only the chunks near it; later borders are found at the same places.
@@ -487,7 +487,7 @@ flow:
 
 @@ twopointers
 == Sort-merge join of two sorted inputs
-kind: none
+kind: sort-merge-join
 when: Two large tables must be joined on a key, both are already sorted by that key (or can be sorted), and a hash table would not fit in memory.
 how: A sort-merge join keeps one pointer in each sorted input. If the left key is smaller, advance the left pointer. If the right key is smaller, advance the right one. If they are equal, emit the matching rows, and advance. Each pointer moves forward only, so the join reads each input once: O(n + m) after sorting.
 Because it reads in order and holds almost nothing in memory, it works on inputs larger than RAM, and it streams the result. If an index or file layout already gives sorted order, the sort step is free. Otherwise the cost is the external sort, which is often the larger part.
@@ -586,7 +586,7 @@ flow:
   Query engine -> Row store [db: columns] : fetch matching rows | Only rows with a set bit are read.
 
 == Packed 64-bit IDs (timestamp, worker, sequence)
-kind: none
+kind: time-ordered-ids
 when: Many servers must create unique, roughly time-ordered IDs without asking a central database for each one.
 how: A 64-bit integer is split into bit fields. In the Snowflake layout: 1 sign bit that is unused, 41 bits of milliseconds since a custom epoch, 10 bits for a worker id, and 12 bits for a per-millisecond sequence. 41 bits of milliseconds last about 69 years. 12 bits allow 4,096 IDs per millisecond per worker.
 Each worker builds an id with shifts and ORs: (time << 22) | (worker << 12) | sequence. No network call is needed. IDs sort by time, so they are friendly to B-tree inserts, and the time can be read back with a shift.

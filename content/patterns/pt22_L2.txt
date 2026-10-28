@@ -72,7 +72,7 @@ ref: docs | cuBLASLt API reference | NVIDIA | https://docs.nvidia.com/cuda/cubla
 
 @@ mixedprec
 == FP32 master weights with BF16 compute
-kind: none
+kind: mixed-precision
 when: Training a large model must run at tensor-core speed and use half the memory for activations, without losing accuracy.
 how: The optimizer keeps a master copy of the weights in FP32. At each step the framework casts weights to BF16 and runs the forward and backward matrix multiplies in BF16 on tensor cores. The multiply results are accumulated in FP32 inside the hardware.
 Gradients come out in low precision. The optimizer adds them to the FP32 master weights, because a small update such as 1e-5 would vanish if added to a 16-bit weight. Optimizer state (Adam's two moments) is also FP32.
@@ -149,7 +149,7 @@ ref: docs | Just-in-time compilation with JAX | JAX documentation | https://docs
 
 @@ pagedattn
 == Block table for the KV cache
-kind: none
+kind: paged-kv
 when: Many LLM requests of unknown length share one GPU, and reserving the maximum length for each wastes memory.
 how: Without paging, the server reserves one contiguous KV buffer per request, sized for the longest allowed output. Most requests stop early, so large parts of the reserved memory stay empty. Studies of earlier serving systems reported that well over half of KV memory was wasted this way.
 PagedAttention splits GPU KV memory into fixed blocks, for example 16 tokens each. Each request has a block table that maps its logical blocks (token 0-15, 16-31, ...) to physical blocks anywhere in memory. A new block is taken from a free list only when the last one is full.
@@ -357,7 +357,7 @@ ref: docs | Faiss: indexes and quantization | Meta Faiss wiki | https://github.c
 
 @@ specdecode
 == Draft model proposes, target model verifies
-kind: none
+kind: speculative-decoding
 when: Decoding is slow because each token needs one full pass of a big model, and the GPU is mostly waiting for memory.
 how: A small draft model (for example 1B parameters) generates k tokens ahead, say k = 4, one at a time. This is cheap. The large target model then scores all k positions in one forward pass. That pass costs about the same as generating one token, because decode is memory-bound.
 The engine compares the two models' probabilities token by token. A draft token is accepted with probability min(1, p_target / p_draft). At the first rejection, the engine resamples that position from a corrected distribution and drops the rest. If all k are accepted, the target adds one bonus token.
@@ -453,7 +453,7 @@ ref: spec | MRC Invalid Traffic Detection and Filtration Guidelines | Media Rati
 
 @@ autodiff
 == Reverse-mode tape in a training step
-kind: none
+kind: autodiff-tape
 when: A model has millions or billions of parameters and one scalar loss, and you need all gradients cheaply.
 how: In reverse mode the framework records each operation during the forward pass, with the tensors it needs for its derivative. This record is called the tape or the autograd graph. Each node knows the local derivative of its operation.
 When you call backward on the loss, the framework walks the tape from the end to the start. For each node it multiplies the incoming gradient by the local derivative and passes the result to the node's inputs. Gradients from several uses of one tensor are added.
@@ -693,7 +693,7 @@ ref: docs | Clustering | scikit-learn user guide | https://scikit-learn.org/stab
 
 @@ crossval
 == Time-based split with a sealed test set
-kind: none
+kind: holdout-eval
 when: Data has a time order, such as clicks or sales, and the model will predict the future from the past.
 how: A random split puts tomorrow's rows into training and yesterday's into test, so the model sees the future. Scores look good and production results disappoint. Split by time instead.
 Example: train on weeks 1 to 10, validate on week 11 and test on week 12. For a model that is retrained often, use rolling windows: train on the past, validate on the next block, then move forward and repeat, which gives several honest scores.
@@ -843,7 +843,7 @@ ref: docs | Feature store concepts | Feast documentation | https://docs.feast.de
 ref: paper | The Dataflow Model | Akidau et al., VLDB 2015 |
 
 == Hashing trick for high-cardinality IDs
-kind: none
+kind: hashing-trick
 when: A feature, such as user id, ad id or URL, has millions or billions of values, and a lookup dictionary would be too large or too slow.
 how: A dictionary that maps each raw value to a column or row number must be built, stored and kept up to date on every serving machine. New values appear every day and break it.
 The hashing trick skips the dictionary. Compute hash(value) modulo B, for example B = 2^22, about 4 million, and use the result as the index in the feature vector or in an embedding table. No state is needed, and unseen values still map to a valid slot.

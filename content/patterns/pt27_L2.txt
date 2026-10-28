@@ -52,7 +52,7 @@ ref: docs | Confidential Computing Consortium | Linux Foundation | https://confi
 
 @@ threatmodel
 == Data-flow diagram with trust boundaries
-kind: none
+kind: threat-model
 when: A new feature or service is designed, and you want to find security flaws before any code exists.
 how: The team draws a data-flow diagram: external actors, processes, data stores and flows. Then it draws dashed lines where trust changes, such as the internet edge, the service to database link, and the tenant boundary.
 For each element that touches a boundary, the team asks the six STRIDE questions: spoofing, tampering, repudiation, information disclosure, denial of service, elevation of privilege. Each threat gets a score (likelihood and impact) and an owner.
@@ -86,7 +86,7 @@ ref: docs | Threat Modeling | OWASP Foundation | https://owasp.org/www-community
 
 @@ archstyles
 == Hexagonal ports and adapters
-kind: none
+kind: hexagonal
 when: Business rules must stay testable and stable while databases, queues and web frameworks change around them.
 how: The core holds the domain logic and defines ports, which are interfaces such as OrderRepository or PaymentGateway. Adapters implement the ports: a Postgres adapter, a REST adapter, a test double. The core depends on the ports only. The adapters depend on the core, never the reverse.
 Driving adapters (HTTP, CLI, a queue consumer) call the core. Driven adapters (database, email, payment API) are called by the core through ports. At startup, one composition root wires the chosen adapters in.
@@ -168,7 +168,7 @@ flow:
 ref: book | Software Architecture in Practice | Bass, Clements & Kazman, 4th ed., 2021 |
 
 == Decision records with fitness functions
-kind: none
+kind: decision-record
 when: The team makes many design choices and must keep them from being forgotten or silently broken over time.
 how: Each significant decision gets a short record in the repository: context, options, decision, and consequences. The record is reviewed in a pull request like code. A new record can supersede an older one, so the history stays readable.
 Quality goals are turned into automated fitness functions that run in CI: a latency test on a fixed dataset, a check that no module imports a forbidden module, a check that the container image is under a size limit. A failing check blocks the merge.
@@ -663,7 +663,7 @@ ref: docs | State backends | Apache Flink documentation | https://nightlies.apac
 
 @@ mvcc
 == Snapshot reads without read locks
-kind: none
+kind: mvcc-snapshot
 when: Many readers and writers use the same rows, and readers must never block or be blocked.
 how: Each write creates a new version of a row and does not overwrite the old one. In PostgreSQL each row version carries xmin (the transaction that created it) and xmax (the transaction that deleted it). A reader takes a snapshot, the list of transactions that were committed at that moment.
 A reader sees a version only if its creator is in the snapshot and its deleter is not. Two readers at different times see different but consistent states. Writers on the same row still conflict, but readers take no locks.
@@ -715,7 +715,7 @@ ref: docs | Point-in-time joins | Feast documentation | https://docs.feast.dev/
 
 @@ occ
 == Atomic pointer commit with retry on conflict
-kind: none
+kind: optimistic-concurrency
 when: Many writers update one shared table or document, conflicts are rare, and locks would be costly or impossible.
 how: The writer reads the current version, say v41, and prepares its change without any lock. To commit, it makes one atomic compare-and-swap: "set the current version to v42 only if it is still v41". The catalog or the storage layer gives this one atomic step.
 If the swap fails, someone else committed first. The writer reloads the new version and checks whether the two changes conflict. If they touch different files or partitions, it commits again as v43. If they overlap, it aborts or fails the job.
@@ -732,7 +732,7 @@ flow:
 ref: docs | Reliability: optimistic concurrency | Apache Iceberg documentation | https://iceberg.apache.org/docs/latest/reliability/
 
 == Version column in web APIs
-kind: none
+kind: optimistic-concurrency
 when: Two users or services may edit the same record from stale copies, and the lost update must be detected.
 how: Each record has a version number or an ETag. A client reads the record and gets the version, say 7. When it saves, it sends the version back, for example in an If-Match header. The database runs UPDATE ... SET ..., version = 8 WHERE id = ? AND version = 7.
 If one row is updated, the save worked. If zero rows are updated, someone else saved first, and the API answers 409 Conflict or 412 Precondition Failed. The client shows the new data and lets the user merge or retry.
@@ -749,7 +749,7 @@ flow:
 ref: spec | HTTP Semantics: If-Match | IETF RFC 9110, 2022 | https://www.rfc-editor.org/rfc/rfc9110#field.if-match
 
 == Conditional put on object storage
-kind: none
+kind: optimistic-concurrency
 when: A lake or a log is on plain object storage with no database, and writers must not overwrite each other.
 how: Object stores such as S3 now support conditional writes: put an object only if it does not exist (If-None-Match) or only if its ETag still matches (If-Match). This is a compare-and-swap on one object.
 A table format uses it to commit. The writer wants to add log entry number 42, so it puts the file 00000042.json with If-None-Match. If another writer already created that name, the put fails, and the first writer reloads, checks conflicts and tries number 43. The log gives a total order of commits without a lock service.
@@ -767,7 +767,7 @@ ref: docs | Conditional writes | Amazon S3 documentation | https://docs.aws.amaz
 
 @@ raid
 == RAID 10 volume for a transactional database
-kind: none
+kind: disk-redundancy
 when: A single-server database needs fast random writes and must survive one disk failure without downtime.
 how: RAID 10 mirrors disks in pairs (RAID 1) and stripes data across the pairs (RAID 0). With 8 disks there are 4 pairs, and the usable space is half of the raw space. Each write goes to both disks of one pair. A read can be served by either disk of a pair.
 Random writes cost two disk writes and no parity work, so latency stays low. This is why databases are often placed on RAID 10 rather than RAID 5, where each small write needs a read-modify-write of parity.
@@ -784,7 +784,7 @@ flow:
 ref: paper | A Case for Redundant Arrays of Inexpensive Disks (RAID) | Patterson, Gibson & Katz, SIGMOD 1988 |
 
 == Parity array with hot spare and scrubbing
-kind: none
+kind: disk-redundancy
 when: Large, mostly sequential data, such as media or backups, needs cheap redundancy with a good share of usable space.
 how: In RAID 6, data and two parity blocks per stripe are spread over all disks. With 10 disks, 8 hold data, so usable space is 80 percent. Any two disks can fail without data loss. ZFS RAID-Z2 follows the same idea.
 When a disk fails, the array rebuilds onto a hot spare by reading all other disks and computing the missing blocks. A 20 TB disk at 200 MB/s takes about 28 hours, and the array is slower and at higher risk during that time. A second failure or an unreadable sector during the rebuild is the main danger.

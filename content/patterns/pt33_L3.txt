@@ -1,0 +1,775 @@
+@@ quic
+== HTTP/3 at the edge with TCP fallback
+kind: cdn-edge, layered-protocol
+when: Users on mobile networks load pages and APIs from a CDN, and slow handshakes and stalls after packet loss hurt them.
+how: The browser first connects over TCP and TLS, and the server answers with an Alt-Svc header that says "h3 is available on UDP port 443". On the next request the browser opens a QUIC connection to the edge. QUIC does the transport handshake and TLS 1.3 together, so a new connection needs 1 round trip and a resumed one can send data in 0 round trips.
+Each request is a separate QUIC stream. If one packet is lost, only the stream that owns it waits; the other streams keep going. With TCP and HTTP/2, one lost packet stalls every stream. The connection is named by a connection ID, not by the IP address, so a phone that moves from Wi-Fi to 5G keeps the same connection.
+Some networks block UDP. The browser races or falls back to TCP, so the site must keep serving HTTP/2 or HTTP/1.1 as well. Congestion control runs in user space, so the CDN can update it without a kernel change.
+used: Google Search and YouTube, Cloudflare, Fastly and Akamai edges, Meta apps (common in large CDNs); all major browsers.
+avoid: Inside a data center on clean links, where TCP is cheaper in CPU; or when UDP is blocked for most of your users.
+flow:
+  Browser [client] -> CDN edge [svc: TCP + QUIC] : HTTP/2 over TCP | The first visit uses TCP and TLS, because the browser does not know about HTTP/3 yet.
+  CDN edge -> Browser : Alt-Svc: h3=":443" | The response header tells the browser that the same host speaks HTTP/3 over UDP.
+  Browser -> CDN edge : QUIC Initial + TLS hello | The next visit opens QUIC: transport and TLS 1.3 handshake in one round trip.
+  CDN edge -> Browser : streams 0, 4, 8 | Three responses travel as separate streams in one connection.
+  CDN edge -x> Browser : packet for stream 4 lost | Only stream 4 waits for a retransmission; streams 0 and 8 are delivered.
+  Browser ~> CDN edge : same connection ID, new IP | The phone changes network and the connection continues without a new handshake.
+  CDN edge ~> Origin [svc: app servers] : cache miss fetch | On a cache miss the edge fetches from the origin, often over TCP and HTTP/2.
+ref: spec | RFC 9000: QUIC, a UDP-Based Multiplexed and Secure Transport | IETF, Iyengar and Thomson, 2021 | https://www.rfc-editor.org/rfc/rfc9000
+ref: spec | RFC 9114: HTTP/3 | IETF, Bishop, 2022 | https://www.rfc-editor.org/rfc/rfc9114
+
+== Connection-ID routing in a QUIC load balancer
+kind: horizontal-scale, control-data-plane
+when: Many QUIC servers sit behind a fleet of L4 load balancers, and packets of one connection must always reach the same server.
+how: A TCP load balancer can hash the 4-tuple (source and destination IP and port). For QUIC this breaks, because a client can change its IP and port during a connection (migration). The packet would then hash to a different server, which cannot decrypt it.
+So the server puts routing information into the connection ID it hands out. The load balancer reads the connection ID in the packet header, which is not encrypted, and maps it to a backend. The IETF QUIC-LB draft defines how to encode a server ID in the connection ID, with or without encryption. The balancer needs no per-connection state.
+If a packet still reaches the wrong server, that server can forward it or send a Stateless Reset. The design needs care: connection IDs must not link a user across networks, so encoders rotate and obscure the server ID.
+used: Meta's Katran L4 balancer routes QUIC by connection ID (common design in large QUIC deployments); the IETF QUIC-LB draft standardises it.
+avoid: A small service with one or two servers; use the plain 4-tuple hash of the cloud load balancer.
+flow:
+  Client [client] -> L4 balancer [svc: stateless] : packet, CID=0x7A21... | The client sends QUIC packets. The connection ID starts with an encoded server ID.
+  L4 balancer -> Server 7 [svc] : forward by CID | The balancer decodes the server ID from the connection ID and forwards the packet. No table is kept.
+  Server 7 -> Client : response | Server 7 answers directly or through the balancer.
+  Client -> L4 balancer : same CID, new source IP | The client moves from Wi-Fi to 5G. The 4-tuple changes but the connection ID does not.
+  L4 balancer -> Server 7 : forward by CID | The packet still reaches server 7, so the connection survives the migration.
+  Server 7 ~> L4 balancer : new CID, same server ID | The server issues new connection IDs from time to time. Each one keeps the same routing prefix.
+ref: spec | QUIC-LB: Generating Routable QUIC Connection IDs | IETF draft, Duke, Banks and Huitema | https://datatracker.ietf.org/doc/draft-ietf-quic-load-balancers/
+
+@@ rdma
+== RDMA fabric for GPU all-reduce
+kind: offload-accelerator, data-parallel
+when: Many GPUs train one model, and gradients must be summed across servers many times per second.
+how: Inside a server, GPUs talk over NVLink. Between servers, each GPU has its own network card (a NIC) on InfiniBand or RoCE (RDMA over Ethernet). The NIC reads GPU memory and writes into the remote GPU memory directly, using GPUDirect RDMA over PCIe. The CPU only sets up the transfer.
+A library such as NCCL builds a ring or tree across the GPUs. Each step sends a chunk of gradients to the next GPU while it receives from the previous one. All links work at the same time, so the cost per GPU is about 2 times the data size, not growing with the number of GPUs.
+The fabric must be lossless or nearly so. InfiniBand uses credit-based flow control. RoCE uses priority flow control and ECN, which need careful tuning. One slow or failing link slows the whole job, because every step waits for the slowest GPU.
+used: NCCL on NVIDIA DGX and HGX clusters; large training clusters built on InfiniBand or tuned RoCE Ethernet fabrics.
+avoid: Small jobs on one server, where NVLink is enough; or general web services, where TCP is simpler and tolerates loss.
+flow:
+  GPU A [svc: server 1] -> NIC A [svc: RDMA NIC] : post work request | The GPU library posts a send request to the NIC queue. No system call is needed.
+  NIC A -> GPU A : DMA read of gradients | The NIC reads gradient chunk 1 from GPU memory over PCIe, without copying to host memory.
+  NIC A -> Leaf switch [svc: InfiniBand] : RDMA write, chunk 1 | The NIC sends the chunk over the fabric. Credit-based flow control avoids drops.
+  Leaf switch -> NIC B [svc: RDMA NIC] : forward | The switch forwards by the destination address. It does not buffer for long.
+  NIC B -> GPU B [svc: server 2] : DMA write into GPU memory | The remote NIC writes straight into GPU memory. The remote CPU is not involved.
+  GPU B -> GPU A : completion event | The receiver sees a completion entry and adds the chunk to its sum, then sends the next chunk.
+ref: docs | NCCL documentation | NVIDIA | https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html
+ref: paper | RDMA over Commodity Ethernet at Scale | Guo et al., SIGCOMM 2016 |
+
+== Storage over RDMA (NVMe-oF)
+kind: offload-accelerator, data-locality
+when: Applications need near-local flash speed from shared storage, with low CPU use on both sides.
+how: NVMe over Fabrics with RDMA exposes remote NVMe drives as local block devices. The host sends a small command capsule to the storage target. The target NIC moves the data directly between the drive buffer and host memory by RDMA read or write.
+The data path skips the TCP stack and extra memory copies. Typical remote read latency is a few tens of microseconds more than local flash, and one core can drive far more I/O than with TCP. This lets many servers share one pool of flash and be diskless.
+The cost is the fabric. RDMA needs RoCE or InfiniBand with flow control set up well, and network faults show up as storage stalls. NVMe/TCP is the lower-cost option on ordinary Ethernet.
+used: NVMe-oF targets in the Linux kernel and SPDK; all-flash arrays and parallel file systems for GPU clusters (common); GPUDirect Storage.
+avoid: When the network is a normal lossy Ethernet without flow-control tuning; use NVMe/TCP.
+flow:
+  App server [svc: NVMe-oF host] -> Target NIC [svc: RDMA NIC] : command capsule: read 4 KB | The host sends a small read command to the storage target.
+  Target NIC -> Flash target [db: NVMe SSDs] : submit read | The target passes the read to the local NVMe drive.
+  Flash target -> Target NIC : data in buffer | The drive finishes and the data waits in a registered buffer.
+  Target NIC -> App server : RDMA write to host memory | The NIC writes the data into the host's registered memory. The CPU does not copy it.
+  Target NIC -> App server : response capsule | A small completion message ends the request.
+ref: spec | NVMe over Fabrics specification | NVM Express | https://nvmexpress.org/specifications/
+
+@@ routingalgo
+== Link-state flooding and shortest-path routing
+kind: control-data-plane, heartbeat
+when: Routers in one network must find the best paths on their own and repair them quickly after a link fails.
+how: Each router sends hello packets to its neighbours to check that the link is alive. Each router describes its own links and costs in a link-state message and floods it to all routers in the area. Every router ends with the same map of the network.
+Each router runs Dijkstra's shortest-path algorithm on this map and puts the next hop for every prefix into its forwarding table (the FIB). This is the control plane. The forwarding hardware then moves packets by looking up the table, which is the data plane.
+When a link fails, the neighbours stop hearing hellos, flood a new message and every router recomputes. With tuning, this takes well under a second. Large networks are split into areas to keep the map and the flooding small.
+used: OSPF and IS-IS inside ISP and enterprise networks; IS-IS or OSPF as the underlay in many data centers.
+avoid: Between different organisations, where policy matters more than shortest path; use BGP.
+flow:
+  Router A [svc: OSPF] -> Router B [svc: OSPF] : hello | Routers send hello packets every few seconds to confirm the neighbour is alive.
+  Router A -> Router B, Router C [svc: OSPF] : LSA: A-B 10, A-C 5 | A floods a link-state message that lists its links and costs.
+  Router B -> Router D [svc: OSPF] : LSA flooded on | Each router passes the message on, so all routers share one map.
+  * Router A: SPF run, route to D via C | Router A runs Dijkstra on the map and picks the cheapest path to D.
+  Router A -> FIB [store: forwarding table] : install next hop | The best next hop is written into the forwarding table used by the data plane.
+  Router A -x> Router C : link C down | Hellos stop. A floods the change and recomputes, so traffic moves to another path.
+ref: spec | RFC 2328: OSPF Version 2 | IETF, Moy, 1998 | https://www.rfc-editor.org/rfc/rfc2328
+
+== ECMP over a Clos fabric with BGP
+kind: horizontal-scale, control-data-plane
+when: A data center needs high bandwidth between any two servers using many equal, cheap switches.
+how: Servers connect to leaf switches, and every leaf connects to every spine switch (a Clos or fat-tree network). Between two racks there are as many equal-cost paths as there are spines. Each switch runs BGP, with one private AS per rack or per switch, as described in RFC 7938.
+BGP installs all equal-length paths. The switch uses ECMP (equal-cost multipath): it hashes the 5-tuple of each packet (IPs, ports, protocol) to choose one next hop. All packets of one flow take one path and stay in order, while many flows spread over all paths.
+A failed spine just removes one next hop and the hash spreads flows over the rest. The weakness is hash collisions: a few large flows can land on the same link, so operators watch link use and sometimes use flowlet or adaptive routing.
+used: Meta, Microsoft and many hyperscale networks use BGP in the data center (RFC 7938); the leaf-spine design is standard in cloud and AI clusters.
+avoid: Very small networks with 2 switches, where static routes or a simple LAN are enough.
+flow:
+  Server 1 [client: rack 1] -> Leaf 1 [svc: BGP, ECMP] : packet to rack 4 | A server sends a packet to a server in another rack.
+  Leaf 1 -> Spine 1 [svc: BGP], Spine 2 [svc: BGP] : hash(5-tuple) picks one | Leaf 1 has two equal paths. It hashes the 5-tuple and picks one spine.
+  Spine 2 -> Leaf 4 [svc: BGP, ECMP] : forward | The spine forwards to the leaf of rack 4.
+  Leaf 4 -> Server 4 [client: rack 4] : deliver | The packet arrives. Packets of the same flow follow the same path, so order is kept.
+  Spine 1 -x> Leaf 1 : link down | A spine link fails. BGP withdraws the route.
+  * Leaf 1: 1 path left | Leaf 1 now hashes all flows to the remaining spine until the link returns.
+ref: spec | RFC 7938: Use of BGP for Routing in Large-Scale Data Centers | IETF, Lapukhov, Premji and Mitchell, 2016 | https://www.rfc-editor.org/rfc/rfc7938
+
+@@ rpc
+== Deadline propagation across a call chain
+kind: timeout-deadline, retry-backoff
+when: A request passes through several services, and a slow service deep in the chain must not keep work running after the user has given up.
+how: The caller sets one absolute deadline, for example 800 ms from now. gRPC sends it in the grpc-timeout header, and each service passes the remaining time to the next call. The frontend has 800 ms, the next service sees 650 ms, the next sees 400 ms.
+When time runs out, the client cancels the call and the server sees the cancellation. It can stop work early and free threads, memory and database queries. Without this, each hop uses its own fixed timeout, and the sum can be far longer than what the user waits.
+Retries must respect the same budget. A service should not retry if the remaining time is less than a normal call takes. Also use retry budgets, so retries do not multiply load during an outage.
+used: gRPC deadlines (Google internal Stubby, same idea); Finagle and Envoy timeouts; common in microservice platforms.
+avoid: Long background jobs; use a queue and a job id, not one long RPC.
+flow:
+  Frontend [svc: deadline 800 ms] -> Orders [svc] : GetOrder, 800 ms left | The frontend starts the clock and sends the remaining time with the call.
+  Orders -> Pricing [svc], Stock [svc] : 650 ms left | Orders calls two services in parallel, each with the time that remains.
+  Pricing -> Pricing DB [db] : query, 400 ms left | Pricing passes the smaller budget to its database call.
+  Pricing DB -x> Pricing : slow, deadline passed | The database is slow. The deadline expires.
+  Pricing -x> Orders : DEADLINE_EXCEEDED | Pricing returns an error at once instead of waiting longer.
+  Orders -> Frontend : partial answer or error | Orders cancels the Stock call and returns a fallback or an error within the budget.
+ref: docs | gRPC and Deadlines | gRPC project | https://grpc.io/docs/guides/deadlines/
+
+== Client-side load balancing with service discovery
+kind: service-discovery, horizontal-scale
+when: Many clients call a service with many instances over long-lived connections, and a simple L4 balancer would pin all traffic to a few of them.
+how: gRPC uses HTTP/2, which keeps one connection open and multiplexes many calls on it. A TCP balancer picks a backend once per connection, so a client may send all calls to one instance. Load becomes uneven.
+With client-side balancing the client asks a resolver (DNS, or xDS from a control plane) for the list of instances. It opens one connection to each and picks a backend for each call, for example round robin or least loaded. When the list changes, the client updates its connections.
+The cost is logic in every client library and every language. A service mesh or an xDS control plane moves this logic to a sidecar or to the library with central policy.
+used: gRPC with xDS (Envoy, Istio, Traffic Director); Finagle at Twitter; Kubernetes headless services with gRPC round robin.
+avoid: Few clients and short connections, where a plain L4 or L7 load balancer is simpler.
+flow:
+  Client [client: gRPC stub] -> Resolver [svc: DNS or xDS] : list instances of orders | The client asks which instances serve orders.
+  Resolver -> Client : 3 addresses | The resolver returns three addresses.
+  Client -> Orders A [svc], Orders B [svc], Orders C [svc] : one HTTP/2 connection each | The client keeps a connection to each instance.
+  Client -> Orders B : call 1 | The picker sends each call to the next backend, so load is even.
+  * Resolver: instance C removed | Instance C is scaled down and the resolver publishes a new list.
+  Resolver ~> Client : updated list | The client closes the connection to C and keeps the other two.
+ref: docs | gRPC load balancing | gRPC project | https://grpc.io/docs/guides/custom-load-balancing/
+
+@@ sockets
+== Event-loop server on epoll
+kind: event-loop, thread-pool
+when: One server must hold tens of thousands of mostly idle connections without one thread per connection.
+how: The server creates a listening socket and sets all sockets to non-blocking. It registers them with epoll on Linux (kqueue on BSD and macOS, io_uring as a newer option). One thread calls epoll_wait and sleeps until the kernel says some sockets are ready.
+For each ready socket the thread reads available bytes, runs the handler and writes the reply. It never blocks on one slow client. A few such threads, one per CPU core, can hold 100,000 or more idle connections, since an idle connection costs only a socket buffer and a small struct.
+Heavy CPU work or blocking calls must go to a worker pool, or they stall every connection on that loop. Slow readers need limits on the write buffer, so memory does not grow without bound.
+used: nginx, Redis, Node.js (libuv), Netty, HAProxy; the C10K solution on Linux.
+avoid: CPU-heavy requests with few connections, where plain threads are simpler.
+flow:
+  Client [client] -> Listen socket [svc: port 443] : SYN, handshake | The kernel completes the TCP handshake and queues the connection.
+  Listen socket -> Event loop [svc: epoll_wait] : listener readable | The loop wakes up and calls accept() to get a new socket.
+  Client -> Event loop : request bytes | Data arrives on a socket. epoll reports that it is readable.
+  Event loop -> Worker pool [svc: 8 threads] : parse and handle | CPU-heavy or blocking work goes to a pool, so the loop stays responsive.
+  Worker pool -> Event loop : response ready | The result returns to the loop.
+  Event loop -> Client : write response | The loop writes to the non-blocking socket. If the buffer is full, it waits for writable.
+ref: book | The Linux Programming Interface | Michael Kerrisk, 2010 |
+
+== One listen port shared by many workers
+kind: horizontal-scale, thread-pool
+when: A single accept loop is a bottleneck, and you want every CPU core to take new connections.
+how: Several worker processes or threads each create a listening socket on the same port with SO_REUSEPORT (Linux 3.9 and later). The kernel hashes each new connection by its 4-tuple and gives it to one of the sockets. Each worker has its own accept queue, so there is no shared lock.
+This spreads connections evenly and removes the "thundering herd", where many workers wake up for one new connection. It also allows a restart without dropping the port: a new process binds the same port, and the old one drains and exits.
+The weakness is balance. Hashing is random, so a worker with long connections can be overloaded while others idle. Some systems use eBPF to choose the socket for a better spread.
+used: nginx (reuseport option), HAProxy, Envoy, Seastar and other per-core designs.
+avoid: Few connections that are very uneven in cost; use one accept loop that hands work to a pool.
+flow:
+  Client [client] -> Kernel [svc: TCP, port 443] : SYN | A new connection arrives at the shared port.
+  Kernel -> Worker 1 [svc: own socket], Worker 2 [svc: own socket], Worker 3 [svc: own socket] : hash(4-tuple) | The kernel hashes the connection and picks one worker socket.
+  Worker 2 -> Client : response | The chosen worker accepts and serves the connection by itself.
+  * Worker 2: 1 connection | Only worker 2 woke up. The others kept sleeping.
+  Worker 2 -x> Kernel : worker restarts | A worker exits during a deploy. Its pending connections are dropped unless it drains first.
+ref: blog | The SO_REUSEPORT socket option | LWN.net, 2013 | https://lwn.net/Articles/542629/
+
+@@ ssh
+== Bastion host with jump proxy
+kind: bastion-host
+when: Servers in a private network must be reachable by admins, but only one hardened machine may be exposed to the internet.
+how: Only the bastion (jump host) has a public IP and port 22 open. Private servers accept SSH only from the bastion's address. An admin connects with ssh -J bastion target (ProxyJump). The SSH client opens an encrypted session to the bastion, and inside it opens a second, end-to-end session to the target.
+The bastion forwards the bytes but does not see the content of the inner session. Keys stay on the admin laptop, and agent forwarding is avoided. The bastion logs every connection and can require MFA. One narrow door is easier to patch, watch and close.
+The risk is that the bastion is a single point of failure and a high-value target. Run two of them, keep them minimal, and prefer short-lived credentials or a managed service that needs no open port.
+used: Standard practice in cloud VPCs; OpenSSH ProxyJump; AWS Systems Manager Session Manager and Google IAP TCP forwarding as managed alternatives.
+avoid: When a managed access service can replace open inbound ports completely.
+flow:
+  Admin laptop [user] -> Bastion [svc: public port 22] : SSH to bastion | The admin authenticates to the bastion with a key and often a second factor.
+  Bastion -> Audit log [log] : who, when, target | The bastion records the connection for audit.
+  Admin laptop -> Private server [svc: no public IP] : inner SSH via ProxyJump | The client opens a second SSH session through the first. The bastion only relays encrypted bytes.
+  Bastion -> Private server : TCP to port 22 | The bastion connects to port 22 inside the private network.
+  Internet attacker [client] -x> Private server : no route | The private server has no public address, so scans from the internet never reach it.
+ref: docs | ssh_config: ProxyJump | OpenBSD OpenSSH manual | https://man.openbsd.org/ssh_config
+
+== Short-lived SSH certificates from a CA
+kind: valet-key, zero-trust
+when: A company wants to give engineers server access without copying public keys to every server or forgetting to remove them.
+how: Servers trust one SSH certificate authority (CA) public key, set with TrustedUserCAKeys in sshd. The engineer logs in to a single sign-on provider, with MFA. A signing service checks the identity and groups, then signs the engineer's public key as a certificate that is valid for 10 minutes to a few hours.
+The certificate contains the user name, allowed principals (login names) and an expiry. The server checks the CA signature and the validity time. No authorized_keys file is changed on any server.
+Offboarding is simple: the person loses SSO access and can get no new certificate. Old ones expire soon. The CA private key is the crown jewel and must be kept in an HSM or a managed vault.
+used: OpenSSH certificates; HashiCorp Vault SSH secrets engine; Netflix BLESS (now archived); Smallstep and Teleport.
+avoid: Tiny setups with one or two admins, where plain authorized_keys is fine.
+flow:
+  Engineer [user] -> SSO [svc: IdP + MFA] : log in | The engineer proves identity with a password and a second factor.
+  Engineer -> SSH CA [svc: signing service] : sign my public key | The client sends its public key and the SSO token.
+  SSH CA -> Engineer : certificate, valid 1 hour | The CA signs the key with its private key and sets the expiry and allowed logins.
+  Engineer -> Server [svc: sshd trusts CA] : SSH with certificate | The client presents the certificate during the SSH handshake.
+  Server -> Engineer : session open | sshd checks the CA signature, the principals and the time window, then allows login.
+  Engineer -x> Server : certificate expired | After an hour the same certificate is rejected. The engineer must sign in again.
+ref: docs | HashiCorp Vault: SSH secrets engine | HashiCorp | https://developer.hashicorp.com/vault/docs/secrets/ssh
+
+@@ tcp
+== Connection pooling behind a load balancer
+kind: horizontal-scale, bulkhead
+when: A service makes many short calls to another service, and the cost of a new TCP and TLS connection for each call is too high.
+how: A new TCP connection costs one round trip for the handshake, and TLS adds one or two more. In one data center that is about 1 ms, but across regions it can be 50 ms or more. Connection setup also uses CPU and ephemeral ports on both sides.
+The client keeps a pool of open connections, for example 20 per backend. A request takes an idle connection, sends the call and returns the connection to the pool. HTTP keep-alive or HTTP/2 makes reuse possible. The pool has a maximum size, which also protects the backend: if all connections are busy, new calls wait or fail fast.
+Behind a load balancer, a long-lived connection is pinned to one backend. After a deploy or scale-up, old connections keep traffic on old instances. So pools set a maximum connection age (for example 5 minutes) and the server may send Connection: close or a GOAWAY frame, to spread load again.
+used: HikariCP and PgBouncer for databases; Envoy and nginx upstream keep-alive pools; Go http.Transport and Java HTTP clients.
+avoid: Very rare calls, where an idle connection only wastes memory; also watch idle timeouts, because middleboxes may drop idle connections silently.
+flow:
+  App [svc: client pool] -> Load balancer [svc: L4] : reuse connection 3 | The app takes an idle connection from its pool. No handshake is needed.
+  Load balancer -> Backend A [svc], Backend B [svc] : pinned per connection | The balancer chose backend at connect time. Every request on this connection goes to the same backend.
+  Backend A -> App : response | The reply returns and the connection goes back to the pool.
+  * App: pool 20 of 20 busy | Under load the pool is full. New calls queue briefly or fail fast.
+  Backend A -x> App : GOAWAY, max age reached | The server asks the client to stop using this connection, so load can move after a deploy.
+  App -> Load balancer : new connection | The pool opens a new connection and the balancer may choose another backend.
+ref: docs | Envoy connection pooling | Envoy project | https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/connection_pooling
+
+== Backpressure through the TCP window
+kind: load-shedding, producer-consumer
+when: A fast sender must not overrun a slow receiver, and you want the slowdown to travel back to the source without extra code.
+how: The receiver advertises a window: how many more bytes it can buffer. As the application reads slowly, the buffer fills and the window shrinks. When it reaches zero, the sender must stop sending and probe from time to time.
+This gives natural backpressure along a chain. A slow database makes the service stop reading from its socket, the proxy's send buffer fills, and the proxy stops reading from the client. The whole chain slows down, and memory stays bounded.
+Know the limits. Buffers hide the delay: the kernel socket buffers (often 128 KB to several MB) fill before the sender feels it. If a service reads fast into an unbounded queue, no backpressure happens and memory grows. Keep queues bounded and let the socket buffer do the work.
+used: Kafka producers and consumers, Postgres COPY, HTTP/2 streams (its own window on top of TCP); streaming frameworks like Netty with watermarks.
+avoid: Messages that must be dropped when late (live video); use UDP or QUIC with its own rate control, and drop old frames.
+flow:
+  Producer [svc: fast sender] -> Consumer [svc: slow reader] : data, window 64 KB | The producer sends at full speed. The receiver tells it how much room is left.
+  * Consumer: buffer filling | The consumer reads more slowly than data arrives, so its receive buffer grows.
+  Consumer -> Producer : ACK, window 0 | The receive buffer is full. The consumer advertises a zero window.
+  Producer -x> Consumer : stop sending | The sender must stop. The producer's write call blocks, or returns would-block.
+  Consumer -> Sink [db] : write batch | The consumer finishes work and reads from the buffer again.
+  Consumer -> Producer : window update, 32 KB | Space is free. The sender resumes at the speed of the consumer.
+ref: spec | RFC 9293: Transmission Control Protocol | IETF, Eddy (ed.), 2022 | https://www.rfc-editor.org/rfc/rfc9293
+
+@@ tls
+== TLS termination at the edge, re-encrypt inside
+kind: api-gateway, zero-trust
+when: Many services need HTTPS, but you do not want each team to manage certificates and handshake cost.
+how: Clients connect to a load balancer or gateway that holds the public certificate. It does the TLS handshake and decrypts requests. Then it routes by host and path to backends. Certificates are issued and renewed in one place, for example with ACME and Let's Encrypt, so a 90-day certificate renews itself.
+Inside the network the gateway should not send plain HTTP. It opens a new TLS connection to each backend (re-encryption), often with mutual TLS so the backend knows the caller. TLS 1.3 sessions can be resumed, so repeat visitors avoid a full handshake.
+Plain termination without re-encryption is simpler and faster, but everything inside the network is readable to anyone who can sniff it. Passthrough keeps the traffic encrypted end to end, but the balancer cannot read headers and cannot route by path.
+used: AWS ALB and Google Cloud load balancers; nginx, Envoy and HAProxy gateways; Cloudflare and other CDNs terminate TLS at the edge.
+avoid: Traffic that must stay encrypted end to end with client certificates checked by the backend; use TLS passthrough.
+flow:
+  Browser [client] -> Gateway [svc: TLS termination] : ClientHello, SNI | The browser starts the handshake and names the host with SNI. The gateway picks the right certificate.
+  Gateway -> Browser : certificate + key share | The gateway proves its identity with a certificate signed by a public CA.
+  Browser -> Gateway : HTTP request (encrypted) | After the handshake the request travels encrypted. The gateway decrypts it.
+  Gateway -> Cert manager [svc: ACME client] : renew before expiry | A background client renews the certificate every 60 days or so.
+  Gateway -> Orders [svc: mTLS] : re-encrypted request | The gateway opens a second TLS connection to the backend and proves its own identity.
+  Orders -> Gateway : response | The reply is encrypted again and sent back to the browser.
+ref: spec | RFC 8446: TLS Version 1.3 | IETF, Rescorla, 2018 | https://www.rfc-editor.org/rfc/rfc8446
+ref: docs | How Let's Encrypt works | Let's Encrypt | https://letsencrypt.org/how-it-works/
+
+== Mutual TLS between services with short-lived certificates
+kind: zero-trust, service-mesh
+when: Services in a cluster must know who is calling them, and network location alone is not enough proof.
+how: Each workload gets its own identity, for example a SPIFFE ID such as spiffe://prod/ns/payments/sa/api. A certificate authority inside the platform signs a short-lived certificate for it, valid for hours, and rotates it before expiry. The private key never leaves the workload or its sidecar.
+In the handshake both sides present certificates (mutual TLS). Each side checks the chain and the identity. The server then applies a policy such as "only the checkout service may call payments". Traffic is encrypted, so sniffing inside the network gives nothing.
+A mesh sidecar such as Envoy does this with no app code change. The cost is certificate operations: expiry becomes an outage cause, so rotation must be automatic and watched.
+used: Istio, Linkerd and Consul service meshes; SPIFFE and SPIRE for workload identity; Kubernetes clusters that enforce strict mTLS.
+avoid: A tiny system with two services in one trusted VPC, where network policy may be enough.
+flow:
+  Workload [svc: checkout] -> CA [svc: mesh CA] : CSR for identity | At start the sidecar asks the CA for a certificate for the checkout identity.
+  CA -> Workload : cert, valid 24 h | The CA signs a short-lived certificate and the sidecar renews it before it expires.
+  Workload -> Payments [svc: sidecar] : ClientHello + client cert | Checkout opens a TLS connection and shows its certificate.
+  Payments -> Workload : server cert | Payments shows its own certificate. Both sides check the chain.
+  Payments -> Policy [store: authz rules] : may checkout call pay? | Payments checks the caller identity against the policy.
+  Workload -x> Payments : expired or denied | A caller with no valid certificate or no rule is rejected at the handshake or by policy.
+ref: docs | SPIFFE concepts | SPIFFE project | https://spiffe.io/docs/latest/spiffe-about/spiffe-concepts/
+
+@@ websocket
+== Gateway fleet with pub/sub fan-out to sockets
+kind: pubsub, fan-out-write
+when: Many users keep a live connection (chat, prices, notifications) and each event must reach all the right users fast.
+how: A fleet of gateway servers holds the WebSocket connections, perhaps 50,000 per server. Each user is connected to one gateway. The gateway keeps a table of which sockets are interested in which channels. The gateways hold the connection state; the business logic stays in separate services.
+When a service wants to send an event, it publishes it to a message bus such as Redis pub/sub, Kafka or NATS. Every gateway that has a subscriber for that channel receives the event and writes it to those sockets. The publisher does not need to know which gateway holds which user.
+Plan for the limits. A message to a channel with 1 million members means 1 million socket writes, so large channels need sharding of the fan-out. Slow clients need a bounded send queue and a drop or disconnect rule. Load balancers need long idle timeouts and ping frames to keep connections open.
+used: Slack and Discord style chat (common design), Socket.IO with the Redis adapter, Phoenix Channels, trading and sports score feeds.
+avoid: Rare updates where polling or server-sent events are enough, or one-way data where SSE is simpler.
+flow:
+  User A [client] -> Gateway 1 [svc: 50k sockets] : upgrade, join room 42 | User A opens a socket. Gateway 1 notes that this socket listens to room 42.
+  User B [client] -> Gateway 2 [svc: 50k sockets] : upgrade, join room 42 | User B is on another gateway but joins the same room.
+  Chat service [svc] -> Message bus [topic: room.42] : publish "hi" | The chat service publishes once. It does not know where users are.
+  Message bus -> Gateway 1, Gateway 2 : message | Both gateways have a subscriber for the room and receive the event.
+  Gateway 1 -> User A : frame "hi" | Gateway 1 writes a frame to each interested socket.
+  Gateway 2 -> User B : frame "hi" | Gateway 2 does the same. A slow client is dropped if its queue is full.
+ref: spec | RFC 6455: The WebSocket Protocol | IETF, Fette and Melnikov, 2011 | https://www.rfc-editor.org/rfc/rfc6455
+
+== Reconnect with backoff and resume from last event
+kind: retry-backoff, heartbeat
+when: Connections will drop (deploys, mobile networks, proxies), and the client must recover without missing events or causing a storm.
+how: Client and server send ping and pong frames, for example every 25 seconds. If no pong arrives in time, the connection is declared dead. This also keeps proxies from closing an idle connection.
+When the socket closes, the client waits and reconnects with exponential backoff and jitter, for example 1 s, 2 s, 4 s up to 30 s, with a random factor. Without jitter, a gateway restart makes 100,000 clients reconnect at the same moment.
+On reconnect the client sends the id of the last event it saw. The server replays missed events from a short buffer or from a log, then continues live. If the gap is too old, the server tells the client to reload full state from an API.
+used: Socket.IO connection state recovery, Phoenix and Slack-style clients (common), Kafka-backed event feeds with offsets.
+avoid: Streams where old events are useless, such as live prices; reconnect and take only the latest value.
+flow:
+  Client [client: last id 812] -> Gateway [svc] : ping | The client sends a ping every 25 seconds.
+  Gateway -> Client : pong | The gateway answers. The client knows the link is alive.
+  Gateway -x> Client : deploy, socket closed | The gateway restarts and the connection closes.
+  * Client: waiting 1.7 s, jitter | The client waits with exponential backoff and a random delay.
+  Client -> Gateway : connect, last id 812 | The client reconnects and says which event it saw last.
+  Gateway -> Event log [log: last 5 min] : read from 813 | The gateway reads the events the client missed.
+  Gateway -> Client : events 813 to 820 | The missed events are sent first. Then live delivery continues.
+ref: blog | Exponential Backoff And Jitter | Marc Brooker, AWS Architecture Blog, 2015 | https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+
+@@ wifi
+== Controller-managed access point fleet
+kind: control-data-plane, sidecar
+when: A campus or office has hundreds of access points, and settings, channels and security must be managed in one place.
+how: Each access point (AP) handles radio and sends client traffic. A wireless controller, in a data center or in the cloud, holds the configuration: network names (SSIDs), security, power and channel plans. APs fetch their config from the controller over a tunnel such as CAPWAP, or over HTTPS for cloud-managed systems.
+The controller collects signal reports from the APs and chooses channels and power so that nearby APs do not use the same channel. It also helps clients roam: when a laptop walks to another AP, fast roaming (802.11r) reuses the keys, so the move takes tens of milliseconds, not seconds.
+Data can go two ways. Local breakout sends client traffic straight to the wired network. Tunnel mode sends everything to the controller. If the controller is down, APs keep serving existing clients with their last config, so the control plane is separate from the data plane.
+used: Cisco, Aruba and Juniper Mist controllers; Ubiquiti UniFi; cloud-managed Wi-Fi at stores and campuses.
+avoid: A single home router, where one AP needs no controller.
+flow:
+  Controller [svc: cloud or on-prem] -> AP 1 [svc: radio], AP 2 [svc: radio] : config: SSID, channel plan | The controller pushes SSIDs, security settings and a channel plan to every AP.
+  AP 1 -> Controller : RF scan report | APs report which neighbours and noise they hear.
+  Controller -> AP 2 : change to channel 11 | The controller moves AP 2 away from the channel AP 1 uses.
+  Laptop [client] -> AP 1 : data frames | The laptop sends data to AP 1. With local breakout it goes to the wired network, not to the controller.
+  Laptop -> AP 2 : fast roam, 802.11r | The user walks away. The laptop moves to AP 2 and reuses its keys.
+  Controller -x> AP 1 : link lost | The APs keep serving clients with their last config until the controller returns.
+ref: spec | RFC 5415: CAPWAP Protocol Specification | IETF, 2009 | https://www.rfc-editor.org/rfc/rfc5415
+
+== WPA2/WPA3-Enterprise with 802.1X and RADIUS
+kind: federated-identity, zero-trust
+when: A company wants each person to log in to Wi-Fi with their own identity, and wants to revoke one person without changing a shared password.
+how: With a shared password (WPA-Personal) everyone uses one key, and one leaked password exposes the network. In Enterprise mode the AP only relays an authentication exchange (802.1X, with EAP) to a RADIUS server. The RADIUS server checks the user against the directory, for example with a certificate (EAP-TLS) or a password inside a TLS tunnel.
+After success, RADIUS returns a result with attributes such as the VLAN. The client and the RADIUS server derive a key that is unique for this client and session, and the AP uses it for the encrypted link. Other users cannot decrypt your frames, even on the same SSID.
+Disabling a person in the directory stops their next login. EAP-TLS with device certificates is the strongest choice, but needs a way to issue certificates to all devices (MDM).
+used: eduroam (federated across universities), corporate networks with Cisco ISE, FreeRADIUS or cloud RADIUS; Microsoft NPS.
+avoid: Guest or home Wi-Fi, where a shared WPA3-Personal password is enough; use a captive portal for guests.
+flow:
+  Laptop [client] -> AP [svc: authenticator] : EAPOL start | The laptop asks to join the network. The AP blocks all traffic except authentication.
+  AP -> RADIUS [svc: auth server] : EAP identity, relayed | The AP wraps the EAP messages in RADIUS and forwards them.
+  RADIUS -> Directory [db: users, certs] : check identity | The server checks the certificate or password against the directory.
+  RADIUS -> AP : Access-Accept, VLAN 20 | The server accepts the user, assigns a VLAN and sends key material to the AP.
+  AP -> Laptop : 4-way handshake | AP and laptop derive per-session encryption keys. The port opens.
+  Directory -x> RADIUS : user disabled | After offboarding the next login is denied. No shared password needs to change.
+ref: spec | RFC 3748: Extensible Authentication Protocol (EAP) | IETF, 2004 | https://www.rfc-editor.org/rfc/rfc3748
+
+@@ aead
+== Envelope encryption with AEAD and bound context
+kind: envelope-encryption
+when: Stored data must be encrypted so that tampering is detected and a record cannot be swapped into another place.
+how: A fresh random data key encrypts each object with AES-256-GCM (or ChaCha20-Poly1305). The cipher output is the ciphertext plus an authentication tag. A wrong key or a changed bit makes decryption fail, instead of giving garbage.
+The context is passed as associated data (AAD): it is authenticated but not encrypted. Typical AAD is the tenant id, the row id and the schema version. If an attacker copies a ciphertext from tenant A to tenant B, the AAD will not match and the tag check fails.
+The data key is itself encrypted by a key management service (KMS), and the stored wrapped key is saved next to the ciphertext. The nonce must never repeat for one key. With random 96-bit nonces in GCM, limit one key to about 2^32 messages, or use a new data key per object.
+used: AWS KMS encryption context, Google Tink AEAD primitives, libsodium secretbox, Age and TLS records use the same primitive.
+avoid: Large files read at random offsets; use a chunked format with a per-chunk nonce and authentication. Also do not use plain AES-CBC without a MAC.
+flow:
+  App [svc] -> KMS [svc: master key] : GenerateDataKey | The app asks the key service for a new data key.
+  KMS -> App : clear key + wrapped key | KMS returns the key in clear and the same key encrypted under the master key.
+  App -> Crypto library [svc: AES-256-GCM] : seal, AAD=tenant+row | The library encrypts the record and authenticates the context in one operation.
+  Crypto library -> Database [db: ct, tag, wrapped key] : store | The database holds the ciphertext, nonce, tag and wrapped key. The clear key is dropped from memory.
+  Database -x> App : row moved to tenant B | An attacker moves the row. Decryption with the new AAD fails the tag check.
+  App -> KMS : Decrypt wrapped key | To read, the app unwraps the data key through KMS and then opens the record.
+ref: docs | Google Tink: AEAD primitive | Google | https://developers.google.com/tink/aead
+ref: spec | RFC 5116: An Interface and Algorithms for Authenticated Encryption | IETF, McGrew, 2008 | https://www.rfc-editor.org/rfc/rfc5116
+
+== Record protection with a counter nonce
+kind: layered-protocol
+when: Two peers send many messages over a channel, and each message must be private, authentic and safe from replay or reordering.
+how: After a handshake, both sides hold a shared key. Each direction keeps a 64-bit sequence number that starts at 0. For each record the nonce is built from the sequence number mixed with a fixed per-direction value. The sender never reuses a number, so it never repeats a nonce.
+Each record is sealed with AEAD. The header (type, length) is the associated data. The receiver rebuilds the same nonce from its own counter, so a replayed, dropped or reordered record fails the tag check. TLS 1.3 uses this over TCP, and QUIC uses packet numbers in a similar way.
+Before the counter reaches its limit, or after a set amount of data, the peers rotate the key (TLS 1.3 KeyUpdate). A nonce reuse with GCM is a disaster that leaks the key stream and the authentication key.
+used: TLS 1.3 records, QUIC packets, WireGuard (ChaCha20-Poly1305 with a counter), SSH with chacha20-poly1305.
+avoid: Datagram channels where packets may be lost or reordered, unless the counter is sent in the packet and a replay window is kept.
+flow:
+  Sender [svc: counter 7] -> Wire [queue: untrusted network] : record 7 + tag | The sender builds the nonce as IV xor 7, seals the record and sends header, ciphertext and tag.
+  * Sender: counter 8 | The counter moves on, so the next nonce is new.
+  Wire -> Receiver [svc: expects 7] : record 7 | The receiver gets the record and builds the same nonce from its own counter.
+  * Receiver: tag ok, expects 8 | The tag check passes and the plaintext is released. The counter moves to 8.
+  Wire -x> Receiver : replayed record 7 | An attacker sends record 7 again. The receiver expects 8, so the tag check fails.
+  * Receiver: connection closed | The receiver treats the failure as fatal and closes the connection.
+ref: spec | RFC 8446 section 5.3: Per-Record Nonce | IETF, 2018 | https://www.rfc-editor.org/rfc/rfc8446#section-5.3
+
+@@ dh
+== Ephemeral key exchange for forward secrecy
+kind: forward-secrecy
+when: Recorded encrypted traffic must stay unreadable even if the server's long-term key is stolen later.
+how: In each new TLS 1.3 connection, client and server each create a fresh (ephemeral) key pair, usually X25519. They exchange public keys. Each computes the same shared secret from its own private key and the other public key. An eavesdropper sees only the public keys and cannot compute the secret.
+The long-term certificate key is used only to sign the handshake, which proves who the server is. It does not protect the session key. After the handshake both sides delete the ephemeral private keys. A key stolen next year does not decrypt traffic recorded today.
+Modern browsers now offer a hybrid exchange, X25519 with ML-KEM, to protect against future quantum computers. A recorder could store traffic today and decrypt it later, so the key exchange must resist that.
+used: TLS 1.3 (ephemeral Diffie-Hellman is mandatory), SSH, IPsec IKEv2, Chrome and Cloudflare hybrid X25519MLKEM768.
+avoid: Static RSA key transport, which TLS 1.3 removed. Also do not reuse ephemeral keys across connections.
+flow:
+  Client [client] -> Server [svc: cert key] : hello + X25519 public key | The client picks a fresh key pair and sends the public part with its hello.
+  Server -> Client : hello + server public key | The server also picks a fresh pair and replies with its public key.
+  Server -> Client : certificate, signature | The server signs the handshake with its long-term key. This proves identity only.
+  * Client: shared secret computed | Both sides compute the same secret and derive session keys with HKDF.
+  Client -> Server : encrypted data | Application data is now protected with keys that came from the exchange.
+  Attacker [client: stole cert key] -x> Server : cannot decrypt old traffic | The stolen long-term key cannot recreate the deleted ephemeral secrets.
+ref: spec | RFC 7748: Elliptic Curves for Security (X25519) | IETF, Langley, Hamburg and Turner, 2016 | https://www.rfc-editor.org/rfc/rfc7748
+
+== Key agreement in a Noise-based VPN with rekeying
+kind: forward-secrecy
+when: Two peers with known public keys need a fast secure tunnel that renews its keys often and has no certificate system.
+how: In WireGuard each peer has a static public key that the other peer lists as allowed. To connect, the initiator runs a Noise_IK handshake with Curve25519: it mixes several DH results (ephemeral with static, and static with static) to derive session keys. It takes one round trip, with two messages.
+After the handshake, packets are protected with ChaCha20-Poly1305 and a counter. A peer starts a new handshake after about 2 minutes or a limit of messages, so the session keys keep changing. Old keys are erased, which gives forward secrecy.
+There is no negotiation of algorithms, so there is less code and fewer downgrade attacks. The tradeoff is that you must distribute public keys yourself, and changing algorithms later means a new protocol version.
+used: WireGuard, Tailscale, Cloudflare WARP (WireGuard-based), many cloud VPN products.
+avoid: Large fleets that need certificates, user identity and policy built in; use IKEv2 or a mesh product that manages keys.
+flow:
+  Peer A [svc: laptop] -> Peer B [svc: VPN gateway] : handshake initiation | A sends an ephemeral key and its static key, encrypted under keys from DH.
+  Peer B -> Peer A : handshake response | B replies with its ephemeral key. Both derive the same transport keys.
+  Peer A -> Peer B : data packet, counter 0 | Packets are sealed with ChaCha20-Poly1305 and a counter.
+  Peer B -> Internal net [svc: private subnet] : decrypted packet | The gateway forwards the clear packet to the private network.
+  * Peer A: keys 2 min old | The key age reaches the limit and A starts a new handshake.
+  Peer A -> Peer B : new handshake | New ephemeral keys are mixed in. Old session keys are erased.
+ref: paper | WireGuard: Next Generation Kernel Network Tunnel | Jason Donenfeld, NDSS 2017 | https://www.wireguard.com/papers/wireguard.pdf
+
+@@ hashfn
+== Content-addressed storage
+kind: content-addressing
+when: Many objects repeat or must be verified, and you want identical content stored once and found by its content.
+how: The name of an object is the hash of its bytes, for example SHA-256. To store a blob, compute the hash, check if it already exists, and write it only if it does not. Two copies of the same file get the same name, so they are stored once (deduplication).
+To read, ask for the hash and check the bytes against it. The reader needs no trust in the storage, because any change gives a different hash. Objects never change, so they can be cached forever and replicated freely.
+Trees of objects point to children by hash, so one root hash covers the whole tree. Git uses this for commits, trees and blobs, and container registries use it for image layers (sha256 digests). Garbage collection is needed, because nothing is ever overwritten.
+used: Git objects, Docker and OCI image layers, Nix store, IPFS, backup tools such as restic and borg, Bazel remote caches.
+avoid: Data that changes in place or needs the update-by-name model; use normal keys with versions.
+flow:
+  Client [client: docker push] -> Registry [svc: OCI registry] : HEAD layer sha256:ab12 | The client asks if the layer with this digest already exists.
+  Registry -> Client : 404, not found | The registry has no such layer yet.
+  Client -> Blob store [store: keyed by digest] : upload layer bytes | The client uploads the bytes. The server hashes them while it reads.
+  Blob store -> Registry : digest matches ab12 | The hash of the bytes equals the name, so the upload is accepted.
+  Client -> Registry : manifest of layer digests | The manifest points to layers by hash and is itself named by its hash.
+  Registry -> Client : 200, layer exists | Another image that uses the same layer now skips the upload.
+ref: docs | OCI Image Format Specification | Open Container Initiative | https://github.com/opencontainers/image-spec
+
+== Merkle tree to find and verify differences
+kind: merkle-proof
+when: Two large copies of data must be compared or verified, and sending all of it would cost too much.
+how: Split the data into blocks and hash each block. Hash pairs of hashes up the tree until one root hash remains. Two copies with the same root hash are identical. If the roots differ, compare the children and go only into the subtrees that differ.
+To find 1 changed block in 1 million, you compare about 20 levels and about 40 hashes, instead of the whole data. A proof that one block belongs to a root needs only the sibling hashes along the path, about 20 hashes of 32 bytes.
+Replicated databases use this for anti-entropy: replicas exchange trees and repair only the differences. Logs for certificate transparency use it to prove that an entry is in the log and that the log only grows. The cost is keeping the tree up to date when data changes.
+used: Cassandra and Dynamo-style anti-entropy repair, Git and Bitcoin, Certificate Transparency logs (RFC 6962 and 9162), ZFS checksums.
+avoid: Data where a simple version number or timestamp is enough to find changes.
+flow:
+  Repair job [svc: anti-entropy] -> Replica A [db: root h1], Replica B [db: root h2] : fetch root hashes | A scheduled repair job asks both replicas for their root hashes.
+  Replica A -> Replica B : compare roots | The replicas send their root hashes. They differ, so some data differs.
+  Replica A -> Replica B : child hashes | A sends the two child hashes. The left child equals B's, the right does not.
+  Replica B -> Replica A : descend into right subtree | Only the right subtree is compared. The left half is skipped.
+  * Replica B: leaf 7 differs | After about 20 steps the leaf block that differs is found.
+  Replica A -> Replica B : send block 7 | Only the one changed block is copied.
+  Replica B -> Replica A : roots equal | Both roots now match. The repair is complete.
+ref: spec | RFC 9162: Certificate Transparency Version 2.0 | IETF, Laurie et al., 2021 | https://www.rfc-editor.org/rfc/rfc9162
+
+@@ hmac
+== Signed webhook payloads verified by the receiver
+kind: webhook-callback
+when: A provider sends events to a customer URL on the public internet, and the customer must know they really came from the provider.
+how: The provider and the customer share a secret, given once when the webhook is created. For each event the provider computes HMAC-SHA256 over the exact raw body, often with a timestamp added, and sends the result in a header such as X-Signature.
+The receiver computes the same HMAC over the raw bytes it received, before any JSON parsing. It compares the two values in constant time, so timing does not leak the value. If they differ, it returns 400 and does nothing. Anyone who does not know the secret cannot forge a valid signature.
+Signing the timestamp too lets the receiver reject events older than about 5 minutes, which stops replays. Deliveries are retried, so the receiver also stores the event id and ignores duplicates. Secrets are rotated by accepting two secrets for a short time.
+used: Stripe (Stripe-Signature), GitHub (X-Hub-Signature-256), Slack request signing, Shopify webhooks.
+avoid: When the receiver must prove the sender to a third party; HMAC is shared-secret, so either side could have made it. Use a public-key signature.
+flow:
+  Provider [svc: has secret] -> Customer endpoint [svc: has secret] : POST, X-Signature, ts | The provider computes HMAC(secret, timestamp + raw body) and sends the event with the signature and timestamp in headers.
+  * Customer endpoint: signature checked | The receiver recomputes the HMAC on the raw bytes and compares in constant time.
+  Customer endpoint -> Event store [db: seen event ids] : insert event id | A new id is stored. A repeated id is skipped, because the provider retries.
+  Attacker [client] -x> Customer endpoint : forged body, bad signature | A request without the right secret fails the check and gets a 400.
+  Customer endpoint -> Provider : 200 OK | After a valid check the receiver replies at once and works in the background.
+ref: docs | Stripe: Check webhook signatures | Stripe documentation | https://docs.stripe.com/webhooks#verify-events
+ref: spec | RFC 2104: HMAC | IETF, Krawczyk, Bellare and Canetti, 1997 | https://www.rfc-editor.org/rfc/rfc2104
+
+== HMAC-signed API requests with derived keys
+kind: signed-request
+when: Many clients call an API, and each request must be proven authentic without sending the secret and without a login step.
+how: Each client has an access key id and a secret. To sign a request, the client builds a canonical string from the method, path, sorted query, chosen headers, the hash of the body and a timestamp. It computes an HMAC of this string and sends the key id and the signature in a header. The secret is never sent.
+AWS Signature Version 4 does not use the secret directly. It derives a chain of keys: HMAC of the date, then the region, then the service, then the word "aws4_request". The final key is limited to one day, one region and one service, so a leaked derived key has a small reach.
+The server looks up the secret by key id, repeats the same steps and compares. Because the signature covers the body hash and the time, a changed request or an old one fails. The cost is that both sides must build the canonical string in exactly the same way.
+used: AWS SigV4, Google Cloud HMAC keys for storage, many payment and exchange APIs that sign requests with a shared secret.
+avoid: Browser clients, where a secret cannot be hidden; use OAuth tokens instead.
+flow:
+  Client [client: key id + secret] -> API server [svc] : request + signature | The client derives a narrow key with chained HMACs, signs the request and sends the key id and signature.
+  API server -> Key store [db: secrets by key id] : lookup secret | The server finds the secret for this key id.
+  * API server: signature recomputed | The server builds the same canonical string and signs it.
+  API server -> Client : 200 OK | The signatures match and the time is fresh, so the request is accepted.
+  Client -x> API server : replay after 15 min | An old signature is outside the allowed clock window and is rejected.
+ref: docs | Signature Version 4 signing process | AWS documentation | https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv.html
+
+@@ pkcrypto
+== Certificate chain of trust (web PKI)
+kind: chain-of-trust
+when: A client must trust the public key of a server it has never met, without a shared secret.
+how: The operating system or browser ships a list of root CA public keys (a trust store). A root CA signs an intermediate CA, and the intermediate signs the server's certificate for example.com. The server sends its certificate and the intermediate during the TLS handshake.
+The client checks each signature up to a root in its store. It also checks the dates, that the name matches, and revocation or short validity. Roots stay offline. The intermediates do the daily signing, so a leaked intermediate can be revoked without replacing the root.
+Certificate Transparency adds public logs: CAs must log certificates, and browsers require proof of logging. This lets domain owners see wrongly issued certificates. Since 15 March 2026 public TLS certificates are valid for at most 200 days, falling to 100 days in 2027 and 47 days in 2029 (CA/Browser Forum ballot SC-081).
+used: Every HTTPS site; Let's Encrypt, DigiCert and other public CAs; private PKIs inside companies for internal services.
+avoid: Closed systems with a few peers, where pinning known public keys is simpler (SSH, WireGuard).
+flow:
+  Site owner [user] -> Intermediate CA [svc: signs leaf certs] : CSR + domain proof | The owner proves control of the domain and asks for a certificate.
+  Intermediate CA -> CT log [log: public] : log the certificate | The CA records the certificate in a public log and gets a signed receipt.
+  Intermediate CA -> Site owner : leaf certificate | The CA signs the server's public key and returns the certificate.
+  Browser [client: trust store] -> Server [svc: https] : connect | The browser opens a TLS connection.
+  Server -> Browser : leaf + intermediate | The server sends the chain. The root is not sent, because the browser already has it.
+  * Browser: chain checked to root | The browser checks each signature, name and date up to a root in its store.
+ref: spec | RFC 5280: Internet X.509 PKI Certificate and CRL Profile | IETF, Cooper et al., 2008 | https://www.rfc-editor.org/rfc/rfc5280
+
+== Hybrid public-key encryption to a recipient
+kind: envelope-encryption
+when: A sender must encrypt data for a recipient who has only published a public key, and the data may be large.
+how: Public-key operations are slow and handle only small inputs. So the sender uses hybrid encryption. It creates a one-time key, encrypts the data with a fast symmetric cipher (AEAD), and then protects the one-time key with the recipient's public key.
+HPKE (RFC 9180) standardises this. The sender makes an ephemeral key pair and combines it with the recipient's public key by Diffie-Hellman (KEM). It derives a key with HKDF and seals the message with AEAD. The output is the ephemeral public key plus the ciphertext. Only the holder of the private key can open it.
+The private key stays in one place, such as an HSM, while many senders encrypt with the public key. The sender cannot read what other senders sent. The weakness is key distribution: the sender must get the right public key, which is why certificates or a trusted directory are needed.
+used: HPKE in TLS Encrypted Client Hello and Messaging Layer Security (MLS); age and PGP file encryption; payment card data encrypted in the browser with the processor's public key (common).
+avoid: When both sides already share a secret key; plain AEAD is simpler and faster.
+flow:
+  Recipient [svc: holds private key] -> Key directory [store: public keys] : publish public key | The recipient publishes a public key.
+  Sender [client] -> Key directory : fetch recipient key | The sender gets the key. It must check that the key is the right one.
+  Sender -> Recipient : ephemeral key + ciphertext | The sender makes an ephemeral key, derives a key with HKDF, seals the data with AEAD and sends the public part and the ciphertext.
+  * Recipient: key derived, data opened | The recipient uses its private key and the ephemeral public key to get the same key.
+ref: spec | RFC 9180: Hybrid Public Key Encryption | IETF, Barnes, Bhargavan, Lipp and Wood, 2022 | https://www.rfc-editor.org/rfc/rfc9180
+
+@@ pqcrypto
+== Hybrid post-quantum key exchange rollout
+kind: blue-green, feature-flags
+when: Traffic recorded today could be decrypted by a quantum computer in the future, and you must add protection without breaking old clients.
+how: The client offers a hybrid key share in the TLS 1.3 handshake: X25519 plus ML-KEM-768 (called X25519MLKEM768). The shared secret is made from both parts. An attacker must break both the classic and the post-quantum part, so the connection is no weaker than before.
+The server enables the new group next to the old ones, and picks it only when the client offers it. Old clients keep using X25519. This allows a gradual rollout by percentage of traffic, with a flag to switch it off.
+The cost is size. The ML-KEM-768 public key is 1,184 bytes, so the client key share is about 1.2 KB. A ClientHello can then be larger than one packet, and a few old middleboxes failed on this. Teams watch handshake errors and latency during the rollout.
+used: Chrome and Firefox by default with X25519MLKEM768; Cloudflare edge; OpenSSL 3.5 and later; AWS and Google Cloud endpoints offer hybrid groups.
+avoid: Do not drop the classical part yet; do not use pure post-quantum key exchange where hybrid is possible.
+flow:
+  Browser [client: hybrid key share] -> Edge [svc: TLS 1.3] : hello, X25519+ML-KEM | The browser sends two key shares in one hello, about 1.2 KB in all.
+  Edge -> Browser : hello, hybrid key share | The edge picks the hybrid group and replies with its own two key parts.
+  * Browser: secret = X25519 + ML-KEM | Both secrets are joined in the key schedule. An attacker needs to break both.
+  Browser -> Edge : encrypted request | The connection works as usual after the handshake.
+  Old client [client: X25519 only] -> Edge : hello, X25519 | An older client offers only the classic group. The edge accepts it.
+  Old client -x> Edge : hello dropped by middlebox | On a few networks the larger hello is dropped. The team watches this error rate.
+ref: spec | FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard | NIST, 2024 | https://csrc.nist.gov/pubs/fips/203/final
+ref: spec | Post-quantum hybrid ECDHE-MLKEM key agreement for TLS 1.3 | IETF draft | https://datatracker.ietf.org/doc/draft-ietf-tls-ecdhe-mlkem/
+
+== Post-quantum signed firmware and boot chain
+kind: chain-of-trust
+when: Devices live for 10 to 20 years, and their update signatures must stay safe against future quantum computers.
+how: A device has a root of trust in ROM that holds a public key. The vendor signs each firmware image with a private key kept in an HSM. At boot, the ROM verifies the bootloader signature, the bootloader verifies the kernel, and so on. A bad signature stops the boot.
+Quantum computers would break RSA and ECDSA signatures, and keys in ROM cannot be changed after shipping. So new devices use hash-based signatures such as LMS or XMSS (NIST SP 800-208), or ML-DSA (FIPS 204). A hybrid scheme can carry a classic and a post-quantum signature together.
+LMS and XMSS are stateful: each one-time key may be used only once, so the signing system must keep a counter safely, or it becomes insecure. Signatures are bigger than ECDSA (kilobytes), so images and update formats must have room for them.
+used: US CNSA 2.0 guidance asks for LMS or XMSS for firmware signing; hardware roots of trust and secure boot in servers and network gear (common).
+avoid: Short-lived data or services that can rotate keys at any time; classical signatures plus fast rotation may be enough for now.
+flow:
+  Build server [svc: CI] -> Signing HSM [svc: LMS or ML-DSA key] : sign image hash | The build sends the firmware hash to the signing service.
+  Signing HSM -> Build server : signature, key index 41 | The HSM signs and advances its one-time key counter. A repeated index would be unsafe.
+  Build server -> Update server [store: signed images] : publish image + signature | The signed image is distributed to devices.
+  Device ROM [svc: public key in ROM] -> Update server : fetch image | The device downloads the image.
+  * Device ROM: signature verified | The ROM checks the signature with its built-in public key before it runs the code.
+  Device ROM -x> Update server : tampered image rejected | A changed image fails the check and the device keeps the old firmware.
+ref: spec | NIST SP 800-208: Stateful Hash-Based Signature Schemes | NIST, 2020 | https://csrc.nist.gov/pubs/sp/800/208/final
+
+@@ prng
+== Opaque session tokens from the OS random source
+kind: opaque-token
+when: A service must issue session ids or API tokens that nobody can guess, and must be able to revoke them.
+how: The service draws 32 bytes from the operating system's secure random generator (getrandom on Linux, or the language's secrets module). That gives 256 bits, which cannot be guessed. The token is the random value itself and has no meaning inside.
+The server stores only a hash of the token in a database or in Redis, with the user id and an expiry. On each request it hashes the presented token and looks it up. A leak of the database does not leak working tokens. To revoke a session, delete the row.
+Never use a general PRNG such as Math.random or a time-seeded generator for this, because its output can be predicted from a few samples. Virtual machines cloned from one image must reseed their generator, or two VMs may produce the same tokens.
+used: Session ids in Rails, Django and Spring; GitHub personal access tokens and API keys at most SaaS services (random value with stored hash).
+avoid: When you need stateless verification without a lookup; use a signed token (JWT) and accept that revocation is harder.
+flow:
+  Login service [svc] -> OS CSPRNG [svc: getrandom] : 32 random bytes | The service asks the kernel for random bytes. The kernel pool is seeded from hardware entropy.
+  OS CSPRNG -> Login service : token bytes | The service gets 256 bits and encodes them as text.
+  Login service -> Session store [db: hash of token] : store hash, user, expiry | Only the SHA-256 of the token is stored with the user id and expiry.
+  Login service -> Browser [client] : Set-Cookie token | The browser receives the token in a secure, HttpOnly cookie.
+  Browser -> API [svc] : request with cookie | Later requests carry the token.
+  API -> Session store : lookup hash | The API hashes the token, finds the row and checks the expiry. Deleting the row revokes it.
+ref: docs | OWASP Session Management Cheat Sheet | OWASP | https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html
+
+== Counter-based random streams for parallel training
+kind: data-parallel
+when: Many workers need random numbers (dropout, shuffling, sampling), and a run must be reproducible and must not share a generator.
+how: One global seed starts the run. A counter-based generator such as Philox or Threefry makes each random number from the seed and a counter, with no hidden state to share. The key is split deterministically: worker k, step t, layer l each get their own stream.
+Any worker can produce any number at any time, in any order, on a CPU or a GPU. There is no lock and no communication. If a node fails, the job restarts from a checkpoint with the same seed and step, and gets the same dropout masks as before.
+These generators are not for secrets. Their purpose is speed and repeatability, and their output can be predicted. Also test with different seeds, since a single lucky seed can hide variance in results.
+used: JAX random keys (Threefry, split and fold_in), cuRAND Philox, PyTorch CUDA generators, NumPy default_rng with SeedSequence.spawn.
+avoid: Anything secret, such as tokens or keys; use the OS secure generator.
+flow:
+  Trainer [svc: seed 1234] -> Worker 0 [svc: GPU 0], Worker 1 [svc: GPU 1] : key split, one per worker | The trainer splits the seed into independent keys. No generator state is shared.
+  Worker 0 -> Worker 0 batch [store: dropout mask] : Philox(key0, step 17) | Worker 0 creates its mask from key and step number. The call is stateless.
+  Worker 1 -> Worker 1 batch [store: dropout mask] : Philox(key1, step 17) | Worker 1 does the same with its own key. The masks differ and need no coordination.
+  Worker 1 -x> Trainer : node failed at step 17 | One node fails and the job stops.
+  Trainer -> Checkpoint [store: step 15] : restart from step 15 | The job restarts from the last checkpoint with the same seed.
+  * Worker 1: replays step 17 | Worker 1 regenerates the same mask as before, so the run stays reproducible.
+ref: paper | Parallel Random Numbers: As Easy as 1, 2, 3 | Salmon, Moraes, Dror and Shaw, SC 2011 |
+
+@@ pwhash
+== Login service with Argon2id and a rate limit
+kind: rate-limit, bulkhead
+when: A service stores user passwords, and a stolen database must not let attackers recover them quickly.
+how: At sign-up the service creates a random salt and runs a slow, memory-hard hash such as Argon2id with set parameters (for example 19 MiB memory, 2 passes, 1 lane as the OWASP minimum). It stores the algorithm, parameters, salt and hash in one string. Each user has a different salt, so identical passwords look different and rainbow tables do not work.
+At login the service reads the stored parameters, hashes the given password and compares in constant time. A hash costs about 50 to 100 ms of CPU and memory on purpose. An attacker with a stolen database pays the same cost for every guess.
+This cost is also a risk for the service: many login attempts can exhaust CPU. So hashing runs in its own worker pool (a bulkhead), and a rate limit per account and per IP stops guessing and overload. An optional pepper kept in a KMS adds a secret that a database leak does not reveal.
+used: Argon2id in OWASP guidance and in libraries such as libsodium; bcrypt and scrypt in many frameworks; Django and Rails use salted slow hashes by default.
+avoid: Fast hashes such as SHA-256 or MD5 for passwords. For high-entropy API keys a fast hash is fine.
+flow:
+  Browser [client] -> Login API [svc: rate limit] : POST /login | The user sends an email and a password over TLS.
+  Login API -> Rate limiter [cache: per account and IP] : allow? | The limiter counts recent attempts for this account and this IP. Too many attempts get a 429.
+  Login API -> User DB [db: argon2id hash string] : read hash by email | The API loads the stored string with algorithm, parameters and salt.
+  Login API -> Hash pool [svc: 4 workers] : verify(password, hash) | A limited worker pool runs the slow hash, so it cannot starve other requests.
+  Hash pool -> Login API : match, constant-time | The compare takes the same time for right and wrong passwords.
+  Login API -> Browser : session cookie | On success the API creates a session. On failure it returns a generic error.
+ref: docs | OWASP Password Storage Cheat Sheet | OWASP | https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
+ref: spec | RFC 9106: Argon2 | IETF, Biryukov, Dinu, Khovratovich and Josefsson, 2021 | https://www.rfc-editor.org/rfc/rfc9106
+
+== Upgrade password hashes at next login
+kind: strangler-fig
+when: An old database uses a weak hash (MD5, SHA-1, low-cost bcrypt), and you cannot ask all users to reset their passwords.
+how: Add a version marker to every stored hash, for example a prefix like $2b$ for bcrypt or $argon2id$. At login the service checks the marker and verifies with the matching algorithm. If the password is right and the hash is old, it hashes the plaintext again with the new algorithm and saves it in the same transaction.
+Active users move to the new scheme over weeks. This is a strangler migration: the old path shrinks until few rows remain. For the users who never return, you can wrap the old hash in the new one: store argon2id(old_hash) and apply the same two steps at login. All rows are strong at once.
+Raise the cost parameters in the same way when hardware improves. Keep a metric of how many rows use each version, and remove the old verifier when it reaches zero.
+used: Django password hashers (upgrade on login), Laravel Hash::needsRehash and PHP password_needs_rehash; migration guides in OWASP.
+avoid: Do not keep the old verifier forever; wrap or force a reset for the remaining accounts.
+flow:
+  User [user] -> Login API [svc: two verifiers] : email + password | The user logs in as normal.
+  Login API -> User DB [db: v1 sha1, v2 argon2id] : read row, version v1 | The row has an old hash with a version marker.
+  * Login API: verified with v1 | The old verifier says the password is right.
+  Login API -> Login API pool [svc: argon2id] : hash plaintext with v2 | The service hashes the same password with the new algorithm.
+  Login API -> User DB : update row to v2 | The new hash replaces the old one in the same transaction.
+  User DB -> Metrics [store: rows per version] : v1 count falls | A metric shows how many rows still use the old scheme.
+ref: docs | Django: Password management, upgrading | Django documentation | https://docs.djangoproject.com/en/stable/topics/auth/passwords/
+
+@@ signatures
+== Signed artifacts verified at deploy time
+kind: chain-of-trust
+when: A company must be sure that only code built by its own pipeline runs in production.
+how: The CI pipeline builds a container image and signs its digest. With Sigstore cosign, a keyless signature uses a short-lived certificate from Fulcio that is bound to the CI identity (OIDC). The signature and certificate are written to a public transparency log (Rekor) and stored next to the image in the registry.
+At deploy time an admission controller in the cluster (for example Kyverno, or Sigstore policy-controller) checks the image. It verifies the signature, the signer identity, and the log entry. Unsigned or wrongly signed images are rejected before any pod starts.
+This protects against a stolen registry password or a changed tag, since the attacker cannot sign as the pipeline. Add provenance (SLSA attestations) to show how the image was built. The policy must pin images by digest, because tags can move.
+used: Sigstore cosign with Kyverno or policy-controller; npm and PyPI provenance; Apple and Google app store signing; Docker Content Trust and Notary.
+avoid: Closed systems where all images are built and run in one trusted place with no registry exposure.
+flow:
+  CI pipeline [svc: build] -> Registry [store: images] : push image, digest ab12 | The pipeline pushes the image and gets its digest.
+  CI pipeline -> Fulcio CA [svc: short-lived cert] : OIDC token, public key | The pipeline proves its identity and gets a certificate that lasts 10 minutes.
+  CI pipeline -> Rekor [log: transparency log] : signature + cert | The signature is recorded in a public log that cannot be changed.
+  Kubernetes [svc: admission control] -> Registry : fetch image + signature | At deploy the controller reads the image signature.
+  * Kubernetes: signature and identity ok | It checks the signature, the CI identity and the log proof against its policy.
+  Attacker [client: stolen registry login] -x> Kubernetes : unsigned image rejected | An image pushed without a valid signature is denied.
+ref: docs | Sigstore documentation | Sigstore project | https://docs.sigstore.dev/
+ref: spec | SLSA specification | OpenSSF | https://slsa.dev/spec/
+
+== JWTs signed by an identity provider and verified by services
+kind: federated-identity, api-gateway
+when: Many services must trust who the caller is, without each one calling the login service on every request.
+how: After login, the identity provider (IdP) issues a JWT: claims such as subject, audience, expiry and scopes, signed with its private key (RS256 or ES256, or EdDSA). The client sends it in the Authorization header.
+Each service or the API gateway verifies the signature with the IdP's public key, which it fetches from a JWKS URL and caches. It checks the expiry, the issuer and the audience. This is a local check with no network call per request, so it scales with the number of services. Only the IdP can sign, so a service cannot forge tokens for another.
+Tokens are short, for example 5 to 15 minutes, since they cannot be revoked easily. A refresh token is used to get new ones. Keys are rotated: the JWKS has several keys, each with a key id (kid) in the token header.
+used: OAuth 2.0 and OpenID Connect providers such as Okta, Auth0, Keycloak and Google; API gateways such as Envoy and Kong that validate JWTs.
+avoid: When instant revocation is required for every request; use opaque tokens with introspection. Never accept the alg none or a switch of algorithm.
+flow:
+  User [user] -> IdP [svc: holds private key] : login + MFA | The user signs in at the identity provider.
+  IdP -> User : JWT, expires in 10 min | The IdP returns a token signed with its private key.
+  User -> Gateway [svc: JWT check] : request + Bearer token | The client calls the API with the token.
+  Gateway -> IdP : GET /jwks.json | The gateway fetches the public keys and caches them. It does this once, not per request.
+  * Gateway: signature, exp, aud ok | The gateway verifies the signature locally and checks expiry and audience.
+  Gateway -> Orders [svc] : request + user id | The gateway forwards the request with the verified identity.
+  User -x> Gateway : expired or forged token | An expired token or a bad signature gets 401 with no call to the IdP.
+ref: spec | RFC 7519: JSON Web Token | IETF, Jones, Bradley and Sakimura, 2015 | https://www.rfc-editor.org/rfc/rfc7519
+ref: spec | RFC 8725: JWT Best Current Practices | IETF, Sheffer, Hardt and Jones, 2020 | https://www.rfc-editor.org/rfc/rfc8725
+
+@@ symcrypto
+== Encrypted volumes with a key hierarchy and crypto-shredding
+kind: envelope-encryption
+when: Data on disks must be encrypted at rest, and a tenant, disk or device must be wiped by destroying a key.
+how: Disks use a block cipher mode made for storage, AES-XTS, with a volume key. Each sector is encrypted on its own, so random reads and writes work and the size does not change. The volume key is itself encrypted by a key-encryption key (KEK). The KEK lives in a KMS, a TPM or a user passphrase, so the disk holds only wrapped keys.
+To unlock, the host asks the KMS or TPM to unwrap the volume key, and the kernel (dm-crypt, LUKS) keeps it in memory. Rotating the KEK needs only a re-wrap of small keys, not a rewrite of terabytes.
+To delete data for good, destroy the key. Without it, the ciphertext is random noise. This is crypto-shredding. XTS gives no authentication, so a changed sector is not detected; it hides content only. Put integrity at a higher layer, or use authenticated modes (dm-integrity) where needed.
+used: Linux LUKS and dm-crypt, Apple FileVault, Windows BitLocker (TPM), AWS EBS encryption with KMS, self-encrypting drives.
+avoid: Protecting data from a user who is already logged in on a running machine, or from a stolen database dump when the app has the key; add field-level encryption.
+flow:
+  Host [svc: dm-crypt] -> KMS [svc: KEK] : unwrap volume key | At attach time the host asks the KMS to unwrap the stored volume key.
+  KMS -> Host : volume key | The KMS checks access and returns the key. The key stays in kernel memory only.
+  Host -> Volume [store: AES-XTS sectors] : write sector 9 | Each sector is encrypted with the volume key and a tweak from its number.
+  Volume -> Host : read sector 9 | A read decrypts the sector. Random access works.
+  Admin [user] -> KMS : rotate KEK | The KEK changes and only the small wrapped volume key is re-wrapped.
+  KMS -x> Host : key destroyed, shred | The tenant leaves and the key is deleted. The volume cannot be read again.
+ref: docs | LUKS2 on-disk format and dm-crypt | Linux kernel documentation | https://docs.kernel.org/admin-guide/device-mapper/dm-crypt.html
+
+== Hardware-offloaded encryption in the data path
+kind: offload-accelerator
+when: Encrypting all traffic or storage would cost many CPU cores, and you want the cost close to zero.
+how: Modern CPUs have AES instructions (AES-NI, ARMv8 crypto) that run AES at several GB per second per core and use no lookup tables, which also avoids timing leaks. So most software gets fast AES by default through OpenSSL or BoringSSL.
+For more, the work moves to hardware in the data path. A NIC with inline TLS or IPsec offload encrypts packets as they leave. Kernel TLS (kTLS) lets sendfile() send an encrypted file from the page cache without copying it to user space. NVMe drives with hardware encryption do the work in the drive.
+The tradeoff is control. Offload supports a fixed list of ciphers and may limit key updates and debugging. Keep a software path as a fallback, and test it, since the hardware may fail or lack a feature.
+used: Netflix serves video with kTLS and NIC TLS offload on FreeBSD (published talks); AWS Nitro cards encrypt traffic; Linux kTLS in nginx and others.
+avoid: Low traffic, where software AES-NI is enough and the extra complexity is not worth it.
+flow:
+  Video server [svc: nginx + kTLS] -> Kernel [svc: kTLS] : sendfile(file, TLS socket) | The server hands a file to the kernel. No copy goes through user space.
+  Kernel -> Page cache [cache: file data] : read plaintext | The kernel reads the file from memory.
+  Kernel -> Offload NIC [svc: inline TLS] : plaintext records + key | The NIC receives records and the TLS session key.
+  Offload NIC -> Client [client] : encrypted packets | The NIC encrypts and sends. The CPU did no AES work.
+  Offload NIC -x> Kernel : unsupported cipher | If the NIC cannot handle the case, the kernel does the AES in software.
+ref: docs | Kernel TLS | Linux kernel documentation | https://docs.kernel.org/networking/tls.html
+
+@@ zkp
+== Validity proofs for batched transactions (ZK rollup)
+kind: batching, offload-accelerator
+when: A blockchain must check thousands of transactions, but every node re-running them is too slow and costly.
+how: A sequencer collects thousands of transactions off-chain and runs them. A prover then builds one succinct proof that says "these transactions, applied to the old state, give the new state". The proof is a few hundred bytes to a few hundred kilobytes, whatever the batch size.
+A smart contract on Ethereum (Layer 1) verifies the proof, which costs a fixed amount of gas, and stores the new state root. Nodes do not re-run the batch. Anyone who sees a valid proof knows the transitions followed the rules, so no trust in the sequencer is needed for correctness.
+Making proofs is the heavy part. It takes minutes of compute, often on GPUs or many machines, and adds delay. The cost is spread over the batch: more transactions per proof means a lower cost for each. The data must also be published, so that users can rebuild the state.
+used: zkSync, Starknet, Scroll, Linea and Polygon zkEVM rollups on Ethereum; the same idea in zkVMs such as RISC Zero and SP1.
+avoid: Low-volume systems where the proving cost and complexity do not pay off; a simple signed log or a database is enough.
+flow:
+  Users [user] -> Sequencer [svc: off-chain] : 5,000 transactions | Users send transactions to the sequencer, which orders and runs them.
+  Sequencer -> Prover [svc: GPU cluster] : batch + old state root | The batch goes to a prover that builds a proof of correct execution.
+  * Prover: proof built | After minutes of compute the proof is about 200 KB, however large the batch is.
+  Prover -> L1 contract [svc: verifier] : proof + new state root | The proof and the new root are sent in one transaction.
+  L1 contract -> L1 chain [log: state roots] : record root | The contract verifies the proof in a fixed cost of gas and records the new root.
+  Prover -x> L1 contract : bad proof rejected | A wrong state transition cannot produce a valid proof, so the contract rejects it.
+ref: docs | Zero-knowledge rollups | ethereum.org | https://ethereum.org/en/developers/docs/scaling/zk-rollups/
+
+== Prove a fact without revealing the data (private transfers)
+kind: privacy-clean-room
+when: A user must show that a statement is true, for example "I own an unspent coin" or "I am eligible", without giving the underlying data.
+how: The user keeps secret inputs, such as a note with a value and an owner key. The public statement is checked by a circuit: the note exists in a commitment tree, the owner key matches, and the value in and the value out balance. The prover builds a proof from the secret inputs and sends only the proof and public values.
+In Zcash shielded transfers, the chain stores commitments and nullifiers, not amounts or addresses. The verifier checks the proof, checks that the nullifier is new (which prevents double spending), and adds the new commitment. It learns that a valid transfer happened and nothing else.
+The proof is made on the user's device, in seconds, so circuits must be small. Setup is a concern: some systems need a trusted setup, while STARK-based systems do not. A bug in a circuit can break soundness, so audits matter.
+used: Zcash shielded pool (Halo 2 proofs); privacy tools on Ethereum; anonymous credentials and age-proof research for digital identity wallets.
+avoid: When the data is not private, or when a simple signature or a trusted party is enough.
+flow:
+  Wallet [client: secret note] -> Wallet circuit [model: prove] : note, key, path (private) | The wallet feeds the secret inputs into the proving circuit on the device.
+  Wallet circuit -> Wallet : proof + public values | The circuit outputs a short proof and public values. The secrets stay local.
+  Wallet -> Node [svc: verifier] : transaction with proof | The wallet sends only the proof and the public values to the network.
+  Node -> Nullifier set [store: spent markers] : is nullifier new? | The node checks that this note was not spent before.
+  Node -> Chain [log: commitments] : append commitment | The proof is valid and the nullifier is new, so the commitment is added.
+  Wallet -x> Node : same nullifier again | A second spend of the same note has the same nullifier and is rejected.
+ref: docs | Zcash protocol specification | Electric Coin Company | https://zips.z.cash/protocol/protocol.pdf
+
+@@ acid
+== Commit through a write-ahead log
+kind: wal, leader-follower
+when: A database must not lose a committed transaction after a crash, and must not show a half-done one.
+how: A transaction changes pages in memory, and the database writes a log record for each change to a sequential log (the WAL). To commit, it appends a commit record and calls fsync. When fsync returns, the transaction is durable. The data pages can be written later in the background, because the log has everything needed.
+After a crash, recovery reads the log. It redoes changes of committed transactions that did not reach the data pages, and undoes or ignores the changes of transactions with no commit record. This gives atomicity and durability with one fast, sequential write at commit.
+The same log feeds replicas: a standby reads the stream and applies it, and CDC tools read it too. The cost is fsync latency, often 0.1 to 2 ms on SSD or a few ms on cloud disks, so databases group several commits in one fsync (group commit).
+used: PostgreSQL WAL, MySQL InnoDB redo log, SQLite WAL mode, SQL Server transaction log; ARIES recovery.
+avoid: Data that can be rebuilt and may be lost, where disabling fsync is an option; use that only on purpose, for example in caches or tests.
+flow:
+  Client [client] -> Database [svc: buffer pool] : BEGIN, UPDATE, COMMIT | A transaction changes two rows in memory.
+  Database -> WAL [log: sequential file] : append redo + commit | The database appends the redo records and a commit record to the log.
+  WAL -> Database : fsync done | The disk confirms the log is durable. Only then does the client get OK.
+  Database -> Client : COMMIT ok | The client sees a successful commit. Data pages are still only in memory.
+  Database -x> WAL : crash before page flush | The server crashes. The dirty pages in memory are lost.
+  Database -> Data files [db: heap pages] : redo from WAL on restart | Recovery replays the log and rebuilds the committed state in the data files.
+ref: paper | ARIES: A Transaction Recovery Method | Mohan et al., ACM TODS, 1992 |
+ref: docs | PostgreSQL: Write-Ahead Logging | PostgreSQL documentation | https://www.postgresql.org/docs/current/wal-intro.html
+
+== Atomic transfer with retry on conflict
+kind: retry-backoff, idempotent-consumer
+when: A payment or inventory change touches several rows, and concurrent requests must not lose updates or double-apply them.
+how: The service puts all related changes in one transaction: debit account A, credit account B, insert a ledger row. The database makes them all happen or none. A CHECK or a conditional update such as UPDATE ... WHERE balance >= 100 keeps the invariant safe.
+Under SERIALIZABLE or snapshot isolation, two conflicting transactions cannot both commit: the database aborts one with a serialization failure (SQLSTATE 40001) or a deadlock. The app retries the whole transaction with backoff and jitter, usually 3 to 5 times.
+A retry can also come from the client after a timeout, when the first try may have committed. So the request carries an idempotency key. A unique constraint on the key in the same transaction makes the second try a no-op that returns the first result.
+used: Bank and wallet ledgers on PostgreSQL, CockroachDB and Spanner (which expect client retries); Stripe-style idempotency keys.
+avoid: Work that spans several services or databases; use a saga with compensations or an outbox, not a long distributed transaction.
+flow:
+  Client [client: key k-77] -> Payment API [svc: retry loop] : transfer 100, key k-77 | The client sends a transfer with an idempotency key.
+  Payment API -> Postgres [db: SERIALIZABLE] : insert key, debit, credit | One transaction inserts the key, debits A and credits B.
+  Postgres -x> Payment API : 40001 conflict, abort | A concurrent transfer touched the same rows. One transaction is aborted.
+  * Payment API: retry 1 after 40 ms | The API waits with jitter and runs the whole transaction again.
+  Payment API -> Postgres : retry transaction | The second run commits all three changes together.
+  Payment API -> Client : ok | The client gets the result. If it retries with k-77, the unique key returns the same result.
+ref: docs | PostgreSQL: Transaction Isolation | PostgreSQL documentation | https://www.postgresql.org/docs/current/transaction-iso.html

@@ -1,6 +1,6 @@
 @@ dst
 == Seeded simulator with fault injection
-kind: none
+kind: deterministic-simulation
 when: A distributed system has rare bugs that only show up when crashes, delays and timeouts line up, and every failure must be replayable.
 how: The whole cluster runs in one single-threaded process. Nodes, network and disks are simulated objects. Every source of non-determinism goes through the simulator: the clock, the random number generator, thread scheduling and message delivery.
 A driver picks a seed. The seed decides the workload and the faults: kill a node during a disk flush, delay one message behind a newer one, split the network in two. After each step, checkers verify invariants such as "no acknowledged write is lost". When one fails, the seed is the bug report: the same seed replays the same run, step by step, under a debugger.
@@ -18,7 +18,7 @@ ref: paper | FoundationDB: A Distributed Unbundled Transactional Key Value Store
 ref: video | Testing Distributed Systems w/ Deterministic Simulation | Will Wilson, Strange Loop 2014 |
 
 == Seed farm in continuous integration
-kind: none
+kind: deterministic-simulation
 when: A team wants simulation to find bugs before release, without a human running it.
 how: Each night the CI system starts thousands of simulator jobs. Every job takes a fresh random seed, runs the cluster for a fixed simulated time, and reports pass or fail with the seed. Passing runs are thrown away. Failing seeds go to a bug queue.
 Each failing seed is stored with the exact git commit. An engineer replays the seed on that commit and gets the same failure. After the fix, the seed joins a regression list that runs on every pull request, so the bug cannot return.
@@ -179,7 +179,7 @@ ref: paper | Dynamo: Amazon's Highly Available Key-value Store | DeCandia et al.
 
 @@ hlc
 == Transaction timestamps with a hybrid clock
-kind: none
+kind: logical-clock
 when: A distributed database needs transaction timestamps that follow cause and effect and stay close to wall-clock time, without special atomic clocks.
 how: Each node keeps an HLC timestamp of two parts: the largest wall-clock time it has seen, and a small counter. To stamp a local event, the node takes the larger of its last timestamp and its current clock. If the wall part did not move, it adds 1 to the counter.
 Every message carries the sender's timestamp. On receipt, the node sets its own clock to the maximum of its clock, its wall part and the incoming wall part, then adjusts the counter so the new timestamp is above both. So a result read from another node is always ordered after what it read.
@@ -196,7 +196,7 @@ flow:
 ref: paper | Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases | Kulkarni, Demirbas, et al., 2014 |
 
 == Consistent snapshot reads at a past time
-kind: none
+kind: mvcc-snapshot
 when: Many users must read a consistent view of data at one point in time, without blocking writers.
 how: The database stores every row version with its HLC timestamp (MVCC, multi-version concurrency control). A write adds a new version, and does not overwrite the old one.
 A read picks a read timestamp, for example the HLC value at the start of the query. It returns, for each key, the newest version at or below that timestamp. Because HLC respects causality, the view contains every write that happened before the read began, and none that came after.
@@ -335,7 +335,7 @@ flow:
 ref: blog | Announcing Snowflake | Twitter Engineering, 2010 |
 
 == Time-ordered UUIDv7 as database primary key
-kind: none
+kind: time-ordered-ids
 when: A database needs globally unique keys created by any client, and random keys are slowing inserts.
 how: UUIDv7 puts a 48-bit Unix millisecond timestamp in the first bits, then random bits. Any client can create one without talking to the database, and new ids are larger than old ones.
 Random UUIDv4 keys scatter inserts over the whole B-tree index. Each insert touches a random page, which is often not in memory, and pages split often. Time-ordered keys append to the right edge, so the hot pages stay in cache and the index stays dense.
@@ -388,7 +388,7 @@ ref: docs | KRaft | Apache Kafka documentation | https://kafka.apache.org/docume
 
 @@ lamport
 == Lamport timestamps on messages
-kind: none
+kind: logical-clock
 when: Machines must agree on an order of events that respects cause and effect, with no trusted physical clock.
 how: Each process keeps an integer counter. Before each local event or send, it adds 1. Every message carries the counter. On receive, the process sets its counter to the maximum of its own and the message's, plus 1.
 This gives one rule: if event A happened before event B, then the timestamp of A is lower than that of B. Add the process id as a tie-break and you get a total order, so all nodes can sort events the same way.
@@ -529,7 +529,7 @@ ref: docs | TigerBeetle: Financial accounting concepts | TigerBeetle documentati
 
 @@ ot
 == Central server transforms concurrent edits
-kind: none
+kind: operational-transform
 when: Several users edit the same document, each must see their own edit at once, and all must end with the same text.
 how: Each client applies its own edit locally at once and sends it to the server with the revision number it was based on. The server keeps one ordered history of operations. If the client's revision is behind, the server transforms the incoming operation against the operations the client has not seen.
 Example: the document is "ABC". User 1 inserts "X" at position 0. User 2 deletes the character at position 2 (the "C"). After the server orders them, User 2's delete must move to position 3, because the insert shifted the text by one. The transform function does this shift.

@@ -282,7 +282,7 @@ flow:
 ref: docs | llama.cpp server | ggml-org | https://github.com/ggml-org/llama.cpp
 
 == Speculative decoding with a draft model
-kind: none
+kind: speculative-decoding
 when: Generation is slow because each token waits for one full pass of a large model, and a small model is available.
 how: A small draft model guesses the next several tokens, for example 5. The large target model checks all five in one forward pass. Tokens that match the target's own choice are accepted; at the first mismatch the target's token is used and the rest are dropped.
 The output is the same as the large model alone, but each large pass can yield more than one token. The gain depends on the acceptance rate: code and repeated text accept well, creative text less.
@@ -453,7 +453,7 @@ ref: docs | torch.compile | PyTorch documentation | https://pytorch.org/docs/sta
 
 @@ sglang
 == Radix prefix cache for shared prompt prefixes
-kind: none
+kind: prefix-cache
 when: Many requests share a long start, such as a system prompt, few-shot examples or earlier chat turns, and you want to skip recomputing it.
 how: SGLang's RadixAttention keeps the key-value cache of all processed tokens in a radix tree. Each path in the tree is a token sequence. A new request walks the tree, finds the longest matching prefix, and reuses its cached keys and values. Only the new tokens go through prefill.
 When memory is full, the least recently used leaves are evicted first. Requests that share a prefix are best run together, so the scheduler favours them.
@@ -470,7 +470,7 @@ flow:
 ref: paper | SGLang: Efficient Execution of Structured Language Model Programs | Zheng et al., NeurIPS 2024 | https://arxiv.org/abs/2312.07104
 
 == Prefill and decode on separate GPU pools
-kind: none
+kind: pd-disaggregation
 when: Prefill (reading the prompt) and decode (producing tokens) disturb each other on the same GPUs, and you need both fast first tokens and smooth streaming.
 how: Prefill is compute-heavy and runs once per request. Decode is memory-bound and runs for each token. On one GPU, a long prefill stalls the decode of other users. In disaggregation, one pool of GPUs only does prefill and another pool only does decode.
 A router sends the request to a prefill worker. It builds the key-value cache, and transfers it over a fast link (RDMA or NVLink) to a decode worker. The decode worker streams tokens. You size and scale the pools on their own, for example more decode GPUs for long answers.
@@ -774,7 +774,7 @@ flow:
 ref: docs | Tool use with Claude | Anthropic documentation | https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview
 
 == Prompt caching for a large shared context
-kind: none
+kind: prefix-cache
 when: Many requests start with the same large text, such as a manual, a code base or a long system prompt.
 how: You mark the end of the stable part with a cache_control breakpoint. Claude stores the processed prefix. A later request with an identical prefix reads from the cache, so it is faster and costs much less: cache reads are billed at a small part of normal input price (about one tenth), while the first write costs a little more.
 The default lifetime is 5 minutes, refreshed on each hit, and a 1-hour option exists. The match is exact, so put fixed content first (tools, system prompt, documents) and changing content last. Any change before the breakpoint breaks the cache.

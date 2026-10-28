@@ -1,0 +1,743 @@
+@@ hm
+== Infer types, then copy generic code per type
+kind: interpreter-compiler
+when: You want short code without type annotations, and generic code that runs as fast as hand-written code for each type.
+how: The compiler front end gives every unknown type a type variable. Each expression adds equations, for example "the argument of push must be the element type of the vector". Unification solves the equations and finds the most general type.
+Then the back end chooses how to run generic code. Rust and C++ use monomorphization: one specialised copy of the function per concrete type, so a call to a generic max over i32 becomes plain machine code. Java uses erasure: one shared copy, with casts inserted. Go mixes both: it shares code between types with the same memory shape.
+The price is paid at build time and in binary size. Many copies make the binary larger and the compile slower. Erasure is smaller but boxes values and loses type facts at run time.
+used: rustc (local inference, then monomorphization at code generation); the Java compiler (erasure); the Go 1.18+ compiler; OCaml and Haskell (full Hindley-Milner style inference).
+avoid: When binary size or compile time is the main limit; prefer shared code (dyn Trait in Rust, interfaces) for rarely used paths.
+flow:
+  Source [client: let mut v = Vec::new()] -> Type checker [svc: unification] : equations | The checker makes variable T for the element type and records "v is Vec of T".
+  Source -> Type checker : v.push(5u8) | A later push adds the equation T = u8, so unification fixes T.
+  Type checker -> Typed IR [store: all types known] : Vec of u8 | Every expression now has a concrete type, with no annotation written by the user.
+  Typed IR -> Monomorphizer [svc: one copy per type] : generic fn + u8 | The compiler copies each generic function once for each type it is used with.
+  Monomorphizer -> Machine code [lake: one copy per type] : specialised code | Each copy is optimised for its own type, so there is no run-time type check.
+ref: paper | Principal type-schemes for functional programs | Damas & Milner, POPL 1982 |
+ref: docs | Generics: performance and monomorphization | The Rust Book | https://doc.rust-lang.org/book/ch10-01-syntax.html
+
+== Editor language server that infers types as you type
+kind: language-server
+when: Developers want types, errors and completions inside the editor, quickly, on code that does not compile yet.
+how: The editor talks to a language server over a protocol. The server keeps its own copy of the project, runs type inference on the changed files, and answers hover, completion and error requests.
+Inference must be fast and must tolerate broken code. The server marks a type it cannot solve as unknown and goes on, so one error does not hide the rest. Results are cached per file and per function, and only the changed part is recomputed. An edit then costs milliseconds, not a full build.
+The server and the real compiler can disagree on rare cases, because they are two programs. Always treat the compiler in CI as the final judge.
+used: rust-analyzer (it has its own inference engine, separate from rustc); TypeScript's tsserver; Pyright; gopls.
+avoid: When the project is tiny and a quick compile gives faster feedback than a long-running server.
+flow:
+  Editor [client: VS Code] -> Language server [svc: rust-analyzer] : didChange file | The editor sends each edit as a message, usually while the user is still typing.
+  Language server -> Inference cache [cache: per function] : recompute changed fns | Only the functions that depend on the edit are inferred again.
+  Inference cache -> Language server : types + errors | The cache returns inferred types, with unknown for what it could not solve.
+  Language server -> Editor : hover, diagnostics | The editor shows the type on hover and underlines errors, in milliseconds.
+  Editor -> CI compiler [svc: rustc] : push commit | The real compiler in CI makes the final decision on whether the code is valid.
+ref: spec | Language Server Protocol | Microsoft | https://microsoft.github.io/language-server-protocol/
+
+@@ hoare
+== Annotated code, verification conditions, SMT solver
+kind: machine-checked-proof, solver-service
+when: A small, critical piece of code must be correct for all inputs, and tests alone are not enough.
+how: The developer writes preconditions, postconditions and loop invariants next to the code. The verifier uses Hoare rules to turn the code and annotations into verification conditions: logic formulas that must hold for every input.
+An SMT solver such as Z3 tries to prove each formula. If it proves all of them, the code meets its contract. If not, it returns a counterexample, which is a concrete input that breaks the claim, and this is usually a bug or a weak invariant.
+Proofs can time out on hard formulas, so teams add helper lemmas and break big functions into small ones. Proving is run as a CI job, like a test suite.
+used: Dafny (translates to Boogie, then Z3); the Cedar authorization language model written in Dafny; SPARK Ada in avionics and rail code; Frama-C and Verus.
+avoid: For code that changes daily or has fuzzy requirements; use tests and property-based testing instead.
+flow:
+  Developer [user] -> Dafny source [store: contracts] : write contract | The developer states what the code needs and what it promises.
+  Dafny source -> Verifier [svc: Dafny + Boogie] : verify | The verifier applies one rule per statement and builds the verification conditions.
+  Verifier -> SMT solver [svc: Z3] : formulas | Each formula is sent to the solver, which tries to prove it valid.
+  SMT solver -x> Developer : counterexample | If a formula fails, the solver gives an input that breaks it, so the developer fixes the code or the invariant.
+  SMT solver -> Compiler [svc: to C#, Go, Rust] : all proved | After every proof passes, the code is compiled and shipped.
+ref: docs | Dafny documentation | Dafny project | https://dafny.org/
+
+== One contract: runtime check in tests, proof in release
+kind: none
+when: You want contracts to catch bugs early in tests and also give proofs where they matter, without writing two specifications.
+how: The contract is written once as a precondition or postcondition on a function. In test builds, the compiler turns it into a run-time assertion, so any call that breaks it stops the program at once, near the real fault.
+In the release pipeline, a prover reads the same contracts and tries to prove them for all inputs. A proved contract can be removed from the shipped binary, which makes the check free.
+Teams usually prove only the core, for example parsers or the memory manager, and test the rest. This keeps proof effort in proportion to risk.
+used: SPARK Ada (contracts checked at run time or proved with GNATprove); Eiffel design by contract; Rust code with Verus or Kani proofs plus assert tests.
+avoid: When no part of the code is critical enough to pay for proof effort.
+flow:
+  Function [svc: with contract] -> Test build [svc: checks on] : precondition | In tests the contract becomes a run-time check on every call.
+  Test build -x> Developer [user] : contract violated | A failing check stops the program near the bug, with the broken condition named.
+  Function -> Prover [svc: GNATprove] : same contract | In the release job the same text is sent to a prover.
+  Prover -> Release binary [store: checks removed] : proved | Proved contracts need no run-time check, so the shipped code is faster.
+ref: docs | SPARK User's Guide | AdaCore | https://docs.adacore.com/spark2014-docs/html/ug/
+
+@@ interpreters
+== Embedded scripting VM inside a host server
+kind: plugin-arch
+when: Users or operators need to add custom logic to a server, and it must run next to the data without a network call.
+how: The host embeds a small VM and exposes a few host functions to it. A client sends script text. The host compiles it to bytecode once, caches it by a hash of the text, and runs it in the VM.
+Redis does this with Lua. A script sent with EVAL runs on the main thread, so it is atomic: no other command runs in the middle. The script calls redis.call for each read or write, with no network hop. EVALSHA then runs the cached bytecode by hash, so the text is not sent again.
+The limits are clear. A slow script blocks every other client, and the VM must be sandboxed so a script cannot reach the file system.
+used: Redis Lua scripts; OpenResty (LuaJIT inside Nginx); game engines that embed Lua; Neovim plugins.
+avoid: When the logic is long-running or heavy; run it in a normal service instead of blocking the host.
+flow:
+  Client [client] -> Redis [svc: single thread] : EVAL script, keys | The client sends the script text and the keys it works on.
+  Redis -> Lua VM [svc: bytecode loop] : compile + run | The host compiles the text to bytecode and starts the VM loop.
+  Lua VM -> Data [store: keys and values] : redis.call GET, SET | Host functions give the script direct memory access to the data, with no network call.
+  Lua VM -> Script cache [cache: by SHA1] : keep bytecode | The compiled script is stored under its hash.
+  Client ~> Redis : EVALSHA hash | Later calls send only the hash, which saves bandwidth and compile time.
+ref: docs | Scripting with Lua | Redis documentation | https://redis.io/docs/latest/develop/interact/programmability/eval-intro/
+
+== Verified bytecode as a portable, safe deployment unit
+kind: interpreter-compiler, plugin-arch
+when: You must run code from other parties on many CPU types, and you cannot trust it.
+how: The code is shipped as bytecode, not as machine code. The runtime first validates the module: types of all instructions must agree and jumps must go to valid places. Only a valid module is allowed to start.
+The module can reach the outside world only through imports that the host provides. WebAssembly has no system calls of its own: the host decides if the module gets files, network or clocks. Memory is a bounded array, so a bad index traps instead of reading host memory.
+After validation, the runtime interprets the bytecode or compiles it to machine code for the local CPU. The same file runs on x86 and Arm.
+used: WebAssembly in browsers, Wasmtime and edge platforms such as Cloudflare Workers; the JVM class file verifier; the Linux eBPF verifier for kernel programs.
+avoid: When you fully trust the code and need the last 10 to 20 percent of speed; ship native code.
+flow:
+  Publisher [user] -> Module registry [store: .wasm files] : upload module | The publisher builds once and uploads one bytecode file.
+  Module registry -> Runtime [svc: Wasmtime] : load bytes | A host on any CPU downloads the same file.
+  Runtime -> Validator [svc: type check] : validate | The validator checks every instruction type and every jump target before any code runs.
+  Validator -x> Runtime : reject bad module | An invalid module is refused, so broken or hostile code never starts.
+  Runtime -> Host imports [svc: files and clock] : only granted calls | The module can use only the imports the host gave it.
+ref: spec | WebAssembly specification | W3C WebAssembly Working Group | https://webassembly.github.io/spec/core/
+
+@@ irssa
+== Shared middle end: many languages, many targets
+kind: interpreter-compiler
+when: Several languages must compile to several CPU targets, and you do not want to write every optimizer again.
+how: Each language front end parses and type-checks its own source, then lowers it to one common intermediate representation (IR). The optimizer and the code generators work only on that IR.
+With M languages and N targets, you write M front ends and N back ends, not M times N compilers. LLVM IR is the best known case. Clang, rustc, Swift and Julia produce it, and the same passes then run for x86, Arm and RISC-V.
+The IR is in SSA form: each variable is set once, so each use points to one definition. This makes facts like "this value is constant" cheap to compute and to keep correct.
+The cost is that a language-specific fact, such as a Rust no-alias rule, must be written into the IR as metadata or it is lost.
+used: LLVM (Clang, rustc, Swift, Julia); GCC GIMPLE; the JVM's C2 compiler (Sea of Nodes graph IR); MLIR for ML compilers.
+avoid: For a small domain-specific language where emitting C or bytecode is enough.
+flow:
+  Rust source [client] -> rustc front end [svc: type check] : AST | The front end checks types and borrow rules in its own language terms.
+  C source [client] -> Clang front end [svc] : AST | A different language follows its own front end.
+  rustc front end, Clang front end -> LLVM IR [store: SSA form] : lower | Both produce the same IR, where every variable has one definition.
+  LLVM IR -> Optimizer [svc: opt passes] : IR | The passes work on the IR without knowing the source language.
+  Optimizer -> x86 backend [svc], Arm backend [svc] : optimized IR | Each back end picks instructions and registers for its CPU.
+ref: docs | LLVM Language Reference Manual | LLVM Project | https://llvm.org/docs/LangRef.html
+
+== Pass pipeline over SSA: mem2reg, GVN, dead code removal
+kind: pipes-filters
+when: You want many small optimizations that can be added, reordered and tested one by one.
+how: Each optimization is a pass: a function from IR to IR. A pass manager runs them in order. In LLVM, mem2reg first turns stack slots into SSA values, which exposes the data flow.
+Then instruction combining simplifies expressions, global value numbering removes repeated computations, and dead code elimination deletes unused values. Each pass leaves the IR in a clean state, and the output of one is the input of the next.
+Passes share cached analyses, such as the dominator tree, and the manager drops a cache when a pass changes the code. A bad pass is found by running the IR verifier after it, or by bisecting the pass list.
+used: LLVM new pass manager (opt -O2 is a fixed pipeline); GCC passes over GIMPLE; V8 TurboFan and the JVM C2 as pass pipelines on graph IR.
+avoid: When a transform needs a global view that cannot be split into passes; use a search-based optimizer instead.
+flow:
+  Unoptimized IR [store: stack slots] -> mem2reg [svc: pass] : stack slots | Local variables in memory become SSA values.
+  mem2reg -> Instruction combine [svc: pass] : SSA IR | Patterns like x*2 become x shifted left by one.
+  Instruction combine -> GVN [svc: pass] : simplified IR | A value computed twice is computed once and reused.
+  GVN -> Dead code removal [svc: pass] : IR | Values that nothing uses are deleted.
+  Dead code removal -> IR verifier [svc: checks SSA rules] : final IR | The verifier checks every use has one definition, so a buggy pass is found early.
+ref: docs | LLVM's Analysis and Transform Passes | LLVM Project | https://llvm.org/docs/Passes.html
+
+@@ jit
+== Tiered JIT with deoptimization
+kind: interpreter-compiler
+when: A dynamic language or a managed runtime must start fast and also reach near-native speed on hot code.
+how: Code starts in an interpreter, which has no compile delay. The runtime counts calls and loop back-edges. When a method is warm, a quick compiler makes mid-speed code. When it is very hot, an optimizing compiler uses the collected profile to make fast code.
+The optimizing tier makes bets: this call site always sees one class, this branch is never taken. It inlines on that bet and adds a cheap guard. If a guard fails, for example a new class is loaded, the runtime deoptimizes: it rebuilds the interpreter frame from the machine state and goes on in the interpreter.
+HotSpot has C1 and C2 tiers. V8 has Ignition, Sparkplug, Maglev and TurboFan. The cost is memory for code, compile threads, and warm-up time.
+used: JVM HotSpot (interpreter, C1, C2); V8 in Chrome and Node.js; LuaJIT (trace JIT); PyPy.
+avoid: For short scripts and CLI tools where warm-up never pays back; use ahead-of-time compilation or a plain interpreter.
+flow:
+  Bytecode [store: method foo] -> Interpreter [svc: tier 0] : run | The method starts in the interpreter and nothing is compiled yet.
+  Interpreter -> Profile [store: counters and types] : count, record types | Counters and the seen types are recorded for each call site.
+  Profile -> C1 compiler [svc: quick tier] : warm method | After a few thousand calls a fast compile makes simple machine code.
+  Profile -> C2 compiler [svc: optimizing tier] : hot method + types | The very hot method is compiled with inlining based on the seen types.
+  C2 compiler -> Code cache [cache: machine code] : optimized foo | The code is installed with guards on its assumptions.
+  Code cache -x> Interpreter : guard fails, deopt | A new class breaks an assumption, so the frame returns to the interpreter and the method can be compiled again.
+ref: blog | Launching Ignition and TurboFan | V8 team, 2017 | https://v8.dev/blog/launching-ignition-and-turbofan
+
+== Query JIT for expression evaluation
+kind: interpreter-compiler
+when: A database spends much CPU time in the interpreter for expressions and row decoding on big analytic scans.
+how: The planner estimates the cost of a query. If the estimate is above a threshold, it asks the JIT to compile the expressions of the plan with LLVM. In PostgreSQL the first threshold is jit_above_cost, 100000 by default.
+The compiled code replaces the generic expression interpreter and the row-decoding loop, with the types and column offsets fixed. This removes many branches per row, and big scans can speed up noticeably.
+Compiling costs tens to hundreds of milliseconds. For a short query this is a loss, so the estimate must be right. If the estimate is wrong, a cheap query pays the compile time and runs slower.
+used: PostgreSQL 11 and later with LLVM; Spark whole-stage code generation (compiles Java code at run time); Apache Impala (LLVM).
+avoid: For OLTP queries that touch a few rows; keep JIT off (jit = off) for those workloads.
+flow:
+  Client [client] -> Planner [svc: cost estimate] : SELECT sum(...) big scan | The query arrives and the planner estimates a high cost.
+  Planner -> JIT compiler [svc: LLVM] : cost above 100000 | The cost passes the threshold, so the planner requests compilation.
+  JIT compiler -> Executor [svc: runs plan] : native expression code | The executor gets machine code for the filter and the aggregate, built for this table's column types.
+  Executor -> Table scan [db: 50M rows] : tight loop | The scan loop runs the compiled code on each row, without the generic interpreter.
+  Planner -x> Client : cheap query, no JIT | A small query stays below the threshold and skips the compile cost.
+ref: docs | Just-in-Time Compilation (JIT) | PostgreSQL documentation | https://www.postgresql.org/docs/current/jit.html
+
+@@ lexing
+== Pull-based scanner feeding a recursive-descent parser
+kind: interpreter-compiler, pipes-filters
+when: A compiler or interpreter front end reads source text and must stay fast, simple and able to report exact error positions.
+how: The scanner turns characters into tokens: identifier, number, keyword, operator. It always takes the longest match, so "<=" is one token, not "<" and "=". The parser asks for the next token only when it needs one, so no full token list sits in memory.
+Each token carries its kind, its text and its line and column. The parser uses these to point at the exact place of a syntax error. The scanner also removes comments and spaces, so the grammar stays short.
+Some rules live here and not in the grammar. The Go scanner inserts a semicolon at a line end after certain tokens, so Go source needs few semicolons. The cost is that this rule is hidden from the grammar and can surprise people.
+used: the Go compiler (go/scanner); hand-written scanners in Rust, V8 and Clang; flex scanners behind Bison parsers in PostgreSQL.
+avoid: For nested or context-dependent formats, such as string interpolation, where a plain scanner needs modes; use a scanner with a mode stack.
+flow:
+  Source file [store: x <= 10] -> Scanner [svc: longest match] : characters | The scanner reads characters one at a time from the file.
+  Parser [svc: recursive descent] -> Scanner : next token | The parser asks for one token when it needs it.
+  Scanner -> Parser : LE at line 3 col 3 | The scanner returns "<=" as one token with its position.
+  Scanner -x> Diagnostics [svc: error report] : illegal character | A bad character is reported with its exact line and column.
+  Parser -> AST [store: syntax tree] : binary expression | The parser builds a tree node from the tokens it has read.
+ref: docs | Package go/scanner | The Go Authors | https://pkg.go.dev/go/scanner
+
+== Editor highlighting with line-state caching
+kind: language-server
+when: An editor must color code on every key press, on files of 100000 lines, without delay.
+how: A TextMate-style grammar is a list of regular expressions. The tokenizer runs line by line and keeps a stack of states, for example "inside a block comment". It produces the tokens of each line and the stack at the end of the line.
+The editor caches the end state of every line. After an edit, it re-tokenizes the changed line, and then the next lines, only until a line ends in the same state as its cached state. All lines after that point are unchanged, so the work is small.
+This is not a full parse. It colors by pattern and can be wrong on tricky code. Editors add a real parser, such as tree-sitter, or semantic tokens from a language server for exact colors.
+used: VS Code (vscode-textmate with the Oniguruma regex engine); Sublime Text (its own regex syntax format).
+avoid: When you need exact structure, such as folding by syntax or code navigation; use a parser-based approach.
+flow:
+  Editor [client: line 40 edited] -> Tokenizer [svc: regex rules] : line text + start state | The editor sends the changed line and the state at the start of that line.
+  Tokenizer -> State cache [cache: end state per line] : tokens + end state | The tokenizer returns colored tokens and the end state of the line.
+  State cache -> Tokenizer : line 41 start state | The cached state of line 40 is the start state of line 41.
+  Tokenizer -> Editor : colors for visible lines | Only the visible lines are colored, so a huge file stays fast.
+  * State cache: same state, stop | When a line ends in its old state, no later line needs work.
+ref: docs | Syntax Highlight Guide | Visual Studio Code documentation | https://code.visualstudio.com/api/language-extensions/syntax-highlight-guide
+
+@@ linking
+== Lazy binding of shared libraries through PLT and GOT
+kind: none
+when: Many programs use the same library, and you want one copy in memory and the freedom to update the library alone.
+how: The linker does not copy library code into the program. It adds a table of calls through the PLT (procedure linkage table) and a table of addresses, the GOT (global offset table). At start, the kernel maps the program and the dynamic loader ld.so, which maps libc.so and other libraries.
+On the first call to a function such as printf, the PLT entry jumps to the loader's resolver. The resolver finds printf in libc, writes its address in the GOT, and jumps there. Later calls read the GOT and go straight to printf.
+All processes share the same read-only pages of libc in RAM. Many Linux distributions now build programs with full RELRO and bind-now, which fills the GOT at start and makes it read-only. This costs a little start time and blocks GOT overwrite attacks.
+used: every ELF program on Linux (ld.so and glibc); macOS dyld with its own lazy stubs; Ubuntu and Fedora default hardened builds.
+avoid: For tiny containers or static tools where one self-contained file is easier to ship; link statically (musl, Go).
+flow:
+  Program [svc: ELF, PIE] -> ld.so [svc: dynamic loader] : exec maps program | The kernel starts the program and gives control to the dynamic loader first.
+  ld.so -> libc.so [lake: shared pages] : map library | The loader maps libc into memory, sharing its read-only pages with other processes.
+  Program -> PLT stub [svc: call printf] : first call | The first call goes to the PLT entry for printf.
+  PLT stub -> ld.so : resolve printf | The stub asks the loader to find printf.
+  ld.so -> GOT [store: printf address] : write address | The loader writes the real address so that the next call skips the resolver.
+  Program -> libc.so : next calls via GOT | Later calls jump straight to printf through the GOT.
+ref: docs | ld.so(8) - dynamic linker/loader | Linux man-pages | https://man7.org/linux/man-pages/man8/ld.so.8.html
+
+== Parallel compile, then one fast link with LTO
+kind: fork-join, pipes-filters
+when: A large C++ or Rust build spends minutes on the final link and on cold incremental builds.
+how: The build system compiles each source file to an object file in parallel on many cores or on a remote cache. This is the fork step. The linker is the join step: it must see all objects, resolve every symbol and lay out the final file.
+Fast linkers such as lld and mold use many threads for this step and can cut link time from minutes to seconds on large programs. Link-time optimization (LTO) adds an extra step: objects hold compiler IR, and the linker driver optimizes across files, which allows inlining between files. ThinLTO does this in parallel and keeps the cost lower than full LTO.
+The trade is build time against run speed. Debug builds usually skip LTO and use a fast linker, and release builds turn LTO on.
+used: Chromium and Android builds (lld); mold in large C++ projects; Rust and Clang ThinLTO in release builds.
+avoid: For small projects where link time is already a second or two.
+flow:
+  Build system [svc: Ninja] -> Compiler 1 [svc: a.cc], Compiler 2 [svc: b.cc], Compiler 3 [svc: c.cc] : compile | Each source file is compiled on its own core, in parallel.
+  Compiler 1, Compiler 2, Compiler 3 -> Object files [store: a.o b.o c.o] : object code or IR | Each job writes an object file with unresolved symbols.
+  Object files -> Linker [svc: mold or lld] : all objects | The linker reads all objects at once, as the join step.
+  Linker -> Executable [store: ELF file] : resolved symbols | It resolves symbols, merges sections and writes one ELF file.
+  Linker ~> Compiler 1 : LTO: optimize IR | With LTO, the linker driver calls the optimizer again on all IR together.
+ref: docs | mold: A Modern Linker | Rui Ueyama | https://github.com/rui314/mold
+
+@@ logicprog
+== Datalog fact database for code analysis
+kind: precompute
+when: You must ask many deep questions about a large code base, such as "can user input reach this SQL call?"
+how: An extractor reads the source code once and writes facts into a database: this function calls that function, this variable is assigned from that one. The facts are stored per code base version.
+Analysis rules are written in a Datalog-like language, for example "a value flows to a sink if it flows to a variable that is passed to the sink". The engine applies the rules bottom-up until no new facts appear. This fixed point is the full flow relation. Queries then just read it.
+The extraction cost is paid once, and many queries share it. Rules are short and readable by security engineers. Very large recursive rules can be slow, so engines use indexes and incremental updates.
+used: CodeQL (QL language, used in GitHub code scanning); Soufflé (used for points-to analysis in the Doop framework).
+avoid: For simple pattern search; grep or a linter is cheaper and clear enough.
+flow:
+  Repository [store: source code] -> Extractor [svc: per language] : parse code | The extractor parses each file and records the calls and assignments.
+  Extractor -> Fact database [db: calls and flows] : facts | The facts are written once for this commit.
+  Analyst [user] -> Rule engine [svc: Datalog] : query rules | The analyst writes rules for sources and sinks.
+  Rule engine -> Fact database : join and repeat | The engine joins facts and repeats until nothing new is found.
+  Rule engine -> Alerts [store: SQL injection paths] : results | Each result is a path from user input to a dangerous call.
+ref: docs | CodeQL documentation | GitHub | https://codeql.github.com/docs/
+
+== Policy decision point with Rego rules
+kind: sidecar, control-data-plane
+when: Many services need the same access rules, and rules change more often than the code.
+how: Each service sends a decision request to a local policy engine, with the user, action and resource as JSON. The engine evaluates rules written in Rego, a language based on Datalog ideas, against the input and some loaded data, and returns allow or deny.
+Open Policy Agent runs as a sidecar or a library, so the call stays on localhost and takes about a millisecond. A control plane builds policy bundles from Git and each instance downloads them on a schedule. Decision logs are sent back for audit.
+The service still enforces the answer. A missing call is a missing check, so tests must cover the call sites. Policy data that is large or old can give wrong answers.
+used: Open Policy Agent with Kubernetes Gatekeeper; Envoy external authorization with OPA.
+avoid: When rules are two or three fixed checks; write them in the service code.
+flow:
+  API service [svc: enforces] -> OPA sidecar [svc: Rego rules] : input JSON | The service asks for a decision and sends who, what and which resource.
+  OPA sidecar -> Policy data [cache: bundle in memory] : read rules and data | The engine reads the current bundle from memory.
+  OPA sidecar -> API service : allow or deny | The answer comes back in about a millisecond, and the service enforces it.
+  Policy repo [store: Git] -> Bundle server [svc: control plane] : merge to main | A policy change is reviewed and merged in Git.
+  Bundle server ~> OPA sidecar : new bundle | Sidecars download the new bundle without a service restart.
+  OPA sidecar ~> Decision log [log: audit] : decision record | Every decision is logged for audit.
+ref: docs | Open Policy Agent documentation | OPA project | https://www.openpolicyagent.org/docs/latest/
+
+@@ loopopt
+== Cache tiling with the schedule kept apart from the algorithm
+kind: memory-tiering
+when: A dense loop nest, such as matrix multiply or an image filter, is limited by memory traffic, not by arithmetic.
+how: A naive loop over a 4096 by 4096 matrix reads far-away rows again and again, and each read goes to main memory. Tiling splits the loops into small blocks, for example 64 by 64, that fit in L1 or L2 cache. Each block is reused many times before the loop moves on.
+Tools like Halide and TVM let you write the algorithm once, then write a separate schedule: tile sizes, loop order, vector width and parallel loops. You can change the schedule without touching the algorithm, and the tool checks that the result is the same.
+Good tile sizes depend on the cache sizes of the CPU, so they are searched or tuned for each target. A wrong schedule is only slow, not wrong.
+used: Halide in Google camera pipelines and Adobe tools; TVM and MLIR-based ML compilers; BLAS libraries (hand-tiled); LLVM Polly.
+avoid: For code with unpredictable data access, such as pointer chasing; use better data structures instead.
+flow:
+  Algorithm [store: blur = f(in)] -> Scheduler [svc: tile 64x64] : loop nest | The algorithm says what to compute and says nothing about order.
+  Scheduler -> Autotuner [svc: tries sizes] : candidate schedules | The tool tries several tile sizes and vector widths.
+  Autotuner -> CPU [svc: L1 and L2 cache] : run tiles | Each tile fits in cache and is reused before it is evicted.
+  CPU -> Autotuner : time per run | The measured time picks the best schedule for this machine.
+  Autotuner -> Compiled kernel [store: best schedule] : generate code | The best schedule is compiled into the final kernel.
+ref: paper | Halide: A Language and Compiler for Optimizing Parallelism, Locality, and Recomputation | Ragan-Kelley et al., PLDI 2013 |
+
+== Auto-vectorized loop with a runtime guard
+kind: none
+when: A simple loop over arrays should use SIMD lanes, but the compiler cannot prove that the arrays do not overlap.
+how: The compiler checks the loop with dependence analysis. If it cannot prove that a[i] and b[i] are different memory, it makes two versions of the loop. A cheap guard at run time checks whether the address ranges overlap.
+If they do not overlap, the vector version runs: 8 floats per instruction with AVX2, for example. If they do, a slow scalar copy runs. A short scalar tail loop handles the last few items when the count is not a multiple of the vector width.
+The programmer can help with restrict in C or the no-alias rules of Rust, which remove the guard. The remarks of the compiler show which loops were vectorized and why others were not.
+used: LLVM and GCC loop vectorizers; Rust code, where & and &mut references give strong no-alias facts; NumPy inner loops with SIMD kernels.
+avoid: For loops with data-dependent early exits or cross-iteration dependencies; rewrite the algorithm or use explicit SIMD.
+flow:
+  Loop [store: a = b times k] -> Dependence analysis [svc: alias check] : can a and b overlap? | The compiler cannot prove that the arrays are distinct.
+  Dependence analysis -> Versioned loop [svc: guard + 2 copies] : emit guard | It emits a run-time overlap test and two copies of the loop.
+  Versioned loop -> Vector body [svc: 8 floats per step] : no overlap | When the guard passes, the SIMD copy runs.
+  Versioned loop -x> Scalar body [svc: one per step] : overlap found | When the arrays overlap, the safe scalar copy runs.
+  Vector body -> Scalar tail [svc: last 0 to 7 items] : leftover | A short scalar loop handles the remaining items.
+ref: docs | Auto-Vectorization in LLVM | LLVM Project | https://llvm.org/docs/Vectorizers.html
+
+@@ oop
+== Plugin interface behind dynamic dispatch
+kind: plugin-arch
+when: A host must work with many vendor implementations that are chosen at run time and added without changing the host.
+how: The host defines an interface: a list of methods with fixed meaning. Each vendor writes a class that implements it. At run time the host holds a reference to the interface. A call goes through the object's vtable, a table of function pointers, to the vendor's method.
+JDBC is the standard case. An application codes against Connection, Statement and ResultSet. The PostgreSQL or MySQL driver supplies the classes, and the DriverManager finds drivers with the Java ServiceLoader. Moving from one database to another changes a URL and a jar file.
+The cost is that the interface fixes the common part. Vendor-specific features need extra casts or an extension method, and a poor interface leaks details of the first implementation.
+used: JDBC drivers; Java SLF4J logging facade; Go database/sql drivers (interfaces, not classes).
+avoid: When there will only ever be one implementation; a concrete class is simpler.
+flow:
+  Application [svc: uses Connection] -> DriverManager [svc: ServiceLoader] : getConnection(url) | The app asks for a connection by URL and names no vendor class.
+  DriverManager -> Postgres driver [svc: implements Driver] : accepts jdbc:postgresql | The manager asks each driver if it accepts this URL.
+  Postgres driver -> Application : Connection object | The driver returns its own class, seen by the app as the Connection interface.
+  Application -> Postgres driver : executeQuery via vtable | The call is dispatched at run time to the driver's method.
+  Postgres driver -> Postgres [db] : wire protocol | The driver turns the call into the database's own network protocol.
+ref: docs | JDBC Basics | Oracle Java Tutorials | https://docs.oracle.com/javase/tutorial/jdbc/basics/
+
+== Constructor injection with test doubles
+kind: dependency-injection
+when: Business logic must be tested without a real database or network, and parts must be swapped by configuration.
+how: A class does not create its own helpers. It receives them as constructor arguments, typed as interfaces, for example PaymentGateway. A container or the main function builds the real objects and passes them in. This is dependency injection.
+In production the container wires a StripeGateway. In a unit test, the test passes a FakeGateway that records calls and returns a set answer. The same business class runs in both cases, and the test takes milliseconds.
+The object graph is built in one place, so changing an implementation is a one-line change. Containers hide the wiring, so large apps can be hard to follow; keep the graph shallow.
+used: Spring and Spring Boot (constructor injection); ASP.NET Core built-in container; Google Guice and Dagger; manual injection in Go and Rust.
+avoid: In small scripts where the extra interfaces cost more than they save.
+flow:
+  App main [svc: composition root] -> Container [svc: builds objects] : register bindings | The app declares which class implements each interface.
+  Container -> OrderService [svc: needs PaymentGateway] : inject StripeGateway | The container builds the service and passes the real gateway.
+  OrderService -> StripeGateway [svc: real HTTP call] : charge(order) | In production the call goes to the payment provider.
+  Unit test [client] -> OrderService : inject FakeGateway | In a test the same class gets a fake object.
+  OrderService -> FakeGateway [svc: records calls] : charge(order) | The fake records the call, so the test checks it with no network.
+ref: docs | Dependency Injection | Spring Framework Reference | https://docs.spring.io/spring-framework/reference/core/beans/dependencies/factory-collaborators.html
+
+@@ ownership
+== Ownership transfer through channels
+kind: producer-consumer, actor-model
+when: Several threads must pass work to each other, and you want no data races and no locks on the data.
+how: In Rust, sending a value into a channel moves it. The sender no longer owns it, and the compiler rejects any later use. The receiver becomes the sole owner, so only one thread touches the data at a time.
+The compiler checks this with the Send marker trait. A type can cross a thread boundary only if it is Send. A plain Rc is not Send, so using it across threads is a compile error, and the fix is Arc. Mutable data that really is shared must sit behind a Mutex, and the borrow checker forces you to take the lock to reach it.
+This moves a class of data race bugs from test time to compile time. The cost is that sharing designs must be thought out early, and some graphs need Arc and Mutex anyway.
+used: std::sync::mpsc and crossbeam channels in Rust; Tokio tasks and mpsc channels; Go uses a similar idea by convention but does not enforce it.
+avoid: When many threads must update one big structure with fine-grained access; use a concurrent data structure built on atomics.
+flow:
+  Producer thread [svc: owns Vec] -> Channel [queue: mpsc] : send(batch) moves | The batch is moved into the channel, and the producer cannot use it any more.
+  Producer thread -x> Compiler [svc: borrow checker] : use after move | A later read of the batch is a compile error, not a run-time bug.
+  Channel -> Worker thread [svc: owns batch] : recv() | The worker receives the batch and is now its only owner.
+  Worker thread -> Results [store: Mutex of Vec] : lock, push | Shared output needs the lock, because the type system demands it.
+  Worker thread -> Allocator [svc: free] : drop at scope end | The batch is freed exactly once when the worker is done.
+ref: docs | Fearless Concurrency | The Rust Programming Language | https://doc.rust-lang.org/book/ch16-00-concurrency.html
+
+== Safe API over a small unsafe core
+kind: anti-corruption, layered-arch
+when: You need low-level code, such as raw memory, C calls or hardware access, but want the rest of the program to be memory safe.
+how: The risky code is kept in a small module with unsafe blocks. The module exposes a safe API whose types make misuse impossible. For example, a handle type owns the C resource, closes it when dropped and cannot be copied.
+Callers cannot break the rules without writing unsafe themselves. If a memory bug is found, the search area is the unsafe blocks only, which reviewers read with extra care and which tools such as Miri and sanitizers test.
+Rust's Vec is built this way: raw pointer code inside, safe push and index outside. The Linux kernel's Rust support also wraps C kernel APIs with safe abstractions for drivers.
+used: Rust standard library; Linux kernel Rust abstractions; Android and Chromium Rust components that wrap C and C++ code; bindings crates for C libraries.
+avoid: When the safe wrapper is more complex than the code it wraps; keep a thin C interface instead.
+flow:
+  Driver code [svc: safe Rust] -> Safe wrapper [svc: owns the handle] : open device | Application code uses only the safe type.
+  Safe wrapper -> Unsafe core [svc: small unsafe blocks] : checked raw call | The wrapper checks size and state, then makes the raw call.
+  Unsafe core -> C library [lake: C API] : FFI call | The core calls the C function with a valid pointer and length.
+  Driver code -x> Compiler [svc: borrow checker] : use after close | Using the handle after close does not compile, because close consumes it.
+  Safe wrapper -> C library : close on drop | The wrapper closes the resource when it goes out of scope.
+ref: docs | Unsafe Rust | The Rust Programming Language | https://doc.rust-lang.org/book/ch20-01-unsafe-rust.html
+
+@@ parsealgo
+== Hand-written recursive descent with Pratt expressions
+kind: interpreter-compiler
+when: A production compiler needs fast parsing, precise error messages and recovery from errors, for a language with many operators.
+how: Each grammar rule becomes a function. parse_statement calls parse_expression, which calls other functions, and the call stack mirrors the syntax tree. The next token decides which rule to use, with one or two tokens of lookahead.
+Expressions use a Pratt parser. Each operator has a binding power (a precedence number). parse_expression(min_power) reads a left value, then keeps taking operators whose power is higher than min_power. This handles dozens of operators in about 30 lines, and a new operator is one table entry.
+Code gives full control of errors. On a bad token the parser records an error, skips to a safe token such as a semicolon, and goes on, so one run shows many errors. The cost is that the grammar exists only in code, so changes need care.
+used: Go compiler; Clang (C++ front end); GCC C and C++ front ends; rustc; V8; Crafting Interpreters style tools.
+avoid: For a small or fast-changing grammar you do not own; generate the parser from a grammar file.
+flow:
+  Tokens [store: 1 + 2 * 3] -> parse_statement [svc: rule function] : peek next token | The statement rule looks at one token to decide what to do.
+  parse_statement -> parse_expr [svc: Pratt loop] : min power 0 | The expression function starts with the lowest binding power.
+  parse_expr -> Right operand [svc: parse_expr again] : power 2 | After "+" it parses the right side with a higher power, so "2 * 3" binds first.
+  Right operand -> AST [store: 1 + (2 * 3)] : node for 2 * 3 | The tree has the right shape without a rule per precedence level.
+  parse_statement -x> Error list [log: many errors] : bad token, skip to ; | On an error the parser skips ahead and keeps going.
+ref: blog | Simple but Powerful Pratt Parsing | Alex Kladov, 2020 | https://matklad.github.io/2020/04/13/simple-but-powerful-pratt-parsing.html
+ref: book | Crafting Interpreters | Robert Nystrom, 2021 | https://craftinginterpreters.com/
+
+== Parser generated from a grammar file at build time
+kind: none
+when: A stable grammar, such as SQL, must be parsed exactly, and the grammar file should be the single source of truth.
+how: The team writes a grammar file. A generator reads it at build time and writes parser source code. Bison builds an LALR(1) table: a state machine that shifts tokens onto a stack and reduces them when a rule's right side is on top.
+The generator also finds conflicts, places where the grammar is ambiguous. A conflict is a design bug that is reported before release. The generated parser runs in linear time with tiny memory use.
+PostgreSQL's SQL parser is built this way from gram.y with Bison, with a flex scanner in front. Adding a SQL keyword is a grammar edit and a rebuild. Error messages are generic unless the team adds extra rules.
+used: PostgreSQL (Bison and flex); MySQL (Bison); ANTLR-generated parsers in Hive and Spark SQL; protobuf compilers.
+avoid: When you need the best error messages and recovery; write a recursive descent parser by hand.
+flow:
+  Grammar file [store: gram.y] -> Bison [svc: build step] : read rules | At build time Bison reads the grammar rules.
+  Bison -x> Developer [user] : shift/reduce conflict | An ambiguous rule is reported as a conflict, so it is fixed before release.
+  Bison -> Parser source [store: generated C] : LALR tables | Bison writes C code with the state tables.
+  Parser source -> Compiler [svc: build] : compile | The generated code is compiled into the server.
+  SQL text [client: SELECT 1] -> Server parser [svc: table driven] : tokens | At run time the parser runs the tables on the tokens from the scanner.
+  Server parser -> Parse tree [store: raw tree] : reduce | Each reduce step builds a node of the raw parse tree.
+ref: docs | Bison manual | GNU Project | https://www.gnu.org/software/bison/manual/
+
+@@ parsing
+== Incremental parse tree for editors
+kind: language-server
+when: An editor needs an exact syntax tree on every key press, even when the code has errors.
+how: A grammar is compiled into a parser. When the user edits the text, the editor tells the parser which byte range changed. The parser reuses every old tree node that the edit did not touch and reparses only the damaged region.
+The parser must handle broken code. Tree-sitter inserts error nodes and keeps a tree for the rest of the file, so features still work while the user is mid-edit. The tree then drives highlighting, folding, code navigation and structural search, through small queries.
+One grammar thus serves many tools. The limit is that a syntax tree has no meaning: it does not know what a name refers to. Name resolution and types still need a language server.
+used: tree-sitter in Neovim, Helix, Zed and GitHub code navigation; Roslyn in Visual Studio; rust-analyzer's rowan trees.
+avoid: For batch tools that parse once and exit; a plain parser without incremental state is simpler.
+flow:
+  Editor [client: user types] -> Parser [svc: tree-sitter] : edit range + new text | The editor sends the changed range, not the whole file.
+  Parser -> Old tree [store: previous syntax tree] : find reusable nodes | The parser checks which old nodes the edit did not touch.
+  Parser -> New tree [store: updated tree] : reparse changed part | Only the changed region is parsed again.
+  New tree -> Highlighter [svc: queries] : captures | Small queries mark names, keywords and strings.
+  Highlighter -> Editor : colors, folds | The editor updates the screen from the new tree in about a millisecond.
+  Parser -x> New tree : error node | A syntax error becomes a local error node and does not discard the tree.
+ref: docs | Tree-sitter documentation | Tree-sitter project | https://tree-sitter.github.io/tree-sitter/
+
+== Parse at the trust boundary into typed data
+kind: none
+when: A service takes input from outside, and inner code should never meet a malformed or half-checked value.
+how: At the edge of the service, a strict parser turns raw bytes into a typed object. It checks shape, types, ranges and sizes in one place. Anything that fails is rejected with a clear error before business code runs.
+Inside the service, functions take the typed object, not a raw map. A type such as EmailAddress or UserId exists only if it was parsed successfully, so the core never repeats checks and cannot forget them.
+The grammar of the input is small and fixed. This limits attacks that rely on parser differences, for example two components reading the same JSON in different ways. Set depth and size limits in the parser.
+used: services that use protobuf or gRPC; Pydantic in FastAPI; Zod in TypeScript services; serde in Rust.
+avoid: For quick internal scripts with one trusted caller, where the extra types cost more than they help.
+flow:
+  Client [client] -> Edge parser [svc: strict schema] : raw JSON bytes | The request body arrives as untrusted bytes.
+  Edge parser -x> Client : 400 + field error | A bad field is rejected at once, with the field name.
+  Edge parser -> Typed request [store: checked types] : parsed object | A valid request becomes an object with checked types.
+  Typed request -> Business logic [svc: no raw input] : typed call | The core code gets only typed values and does no re-checks.
+  Business logic -> Database [db] : parameterized write | Only valid, typed values reach storage.
+ref: blog | Parse, don't validate | Alexis King, 2019 | https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/
+
+@@ regalloc
+== Pick the allocator by compile-time budget
+kind: interpreter-compiler
+when: A compiler must balance code quality against compile time, because some code is compiled once and some while the user waits.
+how: Register allocation assigns many virtual registers to a few machine registers, and spills the rest to the stack. Graph colouring builds an interference graph and colours it, and gives good code but costs more time. Linear scan sorts live ranges and walks them once, which is much faster but a bit less exact.
+Compilers keep several allocators. LLVM has a fast allocator for -O0 builds and a greedy allocator for optimized builds. In the JVM, the C1 compiler uses linear scan and the C2 compiler uses graph colouring. A JIT that compiles during run time prefers speed.
+The same program gets different spill counts under each choice. Live-range splitting and rematerialization (recomputing a constant instead of loading it) reduce the cost of spills.
+used: LLVM fast and greedy allocators; HotSpot C1 (linear scan) and C2 (graph colouring); GCC's IRA; V8 TurboFan's linear-scan style allocator.
+avoid: Do not hand-tune allocation for one hot loop before checking the compiler's output; fix the algorithm or use a profile first.
+flow:
+  SSA IR [store: virtual registers] -> Liveness analysis [svc: live ranges] : IR | The compiler finds where each virtual register is alive.
+  Liveness analysis -> Allocator choice [svc: by opt level] : ranges | The driver picks an allocator for the current mode.
+  Allocator choice -> Linear scan [svc: fast] : JIT or -O0 | A fast build uses one pass over sorted ranges.
+  Allocator choice -> Graph colouring [svc: better code] : -O2 or C2 | An optimized build colours the interference graph.
+  Linear scan, Graph colouring -> Machine code [store: regs + spills] : assignments | Values that do not fit go to stack slots.
+ref: paper | Linear Scan Register Allocation | Poletto & Sarkar, TOPLAS 1999 |
+
+== GPU registers limit how many threads run at once
+kind: offload-accelerator
+when: A GPU kernel runs slower than expected, and the cause may be too many registers per thread.
+how: Each GPU streaming multiprocessor has a fixed register file, for example 65,536 32-bit registers on many NVIDIA parts. A kernel that needs 128 registers per thread allows far fewer resident threads than one that needs 32. Fewer threads means less latency hiding, called low occupancy.
+The compiler allocates registers per thread. Developers can cap them with launch bounds or a compile flag, which forces spills to local memory. Spills use slow memory, so the cap helps only if the gain in occupancy is larger than the spill cost.
+The developer checks the compiler report, which shows registers per thread and spill bytes, and the profiler, which shows occupancy. Then tune the cap with measurements.
+used: CUDA kernels in cuBLAS-style libraries; Triton and CUTLASS tuning of tile sizes; AMD ROCm kernels with VGPR limits.
+avoid: When a kernel is limited by memory bandwidth; occupancy is not the problem and more registers may not matter.
+flow:
+  Kernel source [store: CUDA C++] -> nvcc compiler [svc: allocates registers] : compile | The compiler assigns registers for each thread.
+  nvcc compiler -> Build report [log: regs and spills] : 128 regs, 0 spill | The report shows 128 registers per thread and no spills.
+  Build report -> SM scheduler [svc: register file 64K] : occupancy 25% | Only 4 blocks fit, so occupancy is low.
+  Developer [user] -> nvcc compiler : cap at 64 regs | The developer adds launch bounds to force fewer registers.
+  nvcc compiler -x> Local memory [store: spill slots] : 32 B spill | The cap causes small spills to slow local memory.
+  SM scheduler -> Profiler [svc: Nsight] : occupancy 50%, faster | The profile shows if the net result is faster.
+ref: docs | CUDA C++ Programming Guide: launch bounds | NVIDIA | https://docs.nvidia.com/cuda/cuda-c-programming-guide/
+
+@@ typesys
+== Gradual typing with a checker as a CI gate
+kind: quality-gate
+when: A big untyped code base must get safer step by step, without a rewrite.
+how: Types are added as annotations, file by file. The type checker (mypy, Pyright, or tsc) reads the code, checks the annotated parts, and treats the unannotated parts as the dynamic type "any". The program still runs in the normal runtime, and the annotations are erased or ignored there.
+The checker runs in the editor and as a required CI step. A pull request that adds a type error cannot merge. Teams start with strict mode only in new modules, and raise the share of typed code over time, often tracked as a coverage number.
+Types are not run-time checks. Data from outside, such as JSON, must still be validated at the boundary, or the types are only a hope.
+used: TypeScript at large web companies; mypy and Pyright in Python code bases such as Dropbox's; Hack at Meta; Sorbet at Stripe.
+avoid: For throwaway scripts, where the cost of annotations is higher than the benefit.
+flow:
+  Developer [user] -> Editor [client: Pyright] : add annotations | The developer types a module, and the editor shows errors at once.
+  Editor -> Git [store: pull request] : push | The change is pushed for review.
+  Git -> CI checker [svc: mypy strict] : run on changed files | CI runs the checker on the whole project.
+  CI checker -x> Git : type error blocks merge | A new type error fails the check, so the branch cannot merge.
+  CI checker -> Runtime [svc: Python, annotations ignored] : deploy | After a pass the code runs unchanged, because types are not enforced at run time.
+ref: paper | Gradual Typing for Functional Languages | Siek & Taha, 2006 |
+
+== Schema-first API with generated typed clients
+kind: none
+when: Several teams call each other's APIs, and a breaking change must be caught before it reaches production.
+how: The API is defined in a schema file such as protobuf or OpenAPI. A generator creates typed server stubs and client libraries in each language from that one file. The schema is the contract, and the types are generated from it.
+When a field is removed or its type changes, the clients that use it fail to compile. A schema linter also compares the new schema against the last released one and flags breaking edits, such as removing a field or reusing a field number.
+This turns many run-time errors into build errors. It does not check meaning, only shape: a field that changes from "price in cents" to "price in dollars" has the same type.
+used: gRPC and protobuf with Buf's breaking-change check; OpenAPI Generator; GraphQL code generation; Smithy at AWS.
+avoid: For a single small service with one client, where hand-written types are enough.
+flow:
+  API author [user] -> Schema repo [store: orders.proto] : change field | The author edits the schema file.
+  Schema repo -> Breaking check [svc: buf breaking] : compare with main | The tool compares against the released schema.
+  Breaking check -x> API author : field removed | A breaking edit is rejected in review.
+  Schema repo -> Code generator [svc: protoc] : generate | Typed code for each language is generated from the schema.
+  Code generator -> Go client [svc: typed stub], Java server [svc: typed stub] : generated types | Both sides share one definition of each message.
+ref: docs | Buf breaking change detection | Buf | https://buf.build/docs/breaking/
+
+@@ qalgos
+== Hybrid quantum-classical workflow
+kind: offload-accelerator, async-request-reply
+when: A problem has a small part where a quantum algorithm may help, and a large classical part around it.
+how: A classical program prepares the problem and builds a circuit. It sends the circuit to a cloud quantum service and runs it many times, called shots, since the result is a random sample. It then reads the counts and does classical post-processing.
+Shor's algorithm has this shape. The quantum part finds the period of a function. The classical code picks the random number, computes with continued fractions, and then computes the factors with gcd. Grover's algorithm needs about the square root of N steps, which is a speed-up for search but not an exponential one.
+Jobs wait in a queue and may take minutes, so the client submits a job and polls. Today's noisy machines are too small to factor large numbers. These flows are used for research and for testing.
+used: IBM Quantum with Qiskit Runtime; Amazon Braket; Azure Quantum; variational algorithms such as VQE that loop between a CPU and a quantum device.
+avoid: For any problem that classical hardware solves in time; there is no benefit today.
+flow:
+  Classical program [svc: Python] -> Transpiler [svc: map to hardware] : circuit | The program builds a circuit and maps it to the real device gates.
+  Transpiler -> Quantum service [svc: cloud API] : submit job, 4096 shots | The job is sent and a job id comes back at once.
+  Quantum service -> QPU queue [queue: waiting jobs] : wait | The job waits its turn on the device.
+  QPU queue -> Quantum device [model: QPU] : run 4096 times | The device runs the circuit many times, and every run gives a random bit string.
+  Classical program ~> Quantum service : poll job id | The client polls until the job is done.
+  Quantum service -> Classical program : counts | The program reads the counts and does classical post-processing.
+ref: docs | Qiskit Runtime documentation | IBM Quantum | https://quantum.cloud.ibm.com/docs/
+ref: paper | Polynomial-Time Algorithms for Prime Factorization and Discrete Logarithms on a Quantum Computer | Shor, SIAM Journal on Computing 1997 |
+
+== Hybrid key exchange for post-quantum migration
+kind: forward-secrecy
+when: Data sent today must stay secret for many years, and a future quantum computer could break today's key exchange.
+how: Shor's algorithm would break RSA and elliptic-curve key exchange on a large quantum computer. An attacker can record encrypted traffic today and decrypt it later. This is called harvest now, decrypt later.
+In a hybrid TLS handshake, the client sends two key shares: classical X25519 and the post-quantum ML-KEM-768 (NIST FIPS 203). The server answers with both. The two shared secrets are joined, and the session key is derived from both. An attacker must break both to read the traffic.
+The price is size: the extra key share adds about 1 KB to the handshake. Hybrid mode also keeps safety if ML-KEM is later found to be weak. Signatures and certificates still use classical algorithms and are migrated later.
+used: Chrome and Firefox with X25519MLKEM768; Cloudflare and Google edge servers; OpenSSH with a hybrid post-quantum key exchange by default.
+avoid: For short-lived data with no long-term secrecy need; the extra bytes bring little benefit.
+flow:
+  Browser [client: Chrome] -> Edge server [svc: TLS 1.3] : ClientHello with 2 shares | The client sends two key shares in the first message.
+  Edge server -> Browser : two key shares | The server answers with a matching share for each method.
+  Browser -> Key derivation [svc: HKDF] : both secrets | Both shared secrets are fed into key derivation.
+  Edge server -> Key derivation : both secrets | The server derives the same session key.
+  Key derivation -> Session [store: AES-GCM key] : session key | Traffic is encrypted with a key that needs both methods to be broken.
+  Eavesdropper [user] -x> Session : recorded traffic | A recorder today and a quantum computer later still cannot read it without breaking both.
+ref: docs | FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard | NIST, 2024 | https://csrc.nist.gov/pubs/fips/203/final
+
+@@ controlhijack
+== Parse untrusted input in a sandboxed low-privilege process
+kind: least-privilege
+when: A memory-unsafe parser, such as an image or message decoder, must read data from strangers, and one bug must not give the attacker the whole device.
+how: A buffer overflow lets an attacker overwrite a return address or function pointer and take control of the process. You cannot be sure to remove every such bug in a large C or C++ decoder, so you limit what a hijacked process can do.
+The risky decoder runs in its own process with a tight sandbox: no file access, no network, and only a pipe to the parent. The parent sends bytes in and gets back a simple result, such as a bitmap or a parsed record. The result is checked again by the parent.
+An attacker who hijacks the decoder still needs a second bug to escape. The price is one more process and some copying. Apple's BlastDoor service for iMessage and Chrome's renderer sandbox follow this design.
+used: Apple BlastDoor (written in Swift, for iMessage); Chrome renderer and utility processes; Android media codecs in a restricted process; Firefox RLBox.
+avoid: For trusted internal input where the process cost is not justified; fix the bug class with a memory-safe language instead.
+flow:
+  Message [client: untrusted bytes] -> Main app [svc: privileged] : arrives | A message with an attachment arrives from the network.
+  Main app -> Decoder process [svc: sandboxed C++] : bytes over pipe | The parent sends the raw bytes to the sandboxed child.
+  * Decoder process: hijacked by overflow | A bug lets the attacker control the child process.
+  Decoder process -x> File system [store: user data] : open() denied | The sandbox blocks every system call that is not needed.
+  Decoder process -> Main app : bitmap only | A normal run returns only a simple, checked result.
+  Main app -> UI [client] : show image | The parent shows the checked result.
+ref: blog | Smashing the Stack for Fun and Profit | Aleph One, Phrack 49, 1996 | https://phrack.org/issues/49/14.html
+
+== Sampled allocator checks catch memory bugs in production
+kind: feedback-loop, observability-pipeline
+when: Memory bugs only appear on real traffic, and full sanitizers are too slow to leave on for users.
+how: AddressSanitizer in tests finds overflows and use-after-free, but it slows a program by about 2x and uses much more memory. For production, a sampling allocator is used. GWP-ASan puts a tiny random share of allocations, on guarded pages with a trap page next to them.
+A bad read or write on a sampled allocation hits the guard page and crashes with a precise report: the allocation stack and the free stack. The crash is uploaded like any other crash report.
+The fleet is large, so even a rare bug is seen. Engineers group reports by stack, file bugs and ship fixes. The overhead is very small, and only the few users who hit a sampled bug see a crash.
+used: GWP-ASan in Chrome; GWP-ASan and HWAddressSanitizer in Android; Scudo allocator hardening in Android.
+avoid: As the only tool; it finds a bug only if the bad access hits a sampled allocation, so keep ASan fuzzing in CI.
+flow:
+  Browser [client: millions of users] -> Guarded allocator [svc: samples 1 in N] : malloc | A small random share of allocations go to a guarded page.
+  Guarded allocator -> Guard page [store: unmapped] : sampled block | The block is placed next to an unmapped page.
+  Browser -x> Guard page : overflow write | A bug that writes past the block hits the guard page and traps.
+  Guard page -> Crash reporter [svc: stack + free stack] : report | The crash report holds the allocation and free stacks.
+  Crash reporter -> Triage [svc: group by stack] : upload | Reports with the same stack are grouped into one bug.
+  Triage -> Browser : fix in next release | Developers fix the code and ship a new version.
+ref: docs | GWP-ASan | LLVM Project | https://llvm.org/docs/GwpAsan.html
+
+@@ exploitmit
+== Layered hardening at build time and load time
+kind: none
+when: You ship native code, and you assume some memory bug will exist, so you want each exploit step to be harder.
+how: Several independent defences are stacked. The compiler adds stack canaries (-fstack-protector-strong), a random value placed before the return address and checked on return. Fortify checks bound unsafe libc calls. A PIE binary and full RELRO make the linker produce a relocatable program with a read-only GOT.
+At run time the kernel marks stacks and heaps as non-executable (DEP or NX), and the loader places the binary, libraries, stack and heap at random addresses (ASLR). The attacker needs both a bug and an address leak. Control-flow integrity checks restrict indirect calls to valid targets.
+Each layer is bypassable alone, but together they raise cost. The overhead is small, usually a few percent. Distribution default builds on Ubuntu and Fedora enable most of these flags.
+used: Ubuntu and Fedora default hardened builds; Chrome and Android (Clang CFI); Windows with CFG and CET; Linux kernel hardening options.
+avoid: Do not treat them as a fix for the bug. Mitigations make exploits harder, and a safe language removes the bug class.
+flow:
+  Source [client: C code] -> Compiler and linker [svc: hardening flags] : -fstack-protector -pie | The build adds canaries, fortify checks and a relocatable layout.
+  Compiler and linker -> Binary [store: PIE + RELRO + canary] : ELF file | The program is shipped with hardening built in.
+  Binary -> Kernel loader [svc: ASLR + NX] : exec | The kernel maps pages at random addresses and marks data as non-executable.
+  Attacker [user] -x> Binary : overflow overwrites canary | The overflow changes the canary value on the stack.
+  Binary -x> Kernel loader : canary mismatch, abort | The function sees a wrong canary and aborts before it returns.
+ref: docs | Compiler flags for hardening in Ubuntu | Ubuntu Security Team |
+
+== Hardware memory tags catch bad pointers
+kind: none
+when: Spatial and temporal memory bugs must be caught in real programs at low cost, with a precise fault at the faulty access.
+how: ARM Memory Tagging Extension (MTE) gives each 16-byte block of memory a 4-bit tag, and puts the same tag in the top bits of a pointer. On each load or store the CPU compares the pointer tag with the memory tag. A mismatch raises a fault.
+The allocator sets a random tag on malloc, so a pointer that runs into the next block has a different tag and faults. On free, the tag changes, so a dangling pointer faults too. Four bits mean about a 1 in 16 chance that a wrong access matches by luck.
+The cost is some memory for tags and a small slowdown in sync or async modes. The design suits catching bugs on user devices, and as a base of production fuzzing.
+used: Android Scudo allocator with MTE on supported Arm devices; Google Pixel's memory-tagging setting; Linux kernel MTE support; Intel CET shadow stacks for return addresses (a related hardware defence).
+avoid: On CPUs without the feature; use software tools such as ASan in testing.
+flow:
+  Program [svc: calls malloc] -> Tagging allocator [svc: Scudo] : malloc(64) | The program requests a block.
+  Tagging allocator -> Tagged memory [store: tag 7 on block] : set tag 7 | The allocator colours the block with tag 7 and returns a pointer with tag 7.
+  Program -> Tagged memory : p[80] out of bounds | A write goes past the block into memory with tag 3.
+  Tagged memory -x> Program : tag mismatch fault | The CPU finds tag 7 against tag 3 and faults at the faulty instruction.
+  Program -> Tagging allocator : free(p) | On free, the allocator changes the block's tag.
+  Program -x> Tagged memory : use after free | A stale pointer with tag 7 now fails the check against the new tag.
+ref: docs | Arm Memory Tagging Extension | Android Open Source Project | https://source.android.com/docs/security/test/memory-safety/arm-mte
+
+@@ injection
+== Parameterized queries behind a data-access layer
+kind: parameterized-query
+when: Any code builds a database query that includes values from users, headers or other services.
+how: SQL injection happens when text from a user is pasted into the SQL string and is then parsed as part of the code. The fix is to send the query and the values separately. The statement has placeholders, such as "WHERE email = $1", and the driver sends the values in a different protocol field.
+The database parses the statement first, and the values can never change its structure. A value like "x' OR '1'='1" is just a string that matches no email.
+An ORM or query builder does this by default, so developers rarely write SQL strings. The team also removes string-built SQL in review, with a linter rule, and gives the app a database account with the minimum rights as a second layer. Identifiers such as table names cannot be parameters, so use an allow-list for them.
+used: Prepared statements in JDBC, psycopg and database/sql; ORMs such as Hibernate, SQLAlchemy and ActiveRecord; query builders such as jOOQ.
+avoid: Do not rely on escaping or filtering alone; it fails on encoding edge cases.
+flow:
+  Browser [client] -> API handler [svc: no SQL strings] : email = x' OR '1'='1 | The attacker sends a crafted value in a form field.
+  API handler -> ORM layer [svc: query builder] : find_by(email) | The handler passes the value to the data-access layer as data.
+  ORM layer -> Postgres [db: parses SQL first] : WHERE email = $1 | The statement goes with a placeholder, and the structure is fixed.
+  ORM layer -> Postgres : bind value as text | The value is sent in a separate bind step.
+  Postgres -x> API handler : 0 rows | The string matches nothing, and the attack has no effect.
+ref: docs | SQL Injection Prevention Cheat Sheet | OWASP | https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html
+
+== SSRF defence with an egress proxy and an allow-list
+kind: zero-trust
+when: A server fetches URLs that users supply, for example for webhooks or link previews, and must not reach internal systems.
+how: In server-side request forgery (SSRF), the attacker gives a URL that points inside your network, for example the cloud metadata address 169.254.169.254. The server fetches it and returns the secrets it finds.
+The fetcher sends all user-driven requests through an egress proxy in a separate network zone. The proxy resolves the host name itself, rejects private, loopback and link-local addresses, and connects to the address it checked. This stops DNS rebinding tricks. Redirects are checked again, and an allow-list limits the destinations when they are known.
+The cloud side adds a second layer: IMDSv2 on AWS needs a session token that a simple SSRF cannot get, and hop limits stop containers from reaching it.
+used: Stripe's open-source Smokescreen proxy; AWS IMDSv2; webhook systems at SaaS companies that use an egress proxy.
+avoid: Do not rely on a deny-list of bad host names in the app; attackers use other forms of the same address.
+flow:
+  Attacker [user] -> Link preview service [svc: fetches URLs] : url = metadata address | The attacker asks the service to fetch a metadata address.
+  Link preview service -> Egress proxy [svc: Smokescreen] : CONNECT target | The service can only reach the internet through the proxy.
+  Egress proxy -> DNS [svc: resolver] : resolve host | The proxy resolves the name itself and keeps the result.
+  Egress proxy -x> Metadata service [svc: 169.254.169.254] : blocked link-local | The proxy refuses private and link-local addresses.
+  Egress proxy -> Public site [client: allowed host] : connect to checked IP | A valid public URL is fetched from the address that was checked.
+  Egress proxy ~> Audit log [log: denied requests] : deny event | Denied requests are logged and raise an alert.
+ref: docs | Server-Side Request Forgery Prevention Cheat Sheet | OWASP | https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+
+@@ sidechannel
+== Constant-time core behind a safe crypto API
+kind: none
+when: Code handles secret keys or tokens, and its run time or memory access must not depend on the secret.
+how: A normal compare of two byte strings stops at the first different byte, so the run time shows how many bytes were right. An attacker who measures many requests can guess a token one byte at a time.
+Crypto libraries therefore write the core with no secret-dependent branches or table lookups. Compare uses a loop that ORs all differences and tests the result once. The library exposes only safe calls such as verify and decrypt, so application code cannot make the mistake.
+Teams test this claim. Tools such as dudect run the code on two input classes and test statistically for a timing difference. The compiler can still change the code, so the check is done on the built binary.
+used: BoringSSL CRYPTO_memcmp; Go crypto/subtle; libsodium; Curve25519 and AES-GCM implementations built without table lookups.
+avoid: For public data, where constant-time code is slower and gives no gain.
+flow:
+  Attacker [user] -> API server [svc: checks token] : guess token A... | The attacker sends many guesses and measures the response time.
+  API server -> Compare [svc: constant time] : memcmp(secret, guess) | The server compares the guess with the secret.
+  Compare -> API server : same time for any guess | The compare ORs all byte differences and takes the same time for every guess.
+  API server -x> Attacker : 401, no timing signal | The attacker sees no timing difference and learns nothing.
+  CI [svc: dudect test] -> Compare : two input classes | A statistical test in CI looks for any timing difference.
+ref: docs | Constant-Time Toolkit | Trail of Bits | https://github.com/trailofbits/ctgrind
+
+== Site isolation: one site per process
+kind: bulkhead, zero-trust
+when: A program runs code from many origins, and a CPU leak such as Spectre could let one origin read memory of another.
+how: Spectre lets code read data in its own process, even data that it should not reach. Inside one process, the language rules cannot stop this, so the fix is to change what the process holds.
+Chrome Site Isolation puts pages from different sites into different renderer processes. A page cannot read the memory of another site, because that memory is not in its address space. Cross-origin responses such as HTML and JSON are blocked from entering the renderer unless a valid CORS header allows them. High-precision timers and SharedArrayBuffer need pages to opt in with COOP and COEP headers.
+The price is memory: more processes mean more RAM, roughly 10 percent in the first release. It is a bulkhead: one bad site cannot reach the others.
+used: Chrome (on by default on desktop since version 67); Firefox Fission; Edge; sites that set COOP and COEP.
+avoid: On memory-poor devices, where full isolation may be limited to sensitive sites.
+flow:
+  User [user] -> Browser process [svc: coordinator] : open bank.com and evil.com | The user has two tabs from two different sites open.
+  Browser process -> Renderer A [svc: bank.com] : navigate | The bank page gets its own renderer process.
+  Browser process -> Renderer B [svc: evil.com] : navigate | The other site gets another process with another address space.
+  Renderer B -x> Renderer A : Spectre read | The leak in B can read only memory of B, as A's memory is not mapped there.
+  Renderer B -x> Network service [svc: response filter] : fetch bank.com JSON | A cross-origin response without CORS permission is not delivered to B.
+ref: paper | Site Isolation: Process Separation for Web Sites within the Browser | Reis et al., USENIX Security 2019 |
+
+@@ websec
+== Cookie hardening plus CSRF token
+kind: none
+when: A web app uses cookies for login, and a page on another site must not be able to act as the user.
+how: In a CSRF attack, a hostile page makes the browser send a request to your site, and the browser adds your session cookie. The server cannot tell the request apart from a real click.
+The session cookie is set with HttpOnly (script cannot read it), Secure (HTTPS only) and SameSite=Lax (not sent on cross-site POST). Chrome has treated cookies without SameSite as Lax since 2020. For state-changing requests, the server adds a CSRF token: a random value tied to the session, put in the page and sent back in a header or hidden field.
+The server rejects a request with a missing or wrong token. A hostile site cannot read the token because of the same-origin policy. Check also the Origin header on sensitive endpoints.
+used: Django and Rails CSRF middleware; Spring Security; the synchronizer token pattern at banks; SameSite defaults in Chrome, Firefox and Safari.
+avoid: Not needed for APIs that use a bearer token in a header; no cookie means no automatic sending.
+flow:
+  User [user] -> App server [svc: sets cookie] : login | The server sets a session cookie with HttpOnly, Secure and SameSite=Lax.
+  App server -> Browser [client: form with token] : page + CSRF token | The page includes a random token tied to this session.
+  Browser -> App server : POST + cookie + token | A real form sends the cookie and the token.
+  Evil page [client: evil.com] -x> App server : forged POST, no token | A forged request has the cookie, but SameSite blocks it, and it has no token.
+  App server -> Session store [cache: token per session] : verify token | The server compares the token with the stored value and rejects a mismatch.
+ref: docs | Cross-Site Request Forgery Prevention Cheat Sheet | OWASP | https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html
+
+== Content Security Policy with nonces and reporting
+kind: none
+when: Output encoding may fail somewhere, and you want the browser to stop injected script from running as a second layer.
+how: For each response, the server makes a random nonce and sends a header: Content-Security-Policy: script-src 'nonce-R4nd0m' 'strict-dynamic'; object-src 'none'; base-uri 'none'. It puts the same nonce in each of its own script tags.
+The browser runs only scripts with the right nonce. A script injected by XSS has no nonce, so it is blocked. Inline event handlers and javascript: URLs are blocked too. The nonce must be new for every response, or an attacker could guess it.
+The policy also has a reporting endpoint. The browser sends a report on each violation. A collector counts them, so the team finds both attacks and its own broken pages. Roll out first in report-only mode.
+used: Google and other large web apps with strict CSP; Mozilla Observatory checks; Trusted Types in Chrome for DOM XSS.
+avoid: As the only defence; always encode output for the right context, and use CSP as the second layer.
+flow:
+  Browser [client] -> App server [svc: makes nonce] : GET /profile | The browser asks for a page.
+  App server -> Browser : HTML + CSP header + nonce | Each response has a fresh nonce in the header and in own script tags.
+  Browser -> Own script [svc: has the nonce] : run | The browser runs scripts with the matching nonce.
+  Attacker [user] -> App server : bio = script tag | The attacker saves a script tag in a profile field, and it gets into the page.
+  Browser -x> App server : injected script blocked | The injected tag has no nonce, so the browser blocks it.
+  Browser ~> Report collector [svc: CSP reports] : violation report | The browser posts the violation report, so the team sees the attempt.
+ref: docs | Content Security Policy (CSP) | MDN Web Docs | https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CSP
+
+@@ fuzzing
+== Continuous fuzzing farm with automatic bug filing
+kind: feedback-loop
+when: A project parses untrusted input in C or C++ or Rust, and you want new crashes found continuously, not once.
+how: Developers write a fuzz target: a function that takes bytes and calls the parser. The service builds it with sanitizers (ASan, UBSan). A coverage-guided fuzzer such as libFuzzer or AFL++ mutates inputs, keeps those that reach new code paths in a corpus, and so explores deeper over time.
+When an input crashes the target, the service shrinks it, removes duplicates by stack trace, and files a bug with the input attached. After the fix is merged, the service replays the input and closes the bug when it no longer crashes. The corpus is saved, so each night's run starts where the last one ended.
+OSS-Fuzz runs this loop for more than 1,000 open-source projects on ClusterFuzz. Reports become public after a fix or after a deadline. Teams must keep the targets working, because a broken target finds nothing.
+used: OSS-Fuzz and ClusterFuzz; Chromium's fuzzers; the Linux kernel's syzkaller; ClusterFuzzLite in project CI.
+avoid: For code with complex input structure and little parsing; use property-based tests with a model.
+flow:
+  Fuzz target [store: in the repo] -> Build farm [svc: ASan + coverage] : build daily | The service builds the target with sanitizers and coverage counters.
+  Build farm -> Fuzzer workers [svc: libFuzzer or AFL++] : binaries | Many workers mutate inputs and track code coverage.
+  Fuzzer workers -> Corpus [store: interesting inputs] : keep inputs with new paths | Inputs that reach new code are saved and used as seeds.
+  * Fuzzer workers: crash found | An input triggers a sanitizer report.
+  Fuzzer workers -> Bug tracker [svc: dedup by stack] : minimized input | The service shrinks the input, deduplicates, and files one bug.
+  Bug tracker ~> Fuzzer workers : verify fix | After the fix lands, the input is replayed, and the bug is closed if it passes.
+ref: docs | OSS-Fuzz documentation | Google | https://google.github.io/oss-fuzz/
+
+== Property-based tests with shrinking in CI
+kind: quality-gate
+when: A function has a clear rule that must hold for all inputs, and hand-picked examples miss edge cases.
+how: The developer states a property, for example "decode(encode(x)) equals x for any x". The library generates hundreds of random inputs from a typed strategy and checks the property for each one. Strategies bias toward edge values such as empty lists, zero and very long strings.
+When a test fails, the library shrinks the input: it tries smaller and simpler versions that still fail, and reports a minimal example, such as the list [0, 0] and not a list of 300 numbers. Hypothesis also saves the failing example in a local database, so the next run repeats it first.
+In CI the failing seed and example are printed, so a developer can replay the failure on a laptop. The same idea, applied to whole systems with random faults and a checker, is used by Jepsen.
+used: Hypothesis (Python); QuickCheck (Haskell); proptest (Rust); fast-check (JavaScript); Jepsen for distributed databases.
+avoid: For properties you cannot state, or tests that cost seconds per input; use example tests.
+flow:
+  Property test [svc: decode(encode(x)) == x] -> Generator [svc: strategies] : request inputs | The test asks for random inputs of the right type.
+  Generator -> Code under test [svc: encode + decode] : 100 random inputs | Each input is run through the code and the property is checked.
+  Code under test -x> Property test : failure on a 300-item list | One input breaks the property.
+  Property test -> Shrinker [svc: tries smaller] : failing input | The library tries smaller inputs that still fail.
+  Shrinker -> Example DB [db: .hypothesis] : minimal case [0, 0] | The minimal case is saved and tried first on the next run.
+  Shrinker -> CI report [log: seed + example] : minimal failing example | CI prints a small example and the seed, to replay the bug locally.
+ref: docs | Hypothesis documentation | Hypothesis project | https://hypothesis.readthedocs.io/

@@ -56,6 +56,9 @@ const shots = process.argv[3] || null;
   await page.click('[data-view="courses"]'); await page.waitForSelector('#v-courses .tcard');
   await page.click('#v-courses [data-course="CS244B"]'); await page.waitForTimeout(100);
   ok((await page.textContent('#v-courses .tsteps h2')).includes('Distributed Systems'), 'course view shows CS 244B');
+  ok(await page.locator('#v-courses .sch-row').count() >= 3 && await page.locator('#v-courses .sch-row:has-text("MIT") [data-program="mit-63"]').count() === 1, 'program buttons are grouped by school (Stanford, MIT, Caltech)');
+  await page.click('[data-program="mit-63"]'); await page.waitForTimeout(100);
+  ok(/MIT 6\.1210/.test(await page.textContent('#v-courses .tlist')), 'MIT 6-3 lists MIT subjects');
   await page.click('[data-program="ms"]'); await page.waitForTimeout(100);
   ok(await page.locator('#v-courses .tcard').count() > 10, 'MS program lists course groups');
   await page.click('#v-courses [data-rcourse]'); await page.waitForSelector('#reader:not([hidden]) .seqnav');
@@ -582,6 +585,12 @@ const shots = process.argv[3] || null;
   await vp.fill('[data-alin="key"]', '42'); await vp.press('[data-alin="key"]', 'Enter');
   ok(/^insert 42: start at the root/.test(await vp.textContent('#av-msg')) && (await vp.getAttribute('[data-aact="play"]', 'aria-pressed')) === 'false', 'reduced motion: Insert (Enter) jumps to the new key without playing');
   await vctx.close();
+  // "Taught in" names each school: Raft is taught at Stanford and at MIT (6.5840)
+  await page.goto(base + '#read/raft'); await page.waitForSelector('#reader .ladder-cap');
+  const taught = await page.$$eval('#reader .ladder-cap', ps => ps.map(p => p.textContent).find(t => /^Taught in/.test(t)) || '');
+  ok(/Stanford/.test(taught) && /MIT 6\.5840/.test(taught), 'read: "Taught in" groups courses by school (' + taught.slice(0, 80) + ')');
+  await page.click('#reader [data-course="MIT 6.5840"]'); await page.waitForTimeout(200);
+  ok(await page.locator('#v-courses [data-program="mit-meng"][aria-pressed="true"]').count() === 1 && /Distributed Computer Systems Engineering/.test(await page.textContent('#v-courses .tsteps h2')), 'a course link opens its own school\'s program');
   // architecture patterns: a read section with one tab and one animated diagram per pattern, and the catalog view
   await page.goto(base + '#pattern/kafka/2'); await page.waitForSelector('#reader #rs-apat .ap-panel:not([hidden]) svg');
   const npat = await page.evaluate(() => window.__dts.DATA.patterns.filter(x => x.concept === 'kafka').length);
