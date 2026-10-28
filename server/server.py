@@ -144,6 +144,11 @@ class Content:
             for r in db.execute("SELECT concept, body FROM patterns ORDER BY concept, ord"): pats.setdefault(r[0], []).append(json.loads(r[1]))
         self.patterns = [x for n in nodes for x in pats.get(n["id"], [])]
         for n in nodes: self.reads[n["id"]]["patterns"] = pats.get(n["id"], [])
+        # hands-on practice links (content/handson/*.txt), in each concept's read
+        ho = {}
+        if "handson" in has:
+            for r in db.execute("SELECT concept, body FROM handson ORDER BY concept, ord"): ho.setdefault(r[0], []).append(json.loads(r[1]))
+        for n in nodes: self.reads[n["id"]]["handson"] = ho.get(n["id"], [])
         pattern_list = [dict(concept=x["concept"], i=i, title=x["title"], kinds=x["kinds"], when=x["when"], n=len(x["scene"]["steps"]))
                         for n in nodes for i, x in enumerate(pats.get(n["id"], []))]
         row = db.execute("SELECT value FROM meta WHERE key='pcatalog'").fetchone()

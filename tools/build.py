@@ -58,6 +58,8 @@ CREATE TABLE scenes (id TEXT PRIMARY KEY, concept TEXT NOT NULL REFERENCES nodes
 CREATE INDEX scenes_concept ON scenes(concept, ord);
 -- architecture patterns (content/patterns/*.txt, spec in content/patterns/README.md): one JSON object per pattern, with its
 -- compiled scene; the canonical pattern catalog (content/patterns/catalog.txt) is in meta ('pcatalog')
+-- hands-on practice links (content/handson/*.txt): playgrounds, puzzles, labs, CTFs per concept, one JSON object per link
+CREATE TABLE handson (concept TEXT NOT NULL REFERENCES nodes(id), ord INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY (concept, ord));
 CREATE TABLE patterns (concept TEXT NOT NULL REFERENCES nodes(id), ord INTEGER NOT NULL, title TEXT NOT NULL, kinds TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (concept, ord));
 -- problem map (content/problemmap/map.json, built by tools/merge_problemmap.py): one full JSON entry per problem;
 -- the compact form the app loads (/api/problemmap, the standalone page) and its per-concept summary are in meta
@@ -123,6 +125,10 @@ def write_db(data, path):
         db.execute("INSERT INTO templates VALUES (?,?,?)", (name, i, json.dumps(t, ensure_ascii=False)))
     for i, s in enumerate(data.get("scenes", [])):
         db.execute("INSERT INTO scenes VALUES (?,?,?,?,?,?)", (s["id"], s["concept"], i, s.get("title", ""), len(s["steps"]), json.dumps(s, ensure_ascii=False)))
+    ho = {}
+    for x in data.get("handson", []): ho.setdefault(x["concept"], []).append(x)
+    for c, xs in ho.items():
+        db.executemany("INSERT INTO handson VALUES (?,?,?)", [(c, i, json.dumps(x, ensure_ascii=False)) for i, x in enumerate(xs)])
     for c, ps in pats.items():
         db.executemany("INSERT INTO patterns VALUES (?,?,?,?,?)", [(c, i, x["title"], ",".join(x["kinds"]), json.dumps(x, ensure_ascii=False)) for i, x in enumerate(ps)])
     db.execute("INSERT INTO meta VALUES (?,?)", ("pcatalog", json.dumps(data.get("pcatalog", []), ensure_ascii=False)))
@@ -321,6 +327,33 @@ def load_patterns(node_ids):
     catalog = [dict(c, n=sum(1 for ps in pats.values() for x in ps if c["id"] in x["kinds"])) for c in cat.values()]
     return [x for c in pats for x in pats[c]], catalog, errs
 
+HO_KINDS = ("playground", "simulator", "puzzles", "exercises", "lab", "ctf", "game", "dataset", "kata")
+HO_ACCESS = ("open-source", "free", "free-tier")
+def load_handson(node_ids):
+    """content/handson/*.txt: one line per link, "concept | kind | title | who | url | access | what you do there".
+    Returns (links in file order, errors). A concept keeps at most 4 links; duplicates (same concept and url) are errors."""
+    out, errs, seen = [], [], set()
+    for f in sorted(glob.glob(os.path.join(ROOT, "content", "handson", "*.txt"))):
+        where = os.path.relpath(f, ROOT)
+        for ln, line in enumerate(open(f, encoding="utf-8"), 1):
+            line = line.strip()
+            if not line or line.startswith("#"): continue
+            p = [x.strip() for x in line.split(" | ")]
+            w = f"{where}:{ln}"
+            if len(p) != 7: errs.append(f"{w}: needs 7 fields separated by ' | ', got {len(p)}"); continue
+            c, kind, title, who, url, access, what = p
+            if c not in node_ids: errs.append(f"{w}: unknown concept {c!r}"); continue
+            if kind not in HO_KINDS: errs.append(f"{w}: kind must be one of {', '.join(HO_KINDS)}"); continue
+            if access not in HO_ACCESS: errs.append(f"{w}: access must be one of {', '.join(HO_ACCESS)}"); continue
+            if not re.match(r"https?://\S+$", url): errs.append(f"{w}: bad url {url!r}"); continue
+            if not title or not what: errs.append(f"{w}: title and description are required"); continue
+            if (c, url) in seen: errs.append(f"{w}: duplicate link for {c}"); continue
+            seen.add((c, url)); out.append(dict(concept=c, kind=kind, t=title, w=who, u=url, access=access, d=what))
+    n = {}
+    for x in out: n[x["concept"]] = n.get(x["concept"], 0) + 1
+    errs += [f"content/handson: {c} has {k} links (at most 4)" for c, k in n.items() if k > 4]
+    return out, errs
+
 def main():
     args = sys.argv[1:]
     t0 = time.time()
@@ -342,6 +375,10 @@ def main():
     data["patterns"], data["pcatalog"], perrs2 = load_patterns({n["id"] for n in data["nodes"]})
     if perrs2:
         print("PATTERN ERRORS (check one file with python3 tools/checkpatterns.py <file>):\n  " + "\n  ".join(perrs2), file=sys.stderr); sys.exit(1)
+    data["handson"], herrs = load_handson({n["id"] for n in data["nodes"]})
+    if herrs:
+        print("HANDS-ON ERRORS:\n  " + "\n  ".join(herrs), file=sys.stderr); sys.exit(1)
+    data["stats"]["handson"] = len(data["handson"])
     data["stats"]["patterns"] = len(data["patterns"])
     data["stats"]["pattern_concepts"] = len({x["concept"] for x in data["patterns"]})
     pm, pmerrs = load_problemmap()
@@ -355,6 +392,7 @@ def main():
           f"{st['tours']} tours, {st['courses']} courses, {st['words']:,} words, {st['refs']} sources ({st['urls']} with direct links), {st['deep']} deep reads, "
           f"{st['designs']} design questions, {st['practice']} practice problems, {st['templates']} pattern templates, {st['scenes']} animated scenes, "
           f"{st['patterns']} architecture patterns on {st['pattern_concepts']} concepts ({len(data['pcatalog'])} in the catalog), "
+          f"{st['handson']} hands-on practice links, "
           f"{st['problemmap']} problems in the problem map" + ("" if pm else " (no content/problemmap/map.json yet)"))
     if "--check" in args: return
     os.makedirs(os.path.join(ROOT, "data"), exist_ok=True); os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)

@@ -39,6 +39,7 @@ try {
     DATA.layers.forEach(l=>{ READS[l.id]={id:l.id, rd:l.rd, refs:l.refs}; });
     (DATA.scenes||[]).forEach(s=>{ const r=READS[s.concept]; if(r) (r.scenes=r.scenes||[]).push(s); });
     (DATA.patterns||[]).forEach(x=>{ const r=READS[x.concept]; if(r) (r.patterns=r.patterns||[]).push(x); });
+    (DATA.handson||[]).forEach(x=>{ const r=READS[x.concept]; if(r) (r.handson=r.handson||[]).push(x); });
   } else {
     DATA = await api("GET","/api/graph");
   }
@@ -698,6 +699,16 @@ function patternsHTML(id, list){
     ${(x.refs||[]).length?refsHTML(x.refs):""}</div>`;
   return `<p class="stand-sum">How real systems place ${esc(N[id].label)} among other components. ${list.length>1?`${list.length} patterns: pick one above. `:""}Step through each diagram with Back and Next, or press Play.</p><div class="ap-wrap" data-pats="${id}">${tabs}${list.map(panel).join("")}</div>`;
 }
+/* hands-on practice links (content/handson/): places on the web to try the idea, free and open-source first */
+const HO_KIND = {playground:"Playground", simulator:"Simulator", puzzles:"Puzzles", exercises:"Exercises", lab:"Lab", ctf:"CTF", game:"Game", dataset:"Dataset", kata:"Kata"};
+const HO_ACC = {"open-source":"Open source", "free":"Free", "free-tier":"Free tier"};
+function handsonHTML(list){
+  const ord = {"open-source":0, "free":1, "free-tier":2};
+  return `<p class="stand-sum">Places on the web to try this yourself, free and open-source first. Each opens in a new tab.</p><ul class="ho-list">${list.slice().sort((a,b)=>ord[a.access]-ord[b.access]).map(x=>`<li><a class="ho" href="${esc(x.u)}" target="_blank" rel="noopener noreferrer">
+    <span class="ho-t">${esc(x.t)} <span aria-hidden="true">↗</span></span>
+    <span class="ho-m"><span class="ho-k">${esc(HO_KIND[x.kind]||x.kind)}</span><span class="ho-a ${esc(x.access)}">${esc(HO_ACC[x.access]||x.access)}</span>${x.w?`<span>${esc(x.w)}</span>`:""}</span>
+    <span class="ho-d">${RI(x.d)}</span></a></li>`).join("")}</ul>`;
+}
 function patTab(wrap, i){
   const list = (READS[wrap.dataset.pats]||{}).patterns||[]; if(!list[i]) return null;
   wrap.querySelectorAll(".ap-tab").forEach((b,j)=>{ b.setAttribute("aria-selected", String(j===i)); b.tabIndex = j===i?0:-1; });
@@ -748,7 +759,7 @@ function nodeRead(n, r, ctx){
   h += ladderHTML(n);
   if(USES[n.id]) h += `<p class="ladder-cap">Appears in design questions: ${USES[n.id].map(did=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-design="${did}">${esc(DES[did].title)}</button>`).join(", ")}.</p>`;
   if(TAUGHT[n.id]) h += `<p class="ladder-cap">Taught in ${taughtBy(n.id).map(([x, codes])=>`${esc(x.short)} ${codes.map(code=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-course="${esc(code)}">${esc(courseShort(code))}</button>`).join(", ")}`).join("; ")}.</p>`;
-  const toc = [["value","Why it exists"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How it works"],(r.scenes||[]).length&&["watch","Watch it work"],(r.patterns||[]).length&&["apat","Architecture patterns"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],rd.tradeoffs&&["tradeoffs","It depends: trade-offs"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],rd.interview&&["interview","In the interview"],rd.quiz&&["quiz","Check yourself"],pmPins(n.id)&&["problems","Problems that use this"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
+  const toc = [["value","Why it exists"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How it works"],(r.scenes||[]).length&&["watch","Watch it work"],(r.patterns||[]).length&&["apat","Architecture patterns"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],rd.tradeoffs&&["tradeoffs","It depends: trade-offs"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],rd.interview&&["interview","In the interview"],rd.quiz&&["quiz","Check yourself"],(r.handson||[]).length&&["handson","Practice it yourself"],pmPins(n.id)&&["problems","Problems that use this"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
   h += `<nav class="toc" aria-label="Sections">${toc.map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
   let no=0; const NO=()=>String(++no).padStart(2,"0");
   h += sec("value", NO(), "Why it exists", P(rd.value,"lead"));
@@ -768,6 +779,7 @@ function nodeRead(n, r, ctx){
   if(rd.practice) h += sec("practice", NO(), "In practice", P(rd.practice));
   if(rd.interview) h += sec("interview", NO(), "In the interview", qaHTML(rd.interview, "Questions a staff-level interviewer asks about this. Say your answer out loud first, then open it to compare."), "Staff level");
   if(rd.quiz) h += sec("quiz", NO(), "Check yourself", quizHTML(rd.quiz, n.id));
+  if((r.handson||[]).length) h += sec("handson", NO(), "Practice it yourself", handsonHTML(r.handson), r.handson.length+" link"+(r.handson.length===1?"":"s"));
   if(pmPins(n.id)) h += sec("problems", NO(), "Problems that use this", `<div class="pm-pins" data-pmpins="${n.id}"><p class="empty">Loading the problem map…</p></div>`, pmPins(n.id).toLocaleString("en-US")+" problems");
   if(ups.length) h += sec("built", NO(), "What's built on it", `<p class="stand-sum">${ups.length} concept${ups.length===1?"":"s"} use ${esc(n.label)} directly.</p>` + groupByLayer(ups,"s"));
   if(n.side.length) h += sec("side", NO(), "Neighbours", n.side.map(s=>srow(s.o, s.r, false, SIDE[s.t]||s.t)).join(""));
