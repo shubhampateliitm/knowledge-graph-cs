@@ -1,0 +1,884 @@
+@@ grpc
+== Deadline propagation through a call chain
+kind: timeout-deadline, request-reply
+when: A user request fans through several services, and no service should keep working after the user has given up.
+how: The client sets one deadline for the whole call, for example 300 ms. gRPC sends it as the grpc-timeout header. Each server sees the time that is left and can read it from its call context.
+When the server calls the next service, it passes that context on. The next call gets the remaining budget, not a fresh 300 ms. If the first service used 120 ms, the next one gets about 180 ms.
+When time runs out, the client side cancels the call and sends an HTTP/2 RST_STREAM frame. Every service in the chain sees the cancel and stops its work. The caller gets status DEADLINE_EXCEEDED.
+Without this, a slow database makes each layer wait for its own long timeout. Threads pile up and the failure spreads upward.
+used: Google's internal Stubby/gRPC services; Go and Java gRPC services that pass the context object into every outgoing call.
+avoid: When a job must finish even if the caller leaves, such as a payment. Hand it to a queue instead of a call chain.
+flow:
+  Web API [svc] -> Order service [svc] : GetOrder, 300 ms | The web API sets a deadline of 300 ms for the whole call.
+  Order service -> Pricing service [svc] : GetPrice, 180 ms left | The order service spent 120 ms. It passes the remaining budget, not a new timeout.
+  Pricing service -> Pricing DB [db] : query | The pricing service runs a slow query and does not finish in time.
+  Web API -x> Order service : RST_STREAM (cancel) | The deadline passes, so the client cancels the call and gets DEADLINE_EXCEEDED.
+  Order service -x> Pricing service : cancel propagated | The cancel moves down the chain, so no service keeps working for a caller that left.
+ref: docs | gRPC and Deadlines | gRPC project | https://grpc.io/docs/guides/deadlines/
+
+== Client-side load balancing with xDS
+kind: service-discovery, control-data-plane
+when: Many gRPC clients call a replicated service, and a layer-4 load balancer would send all calls of one client to one server.
+how: gRPC keeps one long HTTP/2 connection and sends many calls on it. A layer-4 balancer chooses a server once per connection, so one busy client can load a single backend. The fix is to balance per call inside the client.
+The client channel resolves a name to many addresses, opens a connection to each one, and picks a backend for every call (for example round_robin). Addresses can come from DNS or from an xDS control plane such as Istio or a gRPC-compatible xDS server.
+With xDS the control plane sends endpoint lists, weights and routes over a gRPC stream. The client needs no sidecar proxy. This is called proxyless gRPC. The cost is that every language library must support xDS, and upgrades go through the application.
+used: Envoy-style xDS used directly by gRPC clients (proxyless mode, supported in Istio); Kubernetes headless services with round_robin.
+avoid: When clients are written in many languages with uneven xDS support; use a sidecar or an L7 proxy such as Envoy instead.
+flow:
+  Orders client [client: gRPC channel] -> xDS server [svc: control plane] : subscribe to payments | The channel opens a gRPC stream and asks for the endpoints of the payments service.
+  xDS server -> Orders client : 3 endpoints, weights | The control plane sends three addresses and their weights, and later pushes updates.
+  Orders client -> Payments pod A [svc], Payments pod B [svc], Payments pod C [svc] : per-call pick | The channel keeps three connections open and picks a pod for each call.
+  Payments pod B -x> Orders client : UNAVAILABLE | Pod B fails. The client sees the error and retries on another pod.
+  xDS server ~> Orders client : endpoint removed | The control plane removes pod B, so new calls skip it.
+ref: blog | gRPC Load Balancing | gRPC project, 2017 | https://grpc.io/blog/grpc-load-balancing/
+
+== Bidirectional streaming with flow control
+kind: producer-consumer, load-shedding
+when: Two services exchange a long series of messages, such as events or bids, and the receiver must be able to slow the sender.
+how: A streaming call keeps one HTTP/2 stream open and sends many framed messages in one or both directions. There is no connection setup per message, so the cost of each message is small.
+HTTP/2 gives each stream a flow-control window. The receiver only grants more window when the application reads messages. If the consumer is slow, its window fills and the sender blocks. This is backpressure with no extra code.
+The server can also end the stream with a status code, and the client reconnects with its last seen sequence number. The application must handle this resume itself, because gRPC does not replay lost messages.
+Keep message size small, for example under 64 KB. Long streams also pin a client to one backend, so rebalance by closing them after some minutes.
+used: Telemetry upload to collectors (OTLP over gRPC); etcd watch streams; Kubernetes-style watch APIs; market-data and bid-feed services.
+avoid: When a message must not be lost and the sender cannot resend; use a durable log such as Kafka and let the consumer commit offsets.
+flow:
+  Edge agent [client] -> Ingest service [svc: stream handler] : open stream | The agent opens one bidirectional stream and sends events with sequence numbers.
+  Edge agent -> Ingest service : events 1..500 | Many messages share the same stream and the same TCP connection.
+  Ingest service -> Event buffer [queue: bounded 1000] : enqueue | The handler puts events into a bounded buffer.
+  * Ingest service: window full | The writer is slow, so the buffer is full and the handler stops reading.
+  Ingest service -x> Edge agent : no window update | The agent cannot send more until the server reads, so the agent waits.
+  Ingest service ~> Edge agent : ack up to 480 | Acks flow back on the same stream, and the agent keeps its last acked number for resume.
+ref: docs | Core concepts: streaming and flow control | gRPC project | https://grpc.io/docs/what-is-grpc/core-concepts/
+ref: docs | gRPC on HTTP/2: engineering a robust, high-performance protocol | gRPC project | https://grpc.io/blog/grpc-on-http2/
+
+@@ haproxy
+== Layer-7 routing with health checks and queues
+kind: health-check, load-shedding, api-gateway
+when: Several backend pools sit behind one address, and a sick server or a traffic burst must not reach users.
+how: HAProxy terminates TLS in a frontend and reads each HTTP request. ACL rules route it, for example path /api goes to the api backend and everything else to the web backend.
+Each server line has a health check, such as "check inter 2s fall 3 rise 2". After 3 failed probes the server leaves the pool. After 2 good probes it returns, with slowstart to ramp its share up.
+Each server also has maxconn, for example 100. Extra requests wait in a queue inside HAProxy, which is cheap. If they wait longer than timeout queue, the client gets 503. The backends stay at a load they can bear.
+A reload starts a new worker and lets the old one finish its connections, so config changes cause no downtime.
+used: Front door for web farms and APIs at many large sites; Kubernetes ingress in front of services; common in front of databases and message brokers.
+avoid: When you need a managed global load balancer with anycast; use a cloud load balancer or a CDN in front.
+flow:
+  Browser [client] -> HAProxy [svc: frontend :443] : HTTPS GET /api/items | HAProxy ends TLS and reads the request line and headers.
+  HAProxy -> api-1 [svc], api-2 [svc] : use_backend api | The ACL path_beg /api picks the api backend; leastconn chooses a server.
+  * api-2: check failed x3 | Three failed probes in a row mark api-2 as down, so it gets no new requests.
+  HAProxy -> api-1 : request | All new requests go to the one healthy server.
+  HAProxy -x> Browser : 503 after queue timeout | When api-1 is at maxconn for too long, waiting requests get 503 instead of hanging.
+ref: docs | HAProxy documentation | HAProxy Technologies | https://docs.haproxy.org/
+
+== Stick-table rate limiting at the edge
+kind: rate-limit, load-shedding
+when: A few clients send too many requests or login attempts, and you want to block them before they reach the application.
+how: A stick table is an in-memory table inside HAProxy, keyed by a value such as the client IP. Each entry stores counters, for example the HTTP request rate over the last 10 seconds, and it expires after some minutes.
+A rule tracks every request: "http-request track-sc0 src". A second rule reads the counter: deny with status 429 if the rate is above 100 per 10 seconds. Only the offending addresses are blocked.
+The table can be copied to peer HAProxy nodes with the peers section, so a pair of load balancers share one view of each client. Without peers each node counts alone, and the real limit is the sum of both.
+Behind another proxy or CDN, the source address is the proxy. Use the PROXY protocol or a trusted header to get the real client.
+used: Login and API protection in front of web services; bot and scraper blocking; HAProxy Enterprise bot management builds on stick tables.
+avoid: When limits must be exact across many nodes or per user account; use a shared counter in Redis or an API gateway with quotas.
+flow:
+  Client [client] -> HAProxy [svc: edge proxy] : POST /login | Every request enters HAProxy first.
+  HAProxy -> Stick table [cache: rate by src IP] : track src, count | HAProxy updates the entry for this source IP: request rate over 10 seconds.
+  Stick table -> HAProxy : rate = 140 | The counter is above the 100 limit.
+  HAProxy -x> Client : 429 Too Many Requests | HAProxy rejects the request. The backend never sees it.
+  HAProxy ~> Peer HAProxy [svc: second node] : table update | The peers section copies entries to the second load balancer in the background.
+  HAProxy -> Login app [svc] : requests under limit | Normal clients pass through to the application.
+ref: blog | Introduction to HAProxy Stick Tables | HAProxy Technologies | https://www.haproxy.com/blog/introduction-to-haproxy-stick-tables
+ref: spec | PROXY protocol specification | Willy Tarreau, HAProxy | https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
+
+== Database primary routing with an agent check
+kind: leader-follower, health-check
+when: Applications need one stable address for a database cluster where only one node accepts writes, and the primary can change.
+how: Applications connect to HAProxy on a TCP port in layer-4 mode. HAProxy forwards bytes and does not read the SQL.
+Each database node runs a small HTTP endpoint (Patroni offers one on its REST port). It returns 200 on the current primary and another code on replicas. HAProxy uses "option httpchk" on this endpoint, so only the primary stays in the write backend. A second port goes to a read backend that lists the replicas.
+When the primary fails, the cluster manager promotes a replica. Within a few check intervals HAProxy sees the new 200 and moves new connections there. Use "on-marked-down shutdown-sessions" so connections to the old primary are closed at once.
+Two HAProxy nodes with a virtual IP (keepalived) avoid making the proxy a single point of failure.
+used: PostgreSQL clusters managed by Patroni with HAProxy in front; MySQL and Redis setups with a role check; common in self-managed database platforms.
+avoid: When the database driver already supports multiple hosts and a primary check (for example libpq target_session_attrs) or a managed endpoint exists.
+flow:
+  App [client] -> HAProxy [svc: TCP mode port 5000] : connect | The app uses one address for writes and never needs to know the primary.
+  HAProxy -> Patroni check [svc: REST on each node] : GET /primary | HAProxy probes each node; only the primary answers 200.
+  HAProxy -> Postgres node 1 [db: primary] : forward TCP bytes | Writes go to the node that passed the check.
+  * Postgres node 1: down | The primary fails, and the cluster manager promotes node 2.
+  Patroni check -> HAProxy : node 2 returns 200 | After a few check intervals node 2 is the new primary in the pool.
+  HAProxy -> Postgres node 2 [db: new primary] : new connections | New connections go to node 2. Old sessions to node 1 are closed.
+ref: docs | HAProxy documentation | HAProxy Technologies | https://docs.haproxy.org/
+
+@@ istio
+== Mesh-wide mutual TLS with workload identity
+kind: service-mesh, zero-trust, sidecar
+when: Many services in one cluster must encrypt traffic and prove who they are, without every team writing TLS code.
+how: Istio injects an Envoy sidecar into each pod. Iptables rules (or a CNI plugin) send all pod traffic through that proxy. The app keeps talking plain HTTP to its neighbour.
+The sidecar's helper process asks istiod for a certificate. istiod acts as the mesh certificate authority. It issues a short-lived certificate, valid for about 24 hours by default, that holds a SPIFFE identity such as spiffe://cluster.local/ns/shop/sa/orders. It renews it before expiry.
+When orders calls payments, the two sidecars set up mutual TLS and each learns the other's identity. A PeerAuthentication policy in STRICT mode rejects plain text. An AuthorizationPolicy then says that only the orders identity may call POST /charge.
+The price is one extra proxy per pod: more memory, CPU and a small latency per hop.
+used: Platform teams in regulated industries that need encryption in transit between all services; many Kubernetes platforms with Istio or Istio-based products.
+avoid: When only a few services need TLS; use application TLS or a lighter mesh. Also avoid when sidecar cost is too high; see ambient mode.
+flow:
+  Orders pod [svc: app + Envoy] -> istiod [svc: control plane + CA] : certificate request | The sidecar helper proves its Kubernetes service account and asks for a certificate.
+  istiod -> Orders pod : SPIFFE cert, 24 h | istiod signs a short-lived certificate that names the workload.
+  Orders pod -> Payments pod [svc: app + Envoy] : mTLS, POST /charge | Both sidecars check each other's certificates. The app sees plain HTTP.
+  Payments pod -> Payments app [svc: AuthorizationPolicy] : identity = orders | The policy allows only the orders identity to call this path.
+  Billing pod [svc: no sidecar] -x> Payments pod : plain text | A caller without a certificate is rejected under STRICT mode.
+ref: docs | Istio architecture | Istio documentation | https://istio.io/latest/docs/ops/deployment/architecture/
+ref: docs | Authentication policy | Istio documentation | https://istio.io/latest/docs/tasks/security/authentication/authn-policy/
+
+== Weighted canary release with VirtualService
+kind: blue-green, service-mesh
+when: A new version must receive a small share of real traffic first, and you want to roll back in seconds.
+how: Two Deployments run side by side, v1 and v2, with different version labels. A DestinationRule names them as subsets. A VirtualService lists weights: 95 for v1 and 5 for v2.
+istiod turns this into weighted clusters in the Envoy configuration and pushes it by xDS. The split happens in the calling sidecar for each request. It does not depend on how many pods each version has.
+The team raises the weight to 25, 50 and 100 while watching error rate and latency per version in the mesh metrics. A rollback is a change of weights back to 100 and 0. Tools such as Argo Rollouts or Flagger can automate the steps from metrics.
+Mirroring is a variation: send a copy of live traffic to v2 and drop its responses.
+used: Progressive delivery on Kubernetes with Argo Rollouts or Flagger on top of Istio; dark launches with traffic mirroring.
+avoid: When the new version changes a database schema in a way v1 cannot read; fix the data migration first. For simple cases a Deployment rolling update is enough.
+flow:
+  Team [user] -> Kubernetes API [svc] : apply VirtualService 95/5 | The team applies a routing rule with weights 95 and 5.
+  Kubernetes API -> istiod [svc: control plane] : watch event | istiod sees the new resource.
+  istiod -> Frontend Envoy [svc: caller sidecar] : xDS update | istiod pushes weighted clusters to the sidecars.
+  Frontend Envoy -> Reviews v1 [svc: 95 percent], Reviews v2 [svc: 5 percent] : weighted pick | Each request is sent to v1 or v2 by chance, using the weights.
+  Reviews v2 -x> Frontend Envoy : 5xx rate rises | The new version shows more errors in the metrics.
+  Team -> Kubernetes API : weights 100/0 | The team sets all traffic back to v1 in seconds.
+ref: docs | Traffic shifting | Istio documentation | https://istio.io/latest/docs/tasks/traffic-management/traffic-shifting/
+
+== Ambient mode with ztunnel and waypoint proxies
+kind: service-mesh, control-data-plane
+when: You want mesh encryption and identity for many pods, but cannot pay for a sidecar in every pod.
+how: In ambient mode there are no sidecars. A small proxy called ztunnel runs on each node as a DaemonSet. It captures the traffic of ambient pods on that node and wraps it in mutual TLS using HBONE, an HTTP/2 tunnel on port 15008.
+The ztunnel gives layer-4 features: identity, encryption, TCP metrics and simple allow rules. It does not read HTTP, so it is light. Application pods need no restart to join the mesh.
+When a service needs layer-7 features, such as HTTP routing, retries or path-based policy, you deploy a waypoint proxy for that namespace or service. A waypoint is an Envoy deployment. Traffic goes ztunnel, then waypoint, then the destination ztunnel.
+Only the services that need layer 7 pay for a proxy. The rest pay for the shared node proxy.
+used: Large clusters where sidecar memory was a concern; Istio ambient mode, which is generally available in Istio 1.24.
+avoid: When you need every pod to have its own L7 proxy features and per-pod isolation of the proxy; the sidecar mode is still supported.
+flow:
+  Orders pod [svc: no sidecar] -> ztunnel A [svc: node proxy] : plain TCP | The node proxy captures the pod's traffic. The pod is not changed.
+  ztunnel A -> Waypoint [svc: Envoy L7] : HBONE mTLS | For a service with L7 policy, traffic goes first to the waypoint.
+  Waypoint -> ztunnel B [svc: node proxy] : HTTP routed, mTLS | The waypoint applies routing and HTTP authorization, then forwards over mTLS.
+  ztunnel B -> Payments pod [svc: no sidecar] : plain TCP | The destination node proxy delivers the request to the pod.
+  istiod [svc: control plane] ~> ztunnel A, ztunnel B, Waypoint : config and certs | istiod sends identity and policy to all three proxy types over xDS.
+ref: docs | Ambient mode overview | Istio documentation | https://istio.io/latest/docs/ambient/overview/
+
+@@ kubernetes
+== Watch-based reconciliation of a Deployment
+kind: control-loop, event-driven
+when: You want a system that repairs itself, so that actual state keeps moving toward the state you declared.
+how: You store a desired state in the API server, which keeps it in etcd: a Deployment with replicas set to 3. You do not issue commands to start pods.
+Controllers watch the API server for changes. The Deployment controller creates a ReplicaSet. The ReplicaSet controller sees 0 pods but wants 3, so it creates 3 Pod objects. The scheduler watches for pods with no node and writes a node name on each. The kubelet on that node sees the pod and starts the containers.
+Every controller runs the same loop: read the desired state, read the observed state, act on the difference, repeat. If a node dies, the pod count drops to 2 and the same loop makes a new pod. No component holds a script for the whole task.
+Controllers must be level-triggered and idempotent, since events can be lost or repeated. They re-list all objects from time to time.
+used: Every built-in controller; operators for databases and message brokers (Strimzi, CloudNativePG); Argo CD and Crossplane use the same loop.
+avoid: For one-time, ordered jobs such as a schema migration; use a Job or a workflow engine.
+flow:
+  kubectl [client] -> API server [svc: stores in etcd] : create Deployment x3 | The desired state is stored. Nothing runs yet.
+  API server -> Controller manager [svc: controllers] : watch event | The Deployment and ReplicaSet controllers are told about the new object.
+  Controller manager -> API server : create 3 Pods | The ReplicaSet controller sees 0 of 3 pods and creates three Pod objects.
+  API server -> Scheduler [svc] : watch: pods without node | The scheduler picks a node for each pod and writes it back.
+  API server -> Kubelet [svc: on node 1] : watch: pods for node 1 | The kubelet starts the containers through the container runtime.
+  * Kubelet: node 1 down | The node dies, and the pods on it are marked as lost.
+  Controller manager -> API server : create replacement Pod | The loop sees 2 of 3 and creates one more pod, which the scheduler places elsewhere.
+ref: docs | Controllers | Kubernetes documentation | https://kubernetes.io/docs/concepts/architecture/controller/
+
+== Rolling update guarded by readiness probes
+kind: blue-green, health-check
+when: You must ship a new version of a stateless service without downtime and with an automatic stop if it is broken.
+how: A Deployment replaces pods in small steps. With maxSurge 25 percent and maxUnavailable 0 on 4 replicas, it first starts 1 new pod, so there are 5 in total. It waits until the new pod is Ready, then stops 1 old pod, and repeats.
+Ready comes from the readiness probe, for example an HTTP check on /healthz. A pod that is not Ready is removed from the Service's EndpointSlice, so it gets no traffic. A bad image that never becomes Ready stops the rollout; the old pods keep serving.
+When a pod is stopped, it gets SIGTERM and a grace period (30 seconds by default). A preStop sleep or a clean drain lets the load balancer remove it first. Rollback is "kubectl rollout undo", which swaps back to the previous ReplicaSet.
+used: Default update strategy of every Deployment; stateless web and API services on any Kubernetes cluster.
+avoid: When old and new versions cannot run together, or you want a slow, metric-driven canary; use blue-green or Argo Rollouts.
+flow:
+  CI [svc: pipeline] -> API server [svc] : set image v2 | The pipeline changes the image in the Deployment.
+  API server -> Deployment controller [svc] : new ReplicaSet v2 | A new ReplicaSet is created with 0 pods and is scaled up step by step.
+  Deployment controller -> Pod v2 [svc: starting] : surge 1 pod | One new pod is started first, so capacity does not drop.
+  Pod v2 -> Service [svc: EndpointSlice] : readiness OK | When the probe passes, the pod is added to the Service endpoints.
+  Deployment controller -> Pod v1 [svc: old] : SIGTERM, drain | Only now is one old pod stopped. The cycle repeats until all pods are v2.
+  Pod v2 -x> Service : readiness failing | If v2 never becomes ready, it gets no traffic and the rollout pauses.
+ref: docs | Deployments | Kubernetes documentation | https://kubernetes.io/docs/concepts/workloads/controllers/deployment/
+
+== Horizontal Pod Autoscaler on a load metric
+kind: autoscaling, control-loop
+when: Load changes during the day, and you want the number of pods to follow it without a person.
+how: The Horizontal Pod Autoscaler checks a metric every 15 seconds by default. For CPU it asks the metrics server for the average use of all pods, compared with the requested CPU of each pod.
+It computes desired = ceil(current replicas x current value / target value). With 4 pods at 90 percent CPU and a target of 60, desired is ceil(4 x 1.5) = 6. It then changes the replica count on the Deployment. The Deployment controller starts the pods.
+To avoid flapping, scale-down uses a stabilization window (300 seconds by default). Rules can also limit how fast it grows. Custom metrics, such as queue depth or requests per second, come from an adapter, or from KEDA for event sources.
+If nodes are full, new pods stay Pending. A node autoscaler (Cluster Autoscaler or Karpenter) adds machines for them.
+used: Web and API tiers; queue workers scaled on backlog with KEDA; ad-serving and bidder fleets that follow daily traffic waves.
+avoid: For stateful services that do not scale out, or if the pods start slowly compared with the load spike; keep headroom or scale on a schedule.
+flow:
+  Metrics server [svc] -> HPA controller [svc: loop every 15 s] : CPU 90 percent of request | The controller reads average CPU of the 4 pods. The target is 60 percent.
+  HPA controller -> Deployment [svc: replicas 4] : scale to 6 | It computes ceil(4 x 90 / 60) = 6 and updates the replica count.
+  Deployment -> Scheduler [svc] : 2 new pods | The scheduler places the new pods on nodes with free capacity.
+  Scheduler -x> Node autoscaler [svc: Karpenter or CA] : pod Pending | If no node has room, the pod waits, and a node autoscaler adds a machine.
+  Node autoscaler ~> Scheduler : new node ready | The new node joins and the pending pods are placed on it.
+  * Deployment: replicas 6 | Load falls later. Scale-down waits 300 seconds before it removes pods.
+ref: docs | Horizontal Pod Autoscaling | Kubernetes documentation | https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
+
+@@ lambda
+== SQS queue worker with partial batch failure
+kind: load-leveling, competing-consumers, dead-letter
+when: Work arrives in bursts, and a pool of functions must process each message once with retries and a safe place for poison messages.
+how: Producers send messages to an SQS queue. Lambda polls the queue for you and starts function instances. It passes a batch, for example up to 10 messages. The number of instances grows with the backlog, and you can cap it with maximum concurrency.
+If the function throws, the whole batch returns to the queue. With ReportBatchItemFailures the function returns only the ids that failed, and the good messages are deleted. This stops a poison message from causing repeated work.
+After maxReceiveCount tries, for example 5, SQS moves the message to a dead-letter queue. An alarm on the dead-letter queue depth alerts the team. Set the queue visibility timeout to at least 6 times the function timeout.
+Delivery is at least once, so the handler must be idempotent.
+used: Order, email and image-processing back ends on AWS; log and event enrichment steps in ad-tech pipelines on AWS.
+avoid: When you need strict ordering with high throughput, or work lasts longer than the 15-minute function limit; use containers or Step Functions.
+flow:
+  Producer [svc] -> Orders queue [queue: SQS standard] : SendMessage | The producer returns at once. The queue stores messages and absorbs bursts.
+  Orders queue -> Lambda poller [svc: event source mapping] : batch of 10 | The managed poller reads batches and scales out with backlog.
+  Lambda poller -> Worker function [svc: Lambda] : invoke with batch | Each batch is one invocation of the function.
+  Worker function -> Orders DB [db] : upsert by order id | An idempotent write means a retry does no harm.
+  Worker function -x> Lambda poller : failed item ids | The function reports only the 2 failed messages in the batch.
+  Orders queue -> Dead-letter queue [queue: after 5 tries] : poison message | A message that keeps failing moves aside, and an alarm fires.
+ref: docs | Using Lambda with Amazon SQS | AWS documentation | https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html
+
+== Serverless HTTP API behind API Gateway
+kind: api-gateway, horizontal-scale
+when: You need an HTTP API with uneven or low traffic, and you do not want to run servers or pay for idle capacity.
+how: API Gateway (or a Lambda function URL) receives the HTTPS request. It checks authentication, for example a JWT authorizer, applies throttling and sends the request as an event to a function.
+Lambda runs the request in an execution environment, a Firecracker microVM. If no warm environment is free, it creates one: this is a cold start, often from tens of milliseconds to a few seconds, depending on runtime and package size. After that the environment is reused for later requests.
+Each environment handles one request at a time. Concurrency is therefore the number of requests in flight. You can set reserved concurrency to protect a database and provisioned concurrency to keep warm environments.
+State lives outside: DynamoDB, S3 or RDS Proxy. Connection counts are the usual trap, so use a proxy or an HTTP-based data API.
+used: Webhooks, mobile and web back ends, and internal tools on AWS; Lambda runs on Firecracker, which AWS built for it.
+avoid: For steady, high traffic where always-on containers cost less, or for tight latency targets that cold starts would break.
+flow:
+  Client [client] -> API Gateway [svc: auth + throttle] : GET /items/7 | The gateway checks the token and the rate limit.
+  API Gateway -> Lambda service [svc: routing] : invoke event | The request becomes a JSON event for the function.
+  Lambda service -> Function env [svc: warm microVM] : run handler | A warm environment runs the handler. A cold one would first start and load code.
+  Function env -> DynamoDB [db] : GetItem | The function reads state from a managed database, because it keeps none.
+  Function env -> API Gateway : 200 JSON | The response goes back through the gateway.
+  * Lambda service: 500 environments | A traffic spike creates new environments in parallel, up to the account limit.
+ref: paper | Firecracker: Lightweight Virtualization for Serverless Applications | Agache et al., NSDI 2020 | https://www.usenix.org/conference/nsdi20/presentation/agache
+ref: docs | Using Lambda with API Gateway | AWS documentation | https://docs.aws.amazon.com/lambda/latest/dg/services-apigateway.html
+
+== S3 upload triggers a processing function
+kind: event-driven, claim-check
+when: Files arrive from outside, and each file must be processed soon after it lands, without a polling job.
+how: A client or partner writes a file to an S3 bucket. S3 emits an ObjectCreated event for it, to Lambda directly, or through SQS or EventBridge when you need buffering or filtering.
+The event carries only the bucket and key, not the file. This is the claim-check pattern. The function reads the object, transforms it, and writes the result to another bucket or prefix, such as Parquet files in a lake.
+Never write the output to the same prefix that triggers the function, or it will call itself without end. Use separate prefixes or buckets. Events are delivered at least once, so a file can be processed twice; derive the output key from the input key so a repeat overwrites the same result.
+For files that need more than 15 minutes or more memory, send the event to a queue and use a container task.
+used: Image and video thumbnails; log file parsing; ad-tech log files converted to Parquet; antivirus scans for uploads.
+avoid: For very large or very frequent files where per-file overhead dominates; batch with Spark or Glue, or stream through Kinesis or Kafka.
+flow:
+  Partner [client] -> Landing bucket [store: raw/] : PUT file.csv | The partner uploads the file with a pre-signed URL.
+  Landing bucket -> Event queue [queue: SQS] : ObjectCreated event | S3 sends a small event: bucket and key only.
+  Event queue -> Parse function [svc: Lambda] : batch of events | Lambda reads the events from the queue in batches.
+  Parse function -> Landing bucket : GetObject | The function fetches the real file by its key.
+  Parse function -> Curated bucket [lake: Parquet] : PutObject part-0001 | The output key comes from the input key, so a repeat run overwrites it.
+  Event queue -x> Dead-letter queue [queue] : after 3 failures | A bad file moves aside after 3 tries.
+ref: docs | Amazon S3 Event Notifications | AWS documentation | https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html
+
+@@ linux
+== Containers from namespaces and cgroups
+kind: none
+when: Many workloads share one machine and need separate views of the system and fixed resource limits, without a full virtual machine.
+how: A container is an ordinary Linux process with two kernel features applied. Namespaces change what the process can see: its own process ids (pid), network stack (net), mount points (mnt), host name (uts), users (user) and more. Each is a separate namespace.
+Control groups (cgroups v2) change what the process can use. A cgroup holds a set of processes and limits them, for example cpu.max = 50000 100000 (half a core) and memory.max = 512M. If the group goes over memory.max, the kernel's OOM killer ends a process inside it.
+A runtime such as runc calls clone() or unshare() with the namespace flags, mounts the image as the root file system, puts the process in a cgroup and then runs the program. Docker, containerd and Kubernetes all do this.
+All containers share one kernel. A kernel bug can break isolation, so mixed-trust workloads add seccomp filters, or a microVM or user-space kernel such as Firecracker or gVisor.
+used: Docker, containerd, runc and Kubernetes pods; systemd services use cgroups; CI runners and multi-tenant platforms.
+avoid: For hostile tenants running arbitrary code on a shared kernel; use microVMs (Firecracker, Kata Containers).
+flow:
+  Runtime [svc: runc] -> Kernel [svc: Linux] : clone with pid, net, mnt | The runtime creates a process with new namespaces.
+  Runtime -> cgroup [store: memory.max 512M] : write limits | It creates a cgroup and writes the CPU and memory limits.
+  Kernel -> App process [svc: sees pid 1] : exec program | The program starts. It sees only its own processes, network and file system.
+  App process -> Kernel : allocate memory | The app asks for memory like any process.
+  cgroup -x> App process : OOM kill at 512M | When the group passes its limit, the kernel kills a process in the group, and no other container is hurt.
+ref: docs | Control Group v2 | Linux kernel documentation | https://docs.kernel.org/admin-guide/cgroup-v2.html
+ref: docs | namespaces(7) | Linux man-pages | https://man7.org/linux/man-pages/man7/namespaces.7.html
+
+== epoll event loop for many connections
+kind: event-loop
+when: One server must hold tens of thousands of mostly idle connections with a few threads.
+how: A thread creates an epoll instance and adds every socket to it with epoll_ctl. It then calls epoll_wait, which sleeps until some sockets are ready and returns only the ready ones. The cost depends on the number of ready sockets, not on the number of all sockets, unlike select and poll.
+For each ready socket, the thread reads what is available and writes any reply. Sockets are set to non-blocking mode, so a slow client never blocks the thread. A partial request is kept in a small buffer for that connection until the rest arrives.
+Servers usually run one loop per CPU core. SO_REUSEPORT lets each loop have its own listening socket, so the kernel spreads new connections among them. Disk reads that can block are moved to a thread pool, or use io_uring.
+Edge-triggered mode reports only a change in readiness, so you must read until the socket returns EAGAIN. Missing that gives hung connections.
+used: NGINX, HAProxy, Redis, Node.js (through libuv), Envoy and Netty.
+avoid: For CPU-heavy requests; one slow handler blocks the whole loop, so use a worker pool.
+flow:
+  Client A [client] -> Listen socket [svc: SO_REUSEPORT] : connect | New connections arrive at the listening socket of this loop.
+  Listen socket -> epoll set [svc: 20000 sockets] : epoll_ctl ADD | The loop adds the new socket to the epoll set.
+  epoll set -> Worker loop [svc: 1 thread per core] : epoll_wait: 3 ready | The kernel returns only the 3 sockets that have data.
+  Worker loop -> Client A : read, handle, write | The loop reads from a ready socket, runs a short handler and writes the reply.
+  Worker loop ~> Thread pool [svc: blocking jobs] : disk read | Slow or blocking work is handed off so the loop never stalls.
+  Thread pool ~> Worker loop : done event | The result comes back as an event for the loop.
+ref: docs | epoll(7) | Linux man-pages | https://man7.org/linux/man-pages/man7/epoll.7.html
+
+== Page cache and zero-copy for log-style serving
+kind: memory-tiering, data-locality
+when: A service reads and writes large files in order, such as a log or media files, and wants disk speed without its own cache.
+how: Linux keeps recently used file data in free memory, called the page cache. A write goes to the cache first, and the kernel writes it to disk later. A read of cached data comes from memory, in microseconds, with no disk access.
+A sequential reader gets read-ahead: the kernel fetches the next blocks before they are asked for. So a log that is written once and read soon after is nearly always served from memory.
+For sending a file to a socket, sendfile() asks the kernel to move data from the page cache to the network card path without copying it through user space. This saves CPU and memory bandwidth. Kafka uses this for consumers that read recent data.
+Durability needs an explicit fsync, or the data can be lost in a crash. The page cache also counts as used memory in cgroups, so size container limits with it in mind.
+used: Kafka brokers serve fetch requests from the page cache with sendfile; NGINX static files; databases that rely on the OS cache, such as PostgreSQL.
+avoid: When the working set is much larger than memory, or the app must control caching exactly; use direct I/O with an own buffer pool.
+flow:
+  Producer [client] -> Broker [svc: appends to log] : append 1 MB | The broker writes the bytes into the log file.
+  Broker -> Page cache [cache: in RAM] : write() | The data lands in memory first, so the write returns in microseconds.
+  Page cache ~> Disk [store: NVMe] : flush later | The kernel writes dirty pages back in the background.
+  Consumer [client] -> Broker : fetch recent offset | A consumer asks for data written a moment ago.
+  Broker -> Page cache : sendfile() | The kernel sends the pages straight to the socket with no user-space copy.
+  Page cache -x> Disk : miss: read from disk | A consumer reading old data causes a cache miss and a real disk read.
+ref: docs | Page cache | Linux kernel documentation | https://docs.kernel.org/admin-guide/mm/concepts.html
+
+@@ nginx
+== Reverse proxy with TLS termination and upstream pool
+kind: api-gateway, horizontal-scale
+when: Many app servers should sit behind one public address that handles TLS, static files and routing.
+how: NGINX listens on port 443 and ends TLS, so app servers speak plain HTTP on a private network. A location block such as /api passes the request to an upstream group with proxy_pass. Other paths serve static files from disk, which NGINX does very well.
+The upstream block lists the app servers and a method: round robin by default, or least_conn, or hash for stickiness. With max_fails=3 and fail_timeout=30s a server that fails is skipped for 30 seconds. This is passive health checking. Active checks are only in NGINX Plus.
+Keepalive connections to the upstreams save the cost of a new TCP connection for each request. NGINX adds headers such as X-Forwarded-For, so the app knows the client address.
+Each worker process runs an event loop. A few workers hold thousands of idle client connections, which is why NGINX sits in front of slow application servers.
+used: Front of web and API servers at a very large share of the internet; Kubernetes ingress controllers; front end for PHP-FPM, Gunicorn and Node apps.
+avoid: When you need rich dynamic routing and active health checks in open source; consider HAProxy or Envoy.
+flow:
+  Browser [client] -> NGINX [svc: TLS :443] : HTTPS GET /api/cart | NGINX ends TLS and reads the HTTP request.
+  NGINX -> Static files [store: /var/www] : location / | Paths that are not API calls are served directly from disk.
+  NGINX -> App 1 [svc: upstream], App 2 [svc: upstream] : proxy_pass, least_conn | API paths go to the upstream group. Keepalive connections are reused.
+  App 2 -x> NGINX : connection refused x3 | After 3 failures App 2 is skipped for 30 seconds.
+  NGINX -> App 1 : retry request | NGINX tries the next upstream for safe requests, such as GET.
+  NGINX -> Browser : response | NGINX sends the answer and buffers it, so the slow client does not hold the app.
+ref: docs | ngx_http_upstream_module | nginx.org | https://nginx.org/en/docs/http/ngx_http_upstream_module.html
+
+== Micro-caching of dynamic responses
+kind: cdn-edge, cache-aside
+when: A dynamic page is read by many users, and one second of old data is acceptable, so the app can be shielded from load.
+how: With proxy_cache, NGINX stores upstream responses on local disk, keyed by a cache key such as the host and the URL. A request that finds a fresh entry is answered from NGINX without touching the app.
+Even a cache time of 1 to 5 seconds helps a lot. If a page is requested 1,000 times per second, the app renders it once per second, not 1,000 times. Set proxy_cache_lock on, so that when an entry is missing, only one request goes to the app and the others wait for it. This stops a cache stampede.
+proxy_cache_use_stale lets NGINX serve an old copy while the entry is refreshed, or when the app returns errors. The site then survives a short outage of the backend.
+Do not cache personal pages. Vary the key by cookie or skip the cache when an authorization header or session cookie is present.
+used: News and content sites; product catalog and search pages; API gateways for public read endpoints; common in front of WordPress.
+avoid: For per-user data or pages that must be exact; cache in the application, or not at all.
+flow:
+  Reader 1 [client] -> NGINX [svc: proxy_cache] : GET /home | A request arrives. NGINX looks up the cache key.
+  NGINX -> App [svc: renders page] : MISS: one request | The entry is missing. proxy_cache_lock lets only this one request go to the app.
+  App -> NGINX : 200, cache 1 s | The app renders the page once. NGINX stores it on disk.
+  NGINX -> Reader 1 : page | The first reader gets the answer.
+  Reader 2 [client] -> NGINX : GET /home | Hundreds of other readers arrive within the same second.
+  NGINX -> Reader 2 : HIT, no app call | These are served from the cache. The app saw one request.
+  App -x> NGINX : 502 error | Later the app fails. With use_stale NGINX serves the old copy instead of an error.
+ref: docs | ngx_http_proxy_module: proxy_cache | nginx.org | https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_cache
+
+== Rate limiting with limit_req and burst
+kind: rate-limit, load-shedding
+when: An API or login page must stay available for all clients when one client or script sends far too many requests.
+how: limit_req_zone defines a shared memory zone keyed by the client address, with a rate such as 10 requests per second. NGINX tracks each key with the leaky bucket method: requests leave the bucket at the set rate.
+limit_req then applies the zone to a location. With burst=20, up to 20 requests above the rate are held in a queue and released at the set rate. With nodelay they are served at once but use up the burst. Requests beyond the burst get an error, status 503 by default, or 429 if you set limit_req_status 429.
+limit_conn limits the number of concurrent connections per key in the same way.
+The zone is per NGINX instance. With 4 instances behind a balancer, the total allowed is about 4 times the rate. Behind a CDN, key on the real client address from a trusted header, or all clients share one limit.
+used: Login and password reset pages; public APIs; protection of expensive search endpoints.
+avoid: When you need exact, per-account quotas across many nodes; use a shared counter store or an API gateway with quota features.
+flow:
+  Client A [client] -> NGINX [svc: limit_req zone] : 30 req in 1 s | A script sends 30 requests in one second. The limit is 10 per second.
+  NGINX -> Zone [cache: shared memory] : lookup key = IP | NGINX finds the leaky bucket state of this address.
+  Zone -> NGINX : 10 ok, 20 in burst | 10 pass at once. The next 20 are queued and released at 10 per second.
+  NGINX -x> Client A : 429 for the rest | Requests beyond rate plus burst are refused at once.
+  NGINX -> App [svc: protected] : requests at 10 per s | The app sees a steady stream at the set rate.
+  Client B [client] -> NGINX : 3 req in 1 s | Other clients have their own key, so their traffic is not touched.
+ref: docs | ngx_http_limit_req_module | nginx.org | https://nginx.org/en/docs/http/ngx_http_limit_req_module.html
+
+@@ otel
+== Agent and gateway collector tiers
+kind: observability-pipeline, sidecar
+when: Many services emit traces, metrics and logs, and you want one place to add metadata, filter and route them to back ends.
+how: Each application uses an OpenTelemetry SDK that sends data by OTLP to a local collector, the agent. The agent runs next to the app, as a sidecar or one per node (a DaemonSet). It is cheap and adds host and pod attributes with the resource detection and k8s attributes processors.
+Agents forward to a gateway tier: a pool of collectors behind a load balancer. The gateway holds the central rules: batching, memory limit, filtering, redaction of secrets, and routing. It exports to one or many back ends, for example Tempo, Prometheus-compatible stores, or a vendor.
+A back end can then be replaced by changing the gateway config, not the apps. Use the memory_limiter processor first and the batch processor last in a pipeline. Add a persistent queue if data must survive a restart.
+used: Kubernetes platforms with a collector DaemonSet plus a gateway deployment; teams that send the same data to two vendors during a migration.
+avoid: For a small system; one collector, or exporting straight from the SDK, is enough.
+flow:
+  Orders service [svc: OTel SDK] -> Node agent [svc: Collector DaemonSet] : OTLP spans and metrics | The app sends data to localhost, so its export is fast and cannot block requests.
+  Node agent -> Gateway [svc: Collector pool] : OTLP, batched | The agent adds pod attributes and sends batches to the gateway.
+  Gateway -> Trace store [store: Tempo or vendor] : traces | The gateway removes secrets from attributes and exports traces.
+  Gateway -> Metrics store [store: Prometheus-like] : metrics | Metrics go to a different back end through the same gateway.
+  Gateway -x> Trace store : back end down | The trace back end is down. The gateway queues data until its memory limit.
+  Gateway -x> Node agent : refuse, backpressure | When full, the gateway refuses data, and the agent retries later.
+ref: docs | Collector deployment patterns | OpenTelemetry | https://opentelemetry.io/docs/collector/deployment/
+ref: docs | Collector architecture | OpenTelemetry | https://opentelemetry.io/docs/collector/architecture/
+
+== Tail-based sampling behind a trace-aware load balancer
+kind: observability-pipeline, consistent-hashing
+when: Storing every trace costs too much, but you must keep all slow traces and all error traces.
+how: Head sampling decides at the first span, before it knows how the trace ends. Tail sampling waits until the whole trace is collected, then keeps it or drops it by rule: keep all traces with an error, keep all over 2 seconds, and keep 5 percent of the rest.
+All spans of one trace must reach the same collector. The first tier uses the loadbalancing exporter, which hashes the trace id to choose a collector in the second tier. The second tier runs the tail_sampling processor. It holds spans in memory for a decision wait time, for example 30 seconds.
+Memory is the cost: spans of all active traces are held for the wait time. If the second tier changes size, the hash changes and some traces are split. Plan scale changes with care.
+Spans that arrive after the decision are not seen by the policy, so a long trace can be cut.
+used: Teams that keep traces for errors and latency tails only; OpenTelemetry Collector contrib components loadbalancing exporter and tail_sampling processor.
+avoid: When traffic is small, or cost is not an issue; use a fixed percentage at the head with a simple sampler.
+flow:
+  Services [svc: SDK 100 percent] -> LB collectors [svc: loadbalancing exp] : all spans | The first tier receives every span from every service.
+  LB collectors -> Sampler 1 [svc: tail_sampling], Sampler 2 [svc: tail_sampling] : hash of trace id | All spans of one trace go to the same sampler, so it can see the full trace.
+  * Sampler 1: holding traces 30 s | The sampler holds the spans of each trace in memory until the trace is probably complete.
+  Sampler 1 -> Trace store [store: kept traces] : errors, slow, 5 percent | Only traces that match a policy are exported.
+  Sampler 2 -x> Trace store : normal fast trace dropped | A normal, fast trace is dropped. This is where the savings come from.
+ref: docs | Sampling | OpenTelemetry | https://opentelemetry.io/docs/concepts/sampling/
+
+== Trace context propagation across sync and async hops
+kind: none
+when: One user action crosses many services and a message queue, and you need to see it as one trace.
+how: The first service creates a trace id (16 bytes) and a span id (8 bytes). The SDK puts them in the W3C traceparent header, for example 00-<trace-id>-<span-id>-01. It is added to every outgoing HTTP or gRPC call by the client instrumentation.
+The next service reads the header, and its new span uses the same trace id with the incoming span as its parent. The result is a tree of spans that share one trace id.
+For queues, the producer writes traceparent into the message headers. The consumer reads it and either continues the trace or starts a new trace linked to the old one. Span links are better for batch consumers that handle many messages at once.
+Baggage can carry small key-value pairs, such as a tenant id, to all services. Do not put secrets in it, since it travels in plain text on every call.
+used: Any OpenTelemetry-instrumented system; W3C Trace Context is also used by Jaeger, Zipkin bridges and cloud tracing products.
+avoid: When traffic goes through a third party that drops headers; add a trace id to your own request id log field.
+flow:
+  Web API [svc: root span] -> Order service [svc: child span] : traceparent header | The API starts the trace. The header carries trace id and parent span id.
+  Order service -> Orders topic [log: message headers] : event + traceparent | The producer copies the trace context into the message headers.
+  Orders topic -> Email worker [svc: consumer span] : event + traceparent | The consumer reads the header and links its span to the same trace.
+  Order service -> Collector [svc: OTel Collector] : spans | Each service sends its own spans to the collector, not to each other.
+  Email worker ~> Collector : span (same trace id) | The backend joins spans by trace id into one view.
+ref: spec | Trace Context | W3C, 2021 | https://www.w3.org/TR/trace-context/
+ref: docs | Context propagation | OpenTelemetry | https://opentelemetry.io/docs/concepts/context-propagation/
+
+@@ prometheus
+== Pull-based scraping with service discovery
+kind: service-discovery, observability-pipeline
+when: Instances come and go all the time, and you want metrics without each app knowing where to send them.
+how: Each service exposes its current metrics as text on an HTTP endpoint, usually /metrics. Prometheus fetches ("scrapes") each endpoint at a fixed interval, for example every 15 seconds, and stores the samples in its local time series database.
+Targets are not written by hand. Prometheus asks a discovery source, such as the Kubernetes API, Consul or EC2, for the list of instances. Relabeling rules keep or drop targets and turn labels like pod and namespace into metric labels.
+The scrape itself is a health check. The built-in metric up is 1 if the scrape worked and 0 if not, so a dead service shows up with no extra code.
+A few million active series per server is a common size, so split by team or region when you get close. Keep label values low in variety: a user id label creates millions of series.
+used: Standard monitoring of Kubernetes clusters (kube-prometheus-stack); node_exporter on hosts; exporters for databases and brokers.
+avoid: For short batch jobs or devices behind firewalls; use the Pushgateway for batch jobs, or a push agent with remote write.
+flow:
+  Prometheus [svc: scrape loop] -> Kubernetes API [svc: discovery] : list pods with annotation | Prometheus asks which pods exist and keeps the ones with a metrics port.
+  Kubernetes API -> Prometheus : 40 targets | The target list updates when pods start or stop.
+  Prometheus -> Checkout pod 1 [svc: /metrics], Checkout pod 2 [svc: /metrics] : GET /metrics every 15 s | Each target returns its counters and gauges as plain text.
+  Checkout pod 2 -x> Prometheus : timeout | One scrape fails. Prometheus records up = 0 for that target.
+  Prometheus -> TSDB [db: local 15 d] : append samples | Samples are written to the local time series database with their timestamps.
+ref: docs | Prometheus overview | Prometheus documentation | https://prometheus.io/docs/introduction/overview/
+ref: docs | When to use the Pushgateway | Prometheus documentation | https://prometheus.io/docs/practices/pushing/
+
+== Recording rules and alerts through Alertmanager
+kind: pre-aggregation, observability-pipeline
+when: Dashboards and alerts use expensive queries, and the team needs notices that are grouped and not repeated.
+how: A recording rule runs a PromQL query at each evaluation interval, such as every 30 seconds, and saves the result as a new series. For example, job:http_requests:rate5m sums request rates over many pods. Dashboards then read one cheap series, not thousands.
+Alerting rules are queries with a condition and a for: duration, such as error ratio above 5 percent for 10 minutes. The for: time avoids alerts on short spikes. When a rule fires, Prometheus sends the alert to Alertmanager.
+Alertmanager groups alerts with similar labels into one message, removes duplicates from several Prometheus servers, applies silences and inhibit rules (a cluster-down alert hides its pod alerts), and routes by label to Slack, e-mail or a paging service.
+Alert on symptoms that users feel, like error ratio and latency, more than on causes like CPU.
+used: SRE alerting on SLO burn rate; kube-prometheus-stack rules; two Prometheus servers sending to a clustered Alertmanager.
+avoid: When alert logic needs complex joins with business data; do it in a stream job or a data warehouse and send the result as a metric.
+flow:
+  Prometheus [svc: rule engine] -> TSDB [db] : record job:http:rate5m | A recording rule stores a pre-computed series every 30 seconds.
+  Grafana [client: dashboard] -> TSDB : query recorded series | The dashboard reads the cheap series instead of summing thousands.
+  * Prometheus: alert pending | Error ratio is over 5 percent. The alert stays pending until the for: time of 10 minutes ends.
+  Prometheus -> Alertmanager [svc: group and dedupe] : alert HighErrorRate | The alert is now firing and is sent to Alertmanager.
+  Alertmanager -> On-call chat [svc: Slack or pager] : 1 grouped notice | Fifty pod alerts become one message. Silences and inhibits apply.
+ref: docs | Alertmanager | Prometheus documentation | https://prometheus.io/docs/alerting/latest/alertmanager/
+ref: docs | Recording rules | Prometheus documentation | https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/
+
+== Remote write to long-term storage with an HA pair
+kind: tiered-storage, observability-pipeline
+when: You need metrics for months or years, from many clusters, in one place that can answer global queries.
+how: A Prometheus server keeps data on local disk for a short time, for example 15 days. It also forwards every sample by remote write to a long-term back end such as Thanos, Grafana Mimir or Cortex. These store blocks in object storage such as S3 and are cheap for long retention.
+For high availability, run two identical Prometheus servers that scrape the same targets. Both write to the back end, and the back end removes the duplicates, using an external label such as replica. If one server dies, the other keeps the data complete.
+A global query layer reads recent data from the Prometheus servers and old data from object storage. Downsampling, as in Thanos, keeps long ranges fast.
+Remote write uses a queue with retries. If the back end is slow for long, the queue fills and samples are dropped, so alert on the remote write lag.
+used: Thanos and Mimir deployments; managed services that accept Prometheus remote write; multi-cluster monitoring with one query endpoint.
+avoid: For one small cluster with short retention; local storage alone is simpler.
+flow:
+  Prometheus A [svc: replica a] -> Mimir [svc: remote write] : remote write samples | Replica A sends every sample to the long-term back end.
+  Prometheus B [svc: replica b] -> Mimir : remote write samples | Replica B sends the same samples, with a different replica label.
+  Mimir -> Object store [lake: blocks on S3] : upload blocks | Mimir keeps one copy after it removes duplicates, and stores compact blocks.
+  * Prometheus A: down | Replica A fails. Replica B keeps the series complete.
+  Grafana [client] -> Mimir : query last 1 year | A single query reads old data from object storage.
+  Prometheus A -x> Mimir : queue full, drop | If the back end is slow for long, the sender's queue overflows and drops samples.
+ref: docs | Remote-write specification | Prometheus documentation | https://prometheus.io/docs/specs/prw/remote_write_spec/
+ref: docs | Storage: remote storage integrations | Prometheus documentation | https://prometheus.io/docs/prometheus/latest/storage/#remote-storage-integrations
+
+@@ s3
+== Pre-signed URL direct upload
+kind: valet-key, claim-check
+when: Users or devices upload large files, and you do not want the bytes to pass through your own servers.
+how: The client asks your API for permission to upload. The API checks who the user is and signs an S3 PUT request with its own credentials. The signed URL contains the bucket, the key and an expiry such as 5 minutes. Nobody needs to give the client AWS keys.
+The client sends the file directly to S3 with HTTP PUT. Large files use multipart upload, with parts of 5 MB to 5 GB, which can go in parallel and be retried one by one. The API gives a signed URL for each part, or the client uses temporary credentials.
+After the upload S3 can send an event, and your back end then processes the object. The database stores only the key. This is the claim-check pattern.
+Choose the key yourself, for example uploads/<user>/<uuid>, so users cannot overwrite each other. Use a bucket policy and a content-length condition in a signed POST to limit size.
+used: Photo, video and document uploads in web and mobile apps; ad-creative and log-file uploads from partners; data export downloads.
+avoid: When the server must check the content before it is stored; stream through your service or scan the object after the upload.
+flow:
+  Mobile app [client] -> API [svc: checks user] : request upload slot | The user asks to upload a 200 MB video.
+  API -> Mobile app : signed PUT URL, 5 min | The API signs a URL for one key, valid for 5 minutes.
+  Mobile app -> S3 bucket [store: uploads/] : PUT parts in parallel | The file goes straight to S3 as multipart upload. Your servers carry no bytes.
+  S3 bucket -> Event queue [queue: SQS] : ObjectCreated | S3 tells the back end that a new object exists.
+  Event queue -> Processor [svc: transcoder] : key only | The processor gets the key, reads the file from S3 and works on it.
+  Mobile app -x> S3 bucket : PUT after expiry: 403 | A late upload fails, so the URL is useless after the time limit.
+ref: docs | Sharing objects with presigned URLs | AWS documentation | https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html
+
+== Data lake on S3 with an open table format
+kind: open-table-format, medallion
+when: Many engines (Spark, Trino, Athena, Flink) must share large analytic tables, cheaply, with safe concurrent writes.
+how: Data lives as immutable Parquet files in S3 under partition prefixes such as dt=2026-10-01/. Parquet is columnar, so queries read only the needed columns and skip files by their min and max statistics.
+S3 has no rename and no multi-object transaction. A table format such as Apache Iceberg or Delta Lake adds a metadata layer on top. A commit writes new data files, then a new manifest and snapshot, then swaps one pointer to the new snapshot with an atomic condition. Readers always see a full snapshot, never half a write.
+Layers follow the medallion idea: raw data lands in bronze, cleaned data in silver, business tables in gold. Each layer is a set of tables in the same bucket or in separate buckets.
+Small files are the usual problem. A compaction job merges them into files of 128 MB to 512 MB. Old snapshots are expired so that unreferenced files can be removed.
+used: Netflix created Iceberg; lakehouses on Databricks (Delta), Athena, Trino and Spark; ad-tech event lakes with daily partitions.
+avoid: For low-latency point lookups or many small updates; use a database or key-value store.
+flow:
+  Stream job [svc: Flink or Spark] -> Bronze [lake: raw Parquet on S3] : append batches | The job writes raw events as immutable files.
+  Bronze -> Silver [lake: cleaned table] : dedupe, typed | A batch job cleans the data and commits a new table snapshot.
+  Silver -> Gold [lake: daily aggregates] : group by campaign | A second job builds small business tables for reports.
+  Catalog [db: current snapshot] -> Gold : atomic pointer swap | A commit changes one pointer. Readers see the old or the new table, never a mix.
+  Analyst [client: Trino or Athena] -> Gold : SELECT, partition pruning | The query reads only matching partitions and columns.
+  Compactor [svc: maintenance job] ~> Silver : merge small files | Small files are merged in the background so scans stay fast.
+ref: paper | Delta Lake: High-Performance ACID Table Storage over Cloud Object Stores | Armbrust et al., VLDB 2020 | https://www.vldb.org/pvldb/vol13/p3411-armbrust.pdf
+ref: spec | Apache Iceberg table spec | Apache Iceberg | https://iceberg.apache.org/spec/
+
+== Lifecycle tiering of aging data
+kind: tiered-storage, claim-check
+when: Most data is read often only in the first weeks, and you want to cut storage cost without losing old data.
+how: S3 has storage classes with different price and access features. S3 Standard is for hot data. Standard-IA and Glacier Instant Retrieval cost less per GB but charge for retrieval. Glacier Flexible Retrieval and Deep Archive are the cheapest, and reads take minutes to hours.
+A lifecycle rule moves objects by age, for example to Standard-IA after 30 days, to Glacier after 90 days, and deletes them after 7 years. Rules work by prefix or tag. S3 Intelligent-Tiering moves objects by itself, based on access, if the pattern is unknown.
+Check the details before you set a rule: very small objects have a minimum billable size, and there are minimum storage durations, so moving many tiny files can cost more. For tiny files, merge them first.
+Versioning plus a rule to expire old versions and incomplete multipart uploads stops silent growth of the bill.
+used: Log, backup and compliance archives on AWS; raw event data in data lakes; media libraries.
+avoid: For data with unpredictable reads and many small objects; use Intelligent-Tiering or keep it in Standard.
+flow:
+  App [client] -> Logs prefix [store: S3 Standard] : PUT daily logs | New objects start in the hot class.
+  Lifecycle engine [svc: S3 rules] -> Logs prefix : day 30: move to IA | After 30 days a rule moves objects to a cheaper class.
+  Lifecycle engine -> Archive [store: Glacier] : day 90: move to Glacier | After 90 days objects move to archive storage.
+  Auditor [user] -> Archive : restore request | An old object must be restored first. This takes minutes to hours.
+  Archive -> Restored copy [store: temp Standard] : available 7 days | The restored copy is kept for a set number of days, then removed.
+  Lifecycle engine -x> Archive : day 2555: delete | After 7 years the rule deletes the object. Cost stops.
+ref: docs | Managing the lifecycle of objects | AWS documentation | https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html
+
+@@ terraform
+== Plan, review and apply pipeline from Git
+kind: gitops, immutable-infra
+when: Several engineers change cloud infrastructure, and every change needs review, a record and a safe way to apply.
+how: Infrastructure is described in .tf files in a Git repository. An engineer opens a pull request. The CI job runs terraform fmt, validate and plan, and posts the plan as a comment. The plan lists what will be created, changed or destroyed.
+Reviewers read the plan, not only the code. After the merge, a second job runs terraform apply with the saved plan file, so what is applied is what was reviewed. Credentials live in the CI system, often as short-lived OIDC tokens, not on laptops.
+Terraform compares three things: the configuration, the state file and the real resources it reads from the provider APIs. Drift, such as a manual change in the console, shows up in the next plan. A scheduled plan can alert on drift.
+Changing a few resources is safe and quick. Replacing a database or a network by accident is not, so look for lines that say "must be replaced".
+used: Atlantis, Terraform Cloud and HCP Terraform, GitHub Actions and GitLab CI workflows; platform teams that manage AWS, Azure and Google Cloud accounts.
+avoid: For one-off experiments or rapidly changing app config; use a script, or a tool that is meant for continuous reconciliation such as Crossplane.
+flow:
+  Engineer [user] -> Git repo [store: .tf files] : pull request | The engineer proposes a change to the infrastructure code.
+  Git repo -> CI runner [svc: terraform plan] : webhook | CI starts and runs fmt, validate and plan.
+  CI runner -> Cloud API [svc: AWS or GCP] : read current resources | Terraform reads the real resources to compare them with the state.
+  CI runner -> Git repo : plan comment | The plan is posted in the pull request. Reviewers read what will change.
+  Git repo -> CI runner : merge, apply plan | After approval and merge, the same plan file is applied.
+  CI runner -> Cloud API : create, update | Terraform calls the cloud APIs in dependency order and updates the state.
+ref: docs | Terraform introduction | HashiCorp | https://developer.hashicorp.com/terraform/intro
+
+== Reusable modules stamped per environment
+kind: deployment-stamp, plugin-arch
+when: The same stack must exist in dev, staging and production, or in many regions, with small differences between copies.
+how: A module is a folder of Terraform code with input variables and outputs, for example a "service" module that creates a VPC part, a load balancer, an autoscaling group and alarms. The platform team versions it, in a Git tag or a registry.
+Each environment has its own root configuration that calls the module with its own values, such as instance size and region. Each root has its own state file. So a change in dev can never touch production state, and one failed apply has a small blast radius.
+Teams read outputs of other roots through data sources or the remote state data source, such as the network IDs. Keep the layers small and ordered: network, then data, then apps.
+A module change must be rolled out copy by copy. Pin the version in each environment and upgrade dev first.
+used: Platform teams with many accounts and regions; the public Terraform Registry modules; landing-zone setups for AWS Organizations.
+avoid: For a single small environment; plain resources are clearer than a module with one use.
+flow:
+  Module repo [store: service v1.4] -> Dev root [svc: state dev] : module source tag v1.4 | The dev environment pins module version 1.4.
+  Module repo -> Prod root [svc: state prod] : module source tag v1.3 | Production still uses 1.3 until dev has proved 1.4.
+  Dev root -> Dev account [svc: AWS dev] : apply, small sizes | Dev gets the same stack with small instances.
+  * Prod root: upgrade to v1.4 | After dev works, the production root moves to 1.4 by a reviewed change.
+  Prod root -> Prod account [svc: AWS prod] : apply, large sizes | Production gets the change with its own values and its own state.
+  Dev root -x> Prod account : cannot touch | A mistake in dev cannot change production, because state and credentials are separate.
+ref: docs | Modules | HashiCorp | https://developer.hashicorp.com/terraform/language/modules
+
+== Remote state with locking
+kind: none
+when: More than one person or pipeline runs Terraform for the same infrastructure, and two runs must never write the state at once.
+how: The state file maps your configuration to real resource ids. It also holds values that may be secret. It must be shared, so it is stored in a remote backend, for example an S3 bucket with versioning and encryption, or HCP Terraform.
+Before plan or apply that writes, Terraform takes a lock. The S3 backend can use a lock file in the bucket (use_lockfile); older setups use a DynamoDB table. If a second run starts, it fails at once with the lock holder's information. It does not wait forever and does not corrupt the file.
+Terraform writes the new state after each change, so a crash in the middle keeps a record of what was created. If a run is killed, the lock may stay, and a person can use force-unlock after checking that no run is active.
+Versioning on the bucket lets you go back to an older state. Keep access narrow: anyone who reads state can read its secrets.
+used: Almost all team setups; S3 plus lock, Google Cloud Storage, Azure Blob Storage, HCP Terraform, and the Postgres backend.
+avoid: A local state file for shared work; also avoid one giant state for everything, which makes every lock wait for every team.
+flow:
+  Pipeline A [svc: apply] -> State bucket [store: S3 versioned] : create lock file | Pipeline A takes the lock before it reads and writes the state.
+  Pipeline B [svc: apply] -x> State bucket : lock exists | Pipeline B tries to lock and fails at once. It shows who holds the lock.
+  Pipeline A -> Cloud API [svc: AWS] : create resources | Pipeline A changes the real resources.
+  Pipeline A -> State bucket : write new state v42 | The new state is saved as a new object version.
+  Pipeline A -> State bucket : release lock | The lock file is removed.
+  Pipeline B -> State bucket : retry, lock ok | Pipeline B now plans against state v42, which includes A's changes.
+ref: docs | State | HashiCorp | https://developer.hashicorp.com/terraform/language/state
+ref: docs | S3 backend | HashiCorp | https://developer.hashicorp.com/terraform/language/backend/s3
+
+@@ vault
+== Dynamic database credentials with leases
+kind: lease, zero-trust
+when: Applications need database access, and long-lived shared passwords are a risk you want to remove.
+how: Vault holds one privileged account for the database, set up once in the database secrets engine. The app does not get that password. It asks Vault for credentials for a role, such as "orders-readonly".
+Vault connects to the database and runs the role's creation statement. This makes a new user with a random password and the allowed grants. It returns the user and password with a lease, for example 1 hour. The app uses them and renews the lease while it runs.
+When the lease ends or is revoked, Vault drops the user. A leaked credential is therefore short-lived and tied to one instance. Audit logs show which identity asked for which credentials.
+The database must handle the extra users, and connections must be re-opened when credentials change. Use an agent or library that renews and reloads for the app.
+used: PostgreSQL, MySQL, MongoDB and cloud database roles with Vault database secrets engines; many platform teams that want no static passwords.
+avoid: For legacy apps that cannot reload credentials, or databases with a low limit on users; use rotated static roles instead.
+flow:
+  Orders app [svc] -> Vault [svc: DB secrets engine] : read creds orders-readonly | The app proves its identity and asks for credentials for one role.
+  Vault -> Postgres [db: admin account] : CREATE ROLE v-orders-x7k | Vault creates a new user with a random password and read-only rights.
+  Vault -> Orders app : user, password, lease 1 h | The app gets the new credentials and a lease ID.
+  Orders app -> Postgres : queries as v-orders-x7k | The app works with its own temporary user.
+  Orders app ~> Vault : renew lease | While it runs, the app renews the lease before it ends.
+  Vault -x> Postgres : DROP ROLE at lease end | When the lease is not renewed or is revoked, Vault removes the user.
+ref: docs | Database secrets engine | HashiCorp | https://developer.hashicorp.com/vault/docs/secrets/databases
+
+== Encryption as a service with the Transit engine
+kind: envelope-encryption, zero-trust
+when: Many applications must encrypt fields, but none should hold the encryption keys.
+how: The Transit secrets engine keeps named keys inside Vault. The key never leaves it. The app sends plaintext (base64) to the encrypt endpoint of a key. Vault returns ciphertext that starts with a version tag such as vault:v1:.
+The app stores the ciphertext in its own database. To read, it sends the ciphertext to decrypt and gets the plaintext back, if its policy allows it. Rotation adds a new key version. New data uses the latest version, and old ciphertext still decrypts. A rewrap call moves old ciphertext to the new key without showing the plaintext.
+For large files, do not send them to Vault. Ask for a data key (generate data key), encrypt the file locally and store the wrapped key next to it. This is envelope encryption.
+Each call is a network hop, so batch many values in one request. Plan for Vault being available, or failures stop reads and writes.
+used: Encrypting card numbers, personal data and tokens in application databases; services that need key rotation without code changes.
+avoid: For very high-rate encryption on hot paths; use local envelope encryption with cached data keys, or a cloud KMS.
+flow:
+  Payments app [svc] -> Vault Transit [svc: key card-key v3] : encrypt PAN | The app sends the card number. The key stays in Vault.
+  Vault Transit -> Payments app : vault:v3:8SDd3... | Vault returns ciphertext tagged with the key version.
+  Payments app -> Payments DB [db: ciphertext only] : store ciphertext | The database never sees plaintext or keys.
+  Admin [user] -> Vault Transit : rotate key to v4 | New writes will use version 4. Old data still decrypts.
+  Rewrap job [svc] -> Vault Transit : rewrap v3 to v4 | A job moves old ciphertext to the new key with no plaintext shown.
+  Reporting app [svc] -x> Vault Transit : decrypt denied | A policy without decrypt rights is refused.
+ref: docs | Transit secrets engine | HashiCorp | https://developer.hashicorp.com/vault/docs/secrets/transit
+
+== Kubernetes auth with a Vault Agent sidecar
+kind: sidecar, federated-identity
+when: Pods need secrets, and you want to avoid putting them in images, environment files or Kubernetes Secrets.
+how: A pod has a service account. Kubernetes gives the pod a signed token for it. A Vault Agent sidecar (added by an injector webhook, or you add it) sends this token to Vault's Kubernetes auth method.
+Vault asks the Kubernetes API to validate the token. It checks the service account name and namespace against a role. If they match, Vault returns a Vault token with a policy, for example read on secret/data/orders.
+The agent fetches the secrets, writes them to a shared in-memory volume as files, and keeps the lease and token fresh. When a secret changes, the agent renders the file again, and the app can reload. The app only reads a file and has no Vault code.
+Other options are the Secrets Store CSI driver and the Vault Secrets Operator. They fit if you do not want a sidecar in each pod.
+used: Platform teams on Kubernetes using Vault; the injector is used in many clusters to give apps secrets as files.
+avoid: When sidecar cost per pod is a problem or jobs are short; use the CSI driver or the operator, which sync secrets without a sidecar.
+flow:
+  Pod init [svc: Vault Agent] -> Vault [svc: k8s auth method] : login role orders | The agent logs in and sends its token and a role name.
+  Vault -> Kubernetes API [svc: TokenReview] : TokenReview | Vault asks Kubernetes if the token is real and which account it belongs to.
+  Vault -> Pod init : client token, 1 h | The role matches. Vault returns a token with a narrow policy.
+  Pod init -> Shared volume [store: tmpfs files] : render secrets file | The agent reads the secrets and writes them to a memory volume.
+  Orders app [svc] -> Shared volume : read file | The app reads the file. It has no Vault code.
+ref: docs | Kubernetes auth method | HashiCorp | https://developer.hashicorp.com/vault/docs/auth/kubernetes
+ref: docs | Vault Agent | HashiCorp | https://developer.hashicorp.com/vault/docs/agent-and-proxy/agent
+
+@@ zookeeper
+== Leader election with ephemeral sequential znodes
+kind: leader-election, lease, heartbeat
+when: Several identical processes must pick one leader, and pick a new one at once when it dies.
+how: Each candidate creates a znode under /election with the flags ephemeral and sequential. ZooKeeper adds a growing number, for example /election/n_0000000007. An ephemeral znode is deleted when the client session ends.
+The candidate with the lowest number is the leader. Every other candidate watches only the znode just before its own, not the leader. When that znode goes away, the candidate checks again and may now be the lowest. This avoids a herd effect: only one client wakes up on a change.
+The session is kept alive by heartbeats. If the leader pauses or loses its connection longer than the session timeout, for example 10 seconds, ZooKeeper deletes its znode, and the next candidate takes over.
+A paused old leader may still think it leads. Pass a fencing value, such as the zxid or the znode number, to storage, so that old leaders are rejected.
+used: HBase master election; Hadoop HDFS NameNode failover with the ZKFC; Apache Curator's LeaderLatch and LeaderSelector recipes.
+avoid: When you already run Raft-based tools, such as etcd or Kubernetes; use their lease or lock feature.
+flow:
+  Node A [svc: candidate] -> ZooKeeper [svc: ensemble of 3] : create ephemeral seq | Node A gets /election/n_0000000007, the lowest number, so it is the leader.
+  Node B [svc: candidate] -> ZooKeeper : create ephemeral seq | Node B gets n_0000000008 and watches only n_0000000007.
+  Node C [svc: candidate] -> ZooKeeper : create ephemeral seq | Node C gets n_0000000009 and watches n_0000000008.
+  Node A ~> ZooKeeper : heartbeat | Node A keeps its session alive with pings.
+  Node A -x> ZooKeeper : session expires | Node A hangs for longer than the timeout, and ZooKeeper deletes its znode.
+  ZooKeeper -> Node B : watch fired: n_7 deleted | Node B is now the lowest and becomes the leader. Node C is not woken.
+ref: paper | ZooKeeper: Wait-free coordination for Internet-scale systems | Hunt et al., USENIX ATC 2010 | https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf
+ref: docs | ZooKeeper recipes and solutions | Apache ZooKeeper | https://zookeeper.apache.org/doc/current/recipes.html
+
+== Consistent core holding metadata of a data cluster
+kind: consistent-core, heartbeat
+when: A large data system needs one small, strongly consistent place for membership, ownership and configuration.
+how: A ZooKeeper ensemble of 3 or 5 servers keeps a small tree of znodes in memory. Writes go to the leader, which orders them and commits when a majority has logged them (the ZAB protocol). Reads can be served by any server and may be slightly old, unless the client calls sync first.
+The big data cluster does not put data into ZooKeeper. It stores only small facts: which node is the master, which region server serves which range, which nodes are alive, and which settings are current. Each worker registers an ephemeral znode, so a dead worker disappears from the list.
+Watches tell clients about changes at once, so they need not poll. Because writes need a majority, an ensemble of 5 survives 2 failures. Keep data per znode small (under 1 MB by default), and keep the write rate low.
+used: HBase and older Hadoop HA setups; Apache Solr (SolrCloud); ClickHouse replicated tables with ZooKeeper or ClickHouse Keeper. Kafka used it until KRaft replaced it, and Kafka 4.0 removed it.
+avoid: For new Kafka clusters, which use KRaft; also avoid it as a store for large or fast-changing data.
+flow:
+  Region server 1 [svc: HBase] -> ZooKeeper [svc: leader + 2 followers] : create ephemeral /rs/rs1 | Each region server registers itself with an ephemeral znode.
+  Region server 2 [svc: HBase] -> ZooKeeper : create ephemeral /rs/rs2 | A second server joins the live list.
+  ZooKeeper -> HBase master [svc: watches /rs] : children changed | The master is told about the new members at once.
+  HBase master -> ZooKeeper : write /master state | The write is ordered by the leader and committed by a majority.
+  Region server 2 -x> ZooKeeper : session lost | The server dies, and its znode is deleted.
+  ZooKeeper -> HBase master : watch: rs2 gone | The master moves the regions of server 2 to server 1.
+ref: docs | ZooKeeper overview | Apache ZooKeeper | https://zookeeper.apache.org/doc/current/zookeeperOver.html
+
+== Configuration and discovery with watches
+kind: service-discovery, external-config
+when: A set of services must find each other and pick up setting changes without restarts, and you already run ZooKeeper.
+how: Each service instance registers an ephemeral znode under a path such as /services/payments, holding its host and port. A client lists the children to find all live instances, and sets a watch on the path.
+When an instance dies, its session ends and its znode is removed. The watch fires, and the client reads the new list. Watches fire only once, so the client must set the watch again after each event, and read the data again at the same time. Curator's cache recipes do this for you.
+Shared settings are plain znodes. An operator changes the data of /config/payments/limits. Every instance that watches it gets an event and reads the new value, with a version number. A conditional set uses that version to avoid lost updates.
+Clients keep a local copy and keep using the last known list if ZooKeeper is not reachable for a short time.
+used: Apache Dubbo registries; the Apache Curator service discovery recipe; SolrCloud configuration.
+avoid: For new systems on Kubernetes or Consul, which have discovery built in; also for very large fleets with high churn, which load the ensemble.
+flow:
+  Payments 1 [svc] -> ZooKeeper [svc: ensemble] : create /payments/p1 | Each instance registers its address with an ephemeral znode.
+  Checkout [svc: client] -> ZooKeeper : getChildren + watch | The client reads the list of live payments instances and sets a watch.
+  Checkout -> Payments 1 : call | The client calls an instance from its local list.
+  Payments 1 -x> ZooKeeper : crash, session ends | The session ends, and the znode is deleted.
+  ZooKeeper -> Checkout : watch fired | The client is told the children changed.
+  Checkout -> ZooKeeper : getChildren + new watch | It reads the new list and sets the watch again, because watches fire once.
+ref: docs | ZooKeeper programmer's guide: watches | Apache ZooKeeper | https://zookeeper.apache.org/doc/current/zookeeperProgrammers.html
+
+@@ cpp
+== RAII ownership of memory, locks and handles
+kind: none
+when: Code must free memory, close files and release locks on every path, including errors and exceptions.
+how: RAII means that an object owns a resource: it takes the resource in its constructor and releases it in its destructor. C++ runs the destructor of every local object when the scope ends, by return, break or exception.
+Standard types do this for you. std::unique_ptr owns one heap object and frees it. std::shared_ptr counts owners and frees at zero. std::lock_guard locks a mutex and unlocks it at scope end. std::fstream closes the file. std::vector frees its buffer.
+The rule in practice: no raw new and delete in application code, and no manual unlock or close. Pass ownership by moving (std::move). Pass a plain reference or raw pointer only to say "use, do not own".
+RAII needs destructors that never throw. Beware of reference cycles with shared_ptr: use weak_ptr to break them. Cost: unique_ptr is the size of a pointer and has no run-time overhead.
+used: The C++ standard library; Chromium, LLVM and game engines; any server that handles many connections and must not leak handles.
+avoid: In code that cannot run destructors, such as longjmp-style C APIs or objects in shared memory between processes; manage lifetime by explicit protocol.
+flow:
+  Handler [svc: function scope] -> Lock guard [svc: owns mutex] : construct, lock | The guard locks the mutex when it is created.
+  Handler -> File object [store: owns fd] : open file | The file object holds the file descriptor.
+  Handler -> Buffer [store: unique_ptr 1 MB] : allocate | The buffer is freed when it goes out of scope.
+  * Handler: exception thrown | Something fails in the middle of the work.
+  * Handler: stack unwinding | The runtime leaves the scope. Destructors run in reverse order.
+  Buffer -> File object : freed, closed | The buffer is freed, the file is closed and the mutex is unlocked. Nothing leaks.
+ref: docs | C++ Core Guidelines: resource management | Stroustrup & Sutter | https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#r-resource-management
+
+== Lock-free ring buffer between latency-critical threads
+kind: producer-consumer, pipeline-stages
+when: One thread must hand work to another in microseconds, without locks or system calls, as in feed handlers and audio.
+how: A single-producer single-consumer (SPSC) ring buffer is a fixed array with two counters: head, written only by the consumer, and tail, written only by the producer. Since each counter has one writer, no lock is needed.
+The producer writes the item into the slot at tail, then publishes the new tail with a release store. The consumer reads tail with an acquire load, reads the item, and then publishes head. The memory order ensures that the consumer never sees the new tail before the item.
+Use a size that is a power of two, so wrap-around is a bit mask. Put head and tail on separate cache lines (alignas(64)), or the two cores fight over one line (false sharing). The buffer is bounded, so a full buffer means the producer must drop or spin. That is backpressure.
+This is hard to get right. Use a tested library and test with ThreadSanitizer.
+used: Market-data and trading systems; audio callbacks; logging libraries that move text to a writer thread; the LMAX Disruptor idea in other languages.
+avoid: When there are many producers or consumers, or latency in microseconds is not needed; use a mutex-based queue or a library MPMC queue.
+flow:
+  Network thread [svc: producer] -> Ring buffer [queue: 4096 slots] : write slot, release tail | The producer writes the item and then publishes the new tail.
+  Ring buffer -> Worker thread [svc: pinned consumer] : acquire tail, read slot | The consumer sees the new tail, so it can read the item safely.
+  Worker thread -> Ring buffer : publish head | The consumer frees the slot for reuse.
+  Worker thread -> Order book [store: in memory] : apply update | The worker applies the update with no lock and no allocation.
+  Network thread -x> Ring buffer : full, drop or spin | When the buffer is full the producer cannot write, so it counts a drop or waits.
+ref: docs | C++ memory model: std::memory_order | cppreference.com | https://en.cppreference.com/w/cpp/atomic/memory_order
+
+== Native core with a scripting API on top
+kind: layered-arch, offload-accelerator
+when: A product needs the speed of C++ and the ease of Python for users, as in machine learning libraries.
+how: The performance-critical part, such as tensors, kernels and data structures, is written in C++. A binding layer, such as pybind11, nanobind or a C API, exposes it to Python as classes and functions. Users write short scripts, and each call does a lot of work inside C++.
+Calls should be coarse. One Python call that multiplies two large matrices is cheap in overhead. A Python loop with a million tiny calls is slow. So the API takes whole arrays, not single elements.
+Memory is shared, not copied: Python buffers or NumPy arrays are passed as views (the buffer protocol). The binding code releases the Python global interpreter lock (GIL) during long C++ work, so other threads can run.
+The cost is build and release work: wheels for each platform, ABI compatibility, and object lifetime rules between the two runtimes.
+used: PyTorch (C++ core with Python front end); TensorFlow; Apache Arrow; OpenCV; many database drivers and simulators.
+avoid: When the speed is not the problem; pure Python or Rust-based extensions can be simpler to ship.
+flow:
+  Python script [client] -> Binding layer [svc: pybind11] : model.fit(array) | The user makes one coarse call with a whole array.
+  Binding layer -> C++ core [svc: tensors and kernels] : array view, no copy | The binding passes a pointer to the NumPy memory and drops the GIL.
+  C++ core -> Thread pool [svc: N workers] : split work | The core splits the job over threads.
+  C++ core -> GPU library [svc: CUDA kernels] : heavy ops | Large math is passed to the GPU libraries.
+  C++ core -> Binding layer : result view | The core returns a result that Python wraps as an object.
+  Binding layer -> Python script : tensor | The user continues in Python.
+ref: docs | pybind11 documentation | pybind11 project | https://pybind11.readthedocs.io/
+
+@@ cuda
+== Overlapping copies and compute with streams
+kind: offload-accelerator, pipeline-stages
+when: A GPU job moves large data from host to device, and the copy time is a large part of the total.
+how: A CUDA stream is an ordered queue of GPU work. Work in different streams can run at the same time. The GPU has separate copy engines, so a copy can run while a kernel computes.
+Split the input into chunks. For each chunk, in its own stream, enqueue copy host to device, then kernel, then copy device to host. While chunk 2 copies in, chunk 1 computes and chunk 0 copies out. After the first chunk the GPU is busy all the time.
+The host memory must be pinned (page-locked, from cudaMallocHost), or the copies are not truly asynchronous. Calls such as cudaMemcpyAsync return at once, so the CPU can prepare the next chunk. Use events to wait for a chunk before you reuse its buffer.
+Gains are limited by the slowest stage. If the PCIe copy is ten times slower than the kernel, the copy still dominates. Then reduce the data, for example keep it on the GPU between steps.
+used: Video and image pipelines; data loading in deep learning (pinned memory with non_blocking copies in PyTorch); inference servers.
+avoid: For tiny data or kernels that run in microseconds, where launch overhead dominates; batch them or use CUDA Graphs.
+flow:
+  Host [svc: CPU pinned buffers] -> Stream 1 [queue: chunk 1] : copy H2D async | The CPU queues the copy of chunk 1 and does not wait.
+  Stream 1 -> GPU [svc: SMs + copy engines] : kernel on chunk 1 | After its copy, chunk 1 is processed by a kernel in the same stream.
+  Host -> Stream 2 [queue: chunk 2] : copy H2D async | While chunk 1 computes, chunk 2 is copied. The copy and the kernel overlap.
+  Stream 2 -> GPU : kernel on chunk 2 | The GPU starts chunk 2 as soon as its copy ends.
+  GPU -> Host : copy D2H chunk 1 | The result of chunk 1 returns while chunk 2 still computes.
+  Host -x> Stream 1 : wait on event first | The CPU waits for the event of chunk 1 before it reuses that buffer.
+ref: docs | CUDA C++ Programming Guide: asynchronous concurrent execution | NVIDIA | https://docs.nvidia.com/cuda/cuda-c-programming-guide/
+ref: blog | How to Overlap Data Transfers in CUDA C/C++ | NVIDIA Developer Blog | https://developer.nvidia.com/blog/how-overlap-data-transfers-cuda-cc/
+
+== Tiling through shared memory in a kernel
+kind: memory-tiering, data-locality
+when: A kernel reads the same input values many times, such as in matrix multiplication or a stencil, and global memory is the bottleneck.
+how: Global (device) memory is large but slow, hundreds of cycles per access. Shared memory is a small on-chip memory (tens of KB per block) that is shared by the threads of a block and is far faster.
+In a tiled matrix multiply, a thread block computes a 32 by 32 tile of the output. In each step it loads one tile of A and one tile of B from global memory into shared memory, with each thread loading one element. Threads then call __syncthreads(). Every thread reads from the fast tile many times to update its sum, then the block moves to the next tile.
+Each value is read from global memory once per tile and used 32 times from shared memory. Global traffic falls by about 32 times. Loads are made coalesced, so neighbouring threads read neighbouring addresses.
+Watch for bank conflicts in shared memory, and for shared memory use that cuts how many blocks run at once. In practice, use cuBLAS or CUTLASS, which already do this.
+used: cuBLAS, cuDNN and CUTLASS kernels; FlashAttention, which tiles attention through on-chip memory.
+avoid: When the data is used only once (a pure streaming kernel); tiling only adds cost. Use coalesced loads and enough threads.
+flow:
+  Block [svc: 1024 threads] -> Global memory [store: HBM] : load tile of A and B | Each thread loads one element of each tile. Neighbours read neighbouring addresses.
+  Global memory -> Shared memory [cache: on chip] : 2 tiles of 32x32 | The tiles are now close to the compute units.
+  Block -> Shared memory : __syncthreads() | All threads wait until the whole tile is loaded.
+  Shared memory -> Registers [cache: per thread] : 32 reads per value | Each value is reused 32 times from fast memory.
+  Registers -> Global memory : write C tile once | The finished sums are written once at the end.
+  Global memory -x> Block : naive: 32x more reads | Without tiling every thread would read each value from slow memory.
+ref: docs | CUDA C++ Best Practices Guide: shared memory | NVIDIA | https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/
+
+== Multi-GPU data-parallel training with NCCL all-reduce
+kind: data-parallel
+when: A model fits on one GPU, but training on one GPU is too slow, so you split the data over many.
+how: Each GPU holds a full copy of the model. A global batch of 1,024 samples is split into 8 parts of 128, one per GPU. Each GPU runs the forward and backward pass on its own part and gets its own gradients.
+Then all GPUs run an all-reduce, which sums the gradients and gives every GPU the average. NCCL, the NVIDIA library, does this over NVLink inside a node and over InfiniBand or Ethernet between nodes, usually with a ring or tree. Every GPU then applies the same optimizer step, so the copies stay equal.
+The all-reduce is split into buckets and started while the backward pass is still running, so communication overlaps with compute. This is how PyTorch DistributedDataParallel works.
+Speed depends on link bandwidth against gradient size. A slow network makes GPUs wait. A failed GPU stops the job, so save checkpoints often.
+used: PyTorch DistributedDataParallel; Horovod; large training clusters with NVLink and InfiniBand; the ring all-reduce idea from Baidu and Horovod.
+avoid: When the model does not fit in one GPU memory; shard it with FSDP, ZeRO, tensor or pipeline parallelism.
+flow:
+  Data loader [svc: shards batch] -> GPU 0 [svc: model copy], GPU 1 [svc: model copy] : 128 samples each | Each GPU gets a different part of the global batch.
+  * GPU 0: forward and backward | Each GPU computes its gradients on its own samples.
+  GPU 0 -> NCCL [svc: all-reduce] : gradient bucket | Full buckets are sent as soon as they are ready, while the backward pass goes on.
+  GPU 1 -> NCCL : gradient bucket | Every GPU sends its own gradients.
+  NCCL -> GPU 0, GPU 1 : averaged gradients | Each GPU receives the same average over NVLink or InfiniBand.
+  GPU 1 -x> NCCL : slow link, others wait | The slowest GPU or link sets the step time for all.
+ref: paper | Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour | Goyal et al., 2017 | https://arxiv.org/abs/1706.02677
+ref: docs | NCCL documentation | NVIDIA | https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/
+
+@@ fastapi
+== Async API behind multiple Uvicorn workers
+kind: event-loop, horizontal-scale
+when: An API spends most of its time waiting for databases and other services, and you want to serve many requests with few threads.
+how: FastAPI is an ASGI application. Uvicorn runs it on an asyncio event loop. A route declared with async def runs on the loop. When it awaits a database call or an HTTP call, the loop serves other requests in the meantime. One process can hold thousands of waiting requests.
+A route declared with plain def runs in a thread pool (about 40 threads by default), so a blocking call there does not stop the loop. The worst mistake is a blocking call, such as requests.get or a heavy computation, inside async def. It freezes the whole process.
+Use one event loop per CPU core. Run several Uvicorn workers, or several container replicas, behind a load balancer. Keep the service stateless. Each process has its own database connection pool, so total connections are workers times pool size.
+For CPU-heavy work, call a process pool or a separate service.
+used: Python API services and ML model endpoints; many teams run it as containers on Kubernetes behind NGINX or a cloud load balancer.
+avoid: For CPU-bound work in the request path, or when the team needs a batteries-included framework with admin and ORM; consider Django.
+flow:
+  Client [client] -> Load balancer [svc: NGINX or ALB] : GET /users/7 | Requests are spread over replicas.
+  Load balancer -> Uvicorn worker [svc: asyncio loop] : HTTP request | One worker process holds many open requests.
+  Uvicorn worker -> Postgres [db: async pool of 10] : await query | The route awaits the query. The loop is free to serve other requests.
+  Uvicorn worker -> Thread pool [svc: sync def routes] : def route runs here | Plain def routes run in threads, so blocking code does not freeze the loop.
+  Postgres -> Uvicorn worker : rows | The result wakes the route, which builds a JSON response.
+  Uvicorn worker -x> Client : loop blocked by CPU job | A heavy computation in async def stalls all requests of that worker.
+ref: docs | Concurrency and async / await | FastAPI documentation | https://fastapi.tiangolo.com/async/
+ref: docs | Server workers: Uvicorn with workers | FastAPI documentation | https://fastapi.tiangolo.com/deployment/server-workers/
+
+== Model-serving endpoint with lifespan loading
+kind: online-offline, layered-arch
+when: A trained model must answer prediction requests over HTTP with low latency and validated input.
+how: The model is trained offline and saved as a file or pulled from a model registry. In a lifespan function, FastAPI loads it into memory once, when the process starts, and stores it on app state. Loading per request would cost seconds.
+Pydantic models describe the request and the response. FastAPI checks every request against them and returns a 422 error with details if a field is wrong. The same models create the OpenAPI schema and the interactive docs, so clients get a contract.
+A dependency (Depends) gives each route the model and, for example, an API key check or a database session. Dependencies can be replaced in tests.
+Each worker holds its own copy of the model, so memory grows with the worker count. For a GPU model, use one worker per GPU or a dedicated inference server such as Triton or vLLM behind a thin FastAPI layer. Add a /health route for the orchestrator.
+used: Thin prediction APIs for scikit-learn, PyTorch and Hugging Face models; LLM application back ends that call a model server.
+avoid: For very high throughput GPU inference that needs batching and scheduling; use a model server with dynamic batching.
+flow:
+  Registry [store: model file] -> FastAPI app [svc: lifespan start] : load model once | At start-up the app loads the model and keeps it in memory.
+  Client [client] -> FastAPI app : POST /predict JSON | The client sends features as JSON.
+  FastAPI app -> Pydantic [svc: validation] : check fields | The request body is checked against the schema.
+  Pydantic -x> Client : 422 invalid field | A wrong type or a missing field is rejected, before any model code runs.
+  FastAPI app -> Model [model: in memory] : predict(features) | A valid request runs the model that is already loaded.
+  Model -> Client : score 0.82 | The score goes back as a typed JSON response.
+ref: docs | Lifespan events | FastAPI documentation | https://fastapi.tiangolo.com/advanced/events/
+ref: docs | Dependencies | FastAPI documentation | https://fastapi.tiangolo.com/tutorial/dependencies/
+
+== Accept now, work later with a job queue
+kind: async-request-reply, competing-consumers
+when: A request starts work that takes longer than a user or proxy will wait, such as a report or a video render.
+how: The route validates the request, creates a job record with status "queued" and a job id, puts a message on a queue, and returns 202 Accepted with the job id and a status URL. It answers in milliseconds.
+Workers, for example Celery, RQ or Arq with Redis or RabbitMQ, take jobs from the queue. Many workers share the queue, so each job is done by one worker. A worker updates the job status and writes the result to object storage or a database.
+The client polls GET /jobs/{id}, or gets a webhook or a WebSocket message. FastAPI also has BackgroundTasks, which run small tasks in the same process after the response is sent. They are not durable: a restart loses them, and they use the web process.
+Make jobs idempotent, since a queue can deliver twice. Set a time limit and a retry limit, and send failed jobs to a dead-letter queue.
+used: Report, export and media generation; ML batch inference triggered through an API; email sending.
+avoid: For work that takes under a second; do it in the request. Use BackgroundTasks only for small, loss-tolerant work like an audit log write.
+flow:
+  Client [client] -> FastAPI route [svc: POST /reports] : create report | The user asks for a large report.
+  FastAPI route -> Jobs DB [db: status queued] : insert job id 91 | The route saves the job so its status can be read later.
+  FastAPI route -> Job queue [queue: Redis or RabbitMQ] : enqueue job 91 | The route puts a message on the queue.
+  FastAPI route -> Client : 202 + /jobs/91 | The route returns at once with a status URL.
+  Job queue -> Worker [svc: Celery] : job 91 | A worker takes the job. It is the only one that does.
+  Worker -> Jobs DB : status done, result URL | The worker saves the result and marks the job done.
+  Client -> FastAPI route : GET /jobs/91 | The client polls and finds the finished report.
+ref: docs | Background Tasks | FastAPI documentation | https://fastapi.tiangolo.com/tutorial/background-tasks/

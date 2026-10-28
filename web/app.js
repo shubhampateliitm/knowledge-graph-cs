@@ -38,6 +38,7 @@ try {
     DATA.nodes.forEach(n=>{ READS[n.id]={id:n.id, rd:n.rd, refs:n.refs}; n.b=(n.rd.value||[""])[0]; n.q=(n.rd.intuition||[""])[0]; n.nr=n.refs.length; });
     DATA.layers.forEach(l=>{ READS[l.id]={id:l.id, rd:l.rd, refs:l.refs}; });
     (DATA.scenes||[]).forEach(s=>{ const r=READS[s.concept]; if(r) (r.scenes=r.scenes||[]).push(s); });
+    (DATA.patterns||[]).forEach(x=>{ const r=READS[x.concept]; if(r) (r.patterns=r.patterns||[]).push(x); });
   } else {
     DATA = await api("GET","/api/graph");
   }
@@ -66,6 +67,12 @@ const courseLabel = code => code.replace(/^([A-Z]+)(\d)/,"$1 $2");
 // animated scenes: summaries for every scene (standalone DATA.scenes holds them in full; the server sends them in each read)
 const SCENES = (DATA.scenes||[]).filter(s=>N[s.concept]).map(s=>({id:s.id, concept:s.concept, title:s.title||s.id, n:s.n!==undefined?s.n:(s.steps||[]).length}));
 let SCENE_ALL = STANDALONE ? (DATA.scenes||[]) : null;
+// architecture patterns (content/patterns/): summaries for every pattern (standalone DATA.patterns holds them in full, the server
+// sends them in each read), and the catalog of canonical patterns they name in "kinds"
+const PCAT = DATA.pcatalog || [], PCATI = {}; PCAT.forEach(c=>PCATI[c.id]=c);
+const PATS = []; { const k={}; (DATA.patterns||[]).forEach(x=>{ if(!N[x.concept]) return; const i = x.i!==undefined ? x.i : (k[x.concept]=(k[x.concept]||0)+1)-1; PATS.push({concept:x.concept, i, title:x.title, kinds:x.kinds||[], when:x.when}); }); }
+const PIMPL = {}; PATS.forEach(x=>x.kinds.forEach(k=>(PIMPL[k]=PIMPL[k]||[]).push(x)));
+const PFAMS = [...new Set(PCAT.map(c=>c.fam))];
 const DESIGNS = (DATA.designs||[]).map(d=>{ if(d.rd && d.summary===undefined) d.summary=(d.rd.summary||[""])[0]; return d; });
 const DES = {}, DES_FULL = {}; DESIGNS.forEach(d=>{ DES[d.id]=d; if(d.rd) DES_FULL[d.id]=d; });
 const USES = {}; DESIGNS.forEach(d=>d.concepts.forEach(id=>{ if(N[id]) (USES[id]=USES[id]||[]).push(d.id); }));
@@ -220,7 +227,7 @@ const markHTML = id => { const s=Store.status(id); return s==="read"?`<span clas
 
 /* ---------------- state ---------------- */
 const firstJourney = DATA.tours.findIndex(isJourney);
-const state = { algo:{tab:"viz", viz:"bubble", prob:null}, program:"bs", course:"CS111", view:"explore", start:0, path:["kafka","commitlog","wal"], sel:"wal", tour:Math.max(0, firstJourney), tstep:0, filter:"", expand:{}, libKind:"all", libQ:"", libN:120 };
+const state = { algo:{tab:"viz", viz:"bubble", prob:null}, program:"bs", course:"CS111", view:"explore", start:0, path:["kafka","commitlog","wal"], sel:"wal", tour:Math.max(0, firstJourney), tstep:0, filter:"", expand:{}, libKind:"all", libQ:"", libN:120, pfam:"", pkind:null };
 
 /* ---------------- strip ---------------- */
 function renderStrip(){
@@ -671,6 +678,31 @@ function fillTry(root){
   if(!root || !window.DTSAlgo || !window.DTSAlgo.forConcept) return;
   root.querySelectorAll("[data-trycon]").forEach(p=>{ const v=window.DTSAlgo.forConcept(p.dataset.trycon); p.innerHTML = v.map(x=>`<button type="button" data-tryviz="${esc(x.id)}">Try it yourself: ${esc(x.title)}</button>`).join(""); p.hidden = !v.length; });
 }
+/* architecture patterns in a concept read: one tab per pattern; each panel has the pattern's text and its animated diagram */
+function patternsHTML(id, list){
+  const tabs = list.length>1 ? `<div class="sc-tabs" role="tablist" aria-label="Architecture patterns">${list.map((x,i)=>`<button type="button" role="tab" class="sc-tab ap-tab" data-aptab="${i}" aria-selected="${i===0}" tabindex="${i===0?0:-1}" id="apt-${i}" aria-controls="app-${i}">${esc(x.title)}</button>`).join("")}</div>` : "";
+  const kinds = x => x.kinds.filter(k=>PCATI[k]).map(k=>`<button type="button" class="ap-kind" data-pkind="${esc(k)}" title="${esc(PCATI[k].s)}">${esc(PCATI[k].name)}</button>`).join("");
+  const panel = (x,i) => `<div class="ap-panel" id="app-${i}" role="${list.length>1?"tabpanel":"group"}"${list.length>1?` aria-labelledby="apt-${i}"`:` aria-label="${esc(x.title)}"`}${i?" hidden":""}>
+    <h3 class="ap-t">${esc(x.title)}</h3>${kinds(x)?`<p class="ap-kinds"><span class="ap-lbl">Pattern</span>${kinds(x)}</p>`:""}
+    <p class="ap-when"><b>When to use it.</b> ${RI(x.when)}</p>${P(x.how)}
+    <div class="ap-scene" data-apscene="${i}"></div>
+    ${x.used?`<p class="ap-used"><b>Used by.</b> ${RI(x.used)}</p>`:""}${x.avoid?`<p class="ap-avoid"><b>Avoid when.</b> ${RI(x.avoid)}</p>`:""}
+    ${(x.refs||[]).length?refsHTML(x.refs):""}</div>`;
+  return `<p class="stand-sum">How real systems place ${esc(N[id].label)} among other components. ${list.length>1?`${list.length} patterns: pick one above. `:""}Step through each diagram with Back and Next, or press Play.</p><div class="ap-wrap" data-pats="${id}">${tabs}${list.map(panel).join("")}</div>`;
+}
+function patTab(wrap, i){
+  const list = (READS[wrap.dataset.pats]||{}).patterns||[]; if(!list[i]) return null;
+  wrap.querySelectorAll(".ap-tab").forEach((b,j)=>{ b.setAttribute("aria-selected", String(j===i)); b.tabIndex = j===i?0:-1; });
+  wrap.querySelectorAll(".ap-panel").forEach((p,j)=>{ p.hidden = j!==i; });
+  wrap.querySelectorAll(".ap-scene").forEach(h=>{ const old = h.firstElementChild && h.firstElementChild.__player; if(old) old.destroy(); h.innerHTML=""; });
+  const host = wrap.querySelector(`[data-apscene="${i}"]`);
+  return host && window.DTSScene && list[i].scene ? window.DTSScene.mount(host, list[i].scene, {title:false}) : null;
+}
+function mountPatterns(root, at){
+  const w = root.querySelector(".ap-wrap"); if(!w) return null;
+  const n = ((READS[w.dataset.pats]||{}).patterns||[]).length;
+  return patTab(w, at>=0 && at<n ? at : 0);
+}
 function sec(id, no, title, body, tag){ return body ? `<section class="rd-sec" id="rs-${id}" aria-labelledby="rh-${id}"><h2 id="rh-${id}"><span class="no">${no}</span><span class="h2-t">${title}</span>${tag?`<span class="h2-tag">${tag}</span>`:""}</h2>${body}</section>` : ""; }
 function srow(id, reason, dash, meta){ const m=N[id]; return `<button type="button" class="srow" style="--c:${lc(m.l)}" data-read="${id}"><span class="bar${dash?" dash":""}"></span><span><span class="sn">${esc(m.label)}</span><span class="sm">${meta||"L"+m.l}</span>${markHTML(id)}<span class="sr">${esc(reason)}</span></span></button>`; }
 function groupByLayer(list, key){
@@ -707,7 +739,7 @@ function nodeRead(n, r, ctx){
   h += ladderHTML(n);
   if(USES[n.id]) h += `<p class="ladder-cap">Appears in design questions: ${USES[n.id].map(did=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-design="${did}">${esc(DES[did].title)}</button>`).join(", ")}.</p>`;
   if(TAUGHT[n.id]) h += `<p class="ladder-cap">Taught in Stanford ${TAUGHT[n.id].map(code=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-course="${code}">${esc(courseLabel(code))}</button>`).join(", ")}.</p>`;
-  const toc = [["value","Why it exists"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How it works"],(r.scenes||[]).length&&["watch","Watch it work"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],rd.tradeoffs&&["tradeoffs","It depends: trade-offs"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],rd.interview&&["interview","In the interview"],rd.quiz&&["quiz","Check yourself"],pmPins(n.id)&&["problems","Problems that use this"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
+  const toc = [["value","Why it exists"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How it works"],(r.scenes||[]).length&&["watch","Watch it work"],(r.patterns||[]).length&&["apat","Architecture patterns"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],rd.tradeoffs&&["tradeoffs","It depends: trade-offs"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],rd.interview&&["interview","In the interview"],rd.quiz&&["quiz","Check yourself"],pmPins(n.id)&&["problems","Problems that use this"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
   h += `<nav class="toc" aria-label="Sections">${toc.map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
   let no=0; const NO=()=>String(++no).padStart(2,"0");
   h += sec("value", NO(), "Why it exists", P(rd.value,"lead"));
@@ -715,6 +747,7 @@ function nodeRead(n, r, ctx){
   if(rd.history) h += sec("history", NO(), "How we got here", P(rd.history));
   h += sec("how", NO(), "How it works", P(rd.how) + diagramHTML(rd.diagram) + animHTML(rd.animation));
   if((r.scenes||[]).length) h += sec("watch", NO(), "Watch it work", watchHTML(n.id, r.scenes));
+  if((r.patterns||[]).length) h += sec("apat", NO(), "Architecture patterns", patternsHTML(n.id, r.patterns), r.patterns.length+" pattern"+(r.patterns.length===1?"":"s"));
   if(rd.example) h += sec("example", NO(), "A worked example", exampleHTML(rd.example));
   if(downs.length||insp.length) h += sec("stands", NO(), "What it stands on",
     `<p class="stand-sum">${esc(n.label)} rests directly on ${downs.length} idea${downs.length===1?"":"s"}. Counting everything beneath those, it stands on ${tot} concepts across ${lays.length} layer${lays.length===1?"":"s"} (${lays.map(l=>"L"+l).join(", ")}). Each line says what that lower layer contributes.</p>` +
@@ -832,6 +865,25 @@ function renderDesign(){
   el.innerHTML = `<h2 class="vh">System design</h2><p class="vsub">${DESIGNS.length} interview question${DESIGNS.length===1?"":"s"}, each worked through: requirements, estimates with the arithmetic, API, data model, the design, deep dives, trade-offs, failure modes and the follow-up questions. Every design links to the concepts it uses, so you can study what it stands on.</p>` +
     cats.map(c=>`<h3 class="ysec">${esc(c)}</h3><div class="dgrid">${DESIGNS.filter(d=>d.category===c).map(card).join("")}</div>`).join("");
 }
+/* ---------------- architecture patterns: the catalog by family, with every concept that implements each pattern ---------------- */
+function renderArch(){
+  const el = $("v-architecture"), fam = PFAMS.includes(state.pfam) ? state.pfam : "";
+  if(!PCAT.length){ el.innerHTML = `<h2 class="vh">Architecture patterns</h2><p class="vsub">No patterns yet. Add files to content/patterns/ and run python3 tools/build.py.</p>`; return; }
+  const ncon = new Set(PATS.map(x=>x.concept)).size;
+  // one chip per concept (a concept can implement a pattern more than once); it opens the concept's first such pattern
+  const impl = c => { const by = {}; (PIMPL[c.id]||[]).forEach(x=>(by[x.concept]=by[x.concept]||[]).push(x));
+    return Object.values(by).map(xs=>{ const x=xs[0], m=N[x.concept]; return `<button type="button" class="chip" style="--c:${lc(m.l)}" data-patopen="${x.concept}/${x.i}" title="${esc(xs.map(y=>y.title).join("; "))}"><span class="sw"></span>${esc(m.label)}${xs.length>1?` <span class="mono" style="color:var(--muted);font-size:11px">×${xs.length}</span>`:""}</button>`; }); };
+  const card = c => { const ch = impl(c), ref = c.ref||{};
+    return `<div class="dcard ap-cat${state.pkind===c.id?" on":""}" id="apc-${esc(c.id)}"><span class="tt">${esc(c.name)}</span><span class="ts">${ch.length} concept${ch.length===1?"":"s"}</span><span class="ap-sum">${esc(c.s)}</span>
+      ${ref.t?`<span class="ap-src">${esc(KIND[ref.k]||ref.k||"")} · ${ref.u?`<a href="${esc(ref.u)}" target="_blank" rel="noopener noreferrer">${esc(ref.t)}</a>`:esc(ref.t)} · ${esc(ref.w||"")}</span>`:""}
+      ${ch.length?`<div class="chips ap-impl">${ch.slice(0,10).join("")}${ch.length>10?`<details><summary>${ch.length-10} more</summary><div class="chips">${ch.slice(10).join("")}</div></details>`:""}</div>`:""}</div>`; };
+  const other = PATS.filter(x=>!x.kinds.some(k=>PCATI[k]));
+  el.innerHTML = `<h2 class="vh">Architecture patterns</h2><p class="vsub">${PCAT.length} canonical patterns in ${PFAMS.length} families, from the Azure Architecture Center, Patterns of Distributed Systems, Enterprise Integration Patterns, microservices.io and the original papers. ${PATS.length} worked patterns on ${ncon} concepts show where each one appears in real systems, with an animated diagram. Pick a concept to open its pattern.</p>
+    <div class="filters" role="group" aria-label="Pattern family"><button type="button" data-pfam="" aria-pressed="${!fam}">All · ${PCAT.length}</button>${PFAMS.map(f=>`<button type="button" data-pfam="${esc(f)}" aria-pressed="${fam===f}">${esc(f)} · ${PCAT.filter(c=>c.fam===f).length}</button>`).join("")}</div>` +
+    PFAMS.filter(f=>!fam||f===fam).map(f=>`<h3 class="ysec">${esc(f)}</h3><div class="dgrid">${PCAT.filter(c=>c.fam===f).map(card).join("")}</div>`).join("") +
+    (other.length && !fam ? `<h3 class="ysec">Other patterns · ${other.length}</h3><div class="chips">${other.map(x=>`<button type="button" class="chip" style="--c:${lc(N[x.concept].l)}" data-patopen="${x.concept}/${x.i}"><span class="sw"></span>${esc(N[x.concept].label)}: ${esc(x.title)}</button>`).join("")}</div>` : "");
+  if(state.pkind){ const t = $("apc-"+state.pkind); if(t) requestAnimationFrame(()=>t.scrollIntoView({block:"center"})); }
+}
 function renderAlgoView(){
   const el = $("v-algorithms");
   if(window.DTSAlgo) window.DTSAlgo.render(el, state.algo);
@@ -884,6 +936,8 @@ async function renderReader(){
   animWatch(el);
   const sp = mountScenes(el, c.scene);
   if(c.scene && sp){ const w=$("rs-watch"); if(w) w.scrollIntoView({block:"start"}); try{ sp.root.focus({preventScroll:true}); }catch(e){} }
+  const pp = mountPatterns(el, c.pat);
+  if(c.pat!==undefined){ const w=$("rs-apat"); if(w) w.scrollIntoView({block:"start"}); const t=el.querySelector(`.ap-tab[data-aptab="${c.pat}"]`); try{ (t||(pp&&pp.root)||w).focus({preventScroll:true}); }catch(e){} }
 }
 function updProg(){
   const el=$("reader"), p=$("rprog"); if(!p) return;
@@ -895,8 +949,8 @@ function updProg(){
     if(spent>=need){ Store.setProgress(id,"read").then(()=>{ toast("Marked as read"); refreshMarks(); }).catch(()=>{}); }
   }
 }
-function hashFor(c){ return c.type==="node" ? "#read/"+c.id : c.type==="layer" ? "#layer/"+c.l : c.type==="design" ? "#design/"+c.id : "#reading-list"; }
-const viewHash = () => state.view==="algorithms" && window.DTSAlgo ? window.DTSAlgo.hash(state.algo) : state.view==="problems" && window.DTSPM ? window.DTSPM.hash() : "#"+state.view;
+function hashFor(c){ return c.type==="node" ? (c.pat!==undefined ? "#pattern/"+c.id+"/"+(c.pat+1) : "#read/"+c.id) : c.type==="layer" ? "#layer/"+c.l : c.type==="design" ? "#design/"+c.id : "#reading-list"; }
+const viewHash = () => state.view==="architecture" ? "#architecture"+(state.pkind?"/"+state.pkind:"") : state.view==="algorithms" && window.DTSAlgo ? window.DTSAlgo.hash(state.algo) : state.view==="problems" && window.DTSPM ? window.DTSPM.hash() : "#"+state.view;
 function openRead(c, opts={}){
   flushTime();
   if(R.open && R.cur && !opts.replace) R.hist.push(R.cur);
@@ -916,15 +970,15 @@ const pathSeq = () => ({name:"Your path", ids:state.path.slice()});
 function refreshMarks(){ if(R.open){ const a=$("reader").querySelector(".rd-actions"); const id=curId(); if(a&&id){ a.outerHTML = actionsHTML(id, getComputedStyle($("reader")).getPropertyValue("--c")); } } else render(false); }
 
 /* ---------------- render ---------------- */
-const VIEWS = ["explore","tours","courses","design","algorithms","problems","atlas","library","you"];
+const VIEWS = ["explore","tours","courses","design","algorithms","architecture","problems","atlas","library","you"];
 function render(scrollCols){
   $("tab-problems").hidden = !hasPM();
   renderStrip();
   const v = state.view;
   document.querySelectorAll(".tabs button").forEach(b=>b.setAttribute("aria-pressed", String(b.dataset.view===v)));
   $("v-explore").hidden = v!=="explore"; $("cols").hidden = v!=="explore";
-  $("v-design").hidden = v!=="design"; $("v-algorithms").hidden = v!=="algorithms"; $("v-problems").hidden = v!=="problems";
-  document.querySelector(".desk").classList.toggle("wide", v==="design"||v==="algorithms");
+  $("v-design").hidden = v!=="design"; $("v-algorithms").hidden = v!=="algorithms"; $("v-architecture").hidden = v!=="architecture"; $("v-problems").hidden = v!=="problems";
+  document.querySelector(".desk").classList.toggle("wide", v==="design"||v==="algorithms"||v==="architecture");
   document.querySelector(".desk").classList.toggle("pmv", v==="problems");
   $("v-tours").hidden = v!=="tours"; $("v-courses").hidden = v!=="courses"; $("v-atlas").hidden = v!=="atlas"; $("v-library").hidden = v!=="library"; $("v-you").hidden = v!=="you";
   if(v==="explore"){ renderTrail(); renderCols(scrollCols); }
@@ -932,6 +986,7 @@ function render(scrollCols){
   if(v==="courses") renderCourses();
   if(v==="design") renderDesign();
   if(v==="algorithms") renderAlgoView();
+  if(v==="architecture") renderArch();
   if(v==="problems"){ if(window.DTSPM) window.DTSPM.render($("v-problems")); else $("v-problems").innerHTML = `<p class="empty">Loading the problem map…</p>`; }
   if(v==="atlas") renderAtlas();
   if(v==="library") renderLibrary();
@@ -941,7 +996,7 @@ function render(scrollCols){
 function revealPanel(){ if(narrow()) $("panel").scrollIntoView({behavior:reduced?"auto":"smooth",block:"start"}); else $("panel").scrollTop = 0; }
 function select(id, opts={}){ state.sel = id; state.expand = {}; render(false); if(opts.reveal!==false) revealPanel(); }
 function exploreFrom(id){ state.view="explore"; state.start=N[id].l; state.filter=""; state.path=[id]; state.sel=id; state.expand={}; try{history.replaceState(null,"","#explore")}catch(e){} render(true); revealPanel(); }
-function setView(v){ state.view=v; try{history.replaceState(null,"",viewHash())}catch(e){} if(v==="tours"){ state.sel = DATA.tours[state.tour].steps[state.tstep][0]; } if(v==="explore"){ state.sel = state.path[state.path.length-1]||null; } render(v==="explore"); if(["library","you","design","algorithms","problems"].includes(v)) $("main").scrollTop=0; }
+function setView(v){ state.view=v; try{history.replaceState(null,"",viewHash())}catch(e){} if(v==="tours"){ state.sel = DATA.tours[state.tour].steps[state.tstep][0]; } if(v==="explore"){ state.sel = state.path[state.path.length-1]||null; } render(v==="explore"); if(["library","you","design","algorithms","architecture","problems"].includes(v)) $("main").scrollTop=0; }
 
 document.addEventListener("click", async e=>{
   const j = e.target.closest("a[data-jump]"); if(j){ e.preventDefault(); const t=document.getElementById(j.dataset.jump); if(t) t.scrollIntoView({behavior:reduced?"auto":"smooth",block:"start"}); return; }
@@ -951,6 +1006,10 @@ document.addEventListener("click", async e=>{
   const d = b.dataset;
   try{
     if(d.anim){ const f=b.closest(".anim"); if(f) animAct(f.id, d.anim); return; }
+    if(d.aptab!==undefined){ const w=b.closest(".ap-wrap"); if(w){ patTab(w, +d.aptab); if(R.open && R.cur && R.cur.type==="node"){ R.cur.pat=+d.aptab; try{history.replaceState(null,"",hashFor(R.cur))}catch(e){} } } return; }
+    if(d.pkind){ if(R.open) closeRead(); state.pkind=d.pkind; state.pfam=""; return setView("architecture"); }
+    if(d.pfam!==undefined){ state.pfam=d.pfam; state.pkind=null; try{history.replaceState(null,"",viewHash())}catch(e){} return renderArch(); }
+    if(d.patopen){ const [cid, i] = d.patopen.split("/"); if(N[cid]) return openRead({type:"node", id:cid, pat:+i}, {seq:null}); return; }
     if(d.sctab!==undefined){ const w=b.closest(".sc-wrap"); if(w) sceneTab(w, +d.sctab); return; }
     if(d.sceneopen){ const s=SCENES.find(x=>x.id===d.sceneopen); if(s) return openRead({type:"node", id:s.concept, scene:s.id}, {seq:null}); return; }
     if(d.tryviz){ if(R.open) closeRead(); state.algo.tab="viz"; state.algo.viz=d.tryviz; return setView("algorithms"); }
@@ -996,6 +1055,8 @@ document.addEventListener("keydown", e=>{
   if(e.key==="Escape" && R.open && document.activeElement!==$("q")){ e.preventDefault(); return backRead(); }
   if(e.key==="Enter" && e.target.closest && e.target.closest("[data-gsel]")){ select(e.target.closest("[data-gsel]").dataset.gsel); }
   if(e.key==="Enter" && e.target.closest && e.target.closest("[data-gread]")){ openRead({type:"node", id:e.target.closest("[data-gread]").dataset.gread}, {seq:null}); }
+  const atb = e.target.closest && e.target.closest(".ap-tab");
+  if(atb && (e.key==="ArrowLeft"||e.key==="ArrowRight")){ e.preventDefault(); const all=[...atb.parentNode.querySelectorAll(".ap-tab")], i=(all.indexOf(atb)+(e.key==="ArrowRight"?1:all.length-1))%all.length; all[i].focus(); all[i].click(); return; }
   const tb = e.target.closest && e.target.closest(".sc-tab");
   if(tb && (e.key==="ArrowLeft"||e.key==="ArrowRight")){ e.preventDefault(); const all=[...tb.parentNode.querySelectorAll(".sc-tab")], i=(all.indexOf(tb)+(e.key==="ArrowRight"?1:all.length-1))%all.length; all[i].focus(); sceneTab(tb.closest(".sc-wrap"), i); return; }
   const an = e.target.closest && e.target.closest(".anim");
@@ -1031,6 +1092,10 @@ function route(initial){
   if(ml){ if(R.open && curId()==="L"+ml[1]) return; if(initial) render(true); return openRead({type:"layer", l:+ml[1]}, {seq:null}); }
   const msc = h.match(/^scene\/(.+)$/), scn = msc && SCENES.find(x=>x.id===msc[1]);
   if(scn){ if(R.open && curId()===scn.concept && R.cur.scene===scn.id) return; if(initial) render(true); exploreFrom(scn.concept); return openRead({type:"node", id:scn.concept, scene:scn.id}, {seq:null}); }
+  const mpt = h.match(/^pattern\/([a-z0-9-]+)\/(\d+)$/);
+  if(mpt && N[mpt[1]]){ const i=+mpt[2]-1; if(R.open && curId()===mpt[1] && R.cur.pat===i) return; if(initial) render(true); exploreFrom(mpt[1]); return openRead({type:"node", id:mpt[1], pat:i}, {seq:null}); }
+  const mar = h.match(/^architecture(?:\/([a-z0-9-]+))?$/);
+  if(mar){ if(R.open) closeRead(); state.view="architecture"; state.pkind = mar[1] && PCATI[mar[1]] ? mar[1] : null; render(true); return; }
   if(h==="animations"){ if(R.open) closeRead(); state.view="algorithms"; state.algo.tab="anim"; render(true); return; }
   if(h==="patterns"){ if(R.open) closeRead(); state.view="algorithms"; state.algo.tab="patterns"; render(true); return; }
   const md = h.match(/^design\/(.+)$/);
@@ -1043,7 +1108,7 @@ function route(initial){
     if(R.open) closeRead();
     if(VIEWS.includes(h)) state.view = h;
     if(state.view==="tours") state.sel=DATA.tours[state.tour].steps[state.tstep][0];
-    if(initial && ["atlas","library","you","design","algorithms","problems"].includes(state.view)) state.sel=null;
+    if(initial && ["atlas","library","you","design","algorithms","architecture","problems"].includes(state.view)) state.sel=null;
     render(true);
   }
 }

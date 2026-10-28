@@ -1,0 +1,725 @@
+@@ applem
+== Unified memory shared by CPU, GPU and neural engine
+kind: offload-accelerator, memory-tiering
+when: A workload moves large buffers between the CPU and an accelerator, and copying them over a bus costs more than the compute.
+how: On a PC with a discrete GPU, data lives in system RAM and must be copied over PCIe into the GPU's own memory. On an M-series chip, the CPU cores, GPU cores and neural engine all sit on one die and use one pool of LPDDR memory in the same package.
+The program allocates a buffer once. The CPU fills it, the GPU reads the same bytes, and the neural engine can read them next. No copy is made; only a handle or pointer is passed. Cache coherence hardware and a shared system-level cache keep the views consistent.
+This helps most with large models and video frames. A 64 GB or larger Mac can hold a model that no 24 GB consumer GPU can hold. The limit is bandwidth: the pool is shared, so peak speed is below that of HBM on data center GPUs.
+used: Metal and Core ML apps on Macs; local LLM runtimes such as llama.cpp and MLX; video editors that pass frames between CPU, GPU and media engines.
+avoid: When you need the memory bandwidth of HBM or many GPUs in one job; use data center accelerators instead.
+flow:
+  App [svc: Swift / Metal] -> Unified memory [store: LPDDR in package] : allocate 8 GB buffer | The app allocates one buffer in the single memory pool.
+  App -> CPU cores [svc: P and E cores] : fill buffer | The CPU writes input data into the buffer in place.
+  CPU cores -> GPU cores [svc: Metal compute] : pass pointer | The GPU gets a pointer to the same bytes. No copy over a bus happens.
+  GPU cores -> Unified memory : write results | The GPU writes its output into the same pool.
+  GPU cores -> Neural engine [svc: Core ML] : pass pointer | The neural engine reads the result for the next model stage, again without copying.
+ref: docs | Apple silicon unified memory | Apple developer documentation | 
+
+== Performance and efficiency cores with a scheduler hint
+kind: thread-pool, horizontal-scale
+when: A device must be fast for short bursts and also last many hours on a battery.
+how: An M-series chip has two kinds of CPU cores. Performance cores run at high clock and use more power. Efficiency cores run slower and use far less power, so they handle background work for little energy.
+The operating system tags each thread with a quality-of-service class: user-interactive, user-initiated, utility or background. The kernel scheduler places urgent threads on performance cores and background threads on efficiency cores. Apps set the class through Grand Central Dispatch queues.
+A video export may use all cores. Mail sync, indexing and backups stay on the efficiency cores, so the fans stay off and the battery lasts. Work that is mislabeled as background runs slowly on purpose.
+used: macOS and iOS scheduling with Grand Central Dispatch; the same big.LITTLE idea is common in Android phones with ARM cores.
+avoid: When a job needs predictable latency on every core; pin it with a high QoS class so it never lands on an efficiency core.
+flow:
+  App [client] -> GCD queue [queue: QoS class] : dispatch task | The app submits a task and states its quality of service.
+  GCD queue -> Kernel scheduler [svc: XNU] : runnable thread | The queue hands a thread to the kernel scheduler.
+  Kernel scheduler -> P cores [svc: high clock] : user-interactive | An urgent thread goes to a performance core for low latency.
+  Kernel scheduler -> E cores [svc: low power] : background | A background thread goes to an efficiency core to save energy.
+  * E cores: busy, P cores idle | The performance cores sleep, so the battery lasts longer.
+ref: docs | Energy Efficiency Guide for Mac Apps | Apple developer documentation | 
+
+== On-device inference with a private data path
+kind: precompute, offload-accelerator
+when: A feature needs a model answer on user data, but sending that data to a cloud is not acceptable or is too slow.
+how: The app converts a trained model to Core ML format ahead of time, with quantization to 8-bit or 4-bit weights to shrink it. At run time Core ML splits the model graph across the neural engine, the GPU and the CPU. It picks the unit that can run each layer.
+The user data stays in memory on the device. The result comes back in milliseconds with no network round trip, and it works offline. Photos search, dictation and text prediction use this style.
+The cost is model size and speed: the model must fit in unified memory and in the battery budget. Larger tasks can be sent to a private cloud service by design, but that is a different pattern.
+used: Core ML apps; Apple on-device features such as photo analysis and dictation; open-source MLX and llama.cpp for local LLMs on Macs.
+avoid: When the model is too large for device memory or must use fresh server-side data; serve it from a GPU cluster instead.
+flow:
+  Training cluster [svc: GPUs] -> Core ML package [store: quantized 4-bit] : convert and quantize | The team converts the model offline and shrinks its weights.
+  Core ML package -> App [client: Mac / iPhone] : ship in app | The model file ships inside the app or is downloaded.
+  App -> Core ML runtime [svc: graph planner] : predict(input) | The app calls the model with data that never leaves the device.
+  Core ML runtime -> Neural engine [svc: matrix units], GPU [svc: Metal] : split layers | The runtime sends each layer to the unit that runs it best.
+  Core ML runtime -> App : result in ms | The answer returns locally, with no network call.
+ref: docs | Core ML | Apple developer documentation | 
+
+@@ armisa
+== Big.LITTLE SoC from licensed cores
+kind: plugin-arch, offload-accelerator
+when: A chip maker wants a custom chip for phones, cars or servers without designing a CPU from nothing.
+how: Arm Ltd. does not make chips. It licenses the instruction set (ARMv8 and ARMv9) and also sells ready-made core designs such as Cortex and Neoverse. A chip maker picks a core design, or builds its own core that follows the same instruction set, as Apple does.
+The chip maker then adds other blocks around the cores: GPU, neural unit, memory controller, modem and security block. They connect over an on-chip bus such as AMBA. Phones mix big and small cores so the small ones save power.
+Because the instruction set is shared, one compiled binary runs on any chip from any vendor. The software ecosystem is shared; the silicon is not.
+used: Apple M-series and A-series; Qualcomm Snapdragon; AWS Graviton (Neoverse cores); Ampere Altra; NVIDIA Grace.
+avoid: When you need a chip with an open, royalty-free instruction set; consider RISC-V.
+flow:
+  Arm Ltd. [svc: IP vendor] -> Chip maker [svc: SoC team] : license ISA or core | The chip maker licenses the instruction set or a ready core design.
+  Chip maker -> SoC design [store: RTL + blocks] : add GPU, NPU, memory | The team adds blocks around the cores and connects them with a bus.
+  SoC design -> Foundry [svc: TSMC / Samsung] : tape-out | The finished design goes to a foundry for manufacture.
+  Foundry -> Device [client: phone / server] : chips | The device gets the chip.
+  Compiler [svc: GCC / LLVM] -> Device : aarch64 binary | One binary runs on all ARM chips that follow the same instruction set.
+ref: docs | Arm Architecture Reference Manual for A-profile | Arm | 
+
+== Multi-arch images for x86 and ARM fleets
+kind: blue-green, immutable-infra
+when: A fleet moves from x86 to ARM servers to cut cost, and some machines must stay on x86 during the move.
+how: Build each container image for both architectures, linux/amd64 and linux/arm64. Publish them under one tag as a manifest list, which is an index that points to one image per architecture.
+When a node pulls the tag, its container runtime reads the index and downloads only the image that matches its CPU. The same deployment YAML works on both node types.
+Teams then shift traffic step by step. They add a small pool of ARM nodes, send 5 percent of load there, compare latency and cost, and grow the pool. Many managed services offer ARM instances at lower price per unit of work, though the saving depends on the workload.
+used: AWS Graviton fleets; Docker buildx multi-platform builds; Kubernetes clusters with mixed node pools.
+avoid: When a dependency has no ARM build (some native libraries or old binaries); keep that service on x86 until it does.
+flow:
+  CI [svc: buildx] -> Registry [store: manifest list] : push amd64 + arm64 | CI builds both images and pushes them under one tag.
+  Deployer [svc: Kubernetes] -> x86 node [svc: amd64] : schedule pod | The scheduler places some pods on an x86 node.
+  x86 node -> Registry : pull tag | The node reads the manifest list and picks the amd64 image.
+  Deployer -> ARM node [svc: Graviton] : schedule pod | The scheduler places a canary share of pods on ARM nodes.
+  ARM node -> Registry : pull tag | The ARM node picks the arm64 image from the same tag.
+ref: docs | Multi-platform builds | Docker documentation | https://docs.docker.com/build/building/multi-platform/
+
+@@ cxl
+== Memory pooling and expansion over CXL
+kind: tiered-storage, memory-tiering
+when: Servers run out of DRAM slots or leave memory unused, and adding more whole servers is too costly.
+how: CXL (Compute Express Link) runs over the PCIe physical link. A CXL type 3 device is a memory module that the CPU sees as extra memory, with cache coherence, using normal load and store instructions.
+The operating system shows the CXL memory as a NUMA node with no CPU cores. It is slower than local DRAM, often by roughly 2 times in latency, so the kernel moves hot pages to DRAM and cold pages to CXL. This is the same idea as tiering between fast and slow storage.
+A switch or a multi-headed device can let several hosts share one pool. A fabric manager assigns slices of the pool to hosts, and they return the slices when a job ends. This reduces stranded memory.
+used: Memory expansion cards from Samsung, SK hynix and Micron; Linux memory tiering in the kernel; cloud and database vendors testing pools for in-memory databases.
+avoid: When latency to memory is critical for every access; add local DRAM or HBM instead.
+flow:
+  Host CPU [svc: with CXL port] -> Local DRAM [store: 100 ns] : hot pages | Hot pages stay in local DRAM for the lowest latency.
+  Host CPU -> CXL memory [store: type 3 200 ns] : load / store | Colder pages sit in CXL memory and are read with normal loads.
+  Kernel tiering [svc: page migration] -> Host CPU : promote hot page | The kernel finds a hot page in CXL and moves it to DRAM.
+  Fabric manager [svc: control plane] -> CXL switch [svc: pool] : assign 256 GB slice | The manager gives one host a slice of the shared pool.
+  CXL switch -> CXL memory : route access | The switch routes that host's accesses to its own slice.
+ref: spec | Compute Express Link specification | CXL Consortium | https://computeexpresslink.org/cxl-specification/
+
+== Coherent accelerator attach
+kind: offload-accelerator
+when: An accelerator and the CPU share large data structures, and explicit copy calls make the program hard to write and slow.
+how: CXL type 2 devices, such as accelerators with their own memory, can cache host memory coherently. The CPU can also read the device memory. Both sides use the same address space.
+The program places a data structure in one place and both sides access it. The coherence protocol sends invalidations when one side writes, so neither reads stale data. This removes manual cache flush and copy steps.
+It works best for fine-grained sharing, such as a pointer-rich graph. For bulk data, a DMA copy is still faster. Products in this class are still early, and most shipping CXL parts today are memory expanders.
+used: Smart NIC and accelerator research and vendor roadmaps; CXL type 1 and 2 device designs; the idea is similar to NVLink-C2C between CPU and GPU.
+avoid: When data moves in large one-way blocks; use DMA over plain PCIe.
+flow:
+  CPU [svc: host] -> Accelerator [svc: type 2 device] : submit work | The CPU tells the accelerator which structure to process.
+  Accelerator -> Host memory [store: DRAM] : coherent read | The device reads host memory directly and may cache the lines.
+  CPU -> Host memory : write update | The CPU changes a line that the device has cached.
+  Host memory -> Accelerator : invalidate line | The coherence protocol invalidates the stale copy in the device.
+  Accelerator -> CPU : done | The result is already in shared memory, so no copy-back is needed.
+ref: spec | Compute Express Link specification | CXL Consortium | https://computeexpresslink.org/cxl-specification/
+
+@@ nvgpu
+== Data-parallel training with all-reduce over NVLink
+kind: data-parallel, offload-accelerator
+when: A model fits on one GPU, but training on one GPU would take too long.
+how: Every GPU holds a full copy of the model and trains on its own slice of each batch. After the backward pass, each GPU has its own gradients. They must be averaged before the next step.
+NCCL runs an all-reduce across the GPUs. Inside one server, the GPUs talk over NVLink and NVSwitch at several hundred GB/s per GPU. Across servers they use InfiniBand or RoCE. A ring or tree algorithm moves each gradient byte about twice, so the cost does not grow with the number of GPUs.
+Frameworks overlap this communication with the backward pass, so the network time hides behind compute. If the model does not fit in one GPU, use model or pipeline parallelism too.
+used: PyTorch DistributedDataParallel; Horovod; most large training jobs on DGX and HGX systems.
+avoid: When the model is larger than one GPU memory; add tensor, pipeline or sharded parallelism (FSDP, ZeRO).
+flow:
+  Data loader [svc: sharded batch] -> GPU 0 [svc: model copy], GPU 1 [svc: model copy] : batch slice | Each GPU gets a different slice of the global batch.
+  * GPU 0: backward done | Each GPU runs forward and backward and now holds its own gradients.
+  GPU 0 -> NCCL [svc: all-reduce] : gradients | The gradients enter an all-reduce.
+  GPU 1 -> NCCL : gradients | The other GPUs send theirs.
+  NCCL -> GPU 0, GPU 1 : averaged gradients | Every GPU gets the same averaged gradient over NVLink or InfiniBand.
+  * GPU 0: step applied | All GPUs now update with identical gradients and stay in sync.
+ref: docs | NCCL documentation | NVIDIA | https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html
+
+== Batched GPU inference server
+kind: continuous-batching, batching
+when: A model serves many small requests, and one request alone leaves the GPU mostly idle.
+how: A GPU is fast only when it works on many items at once. A server such as NVIDIA Triton or vLLM puts incoming requests into a queue. It waits a few milliseconds, groups requests into a batch and runs one forward pass.
+For large language models, continuous batching adds new requests to the batch at every token step, and removes finished ones. A KV cache in GPU memory keeps the past tokens of each request, so the model does not recompute them.
+The trade is latency against throughput. A bigger batch gives more tokens per second per GPU, but each user waits longer. Teams set a maximum wait time and a maximum batch size from their latency target.
+used: NVIDIA Triton Inference Server; TensorRT-LLM; vLLM; cloud model-serving products built on these.
+avoid: When requests are rare and latency must be minimal; a small CPU or single-request GPU path is simpler.
+flow:
+  Clients [client] -> Request queue [queue: dynamic batcher] : many small requests | Requests from many users arrive at random times.
+  Request queue -> Batch scheduler [svc: max wait 5 ms] : group up to 32 | The scheduler waits briefly, then forms a batch.
+  Batch scheduler -> GPU [svc: TensorRT engine] : one forward pass | The GPU runs the whole batch in one pass, which uses its cores well.
+  GPU -> KV cache [cache: GPU memory] : store keys and values | The model keeps past token state for each request.
+  GPU -> Clients : split results | The server sends each answer back to its own caller.
+ref: docs | Triton Inference Server: dynamic batching | NVIDIA | https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/model_configuration.html
+
+== GPU as a data-processing accelerator
+kind: offload-accelerator, data-locality
+when: A data job is limited by CPU compute, such as joins, sorts and feature engineering on large tables.
+how: Libraries such as RAPIDS cuDF and the Spark RAPIDS plugin run dataframe operations on the GPU. The CPU plans the query and reads files. Parquet decoding and the heavy operators then run on the GPU in columnar form.
+Data is moved to GPU memory once, then many operators run on it without leaving. This is what makes it worth the copy. Shuffles between machines can use GPUDirect and fast networks.
+The gain depends on the job. Wide joins and aggregates on large data often run several times faster, but small data or string-heavy work may gain little. GPU memory is limited, so spill to host memory can reduce the gain.
+used: Spark RAPIDS accelerator; RAPIDS cuDF and cuML; GPU-based ETL ahead of model training.
+avoid: When data is small or the job waits on I/O; run it on CPUs.
+flow:
+  Driver [svc: Spark] -> Plan rewriter [svc: RAPIDS plugin] : physical plan | The plugin replaces supported CPU operators with GPU versions.
+  Plan rewriter -> Executor [svc: CPU host] : GPU plan | The executor starts the tasks.
+  Executor -> S3 lake [lake: Parquet] : read column chunks | The host reads compressed Parquet chunks from object storage.
+  Executor -> GPU [svc: cuDF kernels] : copy batch | The batch is copied to GPU memory once.
+  * GPU: join and aggregate done | Several operators run in a row on the GPU without going back to the CPU.
+  GPU -> Executor : result batch | Only the small result returns to the host.
+ref: docs | RAPIDS Accelerator for Apache Spark | NVIDIA | 
+
+@@ nvme
+== Per-core submission queues with lock-free I/O
+kind: producer-consumer, pipeline-stages
+when: A server needs millions of storage operations per second, and a single shared queue would become the bottleneck.
+how: NVMe lets the host create up to 65,535 pairs of queues, each with up to 65,535 entries. A submission queue holds commands. A completion queue holds results. Both live in host memory.
+The Linux blk-mq layer gives each CPU core its own queue pair. A core writes a command to its own submission queue and rings a doorbell register on the drive. It needs no lock, because no other core uses that queue. The drive reads many commands at once, runs them in parallel on its flash channels, and writes completions. An interrupt, or polling, tells the core.
+SATA's AHCI had one queue of 32 commands. This is why one NVMe drive can reach over a million random read operations per second, while SATA stops near 100,000.
+used: Linux blk-mq with the nvme driver; SPDK user-space polling drivers; database servers on local NVMe SSDs.
+avoid: When the workload is sequential and small; the queue design adds little, and a simple setup is enough.
+flow:
+  Core 0 [svc: app thread] -> SQ 0 [queue: submission] : write command | Each core writes to its own queue with no lock.
+  Core 1 [svc: app thread] -> SQ 1 [queue: submission] : write command | Another core uses a different queue at the same time.
+  SQ 0, SQ 1 -> NVMe SSD [svc: controller] : doorbell | A doorbell write tells the drive new commands are waiting.
+  NVMe SSD -> Flash channels [store: 8 to 16 dies] : parallel reads | The drive spreads the commands over many flash channels.
+  NVMe SSD -> CQ 0 [queue: completion] : completion entry | The drive posts the result in the completion queue of that core.
+  CQ 0 ~> Core 0 : interrupt or poll | The core learns the command is done.
+ref: spec | NVM Express Base Specification | NVM Express, Inc. | https://nvmexpress.org/specifications/
+
+== NVMe over Fabrics shared storage pool
+kind: data-locality, horizontal-scale
+when: Many compute servers need fast flash, but local drives sit half empty on some machines and full on others.
+how: NVMe over Fabrics (NVMe-oF) sends NVMe commands over a network, using RDMA (RoCE or InfiniBand) or TCP. A storage server, called the target, exports its drives as namespaces.
+A compute server, the initiator, connects and sees a remote namespace as a local block device such as /dev/nvme1n1. The same queue model is used end to end, so the extra latency is small: tens of microseconds with RDMA, more with TCP.
+A control service assigns namespaces to hosts. Capacity can be pooled and moved when a job moves. Kubernetes storage systems and disaggregated databases often use this to separate compute from flash.
+used: NVMe/TCP and NVMe/RDMA in enterprise arrays; cloud block storage back ends; Kubernetes CSI storage built on SPDK.
+avoid: When the lowest latency is needed; local NVMe is faster, with the price of stranded capacity.
+flow:
+  Orchestrator [svc: control plane] -> Target [svc: storage server] : create namespace 1 TB | The control plane carves a namespace out of pooled drives.
+  Orchestrator -> Initiator [svc: compute host] : connect to target | The host is told which target and namespace to use.
+  Initiator -> Target : NVMe connect over TCP | The host opens one queue pair per core over the network.
+  App [client] -> Initiator : read block | The app reads /dev/nvme1n1 as if it were a local drive.
+  Initiator -> Target : read command capsule | The command crosses the network inside a capsule.
+  Target -> Initiator : data + completion | The target returns data and a completion entry.
+ref: spec | NVMe over Fabrics specification | NVM Express, Inc. | https://nvmexpress.org/specifications/
+
+== Zoned namespaces and log-structured writes
+kind: lsm-compaction, wal
+when: A write-heavy database wants to cut flash write amplification and get steady tail latency.
+how: Flash cannot overwrite in place. A normal SSD hides this with a flash translation layer that moves data and erases blocks in the background. This garbage collection causes extra writes and sudden latency spikes.
+NVMe Zoned Namespaces (ZNS) divide the drive into zones. A zone accepts only sequential writes and is erased as a whole. The host decides placement. A log-structured store, such as an LSM tree, already writes big sorted files sequentially, so it fits a zone well.
+The application writes one SSTable file per zone and resets the zone when compaction deletes the file. Write amplification inside the drive drops close to 1. The cost is that the software must manage zones, and not all drives and file systems support it.
+used: RocksDB with ZenFS on ZNS drives; Western Digital and Samsung zoned drives; Linux zoned block device support in the kernel.
+avoid: When random in-place updates are needed and no log-structured software exists; use a regular namespace.
+flow:
+  RocksDB [svc: LSM engine] -> Memtable [cache: in RAM] : write | New writes go to memory first and to the log.
+  Memtable -> ZenFS [svc: zone allocator] : flush SSTable 64 MB | A full memtable becomes a sorted file.
+  ZenFS -> Zone 7 [store: ZNS zone] : sequential append | The file is appended to one zone only.
+  RocksDB -> ZenFS : compaction deletes file | Compaction removes old files.
+  ZenFS -> Zone 7 : reset zone | The whole zone is erased at once, so the drive moves no data.
+ref: paper | ZNS: Avoiding the Block Interface Tax for Flash-based SSDs | Bjorling et al., USENIX ATC 2021 | https://www.usenix.org/conference/atc21/presentation/bjorling
+
+@@ quantumhw
+== Quantum accelerator behind a classical job queue
+kind: offload-accelerator, async-request-reply
+when: A team wants to try a quantum circuit inside a larger classical workflow, but the machine is rare and slow to reach.
+how: Quantum hardware is kept in cryostats or vacuum chambers and is reached through a cloud service. A classical program builds a circuit with a toolkit such as Qiskit or Cirq. It transpiles the circuit for the chip, mapping gates to the physical qubits and gate set.
+The job goes to a queue. When it runs, the machine executes the circuit many times, often 1,000 to 10,000 shots, because each run gives one random measurement. The service returns counts of each outcome.
+The program polls the job or waits for a callback, then processes the counts. Queue wait can be minutes to hours, so the design is asynchronous. A simulator on a CPU or GPU is used for tests first.
+used: IBM Quantum with Qiskit Runtime; Amazon Braket; Azure Quantum; Google Quantum AI with Cirq.
+avoid: When a classical solver can do the job; most business problems today do not need quantum hardware.
+flow:
+  Notebook [client: Qiskit] -> Transpiler [svc: map to qubits] : circuit | The program builds a circuit and fits it to the chip layout.
+  Transpiler -> Cloud API [svc: job service] : submit 4096 shots | The job is sent to the cloud service.
+  Cloud API -> Job queue [queue: shared] : enqueue | The job waits behind other users.
+  Job queue -> QPU [svc: superconducting chip] : run circuit | The chip runs the circuit again and again.
+  QPU -> Cloud API : counts per outcome | The chip returns a table of measured bit strings.
+  Notebook ~> Cloud API : poll job status | The program checks status until the job is done.
+ref: docs | Qiskit documentation | IBM Quantum | https://docs.quantum.ibm.com/
+
+== Hybrid variational loop
+kind: feedback-loop, offload-accelerator
+when: A problem is tried with a small quantum circuit whose parameters are tuned by a classical optimizer.
+how: Algorithms such as VQE and QAOA use a circuit with adjustable angles. A classical optimizer picks starting angles. The quantum chip runs the circuit and returns measured values, from which the program computes a cost, for example an energy.
+The optimizer reads the cost and proposes new angles. This repeats for tens or hundreds of rounds. The quantum part is short, so it fits the limited coherence time of today's noisy qubits.
+Noise is the main limit. Results are mitigated with methods such as zero-noise extrapolation or averaging over many shots. Each round costs a queue trip unless the loop runs in a session close to the hardware.
+used: IBM Qiskit Runtime sessions; chemistry experiments with VQE; research on QAOA for optimization.
+avoid: When a classical optimizer on a simulator is enough; real chips add noise and cost.
+flow:
+  Optimizer [svc: COBYLA] -> QPU [svc: noisy qubits] : circuit with angles | The optimizer sends a circuit with chosen angles.
+  QPU -> Estimator [svc: error mitigation] : raw counts | The chip returns raw noisy counts.
+  Estimator -> Optimizer : cost = -1.02 | The mitigated cost goes back to the optimizer.
+  * Optimizer: new angles | The optimizer lowers the cost by changing the angles.
+  Optimizer -> QPU : circuit with new angles | The next round starts with better parameters.
+  Optimizer -> Result [store: best angles] : converged | After many rounds the best angles are saved.
+ref: paper | A variational eigenvalue solver on a photonic quantum processor | Peruzzo et al., Nature Communications 2014 | https://www.nature.com/articles/ncomms5213
+
+@@ riscv
+== Open core with custom extensions
+kind: plugin-arch, interpreter-compiler
+when: A company wants a CPU it can shape for one job, without paying instruction-set licence fees.
+how: RISC-V is an open instruction set. It has a small base, such as RV64I, and optional standard extensions: M for multiply, A for atomics, V for vectors, and others. Anyone may build a core without a licence.
+A chip team starts from a base plus the extensions it needs. It can add custom instructions in space the standard reserves for this, for example a special op for a codec or a neural network layer. Open cores such as Rocket, BOOM, CVA6 and commercial IP cores are starting points.
+The compiler (LLVM or GCC) is extended to emit the new instruction, or software calls it through an intrinsic. The risk is fragmentation, so profiles such as RVA23 name a fixed set of extensions that software can rely on.
+used: Western Digital and Nvidia use RISC-V controllers in products; SiFive and other IP vendors; embedded chips from Espressif.
+avoid: When you need the widest software support today on servers or phones; ARM and x86 have larger ecosystems.
+flow:
+  Spec [store: base + extensions] -> Chip team [svc: SoC design] : pick RV64 + V + custom | The team chooses base, standard extensions and custom ones.
+  Chip team -> Core RTL [store: open core] : add custom op | The team adds the new instruction to the core design.
+  Chip team -> Compiler [svc: LLVM] : add intrinsic | The compiler learns to emit the new op.
+  Core RTL -> Silicon [svc: FPGA / foundry] : tape-out | The design is built as a chip, or tested first on an FPGA.
+  Compiler -> Silicon : firmware binary | The binary runs on the chip and uses the custom op.
+ref: spec | The RISC-V Instruction Set Manual | RISC-V International | https://riscv.org/technical/specifications/
+
+== RISC-V microcontroller inside a larger chip
+kind: offload-accelerator, sidecar
+when: A chip needs a small, cheap control processor for management tasks, and a licensed core would add cost.
+how: Large chips, such as storage controllers, GPUs and network cards, include small helper cores. They run boot code, power control, security and housekeeping, next to the big compute blocks.
+RISC-V is a good fit here. There is no per-core licence, the core is small, and the vendor can strip it to the exact features needed. Firmware is written in C and built with the standard toolchain.
+The helper core talks to the main blocks over memory-mapped registers and queues. It handles slow control tasks, so the main design stays simple. A downside is that each vendor gets their own core variant, which makes debugging tools different.
+used: Nvidia GPU system controllers (the Falcon core was replaced by RISC-V); Western Digital SweRV cores in storage; Google OpenTitan root of trust.
+avoid: When the firmware needs a mature rich operating system and drivers; use a larger ARM core.
+flow:
+  Boot ROM [store: mask ROM] -> Control core [svc: RISC-V RV32] : reset vector | On power-up the small core starts from a fixed ROM.
+  Control core -> Flash [store: firmware] : load and verify image | It checks a signature, then loads the firmware.
+  Control core -> Power manager [svc: clocks and rails] : set voltage | It sets clocks and voltage for the chip.
+  Control core -> Compute blocks [svc: GPU or NIC engines] : start via registers | It starts the big blocks by writing control registers.
+  Compute blocks ~> Control core : interrupt on error | The big blocks call the helper core when a fault happens.
+ref: docs | OpenTitan | lowRISC and partners | https://opentitan.org/
+
+@@ tpu
+== TPU pod with systolic arrays and a torus network
+kind: model-parallel, data-parallel
+when: A large model must be trained across thousands of chips with the least network cost.
+how: Each TPU chip has matrix units built as systolic arrays, which pass data from cell to cell so one memory read feeds many multiply-add operations. Chips are linked in a 2D or 3D torus by fast inter-chip links, in groups called pods or slices.
+The compiler, XLA, takes the model graph and splits tensors across chips with a sharding plan. Frameworks such as JAX describe it with named mesh axes: for example data on one axis and model on another. XLA inserts all-reduce and all-gather operations that map onto the torus links.
+Because the topology is fixed and the compiler plans every transfer ahead of time, the network delay is predictable. Large runs overlap communication with compute. The cost is that the compiler must see static shapes, and code changes can mean a long recompile.
+used: Google training of its Gemini models and PaLM; Cloud TPU slices; JAX and MaxText on TPU.
+avoid: When the code uses dynamic shapes, custom CUDA kernels or many GPU-only libraries; use GPUs.
+flow:
+  JAX program [client: pjit + mesh] -> XLA compiler [svc: sharding plan] : model graph | The program describes the model and the mesh of chips.
+  XLA compiler -> TPU slice [svc: 256 chips] : compiled executable | XLA produces one program for every chip.
+  * TPU slice: all-reduce on torus | Chips swap partial results with their neighbours over the torus links.
+  Host [svc: CPU VM] -> TPU slice : input batches | The host CPU feeds data through an input pipeline.
+  TPU slice -> Checkpoint store [store: GCS] : save weights | The job saves checkpoints so it can resume after a chip fails.
+ref: paper | TPU v4: An Optically Reconfigurable Supercomputer | Jouppi et al., ISCA 2023 | https://arxiv.org/abs/2304.01433
+
+== Batched model serving on TPU
+kind: batching, continuous-batching
+when: A model must serve many users at low cost per token, and requests are small.
+how: A serving stack gathers incoming requests into batches, because matrix units give best value when fed large matrices. The compiled model has fixed batch sizes, so the server pads requests up to the nearest size, for example 8, 16 or 32.
+For language models the server keeps a KV cache in the chip's high-bandwidth memory. Prefill (reading the prompt) and decode (writing tokens) have different costs, so some stacks run them in separate stages.
+Padding wastes some compute, but it avoids recompilation. Teams choose batch buckets by traffic. Engines such as JetStream and vLLM on TPU aim to add requests continuously as others finish.
+used: Cloud TPU inference with JetStream; Google services that serve models on TPU; vLLM TPU backend.
+avoid: When traffic is low and a single request must be answered as fast as possible; a smaller device is cheaper.
+flow:
+  Users [client] -> Load balancer [svc: gRPC] : prompts | Requests from many users arrive together.
+  Load balancer -> Batcher [queue: size buckets] : enqueue | The batcher groups them and pads to a bucket size.
+  Batcher -> TPU chips [svc: compiled model] : batch of 16 | One compiled program handles the whole batch.
+  TPU chips -> KV cache [cache: HBM] : keys and values | The chips store past token state in fast memory.
+  TPU chips -> Users : streamed tokens | Each user receives their own tokens as they are produced.
+ref: docs | JetStream | Google, open source | 
+
+@@ x86
+== Decode to micro-ops with an out-of-order core
+kind: pipeline-stages, memory-tiering
+when: Old software with a complex instruction set must run fast on modern, wide hardware.
+how: An x86 instruction can be 1 to 15 bytes long and can read memory and compute in one step. The front end fetches bytes, finds instruction boundaries and decodes each instruction into one or more simple micro-ops.
+Decoded micro-ops are stored in a micro-op cache. A hot loop is then served from this cache and skips the slow decoders. A branch predictor guesses the next path so the front end never waits.
+The back end renames registers, puts micro-ops in a reorder buffer and runs them out of order on several execution ports, up to about 6 to 8 per cycle on recent cores. Results retire in the original program order, so the program sees a simple, ordered machine. A wrong guess is thrown away and costs about 15 to 20 cycles.
+used: Intel Core and Xeon; AMD Zen and EPYC. Compilers such as GCC and LLVM tune loops so they stay in the micro-op cache.
+avoid: When power per operation matters more than software compatibility; ARM cores with a simple decoder often use less energy.
+flow:
+  Instruction cache [cache: L1i 32 KB] -> Decoders [svc: x86 to micro-ops] : raw bytes | The front end reads bytes and splits them into instructions.
+  Decoders -> Micro-op cache [cache: decoded] : micro-ops | Decoded micro-ops are kept for reuse.
+  Micro-op cache -> Reorder buffer [queue: out of order] : up to 6 per cycle | Hot loops skip the decoders and enter the back end quickly.
+  Reorder buffer -> Execution ports [svc: ALU and load] : ready micro-ops | Micro-ops run when their inputs are ready, not in program order.
+  Execution ports -x> Reorder buffer : mispredict flush | A wrong branch guess discards the micro-ops that followed.
+  Reorder buffer -> Registers [store: architectural] : retire in order | Results commit in program order, so the program sees normal order.
+ref: docs | Intel 64 and IA-32 Architectures Optimization Reference Manual | Intel | 
+
+== Virtualization with hardware extensions
+kind: horizontal-scale, bulkhead
+when: Many tenants share one physical server, and each needs its own full operating system, isolated from the others.
+how: Intel VT-x and AMD-V add a mode where a guest operating system runs at full speed on the real CPU. A hypervisor, such as KVM, sets up a virtual machine control structure for each guest. Extended page tables (EPT or NPT) let the hardware translate guest addresses to host addresses with no software help.
+When the guest does something that is not allowed, such as touching a device, the CPU exits to the hypervisor. The hypervisor handles it, for example by emulating the device, and resumes the guest. Exits cost a few thousand cycles, so fast paths use paravirtual drivers such as virtio.
+The result is isolation: a guest cannot read another guest's memory. Most cloud virtual machines are built this way. Side-channel attacks such as Spectre showed the isolation is not perfect, so providers add microcode and scheduling rules.
+used: KVM on Linux; AWS Nitro, Google Compute Engine and Azure on x86 servers; Firecracker micro-VMs.
+avoid: When start time in milliseconds and tiny overhead matter more than full isolation; use containers, or micro-VMs if strong isolation is needed.
+flow:
+  Hypervisor [svc: KVM] -> CPU [svc: VT-x] : launch guest 1 | The hypervisor starts a guest with its own control structure.
+  CPU -> Guest OS A [svc: tenant A VM] : run at native speed | Most guest code runs directly on the CPU.
+  Guest OS A -> CPU : memory access | The guest uses its own page tables.
+  CPU -> Page tables [store: EPT] : two-level translation | Hardware translates guest to host addresses without exits.
+  Guest OS A -x> Hypervisor : VM exit on device I/O | A privileged action leaves the guest and enters the hypervisor.
+  Hypervisor -> Guest OS A : resume | The hypervisor handles it, then resumes the guest.
+ref: docs | Intel 64 and IA-32 Architectures Software Developer's Manual, Volume 3C (VMX) | Intel | 
+
+== SIMD vector loop with runtime dispatch
+kind: offload-accelerator, interpreter-compiler
+when: A hot loop works on large arrays, and the same binary must run on old and new CPUs.
+how: x86 has SIMD extensions: SSE (128-bit), AVX2 (256-bit) and AVX-512 (512-bit). One instruction works on 4 to 16 numbers at once. A library can run a data loop several times faster with them.
+Not every CPU has every extension. At start, the library reads the CPUID instruction and sets a function pointer to the best version: AVX-512 where available, otherwise AVX2, otherwise a plain scalar version. Compilers also offer function multiversioning to do this.
+Engines such as simdjson, ClickHouse and numerical libraries like OpenBLAS use this pattern. On some older Intel chips, heavy AVX-512 use lowered the clock, so measure before choosing a wide path.
+used: simdjson; ClickHouse; OpenBLAS and Intel oneMKL; glibc string functions with ifunc.
+avoid: When the loop is small or branch-heavy; vector setup costs more than it gains.
+flow:
+  Library init [svc: startup] -> CPUID [svc: feature query] : which extensions? | At startup the library asks the CPU what it supports.
+  CPUID -> Library init : AVX2 yes, AVX-512 no | The CPU lists its feature bits.
+  Library init -> Dispatch table [store: function pointers] : bind sum_avx2 | The library points the call at the AVX2 version.
+  App [client] -> Dispatch table : sum(array) | Every later call goes through the pointer.
+  Dispatch table -> AVX2 kernel [svc: 8 floats per op] : process 1M floats | The vector loop does 8 values per instruction.
+ref: docs | Intel Intrinsics Guide | Intel | https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html
+
+@@ cilium
+== eBPF CNI with identity-based network policy
+kind: zero-trust, control-data-plane
+when: A Kubernetes cluster needs pod networking and policy that scales to thousands of pods without long iptables lists.
+how: Cilium runs an agent on each node. The agent loads eBPF programs into the Linux kernel at the pod network interfaces. These programs route packets, apply policy and count traffic, with no iptables chain walk.
+Cilium gives each set of pods an identity number derived from their labels. A policy says "frontend may call backend on port 8080". The packet carries or maps to an identity, so the rule does not depend on pod IP addresses, which change all the time. Rules are stored in eBPF hash maps, so lookup time stays flat as the cluster grows.
+The agent watches the Kubernetes API for pods and policies and updates the maps on its node. The control plane is the Kubernetes API plus the agent. The data plane is the kernel.
+used: Default networking on Google GKE Dataplane V2; Amazon EKS Anywhere; Azure AKS powered by Cilium; Kubernetes clusters that need many policies.
+avoid: When the kernel is old and lacks eBPF features; use a simpler CNI such as the cloud provider default.
+flow:
+  Kubernetes API [svc: control plane] -> Cilium agent [svc: on each node] : NetworkPolicy + pod labels | The agent watches the API for pods and policies.
+  Cilium agent -> eBPF maps [store: policy by identity] : update rules | It writes allow rules, keyed by identity, into kernel maps.
+  Frontend pod [client: identity 1201] -> eBPF program [svc: tc hook in kernel] : packet to backend :8080 | A packet leaves the pod and meets the eBPF hook.
+  eBPF program -> eBPF maps : lookup 1201 to 1344 | The program looks up the pair of identities in a hash map.
+  eBPF program -> Backend pod [svc: identity 1344] : forward | The rule allows it, so the packet is passed on.
+  Frontend pod -x> eBPF program : packet to db :5432 | A packet with no matching rule is dropped in the kernel.
+ref: docs | Cilium documentation: network policy | Cilium project | https://docs.cilium.io/en/stable/security/policy/
+
+== Replacing kube-proxy with eBPF load balancing
+kind: service-discovery, horizontal-scale
+when: A cluster has thousands of Services, and kube-proxy's iptables rules make updates and packet paths slow.
+how: In Kubernetes, a Service has a virtual IP that must map to one of many pod IPs. kube-proxy usually does this with long iptables chains. Rule updates and lookups slow down as Services grow.
+Cilium can replace kube-proxy. It attaches eBPF programs at the socket and network layers. For traffic from a pod, the socket hook rewrites the destination from the Service IP to a chosen pod IP at connect time, so packets need no later address translation. For traffic from outside, programs at the network driver (XDP) pick the back end quickly.
+The Service and its back ends are held in eBPF maps. A hash lookup picks the back end, and the cost stays about the same at 100 or 10,000 Services.
+used: Cilium kube-proxy replacement mode; Cilium North-South load balancer; Kubernetes clusters with many Services.
+avoid: When the cluster is small and kube-proxy works well; extra change brings little gain.
+flow:
+  Kubernetes API [svc: Services] -> Cilium agent [svc: node agent] : Service to 3 pods | The agent learns Services and their pod back ends.
+  Cilium agent -> Service map [store: eBPF hash map] : write back ends | It stores the list in a kernel map.
+  Client pod [client] -> Socket hook [svc: eBPF at connect] : connect 10.96.0.10:80 | The pod connects to the Service IP.
+  Socket hook -> Service map : pick back end | The hook picks one pod from the map.
+  Socket hook -> Backend pod [svc: 10.0.2.7] : connect to pod IP | The socket now talks to the pod IP, so no per-packet rewrite is needed.
+ref: docs | Kubernetes without kube-proxy | Cilium documentation | https://docs.cilium.io/en/stable/network/kubernetes/kubeproxy-free/
+
+== Hubble flow observability from the kernel
+kind: observability-pipeline, sidecar
+when: Teams need to see which services talk to which, and why a packet was dropped, without adding sidecars or code changes.
+how: The same eBPF programs that route and filter traffic also emit events: flow records, drops with the reason, DNS requests and HTTP metadata. Each Cilium agent keeps these in a ring buffer on its node.
+Hubble reads the buffers. The Hubble relay joins the nodes into one cluster-wide API, and the Hubble UI draws a service map. Metrics such as request counts and drops are exported to Prometheus.
+Because the data is taken in the kernel, no sidecar is injected into pods and the application is not changed. The cost is that deep layer-7 detail is only visible for protocols that Cilium parses, and it needs a policy or proxy for some of them.
+used: Cilium Hubble UI and CLI; Prometheus and Grafana dashboards of drop and latency metrics.
+avoid: When you need full request bodies and tracing across services; add distributed tracing such as OpenTelemetry.
+flow:
+  eBPF programs [svc: in kernel] -> Ring buffer [log: per node] : flow event | Each packet decision creates a small event.
+  Ring buffer -> Hubble server [svc: in agent] : read events | The agent reads the buffer on its node.
+  Hubble server -> Hubble relay [svc: cluster API] : stream flows | The relay joins flows from all nodes.
+  Hubble relay -> Hubble UI [client: service map] : query | The UI shows who talks to whom.
+  Hubble server -> Prometheus [store: metrics] : drops, HTTP counters | Counters are scraped for dashboards and alerts.
+ref: docs | Hubble: network observability | Cilium documentation | https://docs.cilium.io/en/stable/overview/intro/
+
+@@ cloud
+== Multi-AZ stateless tier behind a load balancer
+kind: horizontal-scale, autoscaling, health-check
+when: A web service must survive the loss of one data center and handle changing load.
+how: A cloud region has several availability zones (AZs). Each is a separate set of data centers with its own power and network. Put the same stateless app servers in at least two or three AZs, in an auto scaling group, behind a load balancer.
+The load balancer checks the health of every instance. A failed instance gets no traffic, and the group replaces it. A scaling policy adds instances when average CPU or request count passes a target, and removes them when load falls.
+State is kept outside the servers: a managed database with a standby in another AZ, a cache and object storage. Then any instance can serve any request. Cross-AZ traffic has a small cost and latency, so keep chatty calls inside one AZ where you can.
+used: AWS Auto Scaling groups with Elastic Load Balancing; Google managed instance groups; Azure virtual machine scale sets.
+avoid: When one region failure must also be survived; add a multi-region design.
+flow:
+  Users [user] -> Load balancer [svc: cross-AZ] : HTTPS request | A request arrives at the managed load balancer.
+  Load balancer -> App AZ-a [svc: instance group], App AZ-b [svc: instance group] : round robin | Traffic is spread over healthy instances in both zones.
+  App AZ-a -> Database [db: primary in AZ-a] : read and write | The app keeps its state in a managed database.
+  Database ~> Standby [db: replica in AZ-b] : synchronous replication | A standby in another zone holds a copy for failover.
+  Load balancer -x> App AZ-a : health check fails | A failed zone gets no traffic.
+  * App AZ-b: scale out to 6 | The scaling group adds instances to take the extra load.
+ref: docs | AWS Well-Architected Framework: Reliability pillar | Amazon Web Services | https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html
+
+== Object-storage data lake with event-driven processing
+kind: medallion, event-driven, tiered-storage
+when: A team collects large volumes of raw files and wants cheap storage that many tools can process.
+how: Files land in object storage (S3, Cloud Storage or Azure Blob). It is cheap, durable and almost without limit on size. A put event triggers a function or a queue message when a new object arrives.
+The function validates the file and writes a cleaned copy in a columnar format such as Parquet, into a second prefix. Query engines (Athena, BigQuery, Synapse or Spark) read the files in place. Compute is separate from storage, so you pay for queries only when they run.
+Lifecycle rules move old data to colder classes, such as S3 Glacier, to cut cost. Access is governed by IAM and bucket policies, and objects are encrypted with KMS keys.
+used: AWS S3 with Lambda and Athena; Google Cloud Storage with BigQuery external tables; Azure Data Lake Storage with Synapse.
+avoid: When you need row-level updates and low latency; use a database or an open table format with transactions.
+flow:
+  Producers [client] -> Raw bucket [lake: raw files] : upload JSON | Producers write raw files and never edit them.
+  Raw bucket -> Event queue [queue: object created] : notification | Each new object triggers an event.
+  Event queue -> Function [svc: serverless] : process file | A function wakes up for each event.
+  Function -> Clean bucket [lake: Parquet] : write columnar copy | It writes a validated, compact copy.
+  Analyst [user] -> Query engine [svc: Athena or BigQuery] : SQL | An analyst runs SQL.
+  Query engine -> Clean bucket : read Parquet in place | The engine reads only the needed columns.
+ref: docs | Data lakes and analytics on AWS | Amazon Web Services | 
+
+== Pre-signed URLs for direct client upload
+kind: valet-key, claim-check
+when: Many clients must upload large files, and routing the bytes through your own servers would be costly.
+how: The client asks the API for permission to upload. The API checks who the user is, then asks the cloud storage service to create a pre-signed URL. This URL carries a signature, an expiry time (for example 15 minutes) and the exact object key.
+The client sends the file straight to object storage with an HTTP PUT. The bytes never touch the app servers, so the API stays small and cheap. Storage scales to any number of parallel uploads.
+When the upload ends, storage sends an event and the backend records the key in its database. Large files use multipart upload, with one signed URL per part. Set a size limit and a content type in the signature so a client cannot upload anything it likes.
+used: Amazon S3 pre-signed URLs; Google Cloud Storage signed URLs; Azure Blob shared access signatures.
+avoid: When the server must inspect or transform data before storing it; accept it on the server, or scan after upload.
+flow:
+  Client [client: browser] -> API [svc: auth check] : request upload URL | The client asks for upload permission.
+  API -> Object store [store: S3 or GCS] : sign key, expiry 15 min | The API creates a signed URL with its own cloud credentials.
+  API -> Client : pre-signed URL | The client receives a short-lived URL.
+  Client -> Object store : PUT file | The client uploads the bytes directly to storage.
+  Object store -> Queue [queue: events] : object created | Storage announces the new object.
+  Queue -> API : record key in DB | The API stores only the object key, not the file.
+ref: docs | Sharing objects with presigned URLs | Amazon S3 User Guide | https://docs.aws.amazon.com/AmazonS3/latest/userguide/ShareObjectPreSignedURL.html
+
+@@ cloudflare
+== Reverse-proxy edge cache in front of an origin
+kind: cdn-edge, api-gateway
+when: A site has users around the world, and the origin server is far away or too small for peak load.
+how: The site changes its DNS so that its hostname points to Cloudflare. Cloudflare announces the same IP addresses from data centers in many cities (anycast), so each user's packets reach a near one.
+The edge server ends the TLS connection close to the user, then checks its cache. The cache key is built from the URL and chosen headers. On a hit, it answers at once. On a miss, it fetches from the origin, stores the response by its Cache-Control headers and returns it.
+Tiered cache lets edge sites ask a regional upper tier before the origin, which raises the hit rate and cuts origin load. A web application firewall and rate limits run at the same edge, before the request can reach the origin.
+used: Public websites and APIs that serve static assets, images and downloads; news and e-commerce sites at traffic peaks.
+avoid: When responses are private and different for each user and cannot be cached; use the edge for TLS and security only.
+flow:
+  User [user: Bengaluru] -> Edge PoP [svc: nearest city] : HTTPS GET /logo.png | The request reaches the nearest Cloudflare data center.
+  Edge PoP -> Edge cache [cache: by URL] : lookup key | The edge looks for a stored copy.
+  Edge PoP -> Upper tier [cache: regional] : miss, ask upper tier | On a miss, a regional tier is asked before the origin.
+  Upper tier -> Origin [svc: your server] : fetch | Only a double miss reaches the origin.
+  Origin -> Edge PoP : 200 + max-age 3600 | The response says how long it may be cached.
+  Edge PoP -> User : response | The next user near this edge gets a cache hit in a few milliseconds.
+ref: docs | How Cloudflare caching works | Cloudflare docs | https://developers.cloudflare.com/cache/concepts/default-cache-behavior/
+
+== Edge compute with Workers and global KV
+kind: precompute, cdn-edge
+when: Light request logic, such as redirects, auth checks or personalisation, must run near users without a regional server.
+how: Cloudflare Workers run JavaScript or WebAssembly in V8 isolates on every edge location. An isolate starts in about a few milliseconds and shares one process with others, so there is almost no cold start.
+The Worker sees the request first. It can rewrite headers, check a token, route to different origins, or answer by itself. For data it uses Workers KV, a key-value store that is read from the local edge cache and is eventually consistent, so changes take up to about a minute to show everywhere. For strong consistency per key, it calls a Durable Object, which keeps one instance of state at one place.
+Limits are CPU time per request and memory, so heavy work goes to the origin. This design suits read-heavy config and routing, not large databases.
+used: Cloudflare Workers with KV and Durable Objects; A/B tests and redirects at the edge; edge API gateways.
+avoid: When the logic needs long CPU time or a large library set; run it in a regional container or serverless function.
+flow:
+  User [user] -> Edge Worker [svc: V8 isolate] : GET /home | The request is handled by a Worker at the nearest data center.
+  Edge Worker -> Workers KV [store: eventually consistent] : get flags:user42 | The Worker reads config from the local KV cache.
+  Edge Worker -> Durable Object [store: strong order] : increment counter | State that needs strict order goes to one object.
+  Edge Worker -> Origin [svc: your server] : fetch only if needed | The Worker calls the origin only when it must.
+  Edge Worker -> User : personalised response | The reply is built at the edge, close to the user.
+ref: docs | How Workers works | Cloudflare docs | https://developers.cloudflare.com/workers/reference/how-workers-works/
+
+== DDoS absorption and zero-trust access
+kind: zero-trust, load-shedding, rate-limit
+when: A public service is attacked by floods, or private apps must be reachable without opening them to the internet.
+how: Because all traffic enters through the anycast network, an attack is spread over many data centers, each taking a small part. Each edge server runs detection on its own packets and drops attack traffic in the kernel, before it reaches any app. Rules are rolled out across the network by the control plane.
+For private apps, Cloudflare Tunnel runs a small daemon (cloudflared) next to the app. The daemon makes only outbound connections to the edge, so the origin needs no open inbound port or public IP.
+Cloudflare Access sits in front of the tunnel. It checks identity from the company's identity provider, with device posture, on every request. Only then does traffic go down the tunnel to the app.
+used: Cloudflare DDoS protection; Cloudflare Tunnel and Access as a replacement for VPN; many companies exposing internal tools.
+avoid: When the traffic cannot pass a third-party proxy because of legal or latency rules; run your own scrubbing and VPN.
+flow:
+  Attacker [client] -x> Edge PoP [svc: anycast] : flood of packets | A flood is split across many locations and dropped at the edge.
+  Employee [user] -> Access [svc: identity check] : request wiki.corp | Each request needs a valid identity.
+  Access -> IdP [svc: Okta or Entra] : verify login + MFA | Access checks the sign-in with the company identity provider.
+  Access -> Tunnel [svc: cloudflared] : allowed request | Only allowed requests go down the tunnel.
+  Tunnel -> Wiki [svc: internal app] : forward | The app has no public address and no inbound port.
+ref: docs | Cloudflare Tunnel | Cloudflare docs | https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
+
+@@ docker
+== Build once, run anywhere from an immutable image
+kind: immutable-infra, blue-green
+when: An app works on one machine but fails on another because of different libraries or settings.
+how: A Dockerfile lists the base image, the dependencies and the app code. The build runs each step and stores the result as a read-only layer. The final image has an id from a hash of its content, so it never changes after the build.
+CI builds the image once, tags it with the commit id and pushes it to a registry. Test, staging and production all pull this same image. Only the configuration changes, through environment variables or mounted files.
+To release, you start containers from the new tag and stop the old ones. To roll back, you start the old tag again. Layers are shared between images, so a pull downloads only the layers a host does not have.
+used: Almost all container-based delivery; Docker Hub, Amazon ECR and GitHub Container Registry as registries; Kubernetes deployments that name an image by digest.
+avoid: When a workload needs a different kernel or strong isolation between tenants; use a virtual machine or micro-VM.
+flow:
+  Dockerfile [store: in Git] -> CI [svc: docker build] : build layers | CI builds the image from the Dockerfile.
+  CI -> Registry [store: image by digest] : push app:3f9c1a | The image is pushed once with an immutable tag.
+  Staging host [svc: Docker engine] -> Registry : pull app:3f9c1a | Staging pulls the same image and runs tests.
+  Prod host [svc: Docker engine] -> Registry : pull app:3f9c1a | Production pulls the same bytes.
+  * Prod host: running 3f9c1a | New containers start from the new image and the old ones stop.
+  * Prod host: rollback to 2b7e0d | A rollback starts the old tag again.
+ref: docs | Docker overview | Docker documentation | https://docs.docker.com/get-started/docker-overview/
+
+== Multi-stage build for small, safe images
+kind: pipes-filters, immutable-infra
+when: Images are large and contain compilers and build tools that production does not need, which slows pulls and widens the attack surface.
+how: A multi-stage Dockerfile has several FROM lines. The first stage uses a big image with the compiler and tools, and builds the app. The last stage starts from a tiny base, such as distroless or alpine, and copies in only the built binary.
+Only the last stage becomes the image. A Go service can fall from about 1 GB to under 30 MB. Smaller images pull faster in autoscaling events and have fewer packages to patch.
+Order the steps so slow steps that rarely change, such as dependency install, come first, and the app code comes last. Then the build cache is reused and rebuilds take seconds. Scan the final image for known vulnerabilities in CI and sign it.
+used: Go, Rust and Java services built for production; distroless images from Google; Docker BuildKit with cache mounts.
+avoid: When the runtime needs a shell and debug tools in production; keep a separate debug image rather than adding them to the main one.
+flow:
+  Source [store: app code] -> Builder stage [svc: golang image 1 GB] : compile | The first stage has the full toolchain.
+  Builder stage -> Final stage [svc: distroless base] : COPY binary only | Only the binary is copied across stages.
+  Final stage -> Image scanner [svc: Trivy or Grype] : scan layers | CI scans the small image for known flaws.
+  Image scanner -> Registry [store: 25 MB image] : push if clean | Only a clean image is published.
+  Registry -> Node [svc: autoscaled] : fast pull | New nodes pull a small image in seconds.
+ref: docs | Multi-stage builds | Docker documentation | https://docs.docker.com/build/building/multi-stage/
+
+== Local multi-service stack with Compose
+kind: microservices, service-discovery
+when: A developer needs the app, a database, a cache and a queue running together on a laptop or CI runner, the same way for everyone.
+how: A compose.yaml file lists the services, their images, ports, environment variables and volumes. The command docker compose up creates a private network and starts each container on it.
+On that network, Docker's built-in DNS lets each container find the others by service name, for example db:5432. A depends_on rule with a health check starts the app only after the database answers. A named volume keeps database files between restarts.
+This gives the same stack in development and in integration tests, with no shared machine. It is not meant for production scale, since it runs on one host with no automatic failover.
+used: Developer laptops and CI integration tests; Testcontainers-style test setups; small single-host deployments.
+avoid: When you need several hosts, rolling updates or autoscaling; use Kubernetes or a managed container service.
+flow:
+  Developer [user] -> Compose [svc: docker compose up] : read compose.yaml | The developer starts the stack with one command.
+  Compose -> Network [svc: bridge network] : create private network | Compose creates a network for the project.
+  Compose -> Postgres [db: volume pgdata] : start db | The database starts and gets a named volume.
+  Compose -> App [svc: web container] : start after db healthy | The app waits until the health check passes.
+  App -> Postgres : connect to db:5432 | The app finds the database by its service name.
+ref: docs | Docker Compose overview | Docker documentation | https://docs.docker.com/compose/
+
+@@ envoy
+== Sidecar proxy in a service mesh
+kind: sidecar, service-mesh, circuit-breaker
+when: Many services in different languages need the same retries, timeouts, mutual TLS and metrics, without each team writing that code.
+how: An Envoy proxy runs beside each service instance, in the same pod. Traffic in and out of the service goes through it. The service calls localhost and knows nothing about the network.
+A control plane, such as Istio's istiod, sends Envoy its listeners, routes, clusters and endpoints over the xDS APIs, a gRPC stream. Envoy updates its config without restart. It then applies load balancing, timeouts, retries with budgets, circuit breaking limits and outlier ejection, and it encrypts the hop with mutual TLS using certificates from the control plane.
+Every hop also gives metrics and trace headers. The price is an extra proxy hop, some CPU and memory on each pod, and a control plane to run.
+used: Istio, which uses Envoy as its data plane; AWS App Mesh; Consul Connect; Kubernetes service meshes at large companies, including Lyft, where Envoy was created.
+avoid: When there are only a few services in one language; a shared client library or an ingress is simpler.
+flow:
+  Control plane [svc: istiod] -> Envoy A [svc: sidecar of service A] : xDS config and certs | The control plane pushes config over a gRPC stream.
+  Service A [svc: app] -> Envoy A : call localhost:8080 | The app makes a plain call to its local proxy.
+  Envoy A -> Envoy B [svc: sidecar of service B] : mTLS, retry up to 2 | Envoy A picks an endpoint and sends it over mutual TLS.
+  Envoy B -> Service B [svc: app] : forward to localhost | The receiving proxy checks policy and passes it on.
+  Envoy A -x> Envoy B : 503 error | A failing endpoint is ejected after repeated errors.
+  Envoy A ~> Telemetry [svc: Prometheus] : stats and spans | Each proxy exports metrics and traces without app code.
+ref: docs | xDS REST and gRPC protocol | Envoy documentation | https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol
+
+== Edge proxy and API gateway with dynamic config
+kind: api-gateway, control-data-plane, rate-limit
+when: A public entry point must route to many back ends, terminate TLS, and change routes often without dropping connections.
+how: Envoy runs as the edge proxy. A listener accepts HTTPS on port 443 and ends TLS. A chain of HTTP filters runs on each request: authentication, rate limit, then routing.
+The route table maps host and path to a cluster, which is a group of upstream endpoints. Envoy health-checks the endpoints and balances load by least request or ring hash. A global rate limit filter calls a rate limit service backed by Redis, so limits are shared by all Envoy instances.
+Routes come from a control plane through xDS, so a new route or a canary weight, say 5 percent to v2, goes live in seconds. Envoy is also the data plane in Kubernetes gateway projects such as Envoy Gateway and Contour, which use the Gateway API.
+used: Envoy Gateway; Contour; Emissary-ingress; Cloud providers that use Envoy inside managed load balancers.
+avoid: When you need a simple static reverse proxy for a few sites; NGINX or HAProxy with a small file is easier to run.
+flow:
+  Client [client] -> Listener [svc: Envoy :443] : HTTPS request | The listener ends TLS and starts the filter chain.
+  Listener -> Rate limit service [svc: Redis counters] : check key | A filter asks a shared service if the caller is over its limit.
+  Listener -> Route table [store: host and path] : match /api/v2 | Envoy finds the cluster for the request.
+  Route table -> Cluster v1 [svc: 95 percent], Cluster v2 [svc: 5 percent] : weighted pick | A weighted route sends a small canary share to v2.
+  Control plane [svc: xDS server] ~> Route table : new weights | The control plane updates routes with no restart or dropped connection.
+ref: docs | Envoy architecture overview | Envoy documentation | https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/arch_overview
+
+== Layer-7 observability tap
+kind: observability-pipeline, sidecar
+when: Teams need per-request metrics and traces across all services, with the same naming and without code changes.
+how: Because Envoy sees each HTTP or gRPC request, it can record method, path, status code, size and time spent. It exposes counters and histograms in Prometheus format, such as upstream request time per cluster.
+Envoy also starts or continues a trace by adding headers such as the W3C traceparent, and reports spans to a collector through OpenTelemetry. Access logs can be sent in a structured form to a log service.
+A dashboard can then show the rate, error ratio and latency percentiles for every service pair, the so-called golden signals. High cardinality is a risk: labels like user id or full URL paths blow up the metric store, so keep labels few.
+used: Istio and Envoy Gateway telemetry; Prometheus with Grafana dashboards; Jaeger or Tempo for traces.
+avoid: When you need business-level spans inside the code; add application tracing too, because a proxy sees only the outside of each request.
+flow:
+  Client service [svc: app] -> Envoy [svc: proxy] : HTTP request | Every request passes through the proxy.
+  Envoy -> Upstream service [svc: app] : forward with traceparent | Envoy adds trace headers and forwards the call.
+  Upstream service -> Envoy : 200 in 42 ms | The response returns with its status code.
+  Envoy ~> Prometheus [store: metrics] : counters and histograms | Envoy exposes metrics that Prometheus scrapes.
+  Envoy ~> OTel collector [svc: OpenTelemetry] : spans | Envoy sends trace spans to the collector.
+  OTel collector -> Trace store [store: Tempo or Jaeger] : store trace | Traces are kept so engineers can follow a request.
+ref: docs | Envoy statistics | Envoy documentation | https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/observability/statistics
+
+@@ etcd
+== Consistent core for cluster state
+kind: consistent-core, consensus-log
+when: A distributed system needs one small, strongly consistent store for its configuration and membership.
+how: etcd is a key-value store run as 3 or 5 nodes. They use the Raft algorithm. One node is the leader and takes all writes. It appends each write to its log and sends it to followers. When a majority has stored it, the write commits and is applied.
+A 3-node cluster survives 1 failure, and a 5-node cluster survives 2. Reads can be linearizable, which makes the leader confirm it still holds a majority, or serializable, which reads a local node, is faster, and may be stale.
+Kubernetes keeps all its state in etcd. The API server is the only component that talks to it. Controllers read and write through the API server and use watches to learn of change. The data set is kept small, by default under 2 GB and recommended up to 8 GB, because the whole database is memory-mapped and snapshots are copied.
+used: Kubernetes control plane; CoreDNS with etcd plugin in some setups; Cilium and other tools that can use etcd for state.
+avoid: When you need big data or high write rates; use a database. etcd is for small, critical metadata.
+flow:
+  kube-apiserver [svc: only client] -> etcd leader [db: node 1 term 4] : Put /pods/web-1 | The API server writes a pod object to the leader.
+  etcd leader -> etcd follower 2 [db: node 2], etcd follower 3 [db: node 3] : AppendEntries | The leader copies the entry to its followers.
+  etcd follower 2 -> etcd leader : ack | A majority (2 of 3) has stored the entry.
+  * etcd leader: committed, rev 1042 | The entry commits and gets a new revision number.
+  etcd leader -> kube-apiserver : OK rev 1042 | The write succeeds only after a majority has it.
+  kube-apiserver -x> etcd follower 3 : node 3 is down | The cluster still works with 2 of 3 nodes.
+ref: docs | etcd learning: data model and Raft | etcd documentation | https://etcd.io/docs/latest/learning/
+
+== Leader election and distributed lock with leases
+kind: leader-election, lease, fencing-token
+when: Several copies of a service run for safety, but only one may act at a time.
+how: Each candidate asks etcd for a lease with a time to live, such as 15 seconds, and tries to create a key, for example /election/scheduler, in a transaction that succeeds only if the key does not exist. The key is attached to the lease. The winner is the leader.
+The leader sends keep-alives to renew the lease. If it crashes, the keep-alives stop, the lease expires and etcd deletes the key. Other candidates watch the key, see it vanish and try again.
+Every key has a revision number that only goes up. A leader can send it as a fencing token with its writes, so a paused old leader cannot damage data. Kubernetes controllers use a lease object for this, stored in etcd through the API server.
+used: kube-scheduler and kube-controller-manager leader election; the etcd concurrency package used by Go services; Patroni-style failover that can use etcd.
+avoid: When the system can accept two actors for a short time; a simpler timer-based approach is cheaper.
+flow:
+  Candidate A [svc: instance A] -> etcd [db: Raft cluster] : grant lease 15 s | Each candidate gets a lease from etcd.
+  Candidate A -> etcd : create key if absent | A's transaction succeeds, so A is the leader.
+  Candidate B [svc: instance B] -x> etcd : create key if absent | B's transaction fails because the key exists.
+  Candidate B ~> etcd : watch the key | B waits for the key to change.
+  Candidate A -x> etcd : crash, no keep-alive | A stops renewing its lease.
+  etcd -> Candidate B : key deleted, lease expired | After 15 seconds B is told and tries to win.
+ref: docs | etcd concurrency API | etcd documentation | https://etcd.io/docs/latest/dev-guide/api_concurrency_reference_v3/
+
+== Watch-based configuration and service registry
+kind: external-config, service-discovery, heartbeat
+when: Many processes need to read shared configuration and react at once when it changes, and see which nodes are alive.
+how: Services store config under key prefixes, for example /config/payments/. Each client opens a watch on the prefix. etcd streams every change, with its revision, over a long-lived gRPC stream. No polling is needed.
+For discovery, each instance writes its address under /services/payments/ with a lease. The instance renews the lease as a heartbeat. If it dies, the key is removed after the time to live, and the watching clients drop it.
+A client that reconnects can resume a watch from its last revision, so it does not miss changes if history has not been compacted. Compaction removes old revisions, so run it on a schedule and defragment to free disk space.
+used: Kubernetes watches through the API server; M3 and other systems that keep topology in etcd; many Go services with etcd clients.
+avoid: When there are thousands of rapidly changing keys or very large values; use a dedicated config service or cache.
+flow:
+  Payments pod [svc: instance] -> etcd [db: Raft cluster] : register p1 with lease | The instance registers itself with a lease.
+  Payments pod ~> etcd : keep-alive | It renews the lease as a heartbeat.
+  Gateway [svc: watcher] -> etcd : watch /services/payments/ | The gateway watches the prefix.
+  etcd -> Gateway : PUT event rev 311 | The gateway learns about the new instance at once.
+  Payments pod -x> etcd : crash | The pod stops renewing.
+  etcd -> Gateway : DELETE event rev 340 | The lease expires and the gateway removes that instance.
+ref: docs | etcd API guarantees and watch | etcd documentation | https://etcd.io/docs/latest/learning/api_guarantees/
+
+@@ grafana
+== Metrics dashboards over Prometheus
+kind: observability-pipeline, materialized-view
+when: Operators need one place to see service health from metrics, and to get alerts.
+how: Prometheus scrapes metrics from services every 15 or 30 seconds and stores them as time series. Grafana does not store the metrics. It is the query and display layer. A dashboard is a JSON file of panels, each holding a PromQL query.
+When a user opens a dashboard, the browser calls the Grafana server. The server forwards each query to the Prometheus data source and returns the points to draw. Variables, such as cluster or service, change the queries without editing panels.
+Grafana alerting runs the same queries on a schedule. When a rule is true for a set time, it sends a notification to Slack, PagerDuty or email, with a link to the panel. Keep dashboards in Git and provision them as code, so they can be reviewed and restored.
+used: Prometheus with Grafana in Kubernetes setups such as kube-prometheus-stack; Grafana Cloud; teams that build RED and USE dashboards.
+avoid: When you need long retention at large scale; add Mimir, Thanos or a remote-write backend behind Prometheus.
+flow:
+  Services [svc: expose /metrics] ~> Prometheus [store: TSDB 15 d] : scrape every 15 s | Prometheus pulls metrics from each service.
+  Engineer [user] -> Grafana [svc: dashboards] : open API latency | An engineer opens a dashboard in the browser.
+  Grafana -> Prometheus : PromQL p99 query | Grafana sends each panel query to the data source.
+  Prometheus -> Grafana : time series points | The points come back and are drawn.
+  Grafana -> Alert manager [svc: routing] : rule firing | An alert rule that stays true is sent out.
+  Alert manager ~> Slack [svc: on-call channel] : notification | The on-call team is notified with a panel link.
+ref: docs | Grafana documentation: dashboards | Grafana Labs | https://grafana.com/docs/grafana/latest/dashboards/
+
+== LGTM stack for metrics, logs and traces
+kind: observability-pipeline, tiered-storage
+when: A team wants to use metrics, logs and traces together, without paying to index every log line.
+how: LGTM stands for Loki (logs), Grafana, Tempo (traces) and Mimir (metrics). Applications send telemetry through an OpenTelemetry Collector or Grafana Alloy. Each signal goes to its own back end, and all of them store data in object storage such as S3.
+Loki indexes only labels, such as app and namespace, and keeps the log text in compressed chunks. This makes storage cheap, but a search by free text scans chunks. Tempo stores traces by trace id, and Mimir stores long-term metrics.
+In Grafana, a user jumps from a metric spike to the logs of that time and then to a trace. Links work through shared labels and trace ids stored in log lines. This ties the three signals together.
+used: Grafana Cloud; self-hosted Loki, Tempo and Mimir in Kubernetes; Grafana Alloy as a collector.
+avoid: When you need fast free-text search over all logs; use Elasticsearch or OpenSearch, which index the content.
+flow:
+  App [svc: OTel SDK] -> Collector [svc: Alloy or OTel] : metrics, logs, traces | The app sends all three signals to one collector.
+  Collector -> Mimir [store: metrics], Loki [store: logs], Tempo [store: traces] : route by signal | Each signal goes to its own back end.
+  Mimir, Loki, Tempo -> Object store [lake: S3 chunks] : flush blocks | All three keep data in cheap object storage.
+  Engineer [user] -> Grafana [svc: Explore] : latency spike at 10:42 | The engineer starts at a metric panel.
+  Grafana -> Loki : logs with same labels | A click shows logs for the same service and time.
+  Grafana -> Tempo : open trace id | A trace id in a log line opens the full trace.
+ref: docs | Grafana Loki: architecture | Grafana Labs | https://grafana.com/docs/loki/latest/get-started/overview/
+
+== Many data sources in one pane
+kind: polyglot-persistence, scatter-gather
+when: Data lives in different stores, such as SQL, Elasticsearch and cloud monitoring, and teams want one view without moving it.
+how: Grafana connects to each store through a data source plugin. The plugin turns a panel's query into that store's own query language, such as SQL, PromQL or Lucene, and turns the result into a common table shape.
+A single dashboard can mix panels from different sources, or a panel can use the Mixed data source to combine queries from several. Transformations, such as join and calculate, can merge results in the browser. The data stays where it is, so there is no copy to keep in sync.
+The limit is size and speed. Joins done in the browser suit small results. Heavy joins should be done in the source or in a warehouse. Give each source a read-only account and set query timeouts, so a bad panel cannot harm a production database.
+used: Grafana with PostgreSQL, MySQL, Elasticsearch, CloudWatch, BigQuery and many other plugins.
+avoid: When a business report needs governed joins and a shared model; use a BI tool and a warehouse.
+flow:
+  Engineer [user] -> Grafana [svc: dashboard] : open ops overview | One dashboard holds panels from several sources.
+  Grafana -> Prometheus [store: metrics] : PromQL | A metric panel runs a PromQL query.
+  Grafana -> Postgres [db: read-only user] : SQL query | A table panel runs SQL with a timeout.
+  Grafana -> CloudWatch [store: AWS metrics] : GetMetricData | A cloud panel calls the cloud API.
+  Prometheus, Postgres, CloudWatch -> Grafana : data frames | All answers come back in one table shape.
+  * Grafana: transform and draw | Grafana joins small results in the browser and draws the panels.
+ref: docs | Data sources | Grafana documentation | https://grafana.com/docs/grafana/latest/datasources/

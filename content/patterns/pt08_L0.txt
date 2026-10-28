@@ -1,0 +1,795 @@
+# Batch pt08_L0: architecture patterns. Spec: content/patterns/README.md
+
+@@ bigquery
+== ELT from a stream into partitioned tables
+kind: etl-elt, medallion
+when: Many event sources must land fast in one warehouse, and analysts transform the raw data later with SQL.
+how: Events go to Pub/Sub. A Dataflow job (or a Pub/Sub BigQuery subscription) writes them through the Storage Write API into a raw table. The table is partitioned by event date and clustered by columns such as campaign id.
+Scheduled SQL then builds a cleaned table and a daily aggregate table from the raw one. This is ELT: load first, transform inside the warehouse. A query that filters on the partition date reads only those partitions, so on-demand cost drops by the same ratio. A 30-day table with a one-day filter scans about 1/30 of the bytes.
+Keep raw data for replay. If a transform has a bug, rerun the SQL over the raw partitions. Set a partition expiry on raw data to limit storage cost.
+used: Common on Google Cloud for ad, app and IoT events; Pub/Sub plus Dataflow plus BigQuery is a standard reference design.
+avoid: When you need single-row lookups in milliseconds or very high update rates per row; use Bigtable or a serving database instead.
+flow:
+  Event producers [svc] -> Pub/Sub [topic: events] : JSON event | Apps publish each event once to a topic.
+  Pub/Sub -> Dataflow [svc: streaming job] : pull | A streaming job reads, validates and batches events.
+  Dataflow -> raw_events [store: partitioned by day] : Storage Write API | The job appends rows to the raw table. Data is queryable within seconds.
+  Dataflow -x> Dead-letter table [store] : bad record | Rows that fail validation go to a side table for review.
+  Scheduled query [svc: hourly SQL] -> clean_events [store: clustered] : INSERT SELECT | SQL cleans and deduplicates the raw partitions for the latest hour.
+  clean_events -> daily_report [store: aggregates] : GROUP BY day | A second query builds the small table that dashboards read.
+ref: docs | Storage Write API overview | Google Cloud documentation | https://cloud.google.com/bigquery/docs/write-api
+ref: paper | Dremel: Interactive Analysis of Web-Scale Datasets | Melnik et al., VLDB 2010 |
+
+== Materialized view with a BI cache for dashboards
+kind: materialized-view, precompute
+when: Many people run the same aggregate query on a big table, and each run should be fast and cheap.
+how: Create a materialized view over the base table. BigQuery refreshes it in the background and, when a query matches, rewrites the query to read the view plus any new base rows. Results stay correct.
+Put BigQuery BI Engine in front of it. BI Engine is an in-memory cache that BigQuery reserves for the BI tool, so repeated dashboard queries run from memory. Looker and Looker Studio use it well.
+The base table may be 5 TB, while the view holds a few GB of daily sums. Each dashboard refresh then scans the small view. The cost is storage for the view and limits on which SQL the view can contain, such as restricted joins.
+used: Looker and Looker Studio dashboards on BigQuery; common in marketing and ad reporting.
+avoid: When every query is different (ad hoc exploration), since there is nothing to reuse; or when the SQL needs joins the view does not support.
+flow:
+  Dashboard [client: Looker] -> BigQuery [svc: query engine] : SQL by campaign, day | A user opens a dashboard that runs an aggregate query.
+  BigQuery -> Mat view [store: daily sums] : rewritten query | The optimizer sees a matching view and reads it instead of the base table.
+  Mat view ~> Base table [store: 5 TB] : incremental refresh | In the background, the view reads only new base rows to stay fresh.
+  BigQuery -> BI Engine [cache: in-memory] : hot columns | Hot data is served from memory, so a refresh takes under a second.
+  BI Engine -> Dashboard : result | The chart renders without scanning the large table.
+ref: docs | Introduction to materialized views | Google Cloud documentation | https://cloud.google.com/bigquery/docs/materialized-views-intro
+
+== Data clean room with authorized sharing
+kind: privacy-clean-room
+when: Two companies, such as an advertiser and a publisher, want to match customer data without sharing raw rows.
+how: Each party keeps its table in its own project. A clean room is set up on Analytics Hub, and each party shares its table into it as a listing. Only approved SQL templates can run, and they return aggregates, not rows.
+The advertiser joins hashed emails to the publisher's audience and gets, for example, the count of matched users per segment. Rules can require a minimum group size, so a query that would reveal a single person is blocked. Raw data never leaves the owner's project, and each party can see who queried what.
+The limit is trust in the rules. The match key (such as hashed email) must be the same on both sides, and low match rates give weak results.
+used: BigQuery data clean rooms, built on Analytics Hub; used for advertiser and publisher audience overlap and measurement.
+avoid: When both sides already trust each other fully and can share rows; a plain authorized view is simpler.
+flow:
+  Advertiser [user] -> Advertiser table [store: hashed emails] : own the data | The advertiser's rows stay in the advertiser's project.
+  Publisher [user] -> Publisher table [store: audience] : own the data | The publisher's rows stay in the publisher's project.
+  Advertiser table, Publisher table -> Clean room [svc: Analytics Hub] : shared as listings | Both tables are shared into the clean room, not copied out.
+  Advertiser -> Clean room : approved SQL template | The advertiser runs an overlap query allowed by the rules.
+  Clean room -x> Advertiser : group too small | A result with too few people is blocked by the privacy rule.
+  Clean room -> Advertiser : counts per segment | Aggregate counts come back, with no user-level rows.
+ref: docs | BigQuery data clean rooms | Google Cloud documentation | https://cloud.google.com/bigquery/docs/data-clean-rooms
+
+@@ clickhouse
+== Real-time analytics on a Kafka stream
+kind: pre-aggregation, lsm-compaction
+when: Dashboards and APIs must query billions of fresh events with sub-second latency and many concurrent users.
+how: A Kafka table engine, or a connector such as ClickPipes, reads events into a ClickHouse table. Rows land in a MergeTree table sorted by the key that queries filter on, for example (customer_id, event_time). Each insert becomes an immutable sorted part, and background merges combine small parts into big ones.
+A materialized view runs on each insert block and writes hourly counts into an AggregatingMergeTree table. Dashboards read the small rollup. The raw table stays for detailed drill-down.
+Insert in large batches, such as 10,000 to 100,000 rows or more. Many tiny inserts create too many parts and slow merges. Columnar storage with compression often reaches 5 to 10 times smaller than raw JSON, and scans run at gigabytes per second per node.
+used: Common in observability, product analytics and ad-tech reporting stacks; ClickHouse documents this pipeline.
+avoid: When you need frequent row updates, strong multi-row transactions or many joins across huge tables; use PostgreSQL or a warehouse.
+flow:
+  Kafka [topic: events] -> Kafka engine table [svc: consumer] : poll batch | A consumer table reads a batch of events from Kafka.
+  Kafka engine table -> events MergeTree [store: sorted parts] : insert block | Each batch becomes one new sorted part on disk.
+  events MergeTree -> Hourly rollup [store: AggregatingMergeTree] : materialized view | A view aggregates each block as it arrives, with no extra query.
+  * events MergeTree: parts merged | Background merges combine small parts into larger ones to keep reads fast.
+  Dashboard [client] -> Hourly rollup : SELECT sum by hour | The dashboard reads the small rollup in milliseconds.
+ref: docs | Materialized views | ClickHouse documentation | https://clickhouse.com/docs/en/guides/developer/cascading-materialized-views
+
+== Sharded cluster with distributed table
+kind: sharding, scatter-gather
+when: One node cannot hold or scan the data, and queries must use the CPU of many nodes in parallel.
+how: Split the data into shards. Each shard holds a replica pair, and ClickHouse Keeper (a Raft-based service) coordinates replication. A Distributed table sits on top. It has no data itself; it knows the shard list and a sharding key, such as a hash of user id.
+An insert goes to the shard picked by the key. A query on the Distributed table is sent to one replica of every shard. Each shard computes a partial result locally, such as a partial count or sum, and the initiator node merges them.
+Sharding by a key that queries also filter or group on lets joins and distinct counts stay local. A bad key causes skew, where one shard holds most of the data. Replicas add read capacity and survive node loss.
+used: Large self-managed ClickHouse clusters at companies such as Cloudflare and Uber have described this style; ClickHouse Cloud hides shards behind shared object storage.
+avoid: When data fits on one node with replicas; a single shard is much simpler to run and tune.
+flow:
+  App [client] -> Node 1 [svc: initiator] : INSERT or SELECT | The app talks to any node that has the Distributed table.
+  Node 1 -> Shard 1 [db: replica pair], Shard 2 [db: replica pair], Shard 3 [db: replica pair] : subquery | The initiator sends the query to one replica of each shard.
+  Shard 1, Shard 2, Shard 3 -> Node 1 : partial aggregates | Each shard scans its own data and returns a small partial result.
+  Node 1 -> App : merged result | The initiator merges the partials and answers the client.
+  Shard 2 ~> Keeper [svc: Raft metadata] : replication log | Replicas of a shard copy each other's parts through Keeper.
+ref: docs | Distributed table engine | ClickHouse documentation | https://clickhouse.com/docs/en/engines/table-engines/special/distributed
+
+== Hot and cold tiers on object storage
+kind: tiered-storage
+when: Data keeps growing for years, but only the last weeks are queried often.
+how: Define a storage policy with two volumes: local NVMe disks (hot) and an S3 bucket (cold). A TTL rule on the table says "move parts older than 30 days to the cold volume". A second rule can delete data after 400 days.
+The move happens per part in the background. Queries still use one table name. Recent queries hit the NVMe disks. Old queries read from S3, so they are slower, but local disks stay small and cheap.
+In ClickHouse Cloud the idea goes further: all data lives in object storage and nodes only keep a local cache, so compute and storage scale apart. For self-managed clusters, plan the S3 request cost and the extra latency of cold reads.
+used: Self-managed ClickHouse log and metrics stores with TTL moves to S3; ClickHouse Cloud with separated compute and storage.
+avoid: When all queries scan the full history all the time; cold reads would then dominate and local disks are better.
+flow:
+  Ingest job [svc] -> hot volume [store: NVMe 30 days] : INSERT | New parts are written to fast local disks.
+  hot volume ~> cold volume [lake: S3 bucket] : TTL move after 30 days | A background task moves old parts to S3 by rule.
+  cold volume ~> Delete task [svc: TTL] : drop after 400 days | A second rule removes data that is too old to keep.
+  Analyst [user] -> hot volume : query last week | Recent data is served from NVMe, in milliseconds.
+  Analyst -> cold volume : query last year | Old data is read from S3 with higher latency and a request cost.
+ref: docs | Using multiple block devices for data storage | ClickHouse documentation | https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree#table_engine-mergetree-multiple-volumes
+
+@@ druid
+== Real-time ingest with a rollup at write time
+kind: pre-aggregation, lambda-arch
+when: You have a firehose of events and users only ask for aggregates by a few dimensions, with sub-second answers.
+how: Events arrive from Kafka. Druid supervisor tasks read each partition and build segments in memory. At ingest, rollup merges rows that have the same truncated timestamp and the same dimensions into one row, with pre-summed metrics such as counts and sums.
+Rollup can cut data size by 10 times or more for low-cardinality data. The cost is that raw rows are gone, so you can only answer questions about the dimensions you kept.
+Real-time tasks answer queries on recent data while they run. When a segment is complete, it is published to deep storage, and Historical nodes load it. The Broker merges results from real-time and historical nodes into one answer.
+used: Ad analytics and product analytics at companies such as Airbnb, Netflix and Pinterest have described Druid for this; common for user-facing metrics.
+avoid: When you need row-level detail, big joins or frequent updates; use ClickHouse or a warehouse.
+flow:
+  Kafka [topic: ad events] -> Indexing task [svc: real-time] : exactly-once read | A task reads Kafka partitions and tracks offsets with its segment metadata.
+  * Indexing task: rolled up | Rows with the same hour and dimensions are merged and summed.
+  Indexing task -> Deep storage [lake: S3] : publish segment | A finished segment is saved to deep storage.
+  Deep storage -> Historical [svc: loads segments] : load | Historical nodes download the segment and serve it from local disk.
+  Dashboard [client] -> Broker [svc: query router] : SQL | A query arrives at the Broker.
+  Broker -> Indexing task, Historical : partial queries | The Broker asks real-time and historical nodes and merges their answers.
+ref: docs | Druid data rollup | Apache Druid documentation | https://druid.apache.org/docs/latest/ingestion/rollup/
+
+== Segment tiers with deep storage as the source of truth
+kind: tiered-storage, scatter-gather
+when: Data is large and queries mostly touch recent time ranges, but you must keep history cheaply and recover from node loss.
+how: Druid splits data by time into immutable segments, often one per day or hour. Each segment is stored in deep storage (S3, HDFS or GCS). The Coordinator assigns segments to Historical nodes using load rules.
+Load rules define tiers. For example, keep the last 30 days with 2 replicas on a "hot" tier of fast nodes. Keep older data with 1 replica on a "cold" tier of cheaper nodes. Drop data after a year, while deep storage can still keep it.
+If a Historical node dies, the Coordinator loads its segments on other nodes from deep storage. The Broker prunes by time range and sends the query only to nodes that hold matching segments. A metadata store (PostgreSQL or MySQL) lists all segments, and ZooKeeper or Kubernetes coordination tracks live nodes.
+used: Druid clusters at large internet companies use hot and cold tiers; Imply and Apache Druid docs describe this tiering.
+avoid: When the data set is small; a single database is simpler than a Druid cluster with five server types.
+flow:
+  Coordinator [svc: assigns segments] -> Hot tier [svc: fast nodes] : load 30 days, 2 replicas | Load rules keep recent segments on fast nodes.
+  Coordinator -> Cold tier [svc: cheap nodes] : load older, 1 replica | Older segments are kept on cheaper nodes.
+  Deep storage [lake: S3 segments] -> Hot tier, Cold tier : download | Both tiers pull segment files from deep storage.
+  Broker [svc: query router] -> Hot tier : query last 7 days | Time pruning sends the query only to nodes with matching segments.
+  Hot tier -x> Coordinator : node lost | A failed node stops sending heartbeats.
+  * Coordinator: reassigning | The Coordinator reloads the lost segments on other nodes from deep storage.
+ref: docs | Druid architecture | Apache Druid documentation | https://druid.apache.org/docs/latest/design/architecture/
+
+== Batch backfill of segments from the lake
+kind: backfill-replay, lambda-arch
+when: Streaming data may be late or wrong, and you need to correct a past time range with trusted batch data.
+how: Real-time ingest from Kafka gives fresh but sometimes incomplete data. A batch job, for example a Spark job or Druid native batch ingestion, reads the cleaned files for a day from the data lake. It builds new segments for that same time interval.
+When the new segments are published, they get a newer version number. Druid's versioning shows queries only the newest version for an interval, so the batch segments atomically replace the streamed ones. No query ever sees a mix.
+This is a Lambda-style design in a small form. It adds a second pipeline to maintain, so use it only when stream data can really be wrong, for example from late events or deduplication.
+used: Common in Druid deployments that re-ingest each day from a lake; the Druid docs describe reindexing and compaction by interval.
+avoid: When the streaming pipeline is accurate enough; skip the batch layer to save work.
+flow:
+  Kafka [topic] -> Streaming tasks [svc: real-time] : live events | Streaming tasks give fresh data for today.
+  Streaming tasks -> Segments v1 [store: day 2026-10-27] : publish | Segments are published with version v1.
+  Lake [lake: cleaned Parquet] -> Batch ingest [svc: Spark or native] : read day | A nightly job reads the cleaned data for yesterday.
+  Batch ingest -> Segments v2 [store: same day] : publish newer version | The new segments cover the same interval and have version v2.
+  Broker [svc] -> Segments v2 : query | Queries now see only v2; v1 is dropped later.
+ref: docs | Druid segments and versioning | Apache Druid documentation | https://druid.apache.org/docs/latest/design/segments/
+
+@@ elasticsearch
+== Search index fed from the system of record
+kind: cqrs, cdc
+when: The main database cannot do fast full-text search, so a separate search index serves the read side.
+how: The source of truth stays in a database such as PostgreSQL. A CDC tool (Debezium and Kafka Connect, or a sync job) reads row changes and writes them as documents into an Elasticsearch index. The application sends text queries to Elasticsearch and loads full records from the database by id if needed.
+An index is split into primary shards, for example 5, and each shard has replicas. A query goes to one copy of every shard, each shard returns its top hits, and the coordinating node merges them. Documents become searchable after the next refresh, by default within about 1 second. This is near real time, not instant.
+Make the index rebuildable. Use an alias such as products pointing to products_v7. To change mappings, build products_v8 from the source, then switch the alias.
+used: Common for search boxes in e-commerce, wikis and support tools.
+avoid: When you need transactions or the search index would become the only copy of the data; Elasticsearch is not a system of record.
+flow:
+  App [svc] -> Postgres [db: system of record] : write order | Writes go to the database first.
+  Postgres -> Debezium [svc: Kafka Connect] : change event | CDC reads the committed change from the log.
+  Debezium -> Elasticsearch [store: 5 shards] : index document | The connector sends the changed row as a JSON document.
+  * Elasticsearch: searchable after refresh | After about 1 second the new document is visible to search.
+  User [user] -> App : search "red shoes" | A user types a query into the app.
+  App -> Elasticsearch : match query | The query goes to one copy of every shard, and top hits are merged.
+  Elasticsearch -> App : hit ids and scores | The app shows the ranked hits.
+ref: docs | Near real-time search | Elasticsearch documentation | https://www.elastic.co/guide/en/elasticsearch/reference/current/near-real-time.html
+
+== Log and metrics store with data streams and lifecycle tiers
+kind: observability-pipeline, tiered-storage
+when: A fleet writes many logs each second, and you need recent search to be fast and old logs to be cheap.
+how: Agents such as Elastic Agent, Filebeat or an OpenTelemetry Collector send logs, optionally through Kafka or Logstash, into a data stream. A data stream is an append-only series of hidden backing indices, and writes go to the newest one.
+An index lifecycle policy (ILM) rolls over to a new backing index when the current one reaches a size such as 50 GB or an age such as 1 day. Then it moves old indices from hot nodes (fast SSD) to warm and cold nodes, and later to searchable snapshots on object storage. At the end it deletes them.
+Kibana queries all backing indices through one name. Plan shard size: 10 to 50 GB per shard is a common target. Too many small shards waste memory on the cluster.
+used: The Elastic Stack (ELK) for logs and security data; common in operations teams that need free-text search over logs.
+avoid: When you only count metrics over time; a time-series database is cheaper. For huge log volumes with simple queries, consider ClickHouse or Loki.
+flow:
+  Agents [svc: Filebeat] -> Data stream [log: logs-app] : bulk of logs | Agents send batches of log lines to the data stream.
+  Data stream -> Hot index [store: SSD nodes] : write to newest | The newest backing index takes all writes.
+  Hot index -> Warm index [store: HDD nodes] : rollover at 50 GB or 1 day | ILM creates a new hot index and moves the old one to warm nodes.
+  Warm index ~> Snapshot [lake: S3 searchable] : move after 30 days | Old data goes to object storage but can still be searched.
+  Snapshot ~> Data stream : delete after 90 days | The last ILM phase deletes data that is too old.
+  Engineer [user] -> Data stream : Kibana search | One query name reaches all tiers.
+ref: docs | Index lifecycle management | Elasticsearch documentation | https://www.elastic.co/guide/en/elasticsearch/reference/current/index-lifecycle-management.html
+
+== Hybrid retrieval for RAG
+kind: rag, scatter-gather
+when: An AI assistant must find the right passages from many documents, using both exact words and meaning.
+how: Split documents into chunks. For each chunk, store the text and a dense vector made by an embedding model, in one Elasticsearch index. At query time, run two searches: a BM25 keyword search and a kNN vector search over the embedding of the question.
+Merge the two ranked lists with reciprocal rank fusion (RRF). A document that ranks high in both lists rises to the top. Keywords catch product codes and names. Vectors catch paraphrases.
+Send the top 5 to 10 chunks to a language model as context. The model writes the answer and cites the chunks. Keep access control in the index too, with a filter on user group, so the model never sees documents the user may not read.
+used: Elastic's own retrieval features and many enterprise search and chat-over-documents products; the same hybrid idea works in OpenSearch and others.
+avoid: When the collection is small enough to fit in the prompt, or when exact lookup by id is all you need.
+flow:
+  User [user] -> Chat app [svc] : question | A user asks a question.
+  Chat app -> Embedding model [model: text to vector] : question | The app turns the question into a vector.
+  Chat app -> Elasticsearch [store: text + vectors] : BM25 + kNN + RRF | One request runs both searches and fuses the two lists.
+  Elasticsearch -> Chat app : top 8 chunks | The best chunks come back, filtered by the user's access group.
+  Chat app -> LLM [model: answer writer] : question + chunks | The model answers using only the given chunks.
+  LLM -> User : answer with sources | The user sees the answer and links to sources.
+ref: docs | Reciprocal rank fusion | Elasticsearch documentation | https://www.elastic.co/guide/en/elasticsearch/reference/current/rrf.html
+
+@@ lucene
+== Immutable segments with merge and near-real-time reader
+kind: lsm-compaction, copy-on-write
+when: You need an index that accepts constant updates and still gives fast, consistent reads.
+how: Lucene never edits a file after it is written. New documents go to an in-memory buffer. A flush writes the buffer as a new segment, which holds its own inverted index. Each segment is a small, complete index.
+A reader opens a point-in-time view of a list of segments. A refresh opens a new view that includes new segments, so readers see new data while old readers still work on the old view. Deleted documents are only marked in a bitmap.
+A background merge policy combines small segments into larger ones and drops deleted documents. Fewer segments mean fewer files to check per query. The price is write amplification: the same data is rewritten several times. Elasticsearch, OpenSearch and Solr all rely on this design.
+used: Inside Elasticsearch, OpenSearch and Apache Solr; each shard is one Lucene index.
+avoid: When you need in-place updates of a single field at very high rate; consider a key-value store.
+flow:
+  Indexer [svc] -> Buffer [cache: in memory] : add documents | New documents wait in memory and in a transaction log.
+  Buffer -> Segment 1 [store: immutable] : flush | The buffer is written as a new segment.
+  Searcher [client] -> Segment 1 : open reader | A reader sees a fixed list of segments.
+  Segment 1 -> Segment 4 [store: merged] : background merge | Small segments merge into one and deleted documents are dropped.
+  Searcher -> Segment 4 : reopen | A refresh gives the next reader the merged view.
+ref: docs | Apache Lucene documentation | Apache Lucene | https://lucene.apache.org/core/documentation.html
+
+== Embedded library inside a shard-per-node search server
+kind: sharding, scatter-gather
+when: You want full-text search inside your own application or server, and you want to add distribution on top yourself.
+how: Lucene is a Java library, not a server. A server wraps it. Each shard is one Lucene index on local disk, and the server adds the network, the shard routing and the replica copies. Elasticsearch, OpenSearch and Solr work this way.
+A query is parsed, run on each shard, and each shard returns its top K documents with scores. The coordinator merges them. For BM25 scoring, each shard uses its own term statistics, so very small or uneven shards can give slightly different scores.
+Small apps can embed Lucene directly and hold one index on disk, with no cluster. The team then owns backup, locking and upgrades.
+used: Elasticsearch, OpenSearch and Solr use Lucene in every shard; some apps and tools embed Lucene directly.
+avoid: When you do not want to run search infrastructure; use a managed search service or database full-text search.
+flow:
+  Client [client] -> Search server [svc: coordinator] : query | A client sends the search request to any node.
+  Search server -> Shard A [store: Lucene index], Shard B [store: Lucene index] : run query | The query goes to one copy of each shard.
+  Shard A, Shard B -> Search server : top 10 each | Each shard returns its local top 10 with scores.
+  Search server -> Client : merged top 10 | The coordinator keeps the best 10 of the 20 and answers.
+ref: docs | Apache Lucene documentation | Apache Lucene | https://lucene.apache.org/core/documentation.html
+
+== Inverted index with HNSW vector search
+kind: index-table, rag
+when: One engine should serve exact keyword search and nearest-neighbour search on embeddings.
+how: For text, Lucene stores an inverted index. It maps each term to a sorted list of document ids (a posting list), with frequencies for scoring. A query for two terms intersects two lists and scores the hits with BM25.
+For vectors, Lucene builds an HNSW graph per segment. Each vector is a node linked to near neighbours. A search walks the graph from a coarse entry point toward the query and returns the approximate nearest neighbours. Segments are searched one by one and results merged.
+Because graphs are built per segment, merges also rebuild graph data, which costs CPU. A filter such as "tenant = 7" is applied during the graph walk. Results are approximate, so recall is below 100 percent.
+used: Lucene HNSW vector search is the base for vector search in Elasticsearch, OpenSearch and Solr.
+avoid: When you have billions of vectors and need GPU or disk-based indexes; use a dedicated vector database.
+flow:
+  Document [svc] -> Analyzer [svc: tokenizer] : text | Text is split into lowercase terms.
+  Analyzer -> Inverted index [store: term to doc ids] : add postings | Each term gets the document id in its posting list.
+  Embedding model [model] -> HNSW graph [store: per segment] : vector | The vector is added as a node and linked to near neighbours.
+  Query [client] -> Inverted index : BM25 on terms | Keyword hits are scored by term frequency.
+  Query -> HNSW graph : kNN of query vector | The graph walk returns approximate neighbours.
+ref: paper | Efficient and robust approximate nearest neighbor search using HNSW | Malkov & Yashunin, 2016 |
+
+@@ opensearch
+== Log analytics with ingestion buffer and ISM tiers
+kind: observability-pipeline, tiered-storage
+when: A team wants open-source search and dashboards for logs and security events, without per-GB license cost.
+how: Agents (Fluent Bit, Logstash or OpenTelemetry Collector) send logs through Data Prepper or Kafka to OpenSearch. Data Prepper is an OpenSearch project that parses, filters and batches events. OpenSearch Dashboards queries and charts the data.
+Index State Management (ISM) policies roll over time-based indices, move them from hot to warm nodes, and delete them after the retention period, for example 30 days. Search and alerting plugins run rules on the data and send alerts.
+A Kafka buffer between agents and OpenSearch protects the cluster when it is slow or restarting. Bulk requests of 5 to 15 MB are a common starting size.
+used: Amazon OpenSearch Service log analytics and Data Prepper; common as the open-source alternative to the ELK stack.
+avoid: When logs are huge and queries are simple counts; a columnar store may cost less.
+flow:
+  Fluent Bit [svc: on each host] -> Kafka [topic: logs] : log lines | Agents write logs to Kafka, a buffer in front of the cluster.
+  Kafka -> Data Prepper [svc: parse and batch] : consume | Data Prepper parses logs into fields.
+  Data Prepper -> OpenSearch [store: hot nodes] : bulk index | Batches are written to the newest index.
+  OpenSearch -> Warm nodes [store: ISM move] : rollover at 1 day | ISM moves older indices to cheaper nodes.
+  Analyst [user] -> Dashboards [svc: OpenSearch Dashboards] : query | An analyst searches and builds charts.
+  Dashboards -> OpenSearch : search | Dashboards query all indices by pattern.
+ref: docs | Data Prepper | OpenSearch documentation | https://opensearch.org/docs/latest/data-prepper/
+
+== Vector and keyword search for RAG with k-NN
+kind: rag, scatter-gather
+when: An application needs semantic search and exact keyword search on the same documents, in an open-source engine.
+how: Create an index with a knn_vector field next to normal text fields. The k-NN plugin supports approximate search through engines such as Faiss and Lucene. An ingest pipeline can call an embedding model, so documents get vectors when they are indexed.
+A hybrid query runs a keyword query and a neural query. A search pipeline normalizes the two score sets and combines them, for example with a weighted mean. The top chunks go to a language model as context.
+Tune recall against latency with the HNSW settings. Shards each search their own graph, so use fewer, larger shards for vector data when you can. Memory use is high, because graphs usually need to stay in RAM.
+used: Amazon OpenSearch Service and OpenSearch neural search are common in AI search and chat-over-documents apps.
+avoid: When the index is only a few thousand chunks; a simple library or a database with a vector extension is enough.
+flow:
+  Document [svc] -> Ingest pipeline [svc: embed text] : text chunk | An ingest pipeline asks an embedding model for a vector.
+  Ingest pipeline -> OpenSearch [store: text + knn_vector] : index | Both text and vector are stored in one document.
+  User [user] -> App [svc] : question | The user asks a question.
+  App -> OpenSearch : hybrid query | A keyword part and a neural part run together.
+  OpenSearch -> Search pipeline [svc: normalize scores] : two score lists | A search pipeline normalizes and combines the scores.
+  Search pipeline -> App : top chunks | The best chunks go to the model that writes the answer.
+ref: docs | Hybrid search | OpenSearch documentation | https://opensearch.org/docs/latest/search-plugins/hybrid-search/
+
+== Snapshots to object storage and searchable cold data
+kind: tiered-storage, active-passive
+when: You must survive losing a cluster or a region, and keep old data searchable at low cost.
+how: Register a snapshot repository on S3. A snapshot policy takes snapshots on a schedule, for example every hour. Snapshots are incremental: they copy only segment files that are new since the last one. Restoring creates the indices on a new cluster.
+For disaster recovery, a standby cluster in another region restores the latest snapshots, or uses cross-cluster replication to follow the leader indices continuously. Switch the application endpoint when the main cluster fails.
+For cost, UltraWarm and cold tiers in the Amazon service keep old indices on S3 with a cache. Searches on cold data are slower but cheap. Test restores: an untested snapshot is not a backup.
+used: Amazon OpenSearch Service snapshots, UltraWarm and cross-cluster replication; common in regulated log retention.
+avoid: When you can rebuild the index from the source in minutes; then skip the cost of replication.
+flow:
+  Primary cluster [store: hot nodes] -> Snapshot repo [lake: S3 bucket] : hourly snapshot | Only new segment files are copied each time.
+  Primary cluster ~> Standby cluster [store: other region] : cross-cluster replication | Leader indices are followed by the standby in near real time.
+  Primary cluster -x> App [client] : region down | The primary becomes unreachable.
+  App -> Standby cluster : switch endpoint | The app now reads from the standby cluster.
+  Snapshot repo ~> Standby cluster : restore | A restore can also rebuild any index from the snapshot.
+ref: docs | Snapshots | OpenSearch documentation | https://opensearch.org/docs/latest/tuning-your-cluster/availability-and-recovery/snapshots/index/
+
+@@ pinot
+== User-facing analytics on a real-time table
+kind: pre-aggregation, lambda-arch
+when: A product page must show live metrics to many users, for example views of my post, with p99 latency under 100 ms.
+how: Pinot servers consume a Kafka topic directly into real-time segments, held in memory and queryable at once. When a segment reaches a size or time limit, it is committed to deep storage, such as S3, as an immutable columnar segment.
+A star-tree index pre-aggregates over chosen dimensions, so queries like "count by country and day" read a small tree instead of many rows. Other indexes (inverted, range, sorted) speed filters.
+The Broker routes a query to the servers with matching segments and merges the partial results. This design handles thousands of queries per second. Rows are stored with the keys users filter on, so the schema must be designed for the query shapes you expect.
+used: LinkedIn (who viewed your profile), and Uber and Stripe have described Pinot for user-facing analytics.
+avoid: When queries are arbitrary and joins are large; a warehouse or ClickHouse fits better.
+flow:
+  Kafka [topic: view events] -> Pinot server [svc: real-time segment] : consume | Servers ingest the events directly, with no extra ETL job.
+  * Pinot server: segment in memory | New rows can be queried within seconds.
+  Pinot server -> Deep store [lake: S3] : commit segment | At a size limit the segment is saved as immutable.
+  App [client] -> Broker [svc: query router] : SQL | The app sends a query for one member id.
+  Broker -> Pinot server : scatter | The Broker asks the servers that hold matching segments.
+  Pinot server -> Broker : partials | Partial results come back and are merged.
+ref: paper | Pinot: Realtime OLAP for 530 Million Users | Im et al., SIGMOD 2018 |
+ref: docs | Apache Pinot documentation | Apache Pinot | https://docs.pinot.apache.org/
+
+== Hybrid table with offline and real-time segments
+kind: lambda-arch, backfill-replay
+when: You need fresh data from a stream and corrected, compact data from batch jobs in one table.
+how: A hybrid table is one logical table with two parts. The real-time part consumes Kafka. The offline part holds segments built by batch jobs, for example from Spark or Flink reading the lake. A time boundary splits them: older data is served from offline segments, newer data from real-time ones.
+A Pinot minion task can also move real-time segments into offline ones on a schedule. This gives better compression and merges small segments. The Broker adds the time filter so no row is counted twice.
+This is a Lambda design inside one engine. You still have two paths to keep correct. Use it when streamed data may be incomplete, or when you want to re-ingest a day with fixed logic.
+used: Described in Apache Pinot documentation and used in Pinot deployments that mix Kafka streams and batch loads.
+avoid: When stream-only ingest is accurate; use a plain real-time table.
+flow:
+  Kafka [topic] -> Real-time part [svc: new segments] : consume | The stream keeps the newest data fresh.
+  Lake [lake: Parquet] -> Offline part [store: batch segments] : Spark batch load | A batch job builds compact segments for older days.
+  Real-time part ~> Offline part : minion task moves old data | A scheduled task converts old real-time segments to offline ones.
+  Query [client] -> Broker [svc] : SQL with time range | The query arrives at the Broker.
+  Broker -> Offline part, Real-time part : split at time boundary | Old time goes to offline and new time to real-time.
+ref: docs | Table types and hybrid tables | Apache Pinot documentation | https://docs.pinot.apache.org/basics/components/table
+
+== Upsert table for latest-state queries on a CDC stream
+kind: cdc, materialized-view
+when: A dashboard needs the latest row per key, such as current order status, while data arrives as a stream of changes.
+how: Debezium reads a database log and writes change events to Kafka, keyed by primary key. A Pinot real-time table in upsert mode reads the topic. Pinot keeps an in-memory map from each primary key to its newest row location.
+A query sees only the newest version of each key. Older versions stay in segments but are hidden. The topic must be partitioned by primary key so that all versions of a key land on the same server.
+The cost is memory: the key map lives on heap or off-heap on each server, so billions of keys need planning. Deletes can be handled with a delete column.
+used: Documented Pinot feature for real-time upsert; used for order status and ride state dashboards.
+avoid: When history of all versions is the goal; use append-only tables.
+flow:
+  Orders DB [db] -> Debezium [svc: CDC] : row changes | Debezium reads committed changes from the database log.
+  Debezium -> orders topic [log: keyed by id] : change event | Events are keyed by primary key, so each key sits in one partition.
+  orders topic -> Pinot server [svc: upsert table] : consume | The server updates its map from key to newest row.
+  * Pinot server: key map 40M keys | The map decides which row version is visible.
+  Ops dashboard [client] -> Pinot server : SELECT status where id | Only the newest version of each order is returned.
+ref: docs | Stream ingestion with upsert | Apache Pinot documentation | https://docs.pinot.apache.org/basics/data-import/upsert
+
+@@ redshift
+== Lake to warehouse with COPY and Spectrum
+kind: etl-elt, medallion
+when: Raw data lives as files in S3, and analysts need fast SQL on cleaned, joined tables.
+how: Raw files land in S3 as the bronze layer. Redshift loads them in parallel with the COPY command. Each compute node (slice) reads its own share of files, so splitting data into many files of 100 MB to 1 GB each, in multiples of the slice count, loads fastest.
+SQL then builds cleaned and aggregated tables inside Redshift, which is ELT. Tables use a distribution key to place joined rows on the same node, and a sort key so range filters skip blocks.
+Redshift Spectrum lets the same SQL read rarely used data in S3 directly, through external tables in the Glue Data Catalog. Hot data lives in the cluster; cold history stays in S3 and costs less. The warehouse and the lake share one catalog.
+used: Standard AWS analytics design; Redshift with S3, Glue and Spectrum is used by many AWS-based data teams.
+avoid: When data is small or SQL load is spiky and light; a smaller engine or Athena on S3 costs less.
+flow:
+  Source apps [svc] -> S3 raw [lake: bronze files] : JSON or CSV files | Apps and tools drop raw files in S3.
+  S3 raw -> Redshift [db: cluster] : COPY in parallel | Each node slice loads its own files at the same time.
+  * Redshift: cleaned tables built | SQL (INSERT SELECT) builds cleaned and aggregated tables inside the cluster.
+  Analyst [user] -> Redshift : SQL | Analysts and BI tools query the warehouse tables.
+  Redshift ~> S3 history [lake: Parquet] : Spectrum external table | Old data is read from S3 when a query needs it.
+ref: docs | Amazon Redshift best practices | AWS documentation | https://docs.aws.amazon.com/redshift/latest/dg/best-practices.html
+
+== Concurrency scaling and workload isolation
+kind: bulkhead, autoscaling
+when: Heavy ETL jobs and many dashboard users share one warehouse and slow each other down.
+how: Workload management (WLM) puts queries in queues, by user group or by rules, each with memory and concurrency limits. Short dashboard queries get their own queue, so a long ETL query cannot block them. Short query acceleration runs very short queries first.
+When the queue grows past a limit, concurrency scaling adds extra transient clusters in the background, and the queue spills to them. Users pay per second for that extra time. Reads scale well. Some writes also scale.
+For stronger isolation, use data sharing: an ETL cluster or serverless workgroup writes tables, and separate consumer clusters read the same data live from managed storage, with no copy. Each team then pays for its own compute.
+used: Redshift RA3 data sharing and Serverless workgroups for isolating ETL, BI and data science.
+avoid: When one small team uses the warehouse; extra queues add settings with no benefit.
+flow:
+  ETL job [svc: Airflow task] -> ETL queue [queue: WLM 5 slots] : heavy INSERT | Long loads wait in their own queue.
+  Dashboard [client] -> BI queue [queue: WLM 15 slots] : short SELECTs | Short queries use a separate queue and stay fast.
+  BI queue -> Redshift main [db: leader + nodes] : run | Queries run on the main cluster.
+  BI queue ~> Scaling cluster [db: transient] : spill when queue is full | Extra clusters start for a spike and are billed per second.
+  Redshift main -> Consumer cluster [db: data share] : live read of shared tables | Another team reads the same data without a copy.
+ref: docs | Workload management | AWS documentation | https://docs.aws.amazon.com/redshift/latest/dg/c_workload_mngmt_classification.html
+
+== Star schema with distribution and sort keys
+kind: star-schema, sharding
+when: Many reports join a big fact table to small dimension tables and must run fast on an MPP cluster.
+how: Model events in a central fact table such as ad_impressions, with foreign keys to small dimensions such as campaign, publisher and date. Give small dimensions DISTSTYLE ALL, so a copy sits on every node. Then a join to a dimension never moves data.
+Distribute the fact table by a key such as campaign_id, and for a large dimension with the same key, use the same key. Matching rows then sit on the same node, which avoids a network shuffle. Choose a sort key, often the event date, so zone maps let queries skip blocks outside the date range.
+Redshift can choose these automatically (AUTO), and you can check with the system tables. A skewed key puts most rows on one node, so watch skew.
+used: Classic data warehouse design on Redshift as described in AWS documentation; common for ad and retail reporting.
+avoid: When the schema changes daily and many joins are ad hoc; a wide denormalized table or a lake engine may be easier.
+flow:
+  BI tool [client] -> Leader node [svc: plans query] : join SQL | The leader builds the plan and sends it to all nodes.
+  Leader node -> Node 1 [db: fact slice], Node 2 [db: fact slice] : plan | Each node holds a slice of the fact table by campaign_id.
+  Node 1, Node 2 -> Dim campaign [store: DISTSTYLE ALL] : local join | Every node has a full copy of the small dimension, so no shuffle happens.
+  Node 1, Node 2 -> Leader node : partial aggregates | Nodes return small partial results.
+  Leader node -> BI tool : final result | The leader merges and answers.
+ref: docs | Working with data distribution styles | AWS documentation | https://docs.aws.amazon.com/redshift/latest/dg/t_Distributing_data.html
+
+@@ snowflake
+== Separated storage and compute with virtual warehouses
+kind: control-data-plane, bulkhead
+when: Different teams run different workloads on the same data and must not slow each other down.
+how: Snowflake stores all table data in cloud object storage as compressed, columnar micro-partitions, usually 50 to 500 MB before compression. A cloud services layer holds metadata, security and the query optimizer. Compute is made of virtual warehouses: clusters that you start, size and stop.
+Give each workload its own warehouse: one for ETL, one for BI, one for data science. All read the same tables. A warehouse can auto-suspend after 60 seconds of idle time and resume on the next query, so you pay for compute only while it runs.
+A multi-cluster warehouse adds clusters when queries queue, and removes them later. Each size step up (XS, S, M, ...) doubles the nodes and the credit rate. Local SSD caches speed repeated reads.
+used: Snowflake's core design as described in its SIGMOD 2016 paper; used by many enterprises for isolated BI and ETL.
+avoid: When load is steady 24 hours a day and tiny; a fixed-size warehouse of another product may cost less.
+flow:
+  ETL job [svc] -> ETL warehouse [svc: size L] : COPY and MERGE | Heavy loads run on their own compute cluster.
+  BI users [user] -> BI warehouse [svc: M 1-4 clusters] : SELECT | Dashboards use a separate warehouse that can add clusters.
+  ETL warehouse, BI warehouse -> Cloud services [svc: metadata + optimizer] : plan and pruning | Both ask the services layer for the plan and which micro-partitions to read.
+  Cloud services -> Object storage [lake: micro-partitions] : file list | Only needed micro-partitions are read, by min-max pruning.
+  * BI warehouse: suspended after 60 s idle | An idle warehouse stops and costs nothing until the next query.
+ref: paper | The Snowflake Elastic Data Warehouse | Dageville et al., SIGMOD 2016 |
+ref: docs | Key concepts and architecture | Snowflake documentation | https://docs.snowflake.com/en/user-guide/intro-key-concepts
+
+== Streams, tasks and dynamic tables for ELT
+kind: etl-elt, medallion
+when: Raw data arrives continuously, and cleaned tables inside the warehouse must stay fresh with little code.
+how: A Snowpipe or Snowpipe Streaming path loads files or rows into a raw table. A stream on that table records which rows are new since the last read. A task runs SQL on a schedule, reads the stream, and merges new rows into a silver table.
+Dynamic tables make this simpler: you write a SELECT and a target lag, such as 5 minutes. Snowflake refreshes the table by itself, often incrementally, to stay within that lag. Chain dynamic tables for bronze to silver to gold layers.
+Choose the lag by need. A lower lag means more refreshes and more credits. Tasks give you full control and error handling; dynamic tables give less code but less control.
+used: Snowflake-native ELT in many data teams; bronze, silver and gold layers inside one account.
+avoid: When transforms need complex tests and lineage across many models; use dbt on top, which can also build dynamic tables.
+flow:
+  S3 files [lake] -> Snowpipe [svc: auto-ingest] : file arrives event | A new file triggers a small automatic load.
+  Snowpipe -> raw_events [store: bronze] : COPY | Rows are appended to the raw table.
+  raw_events -> Dynamic table [store: lag 5 min] : refresh incrementally | Snowflake reads only changed rows to refresh the silver table.
+  Dynamic table -> Gold table [store: lag 1 hour] : refresh | A second dynamic table builds the aggregates.
+  BI tool [client] -> Gold table : SELECT | BI reads the gold table.
+ref: docs | Dynamic tables | Snowflake documentation | https://docs.snowflake.com/en/user-guide/dynamic-tables-about
+
+== Secure data sharing and clean rooms
+kind: privacy-clean-room, pubsub
+when: You must give another company, or another business unit, live access to data without copying it.
+how: The provider creates a share in its account and grants it access to chosen tables or secure views. The consumer creates a read-only database from the share. No data is copied: both accounts point at the same micro-partitions, so the consumer always sees current data. Queries run on the consumer's own warehouse and bill to the consumer.
+Secure views hide rows or columns by consumer, for example with a mapping table. The provider can publish the share on the Snowflake Marketplace. For cross-region or cross-cloud sharing, Snowflake replicates the data first.
+Snowflake data clean rooms build on this: the parties join their data under approved queries and get aggregate answers only. This helps advertisers and publishers match audiences.
+used: Snowflake Marketplace data products; advertiser and publisher collaboration in Snowflake data clean rooms.
+avoid: When the consumer needs to change the data or you must prove deletion in their copy; a copy-based export is then clearer.
+flow:
+  Provider [user: data owner] -> Share [note: grants on views] : create share | The provider lists the tables and secure views to share.
+  Share -> Consumer DB [db: read-only] : create database from share | The consumer mounts the share, with no copy of data.
+  Analyst [user] -> Consumer DB : SELECT | The consumer queries on its own warehouse.
+  Consumer DB -> Provider storage [lake: same micro-partitions] : reads shared files | Reads go to the provider's storage, so data is always current.
+  Provider -x> Consumer DB : revoke share | The provider can end access at any time, and queries then fail.
+ref: docs | About Secure Data Sharing | Snowflake documentation | https://docs.snowflake.com/en/user-guide/data-sharing-intro
+
+@@ airflow
+== Scheduled DAG with an external executor and workers
+kind: scheduler-agent, competing-consumers
+when: A set of daily or hourly jobs with dependencies must run in order, retry on failure and show their state.
+how: A workflow is a Python file that defines a DAG: tasks and the order between them. The scheduler parses DAG files, creates a run for each schedule interval, and sets each task to "queued" when its upstream tasks succeed. A metadata database (PostgreSQL) stores every state.
+The executor sends queued tasks to workers. With the Celery executor, tasks go through a broker such as Redis or RabbitMQ, and a pool of workers takes them. With the Kubernetes executor, each task runs in its own pod. The workers run the task and write the state back.
+Failed tasks retry with a delay and set number of tries. The webserver shows the grid of runs. Tasks should be idempotent, since a retry can run the same code twice. Airflow orchestrates; it should not move big data itself.
+used: Widely used for data pipelines, for example at Airbnb (where it started) and in managed Cloud Composer and MWAA.
+avoid: When you need sub-second or event-by-event processing; use a stream processor. For long durable business workflows, consider Temporal.
+flow:
+  Scheduler [svc] -> Metadata DB [db: task states] : create run, queue tasks | The scheduler writes a new run and queues ready tasks.
+  Scheduler -> Executor [queue: Celery broker] : task to run | Queued tasks are handed to the executor queue.
+  Executor -> Worker 1 [svc: runs task], Worker 2 [svc: runs task] : pull task | Workers take tasks, each task goes to exactly one worker.
+  Worker 1 -> Warehouse [db] : run SQL job | The task starts the real work in another system.
+  Worker 2 -x> Metadata DB : task failed | A failed task is recorded and marked for retry.
+  * Worker 2: retry 2 of 3 after 5 min | The scheduler queues the task again after the delay.
+ref: docs | Airflow architecture overview | Apache Airflow documentation | https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/overview.html
+
+== Orchestrating ELT: sensor, load, transform, quality gate
+kind: etl-elt, medallion
+when: A daily pipeline must wait for data, load it, transform it and check quality before consumers read it.
+how: A sensor task, or a dataset or asset trigger, waits for the upstream file or table update. Then a load task runs COPY or an ingestion job. A transform task runs SQL or dbt models on the warehouse. A quality task runs checks, such as row counts and null rates.
+Only after the checks pass does a final task publish the result, for example by swapping a view or marking a partition as ready. If a check fails, downstream tasks do not run, and an alert goes to the team through a callback.
+Use the data interval of each run as a parameter, so a task for 2026-10-27 always processes that day. Then a backfill, which reruns past intervals, gives the same results as the first run.
+used: Standard pattern in Airflow deployments for warehouses such as Snowflake, BigQuery and Redshift.
+avoid: When the transform is one SQL view that needs no schedule; do not add an orchestrator for one query.
+flow:
+  Sensor [svc: wait for file] -> Load task [svc: COPY] : file arrived | The sensor ends and the load task starts.
+  Load task -> Warehouse [db: raw tables] : load 2026-10-27 | The task loads only the day's data.
+  Load task -> Transform task [svc: dbt run] : success | The transform starts only after the load succeeds.
+  Transform task -> Warehouse : build models | Models are built from raw data.
+  Transform task -> Quality task [svc: checks] : success | Checks run on the new tables.
+  Quality task -x> Alert [svc: Slack or PagerDuty] : null rate too high | A failed check sends an alert and blocks publishing.
+ref: docs | Airflow DAGs and data intervals | Apache Airflow documentation | https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html
+
+== Backfill by rerunning past data intervals
+kind: backfill-replay
+when: A bug fix or a new column means past days of output must be recomputed.
+how: Each DAG run covers a data interval, such as one day. If tasks are written to be idempotent, for example "delete the partition for the day, then insert", a run can be repeated safely. A backfill command, or a clear in the UI, creates runs for a range of past intervals, such as 30 days.
+Set max active runs to a small number, such as 3, so the backfill does not overload the warehouse or the source system. Tasks of different days can run in parallel when they are independent. If each day depends on the previous one, run them in order.
+The risk is side effects. If a task sends emails or writes to an external API, a backfill repeats them. Keep such steps out of backfill DAGs or guard them with a flag.
+used: Everyday practice in Airflow-based data teams for correcting history.
+avoid: When history is huge and cheap to recompute inside one SQL statement; run that statement directly.
+flow:
+  Engineer [user] -> Scheduler [svc] : backfill 30 days | The engineer asks for runs of the past intervals.
+  Scheduler -> Run 09-28 [svc: DAG run], Run 09-29 [svc: DAG run], Run 09-30 [svc: DAG run] : create runs | One run is created for each past day.
+  Run 09-28, Run 09-29, Run 09-30 -> Warehouse [db: partitions] : replace day partition | Each run deletes and rewrites its own day, so a rerun is safe.
+  * Scheduler: max 3 active runs | The limit protects the warehouse from overload.
+  Warehouse -> Engineer : corrected history | After all runs succeed, past days hold the fixed values.
+ref: docs | Backfill | Apache Airflow documentation | https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dag-run.html#backfill
+
+@@ dagster
+== Software-defined assets with lineage
+kind: materialized-view, etl-elt
+when: You think about the tables and files a pipeline produces, and want lineage and freshness to be first-class.
+how: In Dagster you declare assets: each is a function that produces a table, file or model, and lists the assets it depends on. Dagster builds the graph from these dependencies. A materialization is one run that updates an asset and records metadata, such as row count.
+The UI shows lineage, the last update time and which assets are stale. Freshness policies or automation conditions let Dagster refresh an asset when its parents change or when it gets too old, instead of a fixed cron for everything.
+An IO manager or resource decides where the data is stored, such as S3 or a warehouse. This keeps business code the same in local tests and in production. dbt models can be loaded as assets in the same graph.
+used: Dagster deployments for analytics and ML pipelines, where teams want a catalog of data assets with lineage.
+avoid: When you only need to run unrelated scripts on a timer; a plain scheduler is simpler.
+flow:
+  raw_orders [store: asset] -> clean_orders [store: asset] : depends on | Each asset names its upstream assets in code.
+  clean_orders -> revenue_daily [store: asset] : depends on | Dagster builds the graph from these links.
+  Daemon [svc: automation] -> raw_orders : parent updated | The daemon sees a new materialization of a parent asset.
+  Daemon -> clean_orders, revenue_daily : launch run | Dagster launches a run for the stale assets only.
+  clean_orders -> Catalog UI [client: lineage view] : metadata | Each run records row count and time for the UI.
+ref: docs | Software-defined assets | Dagster documentation | https://docs.dagster.io/concepts/assets/software-defined-assets
+
+== Code locations with isolated user code
+kind: control-data-plane, plugin-arch
+when: Many teams ship pipelines on one platform, and one team's dependencies or bugs must not break the others.
+how: Each team packages its assets and jobs as a code location: a separate Python environment, often a Docker image. A gRPC server runs the location. The Dagster webserver and daemon are the control plane. They load definitions from each code location over gRPC, and they never import user code themselves.
+When a run starts, the run launcher starts a new process, Docker container or Kubernetes pod with the team's image. So dependency versions can differ by team. A broken deploy of one location shows an error for that location only.
+Teams redeploy their own location by pushing a new image, with no restart of the platform. The cost is more images to build and keep secure, and the need for shared resources and conventions.
+used: Dagster open-source on Kubernetes, and Dagster+ hybrid, where user code runs in the customer's own network.
+avoid: When one small team owns all code; a single code location is enough.
+flow:
+  Webserver [svc: control plane] -> Location A [svc: team A image] : gRPC: list definitions | The webserver asks each location for its assets and jobs.
+  Webserver -> Location B [svc: team B image] : gRPC: list definitions | Team B can use other library versions.
+  Daemon [svc: schedules] -> Run launcher [svc: Kubernetes] : start run | A schedule fires and a launch request is sent.
+  Run launcher -> Run pod [svc: team A image] : new pod | Each run gets its own pod with the team's code.
+  Run pod -> Run storage [db: events and logs] : write events | Events and logs flow back to the platform database.
+ref: docs | Code locations | Dagster documentation | https://docs.dagster.io/concepts/code-locations
+
+== Partitioned assets for incremental load and backfill
+kind: backfill-replay, etl-elt
+when: A large table is built one day at a time, and you need to refresh or repair only some days.
+how: Declare an asset with daily partitions starting at a given date. Each partition is one slice, such as one day of events. A run for partition 2026-10-27 processes only that day and writes to that slice.
+Dagster tracks which partitions are materialized, so the UI shows a grid of days with missing and stale ones. A backfill selects a range of partitions and launches runs, either one run per partition or one run for the whole range. Downstream partitioned assets map to their upstream partitions, so a fix to one day can trigger only the affected downstream days.
+Keep each partition write idempotent, like replacing the day's slice. Set concurrency limits so a 365-day backfill does not overload the warehouse.
+used: Dagster partitioned assets for daily warehouse and ML feature tables.
+avoid: When data has no natural slicing key or the table is small; rebuild it fully each time.
+flow:
+  Engineer [user] -> Partition grid [client: Dagster UI] : select 09-01 to 09-30 | The UI shows 30 missing or stale days and the engineer selects them.
+  Partition grid -> Run queue [queue: concurrency 4] : 30 partition runs | One run per partition is queued, with a concurrency limit.
+  Run queue -> events_clean [svc: asset partition] : run for one day | Each run reads one day of upstream data.
+  events_clean -> Warehouse [db: day slices] : replace slice | The run replaces only that day in the table.
+  Warehouse -> Partition grid : materialized | The grid turns green for each finished day.
+ref: docs | Partitioning assets | Dagster documentation | https://docs.dagster.io/concepts/partitions-schedules-sensors/partitioning-assets
+
+@@ dbt
+== Layered models: staging, intermediate, marts
+kind: medallion, star-schema, etl-elt
+when: Raw tables in the warehouse must become trusted business tables, with clear code, tests and owners.
+how: dbt models are SELECT statements in files. Each file becomes a view or a table in the warehouse. Staging models sit directly on raw sources and only rename, cast and clean columns. Intermediate models join and reshape. Mart models are the final facts and dimensions that BI tools read.
+A model refers to another with ref('name'). dbt reads these references, builds a DAG, and runs models in dependency order, in parallel where it can. It compiles Jinja and SQL into plain SQL and sends it to the warehouse; dbt does not move data itself.
+Tests (unique, not null, relationships) run on the results. Docs and lineage come from the same code. Staging is usually a view, and marts are tables or incremental models.
+used: Analytics engineering teams on Snowflake, BigQuery, Redshift and Databricks; the layer names are dbt's own style guide.
+avoid: When the transform needs Python at scale or streaming; use Spark or Flink, and use dbt for the SQL layers.
+flow:
+  Raw sources [lake: loaded by EL tool] -> stg_orders [store: staging view] : ref and source | Staging models clean names and types, one per source table.
+  stg_orders -> int_orders_joined [store: intermediate] : ref('stg_orders') | Joins and business rules are built on top.
+  int_orders_joined -> fct_orders [store: mart table] : ref | The mart is the fact table that analysts use.
+  dbt [svc: dbt run] -> Warehouse [db: compiled SQL] : CREATE TABLE AS | dbt sends the compiled SQL in DAG order.
+  dbt -x> Warehouse : test failed | A failed test, such as a duplicate key, stops the downstream models.
+  BI tool [client] -> fct_orders : SELECT | Dashboards read only marts.
+ref: docs | How we structure our dbt projects | dbt Labs documentation | https://docs.getdbt.com/best-practices/how-we-structure/1-guide-overview
+
+== Incremental models for large fact tables
+kind: etl-elt, materialized-view
+when: A fact table has billions of rows, and rebuilding it every night is too slow or costly.
+how: An incremental model has a config with materialized='incremental' and a unique key. On the first run, dbt builds the full table. On later runs, the model's SQL uses a filter like "where event_time > (select max(event_time) from this)", so only new rows are processed and merged or inserted.
+Late data needs care. A common method is a lookback window, such as the last 3 days, which is reprocessed on each run. Use a unique key so that reprocessed rows replace older versions and do not create duplicates.
+When logic changes, run with --full-refresh to rebuild from scratch. Many teams do this weekly as a safety step. Cost drops from a full scan each night to a scan of a few days.
+used: Common for event, order and ad-log tables in dbt projects on every major warehouse.
+avoid: When the table is small, or the source rows change anywhere in history without an update time column; a full rebuild is simpler and safe.
+flow:
+  Scheduler [svc: Airflow or dbt Cloud] -> dbt [svc: dbt run] : run fct_events | The scheduler starts dbt every hour.
+  dbt -> Warehouse [db] : SELECT max(event_time) | dbt finds the newest row already loaded.
+  dbt -> stg_events [store: 2 TB source] : filter last 3 days | Only the lookback window of recent rows is scanned.
+  stg_events -> fct_events [store: incremental table] : MERGE on event_id | New rows are inserted and reprocessed rows replace old ones.
+  * fct_events: 3 days replaced | Late events inside the window are fixed with no duplicates.
+ref: docs | Incremental models | dbt Labs documentation | https://docs.getdbt.com/docs/build/incremental-models
+
+== Slim CI with state comparison and deferral
+kind: blue-green, immutable-infra
+when: Many people change models, and a pull request should be tested on only what changed, without a full rebuild.
+how: A production run saves a manifest file that describes every model. In a pull request, the CI job compares the branch with that manifest using state:modified+ selection. It builds only the changed models and the models downstream of them.
+The unchanged upstream models are not rebuilt. The --defer option makes dbt read them from the production schema. The CI job writes its output into a temporary schema, for example one per pull request, and drops the schema when the PR closes.
+A pull request that changes one staging model may build 12 models, not 800. The checks run in minutes. After merge, the normal production job builds the changes. Take care that production data is safe to read from CI.
+used: dbt Cloud CI jobs and GitHub Actions workflows that use state selection and defer; standard in larger dbt teams.
+avoid: When the project has 20 models; a full build is fast enough.
+flow:
+  Developer [user] -> Pull request [svc: GitHub] : change stg_orders | A model change is proposed in a pull request.
+  Pull request -> CI job [svc: dbt build] : trigger | CI starts and downloads the production manifest.
+  CI job -> Manifest [store: prod state] : compare | dbt selects the changed models and everything downstream.
+  CI job -> Warehouse [db: schema pr_123] : build 12 models | Only the selected models are built in a temporary schema.
+  Warehouse -> Prod schema [db: unchanged models] : defer reads | Unchanged parents are read from production, not rebuilt.
+  CI job -> Pull request : checks green | The result shows in the PR before the merge.
+ref: docs | Continuous integration in dbt | dbt Labs documentation | https://docs.getdbt.com/docs/deploy/continuous-integration
+
+@@ temporal
+== Durable workflow with activities and replay
+kind: event-sourcing, checkpoint-restart
+when: A business process runs for minutes, days or months, calls many services, and must survive crashes without losing its place.
+how: You write the workflow as ordinary code. The Temporal service records every step in an event history, in its own database. Workers poll task queues, run your workflow code, and send commands back, such as "start activity" or "start timer".
+Activities hold the side effects, such as API calls. They have timeouts and retry policies. If a worker crashes, another worker loads the event history and replays the workflow code. Completed activities are not run again. The code reaches the same point, then continues.
+Workflow code must be deterministic: no random numbers, no direct clock or network calls. Temporal gives safe replacements. Activities should be idempotent, since a retry can repeat one. A long sleep is a timer in the history and uses no worker.
+used: Uber (Cadence, the project Temporal grew from), Netflix, Stripe and Snap have described using Temporal or Cadence for long workflows.
+avoid: When the task is a simple, short, one-step job; a queue and a worker are enough.
+flow:
+  Client [client] -> Temporal service [svc: history in DB] : start OrderWorkflow | The client starts a workflow and the service records the first event.
+  Temporal service -> Worker A [svc: workflow code] : workflow task | A worker polls and runs the code up to the first activity call.
+  Worker A -> Payment API [svc] : activity: charge card | The activity calls the payment service with a timeout and retries.
+  Worker A -x> Temporal service : worker crashed | The worker dies after the charge is recorded.
+  Temporal service -> Worker B [svc: replays history] : workflow task | Another worker replays the history and skips the finished charge.
+  Worker B -> Shipping API [svc] : activity: ship order | The workflow goes on to the next step without repeating the charge.
+ref: docs | Temporal workflow execution | Temporal documentation | https://docs.temporal.io/workflows
+ref: docs | What is Temporal? | Temporal documentation | https://docs.temporal.io/temporal
+
+== Saga with compensations
+kind: saga
+when: A business transaction spans several services with no shared database, and it must be undone if a step fails.
+how: Write the saga as one workflow. Each step is an activity, such as reserve stock, charge card, book shipping. Before each step, the workflow records the compensating action: release stock, refund card, cancel shipping.
+If a step fails after its retries, the workflow runs the recorded compensations in reverse order. Because Temporal keeps the state, the saga continues after a crash, so a refund is never forgotten. The whole flow is visible as one history in the UI.
+Compensations must be idempotent and must themselves be retried until they succeed. Be clear about what cannot be undone, such as an email already sent. For those, send them last.
+used: Temporal documents the saga pattern, and it is a common use of Temporal and Cadence in payments, travel and e-commerce.
+avoid: When one database can do the whole change in one ACID transaction; use that.
+flow:
+  Order workflow [svc: Temporal] -> Inventory [svc] : reserve stock | The first step reserves stock. The undo step is recorded.
+  Order workflow -> Payments [svc] : charge card | The second step charges the customer.
+  Order workflow -x> Shipping [svc] : booking failed | The third step fails after all retries.
+  Order workflow -> Payments : compensate: refund | The workflow runs the last undo first, to refund the card.
+  Order workflow -> Inventory : compensate: release | Then it releases the stock. Both are retried until they work.
+ref: blog | Saga pattern made easy | Temporal blog | https://temporal.io/blog/saga-pattern-made-easy
+
+== Human approval with signals, timers and long waits
+kind: async-request-reply, lease
+when: A process must wait for a person or an outside event for hours or days, and then continue or escalate.
+how: The workflow sends the request, for example an expense approval, and then waits for a signal. A signal is a message sent to a running workflow from outside, such as a click in a web page. At the same time, it starts a durable timer of 48 hours.
+If the approval signal arrives first, the workflow goes on. If the timer fires first, it escalates to a manager. The wait costs no worker threads. The state is in the event history, so a deploy or a restart during the wait does not matter.
+Queries let a web page ask the workflow for its current state. Updates let a client send a change and get a result back. Keep the workflow history small: for very long loops, use continue-as-new to start a fresh history with the same state.
+used: Approval flows, onboarding and subscription lifecycles built on Temporal.
+avoid: When the wait is a few seconds; a normal request with a timeout is simpler.
+flow:
+  Web app [client] -> Temporal service [svc] : start ApprovalWorkflow | A person submits an expense request.
+  Temporal service -> Worker [svc: workflow code] : workflow task | The code sends an email and starts a 48 hour timer.
+  * Temporal service: waiting, no worker used | The workflow sleeps in the event history.
+  Manager [user] -> Web app : click approve | The manager approves one day later.
+  Web app -> Temporal service : signal: approved | The signal is added to the history and wakes the workflow.
+  Temporal service -> Worker : workflow task | The workflow continues and pays out. A timer firing instead would escalate.
+ref: docs | Signals, queries and updates | Temporal documentation | https://docs.temporal.io/encyclopedia/application-message-passing
+
+@@ avro
+== Schema registry with compact binary events
+kind: none
+when: Many teams produce and consume Kafka events, and the format must change over time without breaking readers.
+how: A producer serializes each record in Avro binary, which holds no field names, only values in schema order. Instead of sending the schema each time, it sends a small schema id (5 bytes of header in the Confluent format) and the data. A schema registry stores each schema under a subject and gives it an id.
+A consumer reads the id, fetches the writer schema from the registry once, and caches it. Avro then uses schema resolution to read data written with an older or newer schema, by matching fields by name and using defaults for missing ones.
+The registry checks a compatibility rule when a new version is registered, such as BACKWARD, which means new readers can read old data. A bad change, like a new required field with no default, is rejected before it reaches production.
+used: Confluent Schema Registry with Kafka, and similar registries such as AWS Glue Schema Registry; common in event platforms.
+avoid: When humans must read the messages without tools or you need loose, free-form payloads; use JSON, with a JSON Schema if needed.
+flow:
+  Producer [svc] -> Schema registry [svc: schemas by subject] : register v2 | The producer registers the new schema and receives an id.
+  Schema registry -x> Producer : incompatible change | A breaking change is rejected at registration time.
+  Producer -> orders topic [log] : id 7 + Avro bytes | Each message holds the schema id and compact binary data.
+  orders topic -> Consumer [svc: reader schema v2] : poll | The consumer reads the message with its own reader schema.
+  Consumer -> Schema registry : fetch id 7 once | The consumer gets the writer schema, then caches it.
+  * Consumer: resolved v1 to v2 | Avro fills missing fields with defaults.
+ref: spec | Apache Avro specification | Apache Avro | https://avro.apache.org/docs/current/specification/
+ref: docs | Schema evolution and compatibility | Confluent documentation | https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html
+
+== Avro container files for batch and lake data
+kind: etl-elt, open-table-format
+when: You need to store many records in a row-oriented, splittable file with its schema inside, for batch jobs and landing zones.
+how: An Avro container file starts with a header that holds the schema and a random sync marker. Records follow in blocks, and each block can be compressed with Snappy or deflate. The sync marker lets a job find block boundaries, so a large file can be split among parallel readers.
+Because the schema is inside the file, any reader can decode it years later. Spark, Flink and Hive read Avro. Kafka Connect sinks often write Avro files to S3 in the landing layer, for example one file per topic partition per hour.
+Avro is row-based, so it is good for writing and for reading whole records. For analytics on a few columns, convert to Parquet in the next layer. Iceberg can also use Avro for its manifest files.
+used: Landing zones fed by Kafka Connect S3 sink; Iceberg manifests are Avro files; Hadoop-era data pipelines.
+avoid: When queries read a few columns of many rows; use Parquet or ORC.
+flow:
+  Kafka [topic: events] -> Connect S3 sink [svc: Kafka Connect] : consume | A sink connector reads the topic.
+  Connect S3 sink -> S3 landing [lake: Avro files] : hourly file with schema | Records are written in blocks with the schema in the header.
+  S3 landing -> Spark job [svc: splits by sync marker] : read in parallel | Each task reads a range of blocks from one large file.
+  Spark job -> S3 curated [lake: Parquet] : convert | The job writes column-based Parquet for analytics.
+  Analyst [user] -> S3 curated : SQL | Queries read only the needed columns.
+ref: spec | Apache Avro specification: object container files | Apache Avro | https://avro.apache.org/docs/current/specification/#object-container-files
+
+@@ debezium
+== Transactional outbox with the outbox event router
+kind: outbox, cdc
+when: A service must change its database and publish an event, and the two must never disagree.
+how: The service writes its business row and a row in an outbox table in one local transaction. Debezium, running in Kafka Connect, reads the database log and sees the committed outbox row. The outbox event router transform turns the row into a Kafka message: the aggregate id becomes the key, the payload becomes the value, and the event type chooses the topic.
+Because the log holds only committed changes, no event exists without the data change, and none is lost after a crash. The outbox row can be deleted right after the insert, since the log already holds it, so the table stays small.
+Delivery is at least once. After a connector restart, some events can repeat, so consumers must be idempotent, for example by storing the event id.
+used: Debezium documents this pattern; common in order, payment and inventory services in microservice systems.
+avoid: When lost events are acceptable; or when the database offers no change log you can read.
+flow:
+  Order service [svc] -> Postgres [db: orders + outbox] : one transaction | The service writes the order and the outbox row together.
+  Postgres -> Debezium [svc: Kafka Connect] : WAL record | Debezium reads the committed outbox insert from the log.
+  Debezium -> orders.events [topic] : route by event type | The router sets key, value and topic from the outbox columns.
+  Debezium -x> orders.events : resend after restart | After a restart the same event can be sent twice.
+  orders.events -> Shipping service [svc: dedup by id] : OrderPlaced | The consumer ignores event ids it has already handled.
+ref: docs | Outbox Event Router | Debezium documentation | https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html
+
+== Database to lake and warehouse replication
+kind: cdc, etl-elt
+when: Analytics needs near-real-time copies of operational tables, without heavy queries on the production database.
+how: Debezium connectors read the MySQL binlog or PostgreSQL logical decoding stream. On first start, a snapshot copies existing rows. After that, each insert, update and delete becomes an event with before and after values and an operation code (c, u, d). Events go to Kafka, one topic per table.
+Sink connectors, or Flink and Spark jobs, apply the events to a target: Iceberg tables in the lake, Snowflake, or ClickHouse. A merge step uses the primary key and the operation code to keep the target table equal to the source. Deletes are handled with delete markers.
+The load on the source is small, since it reads the log only. Watch replication slot lag in PostgreSQL: an unread slot keeps WAL on disk and can fill the disk.
+used: Debezium into Kafka and Iceberg or warehouse sinks; many teams replace nightly full dumps with this.
+avoid: When a nightly batch extract is fresh enough; avoid the work of running Kafka and Connect.
+flow:
+  MySQL [db: production] -> Debezium [svc: Kafka Connect] : binlog events | Debezium reads the binlog, so production queries are not affected.
+  Debezium -> customers topic [log: before and after] : c, u, d events | Each row change becomes an event with its operation code.
+  customers topic -> Sink job [svc: Flink or Connect] : consume | A sink job reads the stream.
+  Sink job -> Iceberg table [lake: current state] : MERGE by primary key | The job applies inserts, updates and deletes by key.
+  * Iceberg table: matches source | The lake table follows the source within seconds.
+  Analyst [user] -> Iceberg table : SQL | Analysts query the copy and not the production database.
+ref: docs | Debezium architecture | Debezium documentation | https://debezium.io/documentation/reference/stable/architecture.html
+
+== Cache and search index invalidation from the log
+kind: cdc, cqrs
+when: Caches and search indexes must reflect database changes quickly, and the app should not write to every store.
+how: The app writes only to the database. Debezium turns the change log into Kafka events. One consumer updates or deletes keys in Redis. Another consumer updates the search index. A third can feed a materialized view or a read model.
+Each consumer is independent, with its own offset. Because events carry the primary key and the new row state, an update can overwrite the cached value, or delete it on a delete event. Write consumers as idempotent, and keep order per key by partitioning on the primary key.
+This removes dual writes from the app code. The cost is a small delay, usually under a second, in which a read can see old data. Keep a time-to-live on cache keys as a safety net.
+used: Common with Debezium, Kafka, Redis and Elasticsearch or OpenSearch in microservice systems.
+avoid: When reads must always see the newest write; read from the primary or use read-your-own-writes logic.
+flow:
+  App [svc] -> MySQL [db] : UPDATE price | The app writes only to the database.
+  MySQL -> Debezium [svc: Kafka Connect] : binlog | Debezium sees the committed update.
+  Debezium -> products topic [log: keyed by id] : after state | The event is keyed by primary key, to keep order per product.
+  products topic -> Cache updater [svc], Index updater [svc] : poll | Two consumers read the same events on their own.
+  Cache updater -> Redis [cache] : SET or DEL key | The cache entry is rewritten, or deleted for a delete event.
+  Index updater -> Elasticsearch [store] : index document | The search document is updated.
+ref: docs | Debezium features and use cases | Debezium documentation | https://debezium.io/documentation/reference/stable/tutorial.html
+
+@@ flink
+== Event-time windows with watermarks and checkpoints
+kind: windowed-agg, checkpoint-restart
+when: You must compute exact counts or sums over time windows on a stream, even when events arrive late or out of order.
+how: Flink reads Kafka and assigns each event its event time, the time it happened. The job keys the stream, for example by campaign id, and uses a tumbling window of 1 minute. A watermark says "no events older than time T are expected". When the watermark passes the end of a window, Flink fires the window and emits the result.
+Allowed lateness and side outputs handle events that arrive after the watermark: they can update the result or go to a side stream for review.
+State, such as open windows, is kept in RocksDB or in memory. Flink takes a checkpoint every 30 to 60 seconds with distributed snapshots, and writes it to S3. After a failure, Flink restarts from the last checkpoint and rewinds Kafka offsets, so results are exact.
+used: Alibaba, Uber and Netflix describe Flink for real-time metrics; common for ad impression counting and fraud signals.
+avoid: When a small, simple job fits a SQL query on a warehouse every few minutes.
+flow:
+  Kafka [topic: impressions] -> Flink source [svc: assigns watermarks] : events with event time | The source reads events and tracks the watermark.
+  Flink source -> Window operator [svc: 1 min per campaign] : keyed by campaign | Events for one campaign go to the same task.
+  Window operator -> Counts topic [topic: results] : window closed | The window fires when the watermark passes its end.
+  Window operator ~> Checkpoint store [lake: S3] : checkpoint every 30 s | Window state and Kafka offsets are saved together.
+  Window operator -x> Checkpoint store : task failed | A task fails and the job stops.
+  * Window operator: restored | Flink reloads the last checkpoint and rewinds Kafka, so no event is lost or counted twice.
+ref: paper | The Dataflow Model | Akidau et al., VLDB 2015 |
+ref: docs | Flink timely stream processing | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/
+
+== Stream enrichment with a keyed state join
+kind: stream-table-join
+when: Each event needs extra data from a slowly changing table, such as user profile or campaign settings, with low latency.
+how: Flink reads two streams: the events, and a change stream of the reference table, for example from Debezium. Both are keyed by the same key, such as user id. The join operator keeps the latest row of the reference table in keyed state, and for each event it looks up that state locally.
+No network call per event is needed, so throughput can reach hundreds of thousands of events per second per node. The state is checkpointed with the rest of the job, so it survives failures. A temporal join can pick the table version that was valid at the event time, which gives repeatable results.
+The cost is state size. Large tables need RocksDB and enough disk. If the table is small and static, a broadcast state or a cached lookup join is simpler.
+used: Flink SQL temporal joins and keyed process functions for real-time enrichment, common in fraud, ads and recommendation pipelines.
+avoid: When the reference data is huge and rarely used; use an async lookup into a key-value store.
+flow:
+  Events topic [log: clicks] -> Join operator [svc: keyed state] : click by user id | Click events arrive keyed by user id.
+  Profiles CDC [log: user changes] -> Join operator : profile update | Profile changes arrive on the second input with the same key.
+  * Join operator: state holds latest profile | The latest profile per user is kept locally in RocksDB.
+  Join operator -> Enriched topic [log] : click + profile | Each click is joined with the profile from local state, without a network call.
+  Join operator ~> Checkpoint store [lake: S3] : checkpoint | The join state is saved with the job checkpoints.
+ref: docs | Joins in Flink SQL | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/sql/queries/joins/
+
+== Streaming ingest into a lakehouse table
+kind: kappa-arch, open-table-format
+when: Events from Kafka must land in an open table on object storage, with exactly-once results and no small-file mess.
+how: A Flink job reads Kafka and writes Iceberg, Paimon or Delta files to S3. Data files are written continuously, but they only become visible when a checkpoint completes: the sink commits a new table snapshot at each checkpoint. A 1 minute checkpoint interval gives a 1 minute data delay.
+This ties exactly-once to checkpoints. If the job fails, uncommitted files are discarded, and the job replays from the last checkpoint. A longer interval makes fewer, larger files; a shorter one gives fresher data and more small files, which a compaction job must merge later.
+With one job and a replayable log, history can be rebuilt by replay, as in the Kappa architecture. Query engines such as Trino, Spark and Snowflake read the same table.
+used: Flink with Iceberg or Paimon sinks; common for streaming ingest into lakehouses.
+avoid: When hourly freshness is enough; a batch job or a Kafka Connect sink is simpler.
+flow:
+  Kafka [topic: events] -> Flink job [svc: Iceberg sink] : read events | The job reads events and writes data files to S3.
+  Flink job -> S3 data files [lake: Parquet] : write files | Files are written but are not yet part of the table.
+  Flink job -> Iceberg catalog [svc: table metadata] : commit at checkpoint | At each checkpoint the sink adds a new snapshot with the new files.
+  Flink job -x> S3 data files : crash before commit | Files of an uncommitted checkpoint are left unreferenced and ignored.
+  Trino [svc: query engine] -> Iceberg catalog : read latest snapshot | Readers see only committed snapshots.
+ref: docs | Apache Iceberg Flink writes | Apache Iceberg documentation | https://iceberg.apache.org/docs/latest/flink-writes/

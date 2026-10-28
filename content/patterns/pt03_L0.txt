@@ -1,0 +1,816 @@
+@@ polars
+== Lazy scan with pushdown over Parquet
+kind: etl-elt, data-locality
+when: One machine must filter and aggregate a large Parquet dataset on object storage, and reading everything would be too slow or too big for memory.
+how: The job calls scan_parquet and builds a lazy query: filter, select, group by. Nothing runs yet. Polars keeps the whole plan as a tree and optimizes it before it reads a single byte.
+The optimizer pushes the filter and the column list down into the scan. Parquet footers give min and max values per row group, so row groups that cannot match are skipped. Only the needed columns are fetched with range requests. A 200 GB table may become a 6 GB read.
+Then collect runs the plan on all cores, in Arrow columnar chunks. With the streaming engine, which is the default in Polars 2.0, the data is processed in pieces, so the result can be larger than RAM.
+used: Python data teams that replace pandas scripts on a single large VM; feature-building jobs that read Parquet or Delta tables from S3.
+avoid: When the data is many terabytes and one machine cannot read it fast enough; use Spark or Trino, or the Polars distributed engine.
+flow:
+  Analyst [user] -> Polars [svc: lazy plan] : scan, filter, group_by | The analyst writes a lazy query. Polars builds a plan and runs nothing yet.
+  Polars -> Optimizer [svc: pushdown] : logical plan | The optimizer moves the filter and the column list next to the scan.
+  Optimizer -> S3 Parquet [lake: 200 GB] : range reads, 6 columns | Only the needed columns and row groups are fetched. Row groups outside the filter are skipped by statistics.
+  S3 Parquet -> Polars : Arrow chunks | Data arrives in columnar chunks and is processed on all cores.
+  Polars -> Analyst : result 40 MB | Only the small aggregated result is returned.
+ref: docs | Query plan optimizations | Polars documentation | https://docs.pola.rs/user-guide/lazy/optimizations/
+
+== Single-node silver layer in a medallion lakehouse
+kind: medallion, open-table-format
+when: A silver-layer clean-up job handles a few GB to a few hundred GB per run, and a Spark cluster would cost more than it saves.
+how: Raw files land in a bronze table, for example hourly JSON or Parquet drops. A scheduled container task starts, reads only the new partition with Polars, and cleans it: it casts types, drops duplicates, joins a small dimension table and checks rules.
+The job writes the result to a silver Delta Lake or Iceberg table in one commit. The table format gives atomic commits, so readers never see half a batch. Bad rows go to a quarantine table with a reason code.
+This is cheap, simple to test locally and easy to debug. The price is the size limit of one machine, so the pipeline needs partitioned runs. If volume grows 50 times, the same logic must move to a cluster engine.
+used: Small and medium data platforms that run Polars in Airflow, Dagster or Kubernetes jobs and write Delta or Iceberg tables.
+avoid: When one run must shuffle terabytes; use Spark or Trino for that layer.
+flow:
+  Scheduler [svc: Airflow] -> Polars job [svc: 1 container] : run for hour 14 | The scheduler starts one container for the new hour of data.
+  Polars job -> Bronze table [lake: raw files] : read new partition | The job reads only the partition that is new, not the full table.
+  Polars job -> Silver table [lake: Delta or Iceberg] : append, one commit | Clean rows are appended in one atomic commit.
+  Polars job -x> Quarantine table [lake] : bad rows + reason | Rows that fail a rule are kept for review, and do not stop the run.
+  BI tool [client] -> Silver table : query | Analysts read only committed snapshots.
+ref: docs | Cloud storage and Delta Lake | Polars documentation | https://docs.pola.rs/
+
+== Feature engineering to model training with zero-copy Arrow
+kind: feature-store, online-offline
+when: Features are built in a dataframe job and must flow into model training without slow copies or a second code path.
+how: A batch job builds features with Polars expressions: rolling windows, group aggregates, joins on entity id. Expressions are plain functions, so the same file is unit-tested and then run in production.
+The result sits in Arrow memory. It is written to Parquet in a feature table, or handed to training code through the Arrow interface with little or no copying. Libraries such as PyTorch data loaders, XGBoost and scikit-learn accept NumPy or Arrow views of the columns.
+For online serving, the same table is later loaded into a key-value store. The risk is skew between training and serving code, so teams keep one feature definition and test that both paths give equal values.
+used: ML teams that replace pandas in feature jobs for speed; tabular training pipelines that read Parquet and feed XGBoost or PyTorch.
+avoid: When features must be computed on streams in real time; use Flink or Spark Structured Streaming.
+flow:
+  Events Parquet [lake: raw events] -> Feature job [svc: Polars] : scan_parquet | The job lazily scans the event table.
+  Feature job -> Feature table [store: Parquet] : write features | Rolling and group features are written once, with a version tag.
+  Feature table -> Training job [svc: PyTorch or XGBoost] : Arrow to NumPy | Training reads columns with little or no copying.
+  Training job -> Model registry [store] : model v7 | The trained model is saved with its feature version.
+  Feature table ~> Online store [db: key-value] : load latest per user | A background job loads the latest values for low-latency serving.
+ref: docs | Polars user guide | Polars documentation | https://docs.pola.rs/
+
+@@ ray
+== Data-parallel training with streaming ingest
+kind: data-parallel, pipeline-stages
+when: A deep learning model fits on one GPU, but training must use many GPUs and the dataset is too big to copy to every node.
+how: Ray Train starts one worker actor per GPU, for example 16 workers on 2 nodes. Each worker runs the same PyTorch training loop with DistributedDataParallel, so gradients are averaged with all-reduce after each step.
+Ray Data feeds the workers. It reads Parquet or images from S3 in blocks, runs CPU preprocessing on separate tasks, and streams blocks through the shared object store to each worker. The GPUs do not wait for a full dataset load, and data is not copied to disk first.
+Ray Train also saves checkpoints. If a node dies, the run restarts the workers from the last checkpoint. Autoscaling can replace the lost node.
+used: Large-scale training and fine-tuning at companies such as OpenAI and Uber have been described with Ray; Anyscale and open-source Ray Train users.
+avoid: When one GPU is enough, or when you need tensor or pipeline parallelism for a huge model; use the training framework's own parallelism and let Ray start the processes.
+flow:
+  Driver [svc: Ray Train] -> GPU worker 0, GPU worker 1 [svc: PyTorch DDP] : start 16 workers | The driver places one worker per GPU across the cluster.
+  S3 dataset [lake: Parquet] -> Ray Data [svc: CPU tasks] : read blocks | CPU tasks read and decode blocks of the dataset in parallel.
+  Ray Data -> GPU worker 0, GPU worker 1 : batches via object store | Each worker pulls its own shard of batches from the shared object store.
+  GPU worker 0 -> GPU worker 1 : all-reduce gradients | Workers average gradients after every step.
+  GPU worker 0 -> Checkpoint store [store: S3] : checkpoint every 500 steps | Rank 0 saves state so a failed run can resume.
+  GPU worker 1 -x> Driver : node lost | A node fails, and the run restarts from the last checkpoint.
+ref: docs | Ray Train overview | Ray documentation | https://docs.ray.io/en/latest/train/train.html
+
+== Model serving with composition and autoscaling
+kind: autoscaling, horizontal-scale
+when: An online prediction service has several steps (preprocess, model, post-process) with different cost, and traffic changes during the day.
+how: Ray Serve runs each step as a deployment, which is a group of replica actors. A proxy actor on each node accepts HTTP or gRPC requests and routes them to the ingress deployment.
+The ingress calls other deployments by handle, so a request can fan out to a CPU preprocessor, then a GPU model replica. Each deployment has its own replica count and resources, for example 0.5 GPU per replica.
+The autoscaler watches the number of ongoing requests per replica and adds or removes replicas. New replicas can start in seconds on existing nodes, and the cluster autoscaler adds nodes when needed. Dynamic request batching groups requests so the GPU runs fewer, bigger calls.
+used: Model serving at companies that use Anyscale or KubeRay; multi-model pipelines such as retrieval plus rerank.
+avoid: When a single model behind a simple endpoint is enough; a plain container service or a dedicated server like Triton or vLLM is simpler.
+flow:
+  Client [client] -> Proxy [svc: per node] : POST /predict | A request arrives at the proxy on one node.
+  Proxy -> Ingress [svc: 2 replicas] : route | The proxy sends it to a replica of the ingress deployment.
+  Ingress -> Preprocess [svc: 4 CPU replicas] : handle call | The ingress calls the CPU step through a deployment handle.
+  Ingress -> Model [svc: 3 GPU replicas] : batched call | Calls reach the model replicas, which batch up to 16 requests per GPU run.
+  * Model: 3 to 5 replicas | Queue length per replica goes above the target, so Ray Serve adds two replicas.
+  Model -> Client : prediction | The result goes back through the ingress.
+ref: docs | Ray Serve | Ray documentation | https://docs.ray.io/en/latest/serve/index.html
+
+== Heterogeneous batch inference pipeline
+kind: pipes-filters, offload-accelerator
+when: A large dataset must pass through CPU steps and a GPU model, and the GPUs must stay busy while CPUs prepare data.
+how: With Ray Data, the job is a lazy chain: read images, decode and resize on CPU, run the model on GPU, write results. Each stage is an operator with its own resource request. The decode stage uses 8 CPU tasks per node, and the model stage uses an actor pool with one GPU per actor.
+Blocks of data move between stages through the object store in memory, and a stage pauses when the next stage is full. This backpressure stops memory from growing without limit. Blocks spill to disk only if memory runs out.
+The model is loaded once per actor, not once per batch. This is why actors are used for the GPU stage. The result is higher GPU use than a single process that decodes and infers in turn.
+used: Offline embedding and labeling of images, video and text; Ray Data batch inference with vLLM for large models.
+avoid: When the job is pure SQL over tables; Spark is simpler. Also avoid it for tiny datasets where startup time dominates.
+flow:
+  S3 images [lake] -> Read tasks [svc: CPU] : list and read blocks | Many CPU tasks read blocks of image files.
+  Read tasks -> Decode tasks [svc: 8 CPU per node] : raw bytes | Decode and resize run on CPU, next to the data.
+  Decode tasks -> Model actors [svc: 1 GPU per actor] : tensor batches of 64 | Batches go through the object store to the GPU actors.
+  Model actors -x> Decode tasks : backpressure | When the GPU stage is full, upstream stages pause.
+  Model actors -> Output Parquet [lake] : embeddings | Results are written as Parquet files in parallel.
+ref: docs | Ray Data | Ray documentation | https://docs.ray.io/en/latest/data/data.html
+
+@@ spark
+== Medallion ETL on a lakehouse
+kind: medallion, open-table-format
+when: Many raw sources must become trusted, shared tables, and each step must be rerunnable and auditable.
+how: Spark jobs read raw files into bronze tables with little change, plus load time and source name. A silver job cleans the data: it removes duplicates, fixes types and joins reference data. A gold job builds business aggregates, such as daily revenue per campaign.
+Each layer is a Delta Lake or Iceberg table, so every job commits atomically and later jobs read a consistent snapshot. Spark reads only the needed columns from Parquet and skips row groups by statistics. Partitioning by date lets a rerun replace one day.
+Quality checks sit between layers. Rows that fail go to a quarantine table, so one bad file does not block the pipeline. Spark Declarative Pipelines, added in Spark 4.1, can define these layers as flows and materialized views.
+used: Databricks lakehouse customers; ad-tech and media companies that turn impression logs into reporting tables.
+avoid: When data is small enough for one machine; use Polars or DuckDB. For sub-second answers use a serving store.
+flow:
+  Raw files [lake: JSON and CSV] -> Bronze table [lake: Delta] : Spark ingest as is | A first Spark job copies raw data with load time and source name. The raw copy is kept for reprocessing.
+  Bronze table -> Silver table [lake: Delta] : clean, dedupe, merge | A second job reads only new days, fixes types and merges rows by key. Failed rows go to quarantine.
+  Silver table -> Gold table [lake: Delta] : aggregate | A third job builds business aggregates, such as daily revenue per campaign.
+  Gold table -> Dashboard [client: BI tool] : SQL query | Dashboards and SQL users read the small gold table, not the raw data.
+  * Silver table: quality checks pass | Checks between layers stop bad data before it reaches gold.
+ref: docs | What is the medallion lakehouse architecture? | Databricks documentation | https://docs.databricks.com/en/lakehouse/medallion.html
+
+== Shuffle join with skew handling
+kind: map-reduce, sharding
+when: Two very large tables must be joined or grouped by key, and a few keys hold most of the rows.
+how: Spark hashes each row by its join key and writes shuffle files. Reduce tasks then fetch their partition from every map task, so all rows with the same key meet in one task. The default is 200 shuffle partitions, and Adaptive Query Execution (AQE) changes this at run time.
+If one key has 40% of the rows, one task gets 40% of the work and the stage waits for it. AQE sees the real partition sizes after the map stage. It splits the big partition into several tasks and copies the matching rows of the other side. It can also merge tiny partitions.
+When AQE cannot help, for example in a groupBy with a hot key, add a random salt to the key, aggregate in two steps, and then remove the salt.
+used: Click and impression joins on user or campaign id; any Spark job where Spark UI shows one task far slower than the rest.
+avoid: When one side is small, because a broadcast join sends it to every executor and avoids the shuffle.
+flow:
+  Impressions [lake: 2 TB] -> Map tasks [svc: executors] : hash by campaign id | Map tasks hash each row and write shuffle files.
+  Clicks [lake: 300 GB] -> Map tasks : hash by campaign id | The other table is hashed the same way.
+  Map tasks -> Reduce task A [svc: 10 MB], Reduce task B [svc: 4 GB] : shuffle fetch | Task B receives a hot key and is far larger than task A.
+  * Reduce task B: skew found | AQE reads partition sizes and sees task B is 400 times larger.
+  Map tasks -> Reduce task B2 [svc: 2 GB] : half of the hot key | AQE splits the hot partition, so a second task takes half of it and the other table's matching rows are copied.
+  Reduce task A, Reduce task B, Reduce task B2 -> Joined output [lake: Parquet] : write | All tasks write their part of the result.
+ref: docs | Adaptive Query Execution | Apache Spark documentation | https://spark.apache.org/docs/latest/sql-performance-tuning.html
+
+== Dynamic executors on Kubernetes
+kind: autoscaling, data-locality
+when: Jobs have uneven phases, such as a big scan followed by a small aggregate, and idle executors waste money on a shared cluster.
+how: The driver runs as a pod and asks the Kubernetes API server for executor pods. With dynamic allocation, the driver watches pending tasks. If tasks wait, it requests more executors, up to a maximum such as 200. If an executor is idle for 60 seconds, it is released.
+Executors may hold shuffle files that other stages still need. On Kubernetes there is no external shuffle service by default, so Spark uses shuffle tracking: it keeps an executor alive until its shuffle data is no longer needed.
+If an executor pod dies, Spark reruns only the lost tasks. Lost shuffle output is recomputed from lineage, the recorded chain of transformations.
+used: Spark on EKS, GKE and AKS; the Spark Operator and platform teams that give each job its own driver.
+avoid: When latency of pod start (often tens of seconds) is not acceptable; keep a warm pool, or use a long-lived SQL engine like Trino.
+flow:
+  Driver [svc: pod] -> Kubernetes API [svc] : create 20 executor pods | The driver asks for executors when tasks are waiting.
+  Kubernetes API -> Executors [svc: 20 pods] : schedule pods | Pods start on nodes, and the cluster autoscaler adds nodes if needed.
+  Executors -> S3 data [lake] : read splits | Executors read input splits in parallel.
+  * Executors: 20 to 60 | Many tasks are pending, so the driver asks for more executors.
+  Driver -> Kubernetes API : delete idle pods | After 60 idle seconds, unused executors are removed, except those with needed shuffle data.
+  Executors -x> Driver : executor lost | If a pod dies, the driver reruns its tasks and rebuilds lost shuffle data from lineage.
+ref: docs | Job scheduling: dynamic resource allocation | Apache Spark documentation | https://spark.apache.org/docs/latest/job-scheduling.html
+
+@@ spark-sss
+== Checkpointed Kafka to lakehouse ingestion
+kind: checkpoint-restart, idempotent-consumer
+when: Events from Kafka must land in a lakehouse table continuously, with no loss and no duplicates after a restart.
+how: The query reads from Kafka in micro-batches. For each batch, the driver plans the offset range for every partition and writes that range to the checkpoint log before processing. Executors then read exactly those offsets and write the output files.
+The sink commits the batch under a batch id. After a crash, the query reads the checkpoint, finds the last planned batch, and runs it again with the same offsets. The Delta Lake sink records the batch id in its transaction log and ignores a repeat, so the effect is exactly once.
+Triggers set the cost and delay: a trigger of 1 minute gives 1 minute latency with large files. Trigger availableNow processes what is waiting and stops, which suits scheduled jobs.
+used: Kafka to Delta or Iceberg bronze tables on Databricks and open-source Spark; replacing hand-written consumers.
+avoid: When latency must be under a few hundred milliseconds with record-at-a-time state; use Flink, or the real-time mode added in Spark 4.1.
+flow:
+  Kafka [log: 12 partitions] -> Driver [svc: planner] : latest offsets | At each trigger, the driver reads the newest offsets of every partition.
+  Driver -> Checkpoint [store: offsets log] : plan batch 41 | The planned offset ranges are saved before any work starts.
+  Driver -> Executors [svc: 12 tasks] : read offsets 1000 to 2000 | Executors read exactly the planned ranges.
+  Executors -> Delta table [lake: bronze] : write files, batch id 41 | The files are committed under the batch id.
+  Driver -x> Kafka : crash before commit | The driver fails after planning batch 41.
+  Driver -> Executors : rerun batch 41 | On restart, the same offsets are reused. Delta sees batch id 41 again and ignores the repeat.
+ref: docs | Structured Streaming programming guide | Apache Spark documentation | https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html
+
+== Event-time windows with watermarks
+kind: windowed-agg
+when: You need counts or sums per time window, such as ad impressions per minute, and events arrive late or out of order.
+how: Group by window(event_time, "1 minute") plus a key. Spark keeps one state row per window and key in a state store on the executors, backed by RocksDB if configured. State is saved to the checkpoint for recovery.
+withWatermark("event_time", "10 minutes") tells Spark how late data may be. The watermark is the largest event time seen minus 10 minutes. When it passes the end of a window, that window is final, and its state is dropped.
+In append mode a window is emitted once, after it closes. In update mode, changed windows are emitted at each batch. A bigger watermark catches more late events but keeps more state and delays final results.
+used: Ad impression and click counts per minute; clickstream sessions; IoT metrics per device and window.
+avoid: When late data cannot be dropped at all; write raw events to a table and recompute with a batch job.
+flow:
+  Kafka events [log] -> Stream query [svc: micro-batch] : events with event time | Each batch reads new events, which may be out of order.
+  Stream query -> State store [store: RocksDB] : update window counts | Counts per window and campaign are updated in state.
+  * Stream query: watermark 12:05 | The watermark is the max event time (12:15) minus 10 minutes.
+  Late events [client: 12:03] -x> Stream query : dropped | An event for a closed window is too late and is dropped.
+  Stream query -> Metrics table [lake: Delta] : window 12:00 final | Windows older than the watermark are final and written once.
+  Stream query ~> Checkpoint [store] : state snapshot | State is saved so a restart does not lose counts.
+ref: docs | Handling late data and watermarking | Apache Spark documentation | https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html#handling-late-data-and-watermarking
+
+== CDC upsert into a silver table with foreachBatch
+kind: cdc, medallion
+when: Row changes from an OLTP database must be applied to a lake table, so the table mirrors the source.
+how: Debezium reads the database log and publishes change events to Kafka, each with the key, the operation and a sequence number. A Structured Streaming query reads the topic and, in foreachBatch, runs a MERGE into the silver table.
+Inside a batch, Spark first keeps only the latest event per key, by sequence number. Then MERGE updates matched keys, inserts new keys and deletes keys with a delete operation. The merge is one table commit, so readers see whole batches.
+Because Spark may rerun a batch after a failure, the merge must be idempotent. Using the sequence number to ignore older events makes a repeat harmless.
+used: Mirroring MySQL or Postgres tables into Delta or Iceberg; the usual path from OLTP to a lakehouse silver layer.
+avoid: When the source is already a full snapshot each day; a simple overwrite is cheaper.
+flow:
+  Postgres [db: orders] -> Debezium [svc: Kafka Connect] : WAL records | Debezium reads committed changes from the log.
+  Debezium -> orders.cdc [log: Kafka topic] : insert, update, delete | Each change is an event with key and sequence number.
+  orders.cdc -> Stream query [svc: foreachBatch] : micro-batch of 5,000 | A batch of change events is read.
+  * Stream query: latest per key | Only the newest event per key is kept inside the batch.
+  Stream query -> Silver orders [lake: Delta] : MERGE | One merge updates, inserts and deletes rows in a single commit.
+  Silver orders -> Gold job [svc: Spark] : read snapshot | Downstream jobs read a consistent copy of the table.
+ref: docs | Change data capture with Delta Lake | Delta Lake documentation | https://docs.delta.io/
+
+@@ trino
+== Federated query across many data sources
+kind: polyglot-persistence, scatter-gather
+when: Data lives in several systems (a lake, an OLTP database, a search index), and analysts need one SQL query over all of them without copying data first.
+how: Each system is a catalog in Trino, backed by a connector. A query such as a join of a Hive or Iceberg table with a PostgreSQL table names both catalogs in plain SQL. The coordinator parses it, optimizes it and splits it into stages.
+Connectors give the optimizer table statistics and accept pushdown: filters, projections and sometimes aggregates run inside the source database. Workers pull the remaining rows in parallel, join them in memory, and send only the result to the client.
+The weak point is the source. A big scan on a production database competes with its normal load. For repeated joins, teams copy the small side into the lake instead.
+used: Interactive analytics at Meta (Presto), Netflix, Lyft and Uber; Starburst and Amazon Athena are built on Presto or Trino.
+avoid: When the same federated join runs every hour on large data; load it into one store with a batch job.
+flow:
+  Analyst [user] -> Coordinator [svc: plan and schedule] : SQL across 2 catalogs | One SQL query names a lake table and a PostgreSQL table.
+  Coordinator -> Workers [svc: 20 nodes] : stages and splits | The plan is cut into stages and the splits are sent to workers.
+  Workers -> Postgres [db: customers] : pushed filter | The filter runs inside PostgreSQL, so fewer rows cross the network.
+  Workers -> Iceberg lake [lake: orders] : read Parquet splits | Workers read the large table in parallel from object storage.
+  Workers -> Coordinator : joined rows | Workers join in memory and stream results to the coordinator.
+  Coordinator -> Analyst : result pages | The client gets rows while later stages still run.
+ref: docs | Connectors | Trino documentation | https://trino.io/docs/current/connector.html
+
+== Interactive SQL on an Iceberg lakehouse
+kind: open-table-format, data-locality
+when: Many analysts need seconds-level SQL over data in object storage, with no database to load first.
+how: Tables are Parquet files with an Iceberg metadata tree in S3, and a catalog (Hive Metastore, REST or Glue) points to the current snapshot. The coordinator reads manifests to find which files can match the filter, so it prunes most files before any worker starts.
+Workers are stateless. Each stage streams pages of data to the next stage in memory, without writing to disk. This pipelining is why a query returns first rows quickly. The coordinator keeps assigning splits to idle workers, so fast nodes do more work.
+Storage and compute are separate: add workers for peak hours and remove them at night. A file cache on worker disks can reduce S3 reads.
+used: Lakehouse query layers at Netflix, Airbnb and many Starburst customers; ad-hoc analysis on Iceberg, Delta and Hive tables.
+avoid: When the query runs for hours and a worker crash must not restart it; use fault-tolerant execution or Spark.
+flow:
+  BI tool [client] -> Coordinator [svc] : SQL | A dashboard sends a SQL query.
+  Coordinator -> Catalog [svc: Iceberg REST] : get snapshot | The coordinator asks the catalog for the current table snapshot.
+  Coordinator -> S3 metadata [lake: manifests] : prune files | Manifest statistics remove most data files from the plan.
+  Coordinator -> Workers [svc: stateless] : 400 splits | Only the files that can match become splits for workers.
+  Workers -> S3 data [lake: Parquet] : read columns | Workers read only the needed columns.
+  Workers -> BI tool : first rows in 2 s | Pipelined stages return rows before the query is complete.
+ref: docs | Iceberg connector | Trino documentation | https://trino.io/docs/current/connector/iceberg.html
+
+== Fault-tolerant execution with spooled exchange
+kind: checkpoint-restart, backfill-replay
+when: A long ETL query runs for hours on many nodes, and one lost worker must not force a full restart.
+how: In the default mode, data flows between stages in memory, so a worker failure fails the whole query. With fault-tolerant execution (retry-policy TASK), the intermediate data of each stage is written to an external exchange, such as S3 or HDFS.
+The coordinator tracks every task. If a worker dies, only its tasks are run again on other nodes, and they read their input from the exchange. Finished stages are not recomputed. The cluster can also add memory to a retried task that failed from lack of memory.
+The cost is extra writes and slower queries, on short queries, so teams enable it for a batch cluster and not for the interactive one.
+used: Batch ETL clusters at companies that use Trino for scheduled transforms; Starburst Galaxy batch workloads.
+avoid: For short interactive queries, where a plain retry of the whole query is faster and cheaper.
+flow:
+  Scheduler [svc: Airflow] -> Coordinator [svc: TASK retry policy] : INSERT INTO silver | A scheduled job submits a long ETL query.
+  Coordinator -> Workers [svc: 50 nodes] : stage 1 tasks | Tasks of the first stage run on many workers.
+  Workers -> Exchange [store: S3 spool] : write stage output | Each task writes its output to the external exchange.
+  Workers -x> Coordinator : worker 17 lost | One node is lost in stage 2.
+  Coordinator -> Workers : retry only 17's tasks | Only the lost tasks are scheduled again, on other nodes.
+  Workers -> Exchange : read stage 1 output | Retried tasks read their input again, so stage 1 is not repeated.
+ref: docs | Fault-tolerant execution | Trino documentation | https://trino.io/docs/current/admin/fault-tolerant-execution.html
+
+@@ velox
+== Native C++ workers under a Java coordinator
+kind: control-data-plane, offload-accelerator
+when: A Java query engine spends its time in JVM garbage collection and slow row-based operators, and you want faster workers without rewriting the SQL front end.
+how: Presto keeps its Java coordinator for parsing, planning and scheduling. The workers are replaced with Prestissimo, a C++ process that uses Velox to run the plan fragments. The coordinator sends fragments over the same REST protocol as before, so clients and connectors on the control side do not change.
+Velox runs operators on vectors of columnar data, with SIMD instructions, lazy loading of columns and its own memory pools with spill to disk. There is no garbage collector, so latency is steadier and memory is easier to control.
+The shuffle between workers also moves from Java to C++. The cost is migration work: functions and connectors must exist in both worlds, and results must match the Java engine.
+used: Prestissimo, Presto on Velox, deployed at Meta; IBM watsonx.data uses Presto with native workers.
+avoid: When the workload is small or the team cannot run a C++ service; the Java workers are easier to operate.
+flow:
+  Client [client] -> Coordinator [svc: Java] : SQL | The client talks to the same Java coordinator as before.
+  Coordinator -> Prestissimo workers [svc: C++ and Velox] : plan fragments | The coordinator sends plan fragments over the usual protocol.
+  Prestissimo workers -> Velox operators [model: SIMD vectors] : run fragment | Workers call Velox operators that process batches of columns.
+  Velox operators -> Hive or Iceberg files [lake] : scan Parquet | Velox reads only the needed columns, loading them lazily.
+  Prestissimo workers -> Peer workers [svc: C++ and Velox] : shuffle by key | Workers exchange partitions directly in C++.
+  Peer workers -> Coordinator : results | Final rows go back to the coordinator and the client.
+ref: docs | Velox documentation | Meta Velox project | https://facebookincubator.github.io/velox/
+
+== Native Spark acceleration through a plan translator
+kind: interpreter-compiler, plugin-arch
+when: You want Spark's SQL and DataFrame API and scheduler, but faster scans, joins and aggregations on columnar data.
+how: A plugin such as Apache Gluten sits between Spark's planner and its executors. Spark still parses the query and Catalyst optimizes it. The plugin takes the physical plan and converts supported operators into a Substrait plan.
+Each executor passes that plan to a native backend, which can be Velox. Velox runs the operators in C++ on columnar batches and returns results to Spark. Operators or functions that the backend does not support fall back to the normal JVM code. The plan then has a conversion step between row and column formats, which costs time.
+Shuffle and the driver stay in Spark, so fault handling, SQL syntax and tools do not change. Gains depend on the query. Scan-heavy and aggregation-heavy queries gain most.
+used: Apache Gluten (started by Intel and Kyligence) with Velox or ClickHouse as the native backend; vendor engines such as Databricks Photon follow a similar native-engine idea with their own code.
+avoid: When jobs are bound by shuffle or by Python UDFs, since a faster scan does not help there.
+flow:
+  Spark driver [svc: Catalyst] -> Gluten plugin [svc: plan translator] : physical plan | Catalyst produces the optimized physical plan as usual.
+  Gluten plugin -> Substrait plan [note: portable IR] : convert operators | Supported operators become a Substrait plan.
+  Substrait plan -> Executor [svc: JVM] : task and plan | Each task carries its part of the plan to an executor.
+  Executor -> Velox [svc: native C++] : JNI call | The executor hands the plan to Velox through JNI.
+  Velox -> Parquet files [lake] : vectorized scan | Velox scans and aggregates columnar batches.
+  Velox -x> Executor : unsupported function | A function with no native version falls back to the JVM path.
+ref: docs | Velox documentation | Meta Velox project | https://facebookincubator.github.io/velox/
+
+== Embedded query engine in a custom service
+kind: plugin-arch, layered-arch
+when: You are building a database or analytics service and want SQL, optimizer and fast execution without writing them from scratch.
+how: Apache DataFusion is a Rust library. The service embeds it: it registers tables through a TableProvider interface, which tells DataFusion how to scan your own storage. DataFusion parses SQL or accepts a DataFrame plan, optimizes it and runs it as a tree of streams of Arrow batches over many threads.
+Your code adds what is special: a storage format, a cache, user-defined functions or a custom catalog. The engine handles filters pushed to the scan, partition pruning, joins, sorts and aggregations.
+This gives a team a working engine in weeks, and gains from upstream improvements. The cost is a dependency on a fast-moving project, so teams pin versions and test upgrades.
+used: InfluxDB 3 is built on DataFusion; Apache Comet accelerates Spark with it; many Rust data tools embed it.
+avoid: When a ready-made engine such as DuckDB or ClickHouse already fits; embed a library only if you need custom storage or control.
+flow:
+  App service [svc: Rust] -> DataFusion [svc: SQL and optimizer] : SQL text | The service passes a SQL string to the embedded engine.
+  DataFusion -> Table provider [svc: your code] : scan with filters | The engine asks your provider for rows, with filters and columns pushed down.
+  Table provider -> Object store [lake: Parquet] : range reads | Your code reads its own storage format.
+  Table provider -> DataFusion : Arrow batches | Data returns as Arrow batches, which run through multi-threaded operators.
+  DataFusion -> App service : result stream | Results stream back as Arrow batches.
+ref: docs | Apache DataFusion | Apache DataFusion project | https://datafusion.apache.org/
+
+@@ yarn
+== Two-level scheduling with per-job ApplicationMasters
+kind: scheduler-agent, control-loop
+when: Many different frameworks (MapReduce, Spark, Tez) must share one Hadoop cluster, each with its own way to schedule tasks.
+how: The ResourceManager owns only cluster capacity. A client submits an application, and the ResourceManager starts one container for its ApplicationMaster (AM) on a NodeManager. The AM is framework code that knows the job.
+The AM sends resource requests: how many containers, how much memory and CPU, and on which nodes or racks. The ResourceManager answers with containers when capacity exists. The AM then asks the NodeManagers to launch its tasks in those containers.
+NodeManagers send heartbeats, usually every second, with the state of their containers. If a node is lost, the ResourceManager tells the AM, and the AM decides how to rerun the lost work. This split keeps the central scheduler small and lets each framework own its logic.
+used: Hadoop MapReduce, Spark on YARN, Tez and Flink on YARN.
+avoid: On cloud-native stacks that already run on Kubernetes; use its scheduler and operators instead.
+flow:
+  Client [client] -> ResourceManager [svc: cluster scheduler] : submit application | The client submits the job and its AM launch spec.
+  ResourceManager -> NodeManager 1 [svc: node agent] : start AM container | The ResourceManager places the AM in a container on a node.
+  NodeManager 1 -> ResourceManager : heartbeat | Nodes report capacity and container status every second.
+  NodeManager 1 -> ResourceManager : allocate 50 containers | The AM asks for 50 containers of 4 GB with locality hints.
+  ResourceManager -> NodeManager 2 [svc: node agent] : containers granted | The scheduler grants containers on nodes close to the data.
+  NodeManager 2 -x> ResourceManager : node lost | If a node is lost, the AM is told and reruns the tasks.
+ref: paper | Apache Hadoop YARN: Yet Another Resource Negotiator | Vavilapalli et al., SoCC 2013 |
+
+== Capacity scheduler queues for multi-tenant sharing
+kind: bulkhead, priority-queue
+when: Several teams share one cluster, and each needs a guaranteed share but may use idle capacity of others.
+how: The Capacity Scheduler organizes the cluster as a tree of queues, for example root splits into ads 50%, analytics 30% and adhoc 20%. Each queue has a guaranteed capacity and a maximum capacity, and user limits inside the queue stop one user from taking all of it.
+When the ads queue is idle, analytics can use its share, up to its maximum. When ads submits work again, the scheduler takes capacity back as containers finish. With preemption enabled, it can also kill containers of the borrowing queue after a timeout.
+ACLs control who may submit to each queue. This works like a bulkhead: a runaway adhoc job cannot starve the ads pipeline for more than its own limit.
+used: The default scheduler in Apache Hadoop; Cloudera and other Hadoop platforms run shared clusters this way.
+avoid: When jobs have few tenants and a flat pool is enough; the Fair Scheduler or a single queue is simpler.
+flow:
+  Ads job [client] -> ads queue [queue: 50% guaranteed] : submit | The ads team submits to its own queue.
+  Adhoc job [client] -> adhoc queue [queue: 20% guaranteed] : submit large job | A user starts a very large exploratory job.
+  ads queue -> Scheduler [svc: Capacity Scheduler] : demand low | The ads queue has little work now.
+  adhoc queue -> Scheduler : demand high | The adhoc queue wants more than its share.
+  Scheduler -> Containers [svc: NodeManagers] : adhoc borrows up to 40% | Idle capacity is lent to adhoc, up to its maximum.
+  * ads queue: demand returns | The ads team submits a big job again.
+  Scheduler -x> Containers : preempt adhoc containers | After a timeout, borrowed containers are killed so ads gets its share.
+ref: docs | Capacity Scheduler | Apache Hadoop documentation | https://hadoop.apache.org/docs/stable/hadoop-yarn/hadoop-yarn-site/CapacityScheduler.html
+
+== ResourceManager high availability with ZooKeeper
+kind: leader-election, active-passive, fencing-token
+when: The ResourceManager is a single point of failure, and running jobs must survive its restart.
+how: Two or more ResourceManagers run. One is active and the others are standby. They elect the active one through ZooKeeper, using an ephemeral lock node. When the active one dies, its ZooKeeper session expires and a standby wins the election.
+The active RM saves application state in a state store, usually ZooKeeper or an HDFS directory. The new active RM reads it and recovers the running applications. ApplicationMasters and NodeManagers find the new active RM by trying the configured list of RMs.
+A fencing step stops a stale active RM from writing to the store. Work-preserving restart means running containers keep going while the RM switches.
+used: Hadoop clusters with yarn.resourcemanager.ha.enabled set; production Hadoop distributions.
+avoid: Test or small clusters where a few minutes of downtime is fine.
+flow:
+  RM 1 [svc: active] -> ZooKeeper [store: election lock] : hold lock | The active RM holds an ephemeral lock in ZooKeeper.
+  RM 1 -> State store [store: ZooKeeper or HDFS] : save app state | The RM saves the state of each application.
+  RM 2 [svc: standby] -> ZooKeeper : watch lock | The standby watches the lock.
+  RM 1 -x> ZooKeeper : session expires | The active RM crashes, and its lock disappears.
+  RM 2 -> ZooKeeper : acquire lock | The standby takes the lock and becomes active.
+  State store -> RM 2 : load app state | The new active RM restores running applications.
+  NodeManagers [svc: 200 nodes] -> RM 2 : re-register | NodeManagers try the RM list and register with the new active one.
+ref: docs | ResourceManager High Availability | Apache Hadoop documentation | https://hadoop.apache.org/docs/stable/hadoop-yarn/hadoop-yarn-site/ResourceManagerHA.html
+
+@@ bitcoin
+== Proof-of-work as a leader lottery over gossip
+kind: leader-election, gossip
+when: Mutually distrusting parties must agree on one order of transactions, with no central operator and no list of known members.
+how: Each miner collects pending transactions into a block and hashes the block header with a changing nonce. A hash below the network target wins. The target is adjusted every 2,016 blocks so one block appears about every 10 minutes. Winning is a lottery weighted by hash power, so the winner acts as a temporary leader.
+The winner sends the block to its peers. Nodes verify every rule (signatures, no double spend, valid proof) and relay it to their own peers, about 8 outbound links each. News spreads through the network in a few seconds.
+Two miners may win at nearly the same time. Nodes follow the chain with the most accumulated work, so one branch is dropped. Ethereum replaced the lottery with proof of stake in 2022: a validator is chosen by stake for each slot, and attestations finalize blocks.
+used: Bitcoin Core full nodes and mining pools; Ethereum validators with a consensus client and an execution client.
+avoid: When participants are known and trusted; a Raft or Paxos replicated log is much faster and cheaper.
+flow:
+  Wallet [client] -> Node A [svc: full node] : signed transaction | A user broadcasts a signed transaction to a node.
+  Node A -> Node B [svc: full node] : relay tx | Nodes check the transaction and pass it to their peers.
+  Node B -> Miner [svc: hashing] : mempool tx | The miner puts it in a candidate block with others.
+  * Miner: nonce found | After many trillions of hashes the miner finds a header hash below the target.
+  Miner -> Node B : new block | The winner announces its block.
+  Node B -> Node A : relay block | Each node verifies the block and relays it, so the block reaches all peers in seconds.
+ref: paper | Bitcoin: A Peer-to-Peer Electronic Cash System | Satoshi Nakamoto, 2008 | https://bitcoin.org/bitcoin.pdf
+
+== Light client with Merkle proof verification
+kind: none
+when: A phone or an embedded device must check that a payment is in the chain, without downloading the full chain, which is hundreds of GB.
+how: A light client keeps only block headers, about 80 bytes each, and checks that they link by hash and carry valid proof of work. Each header holds the Merkle root of its block's transactions.
+To check one payment, the client asks a full node for a Merkle proof: the sibling hashes along the path from the transaction to the root. For a block with 4,000 transactions the path is about 12 hashes. The client hashes the transaction up the path and compares the result with the root in the header.
+The client trusts the most-work header chain, not any single node. It cannot check all rules, so a miner who breaks a rule could fool it. Ethereum light clients use sync committees, and Merkle Patricia proofs for state.
+used: Mobile and hardware wallets with SPV or Electrum-style servers; Ethereum light clients and bridges that verify headers.
+avoid: When you hold large value and must check every rule yourself; run a full node.
+flow:
+  Wallet app [client: headers only] -> Full node [svc: whole chain] : get headers | The wallet downloads block headers, which are small.
+  Full node -> Wallet app : 80-byte headers | The wallet checks proof of work and hash links.
+  Wallet app -> Header chain [store: 80 bytes per block] : keep valid headers | Only valid headers are stored, about 70 MB in total.
+  Wallet app -> Full node : proof for txid | The wallet asks for a Merkle proof of one payment.
+  Full node -> Wallet app : 12 sibling hashes | The node returns the sibling hashes on the path to the root.
+  * Wallet app: root matches header | The wallet hashes up the path. The result equals the Merkle root in the header.
+  Full node -x> Wallet app : bad proof | A wrong proof gives a different root, and the wallet rejects it.
+ref: paper | Bitcoin: A Peer-to-Peer Electronic Cash System | Satoshi Nakamoto, 2008 | https://bitcoin.org/bitcoin.pdf
+
+== Deposit watcher with confirmation depth
+kind: event-driven, idempotent-consumer
+when: An exchange or shop must credit a customer after an on-chain payment, and must stay safe when the chain reorganizes.
+how: The service runs its own full node and a watcher process. The watcher follows new blocks, finds outputs to the service's deposit addresses and stores each as a deposit with its block hash, in a database with a unique key on transaction id and output index.
+It credits the customer only after N confirmations, for example 3 to 6 blocks on Bitcoin. On Ethereum it waits for finality, about two epochs or 13 minutes. Until then, the deposit shows as pending.
+If a reorg removes the block, the watcher sees that the hash at that height changed, marks the deposit as reversed and does not credit. Because the watcher may replay blocks after a restart, the unique key makes each deposit idempotent.
+used: Exchanges, payment processors and custodians; BTCPay Server, an open-source payment processor, uses a similar flow.
+avoid: When funds are small and speed matters more; accept zero-confirmation, or use a Lightning payment.
+flow:
+  Bitcoin node [svc: full node] -> Watcher [svc: block follower] : new block 840,001 | The watcher receives each new block.
+  Watcher -> Deposits DB [db: unique txid and index] : insert pending | The watcher stores matching outputs as pending, once only.
+  Watcher -> Deposits DB : confirmations 1, 2, 3 | Each new block raises the confirmation count.
+  Deposits DB -> Ledger service [svc] : credit after 3 | Only at the required depth, the customer balance is credited.
+  Bitcoin node -x> Watcher : reorg at 840,001 | A different block replaces 840,001.
+  Watcher -> Deposits DB : mark reversed | An unconfirmed deposit is marked reversed and never credited.
+ref: docs | Bitcoin Developer Guide: block chain | Bitcoin.org | https://developer.bitcoin.org/devguide/block_chain.html
+
+@@ gfxapi
+== Parallel command buffer recording
+kind: fork-join, producer-consumer
+when: A frame has thousands of draw calls, and one CPU thread cannot record them within 16 ms (60 frames per second).
+how: Vulkan, Metal and DirectX 12 let an application record work into command buffers instead of calling the driver for each draw. Command buffers are cheap objects, and each thread uses its own command pool, so threads do not lock each other.
+The engine splits the frame into jobs: shadow pass, main scene, UI. Worker threads record them in parallel. A main thread waits for all jobs to finish (a join), orders the buffers, and submits them with one call to the GPU queue. Submitting in a batch is cheaper than many small submits.
+The GPU reads the queue and runs the commands. The older OpenGL model had one context and an implicit driver state, so this pattern was not possible there.
+used: Game engines such as Unreal and Unity on Vulkan, D3D12 and Metal; browser GPU processes for WebGPU command encoders.
+avoid: When the scene is simple and the CPU is not the bottleneck; extra threads add complexity for no gain.
+flow:
+  Main thread [svc: frame loop] -> Worker 1, Worker 2, Worker 3 [svc: own command pool] : record jobs | The main thread splits the frame into jobs for worker threads.
+  Worker 1 -> Command buffer 1 [queue: shadow pass] : record draws | Worker 1 records shadow draws with no lock.
+  Worker 2 -> Command buffer 2 [queue: main scene] : record draws | Worker 2 records the main scene in parallel.
+  Worker 3 -> Command buffer 3 [queue: UI] : record draws | Worker 3 records the UI.
+  Command buffer 1, Command buffer 2, Command buffer 3 -> GPU queue [queue: graphics] : one submit | The main thread joins the jobs and submits all buffers together.
+  GPU queue -> GPU [svc: SIMT cores] : execute | The GPU runs the commands while the CPU starts the next frame.
+ref: docs | Vulkan specification: command buffers | Khronos Group | https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html
+
+== Frames in flight with fences
+kind: pipeline-stages, producer-consumer
+when: The CPU and the GPU should work at the same time, so neither waits for the other in every frame.
+how: The engine keeps 2 or 3 frames in flight. Each frame has its own command buffer, its own uniform data and a fence. While the GPU draws frame N, the CPU records frame N+1.
+Before the CPU reuses the resources of frame N, it waits on that frame's fence. A semaphore tells the GPU when the swapchain image is ready, and another tells the presentation engine when rendering is done. The swapchain holds the images shown on the display.
+Two frames in flight give a higher frame rate. Three frames give more slack but add about one more frame of input delay. The fence wait is the only place where the CPU blocks, and it acts as backpressure when the GPU is slow.
+used: Every Vulkan and D3D12 renderer; the Vulkan tutorial pattern of frames in flight; Metal apps that use triple buffering with a semaphore.
+avoid: For latency-critical VR or cloud gaming, check delay carefully; fewer frames in flight cut latency.
+flow:
+  CPU [svc: game thread] -> Frame slot 0 [queue: fence and buffers] : wait fence, record | The CPU waits until the GPU has finished using slot 0, then records into it.
+  Frame slot 0 -> GPU [svc: graphics queue] : submit frame N | The commands for frame N go to the GPU.
+  CPU -> Frame slot 1 [queue: fence and buffers] : record frame N+1 | At the same time the CPU records the next frame in slot 1.
+  GPU -> Swapchain [store: 3 images] : render to image | The GPU renders into the next free swapchain image.
+  Swapchain -> Display [client] : present | The finished image is shown at the next vsync.
+  GPU -> Frame slot 0 : signal fence | The fence tells the CPU that slot 0 is free again.
+ref: docs | Vulkan Tutorial: frames in flight | Alexander Overvoorde | https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Frames_in_flight
+
+== Pipeline state objects with a shader cache
+kind: interpreter-compiler, cache-aside
+when: Modern APIs bake the whole pipeline state into one object, and compiling it during play would cause frame stutters.
+how: In Vulkan, D3D12 and Metal, a pipeline object holds the shaders, blend state, vertex layout and render targets. Creating one forces the driver to compile shaders to the GPU's own machine code. This can take from a few to hundreds of milliseconds.
+Shaders are written in HLSL, GLSL, MSL or WGSL and compiled ahead of time to an intermediate form, such as SPIR-V for Vulkan. At run time the engine looks the pipeline up in its own cache. On a miss, it compiles it, preferably on a background thread, and saves it. A pipeline cache blob can be saved to disk and loaded on the next start.
+Engines also compile the likely pipelines at load time. WebGPU adds asynchronous pipeline creation, so the page does not block.
+used: Unreal Engine's PSO precaching; Valve's Steam shader pre-caching for Vulkan games; browser WebGPU implementations.
+avoid: When the set of shaders is tiny and fixed; then compile all at load and skip the cache.
+flow:
+  Renderer [svc: frame loop] -> PSO cache [cache: in memory] : lookup by state hash | The renderer asks for the pipeline needed for a draw.
+  PSO cache -x> Renderer : miss | The pipeline is not built yet, so the draw is delayed or uses a simple fallback.
+  PSO cache -> Compile thread [svc: background] : build pipeline | A background thread starts compiling.
+  Compile thread -> Driver [svc: shader compiler] : SPIR-V to GPU code | The driver turns SPIR-V into machine code for this GPU.
+  Compile thread -> PSO cache : store pipeline | The pipeline is stored for the next draw.
+  PSO cache ~> Disk cache [store: cache blob] : save blob | A blob is saved, so the next launch skips the compile.
+ref: docs | Vulkan specification: pipeline cache | Khronos Group | https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html
+
+@@ aurora
+== Log-only writes to six-copy quorum storage
+kind: quorum, wal
+when: A relational database needs high write throughput and survival of the loss of a whole zone, without the network cost of copying full pages.
+how: A traditional database writes redo logs, data pages, double-write buffers and binary logs. Aurora removes most of this traffic. The database instance sends only redo log records to a storage service that spans three Availability Zones.
+The storage volume is split into 10 GB protection groups. Each group has six copies, two per zone. A write is durable when 4 of 6 copies acknowledge. A read needs 3 of 6, and normally Aurora reads from a single up-to-date copy and uses quorum only for recovery.
+Storage nodes apply the log to build pages in the background, and rebuild a page on demand. Losing a whole zone plus one more node still keeps the write quorum. Repair of a lost 10 GB segment takes seconds because the data comes from many peers in parallel.
+used: Amazon Aurora MySQL and PostgreSQL compatible editions.
+avoid: When you need open-source portability or other clouds; use PostgreSQL with streaming replicas, or a distributed SQL database.
+flow:
+  App [client] -> Writer [svc: Aurora instance] : INSERT and COMMIT | The application commits a transaction on the writer.
+  Writer -> Storage AZ 1, Storage AZ 2, Storage AZ 3 [store: 2 copies each] : redo log records | Only redo records are sent to all six copies.
+  Storage AZ 1 -> Writer : ack | Copies reply as they durably write.
+  Storage AZ 2 -> Writer : ack | When 4 of 6 copies have replied, the commit is durable.
+  * Writer: commit durable | The writer replies to the client without waiting for the slowest two copies.
+  * Storage AZ 3: pages built from log | Each storage node builds pages from the log in the background.
+ref: paper | Amazon Aurora: Design Considerations for High Throughput Cloud-Native Relational Databases | Verbitski et al., SIGMOD 2017 |
+ref: docs | Aurora storage and reliability | AWS documentation | https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Overview.StorageReliability.html
+
+== Read replicas on a shared volume with fast failover
+kind: read-replicas, active-passive
+when: Read traffic is much higher than write traffic, and a writer failure must recover in about a minute.
+how: An Aurora cluster has one writer and up to 15 reader instances. All of them attach to the same storage volume, so a reader needs no copy of the data. The writer sends its redo records to readers too, so they update their buffer caches, and the lag is usually under 100 ms.
+Applications connect to the cluster endpoint for writes and to the reader endpoint for reads. The reader endpoint spreads connections across the readers. Custom endpoints can send reports to bigger instances.
+If the writer fails, Aurora promotes a reader, chosen by failover priority, and moves the cluster endpoint. Because storage is shared, no data copy is needed. Recovery is often under 60 seconds, including time for clients to reconnect. Readers do not need to catch up on the log, since the storage already holds it.
+used: Read-heavy web and SaaS back ends on Aurora; reporting queries moved to dedicated readers.
+avoid: When reads must be strongly consistent with the latest write; read from the writer, because replica reads are slightly behind.
+flow:
+  App [client] -> Cluster endpoint [svc: writer DNS] : writes | Writes go to the writer through the cluster endpoint.
+  App -> Reader endpoint [svc: reader DNS] : reads | Reads use the reader endpoint, which spreads them.
+  Cluster endpoint -> Writer [svc: Aurora writer] : route | The endpoint points to the current writer.
+  Reader endpoint -> Reader 1, Reader 2 [svc: Aurora reader] : round robin | Connections are spread over the readers.
+  Writer -> Shared volume [store: 6 copies] : redo records | The writer and the readers all use one shared storage volume.
+  Writer -x> Shared volume : instance fails | The writer fails.
+  * Reader 1: promoted to writer | Aurora promotes a reader and moves the cluster endpoint to it.
+ref: docs | Amazon Aurora DB clusters | AWS documentation | https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Overview.html
+
+== Global database with storage-level replication
+kind: multi-region, read-replicas
+when: Users in other regions need fast local reads, and the business needs a disaster recovery plan across regions.
+how: An Aurora Global Database has one primary cluster in one region and up to several secondary regions. Replication runs in the storage layer, not through the database engine. The primary storage ships its redo log to the secondary regions, and replica storage applies it.
+Typical lag between regions is under 1 second. Readers in each secondary region serve local reads with low latency. The secondary clusters do not need a writer.
+For a regional outage, you can promote a secondary cluster to be the new primary. A planned switchover loses no data, and an unplanned failover can lose the last second of writes. This is a primary and replica design, not active-active writes; Aurora DSQL covers the multi-Region active-active case.
+used: Regional read scaling and disaster recovery for Aurora MySQL and PostgreSQL customers.
+avoid: When writes must be accepted in several regions at once; use Aurora DSQL, DynamoDB global tables, or CockroachDB.
+flow:
+  App EU [client] -> Primary cluster [svc: us-east-1] : writes | A write from a distant user goes to the primary region.
+  Primary cluster -> Primary storage [store: 6 copies] : redo log | The primary commits as usual in its own storage.
+  Primary storage ~> Replica storage [store: eu-west-1] : ship log under 1 s | The storage layer sends the log to the secondary region.
+  Replica storage -> EU readers [svc: read-only] : updated pages | Readers see new data with small lag.
+  App EU -> EU readers : local reads | European users read from their own region.
+  Primary cluster -x> Replica storage : region outage | The primary region is lost.
+  * EU readers: promoted to primary | An operator promotes the secondary cluster, and the app switches writes to it.
+ref: docs | Aurora Global Database | AWS documentation | https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database.html
+
+@@ bigtable
+== Row-key design for time series and hot spots
+kind: sharding, lsm-compaction
+when: A high-volume stream of events (metrics, ad events, device readings) must be written fast and read back by entity and time range.
+how: Bigtable stores rows sorted by row key and splits them into tablets by key range. A tablet is served by one node at a time. If keys start with a timestamp, all new writes hit the last tablet, which makes a hot spot on one node.
+The fix is to put a well-spread field first, such as device id or a hash bucket, and the time after it: deviceId#reverseTimestamp. Writes now spread over all tablets. A scan for one device and a time range reads one contiguous key range. Reverse timestamps put the newest rows first.
+Each tablet writes to a commit log and a memtable, and flushes sorted SSTables. Compaction merges them. Column families can have garbage-collection rules, such as keep 30 days or 3 versions.
+used: Time series, ad-tech event stores, IoT and financial tick data on Cloud Bigtable and HBase; OpenTSDB on HBase.
+avoid: When queries need joins, ad-hoc filters on many columns or multi-row transactions; use a SQL database or a warehouse.
+flow:
+  Producers [client: devices] -> Bigtable client [svc: row-key builder] : reading 17.3 | Each event becomes a row write with a key chosen by the client.
+  Bigtable client -> Tablet A [svc: dev-000 to dev-3ff] : key dev-0a1#rev-ts | The key starts with the device id, so writes spread over tablets.
+  Bigtable client -> Tablet B [svc: dev-400 to dev-7ff] : key dev-5c2#rev-ts | A different device lands on a different tablet and node.
+  Tablet A -> Commit log [log: on Colossus or HDFS] : append | Each tablet appends to its log, then to a memtable.
+  Tablet A -> SSTables [store: sorted files] : flush and compact | Memtables are flushed as sorted files and merged later.
+  Dashboard [client] -> Tablet A : scan dev-0a1 range | One device and a time window need one contiguous key range.
+ref: paper | Bigtable: A Distributed Storage System for Structured Data | Chang et al., OSDI 2006 | https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/
+ref: docs | Schema design best practices | Google Cloud documentation | https://cloud.google.com/bigtable/docs/schema-design
+
+== Precomputed profile store for low-latency serving
+kind: precompute, feature-store
+when: An online service needs user or item data in a few milliseconds, and the data is computed in large batch or stream jobs.
+how: Batch and streaming jobs (Dataflow, Spark or Flink) compute user profiles, counters or model features. They write them to Bigtable with row key userId and one column family per feature group. Writes use bulk mutation, in batches of hundreds of rows.
+The online service reads a row by key, or many rows with one batched ReadRows call. Single-row reads normally take a few milliseconds at the 99th percentile when the cluster is not overloaded. Bigtable keeps the latest cell versions, so a job can update just the changed columns.
+Cells have timestamps, so a late batch job cannot overwrite a newer streaming value if timestamps are set carefully. For safety, the offline store (a warehouse) stays the source of truth, and Bigtable is a serving copy.
+used: Ad targeting, recommendations and personalization serving on Cloud Bigtable; HBase serving layers at large web companies.
+avoid: When the serving data is small, and an in-memory cache or Redis gives lower latency; or when you need secondary indexes on many fields.
+flow:
+  Warehouse [lake: user history] -> Batch job [svc: Dataflow or Spark] : read events | A nightly job computes profile features for all users.
+  Batch job -> Bigtable [db: row key = userId] : bulk mutate rows | The job writes features in batches of hundreds of rows.
+  Stream job [svc: Flink] -> Bigtable : update counters | A streaming job adds fresh counters throughout the day.
+  Ad server [svc: online] -> Bigtable : ReadRows user 42 | The ad server reads one row by key during a request.
+  Bigtable -> Ad server : profile in 4 ms | One row returns all feature groups for that user.
+ref: docs | Cloud Bigtable overview | Google Cloud documentation | https://cloud.google.com/bigtable/docs/overview
+
+== Multi-cluster replication with app profiles
+kind: multi-region, active-passive
+when: A Bigtable instance must survive a zone or region failure, or must serve users in several regions.
+how: A Cloud Bigtable instance can have several clusters in different zones or regions. Replication between clusters is asynchronous and eventually consistent. Writes made in one cluster are copied to the others, usually within seconds.
+App profiles tell Bigtable how to route each application. Single-cluster routing sends all requests to one cluster and gives read-your-writes consistency; the others act as standby. Multi-cluster routing sends each request to the nearest available cluster and fails over on its own, but readers can see stale data for a short time.
+Teams often use a batch-analytics profile pinned to one cluster so heavy scans do not affect the serving cluster, and a serving profile with multi-cluster routing. Conflicts are resolved by timestamp, so the last write wins.
+used: Cloud Bigtable deployments with two or three clusters; HBase uses its own replication between clusters.
+avoid: When you need strong consistency across regions; use Spanner, or single-cluster routing with manual failover.
+flow:
+  Serving app [client] -> Serving profile [svc: multi-cluster routing] : read and write | The online app uses the profile that allows any cluster.
+  Serving profile -> Cluster us-east [db: 3 nodes] : route to nearest | Requests go to the nearest healthy cluster.
+  Cluster us-east ~> Cluster us-west [db: 3 nodes] : async replication | Writes are copied to the other cluster within seconds.
+  Batch job [svc: analytics] -> Batch profile [svc: single-cluster routing] : full scans | Heavy scans use a profile pinned to one cluster.
+  Batch profile -> Cluster us-west : route | The scans run on the west cluster, so serving is not affected.
+  Cluster us-east -x> Serving profile : cluster unavailable | The east cluster fails.
+  Serving profile -> Cluster us-west : automatic failover | The profile sends traffic to the west cluster, and it may show slightly old data.
+ref: docs | Bigtable replication overview | Google Cloud documentation | https://cloud.google.com/bigtable/docs/replication-overview
+
+@@ cassandra
+== Query-first tables with denormalization
+kind: index-table, sharding
+when: The app has known, high-volume queries and needs predictable low latency at any scale, so joins are not allowed.
+how: In Cassandra, you design one table per query. A table has a partition key, which hashes to a node set, and clustering columns, which sort rows inside the partition. A query that gives the full partition key reads from one replica set and is fast.
+For "orders by customer, newest first", make a table with partition key customer_id and clustering key order_time DESC. For "orders by status", make a second table and write each order to both. The app, a batch of writes, or a materialized view keeps them in sync.
+Duplicating data is normal, since disk is cheap and a cross-node scan is not. Keep partitions bounded, for example under about 100 MB, by adding a time bucket to the key. Storage-attached indexes (SAI) can help with filters on low-volume queries, but not as a main access path.
+used: Netflix, Apple and many others use Cassandra for key-based serving data; viewing history and messaging are typical cases.
+avoid: When access patterns are unknown or change often, or need joins and ad-hoc queries; use PostgreSQL or a warehouse.
+flow:
+  Order service [svc] -> Coordinator node [svc: any node] : write order 9001 | The service sends the write to any node, which acts as coordinator.
+  Coordinator node -> orders_by_customer [db: key = customer_id] : insert row | The coordinator writes the order into the table made for customer queries.
+  Coordinator node -> orders_by_status [db: key = status and bucket] : insert row | The same order is written to a second table for status queries.
+  App [client] -> orders_by_customer : SELECT by customer_id | A read with the partition key goes to one replica set.
+  orders_by_customer -> App : newest 20 orders | Rows are already sorted by time, so there is no sort step.
+  App -x> orders_by_status : query without key | A query that lacks the partition key would scan all nodes, so the design avoids it.
+ref: docs | Apache Cassandra documentation | Apache Cassandra project | https://cassandra.apache.org/doc/latest/
+
+== Multi-datacenter replication with LOCAL_QUORUM
+kind: quorum, multi-region
+when: Users in several regions need fast reads and writes, and the service must survive the loss of a whole datacenter.
+how: The keyspace uses NetworkTopologyStrategy with a replication factor per datacenter, for example 3 in us-east and 3 in eu-west. Each write goes to all six replicas, but the coordinator waits only for replicas in its own datacenter.
+With LOCAL_QUORUM, the coordinator waits for 2 of the 3 local replicas. A local read at LOCAL_QUORUM also contacts 2. Since 2 + 2 is more than 3, the read sees the latest local write. Remote replicas get the write in the background, in tens to hundreds of milliseconds.
+If a datacenter is lost, the other keeps serving. Hinted handoff and repair bring the failed replicas up to date when they return. Cross-datacenter reads are eventually consistent, and conflicting writes are resolved by timestamp.
+used: Netflix and Apple run multi-region Cassandra clusters; common in apps that need regional low latency with active-active writes.
+avoid: When writes need strong cross-region transactions; use a distributed SQL database such as Spanner or CockroachDB.
+flow:
+  App EU [client] -> Coordinator EU [svc: eu-west node] : write at LOCAL_QUORUM | The EU app writes to a node in its own datacenter.
+  Coordinator EU -> Replicas EU [db: 3 replicas] : write to 3 | The coordinator sends the write to three local replicas.
+  Replicas EU -> Coordinator EU : 2 acks | After two acks, the coordinator tells the client the write is done.
+  Coordinator EU ~> Replicas US [db: 3 replicas] : async to remote DC | The write also goes to the US replicas, but nobody waits for them.
+  Coordinator EU -x> Replicas US : US datacenter down | If the US datacenter is down, the write still succeeds in the EU.
+  Coordinator EU ~> Replicas US : hints replayed later | The coordinator keeps hints and replays them after the US recovers.
+ref: docs | Apache Cassandra documentation | Apache Cassandra project | https://cassandra.apache.org/doc/latest/
+
+@@ cockroach
+== Raft ranges with leaseholder reads
+kind: consensus-log, sharding
+when: A SQL database must scale across many nodes, keep strong consistency and survive node or zone loss without manual failover.
+how: CockroachDB sorts all table and index data by key and cuts it into ranges of about 512 MiB. Each range is a Raft group with three replicas by default, placed in different zones. Writes go to the Raft leader, are copied to a majority, and then commit.
+One replica of each range holds the lease. The leaseholder normally is the Raft leader. It serves consistent reads alone, without asking the other replicas, so reads are fast. Any node can accept a SQL connection. It acts as gateway: it finds the range, sends the request to the leaseholder and returns the result.
+A transaction that touches several ranges uses a distributed commit protocol with write intents and a transaction record. If a node dies, the lease moves, and Raft elects a new leader within seconds.
+used: CockroachDB clusters on three or more nodes across zones; the same design as Google Spanner without atomic clocks.
+avoid: When one PostgreSQL primary is enough; the extra network hops make small single-node workloads slower.
+flow:
+  App [client] -> Gateway node [svc: any node] : INSERT order | The app connects to any node, which parses the SQL.
+  Gateway node -> Leaseholder [svc: range 41 leader] : write request | The gateway finds the range for the key and sends the write to its leaseholder.
+  Leaseholder -> Follower 1, Follower 2 [svc: replicas in other zones] : Raft append | The leader copies the entry to two followers.
+  Follower 1 -> Leaseholder : ack | When a majority has the entry, it is committed.
+  Leaseholder -> App : committed | The result goes back through the gateway.
+  Leaseholder -x> Follower 1 : leader node lost | If the leader node dies, the followers elect a new leader and the lease moves.
+ref: docs | Replication layer | CockroachDB documentation | https://www.cockroachlabs.com/docs/stable/architecture/replication-layer
+
+== Regional by row data homing
+kind: multi-region, sharding
+when: A global app needs low-latency access for each user and must keep some users' data inside their own country or region.
+how: A database is declared multi-region with a primary region and other regions, and a survival goal (zone failure or region failure). A table is set to REGIONAL BY ROW. Each row gets a hidden region column, set from the user's region on insert, or by the app.
+The cluster uses this column as a prefix of the key, and the zone configuration places the row's range and its lease in that region. A user in Frankfurt reads and writes rows homed in eu-central at local latency, a few milliseconds. A query by primary key can find the row's home region, but one that does not know the region may need to search several regions.
+Reference data that every region reads, such as a country table, uses GLOBAL tables. Reads are local everywhere, and writes are slower.
+used: Multi-region SaaS and fintech systems that need data residency, for example EU data kept in the EU.
+avoid: When all users are in one region; a single-region cluster is simpler and cheaper.
+flow:
+  EU user [user] -> EU gateway [svc: eu-central node] : INSERT user row | A European user writes a row at a local node.
+  EU gateway -> EU range [db: homed in eu-central] : region column = eu | The row gets the region eu, so it is stored and led in the EU.
+  EU user -> EU range : read own row 4 ms | Reads from the home region are fast.
+  US user [user] -> US gateway [svc: us-east node] : read EU row | A US user asks for a row homed in the EU.
+  US gateway -> EU range : cross-region read 90 ms | The request travels to the EU leaseholder, which costs about 90 ms.
+  EU range ~> US replica [db: replica in us-east] : replicas for survival | Under region survival, replicas also exist in other regions, so the EU range can survive an EU outage.
+ref: docs | Regional tables | CockroachDB documentation | https://www.cockroachlabs.com/docs/stable/regional-tables
+
+== Changefeeds to Kafka for downstream sync
+kind: cdc, outbox
+when: Other systems (search, cache, analytics, events) need every committed row change from the database, in order per row.
+how: A changefeed is created with CREATE CHANGEFEED FOR TABLE orders INTO a Kafka or cloud storage sink. Each node watches the ranges it leads and emits changes for them. A coordinator tracks a resolved timestamp, which promises that all changes up to that time were emitted.
+Each message holds the row key, the new values and an updated timestamp. Messages for one row stay in order, but rows from different ranges are not globally ordered. The resolved timestamps let a consumer know when it has a complete, ordered view up to a time.
+Delivery is at least once, so after a restart the same change can come twice. Consumers should apply changes by key and timestamp. For an outbox, the app inserts an event row in the same transaction, and a changefeed on that table publishes it.
+used: CockroachDB changefeeds to Kafka, Pub/Sub or cloud storage; feeding search indexes and warehouses.
+avoid: When a nightly export is enough, since a changefeed is a long-running job to monitor.
+flow:
+  App [client] -> orders table [db: CockroachDB] : INSERT and UPDATE | The app commits normal transactions.
+  orders table -> Changefeed job [svc: runs on range leaders] : row change events | Nodes emit committed changes of their ranges.
+  Changefeed job -> orders topic [log: Kafka] : key, value, updated ts | Each change is a message that carries a timestamp.
+  Changefeed job -> orders topic : resolved ts 12:00:05 | A resolved timestamp says all changes up to that time were sent.
+  orders topic -> Search indexer [svc: dedup by key and ts] : apply change | The consumer applies changes and ignores older duplicates.
+  orders topic -> Warehouse loader [svc: batch] : load by resolved ts | The loader loads data up to the last resolved timestamp.
+ref: docs | CREATE CHANGEFEED | CockroachDB documentation | https://www.cockroachlabs.com/docs/stable/create-changefeed
+
+@@ dynamodb
+== Single-table design with secondary indexes
+kind: index-table, sharding
+when: An app needs several access patterns on related items with single-digit-millisecond reads, and no joins.
+how: DynamoDB hashes the partition key to pick a storage partition, and sorts items inside it by the sort key. Single-table design puts different entity types in one table. For example PK = CUSTOMER#7 holds the profile (SK = PROFILE) and orders (SK = ORDER#2026-10-01#9001). One Query on the partition returns a customer and the orders together.
+A global secondary index (GSI) gives another access path, for example GSI1PK = ORDER#STATUS and GSI1SK = date. A GSI is its own partitioned copy, updated asynchronously, so reads on it are eventually consistent. The table's writes also consume write capacity in each GSI.
+Design starts from the list of queries. Keys must have many distinct values so that load spreads. A hot key can still throttle, even with adaptive capacity.
+used: Serverless apps on AWS; the single-table style is taught in AWS's NoSQL design guidance.
+avoid: When queries are unknown or analytic; use a relational database, or export to S3 and query with Athena.
+flow:
+  App [client] -> Table [db: PK and SK] : Query PK = CUSTOMER#7 | One query reads a customer and the latest orders from one partition.
+  Table -> App : profile and 20 orders | Items come back sorted by the sort key.
+  App -> Table : PutItem order 9001 | A write goes to the partition for the customer.
+  Table ~> GSI1 [db: PK = order status] : async copy | The index entry is added a little later.
+  Dashboard [client] -> GSI1 : Query status = SHIPPED | Another access pattern reads the index, not the table.
+  Table -x> App : throttled on hot key | A single very hot key can exceed partition limits and return an error.
+ref: docs | Best practices for designing and architecting with DynamoDB | AWS documentation | https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-general-nosql-design.html
+
+== Streams and Lambda for derived views
+kind: cdc, event-driven
+when: Each change to an item must trigger follow-up work, such as updating a search index, a counter table or an event bus.
+how: DynamoDB Streams records every item change in order per item, for 24 hours. Each record has the keys and, as you choose, the old image, the new image or both. An AWS Lambda event source mapping polls the stream shards and calls your function with batches of records.
+The function writes derived data: an OpenSearch document, an aggregate row in another table, or a message to EventBridge or SQS. Failed batches are retried until they succeed or expire, so the function must be idempotent. A failure destination such as an SQS queue can catch records that fail after the retry limit.
+Kinesis Data Streams for DynamoDB is an alternative with a longer retention of up to a year and more consumers.
+used: Serverless apps on AWS; keeping OpenSearch in sync; audit trails and aggregates.
+avoid: When you need exactly-once or global ordering across items; use a log such as Kafka with an outbox design.
+flow:
+  App [client] -> Orders table [db: DynamoDB] : PutItem and UpdateItem | The app writes items as usual.
+  Orders table -> Stream [log: 24 h retention] : change records | Each change is added to the stream, in order per item.
+  Stream -> Lambda [svc: batch of 100] : poll shards | Lambda polls the stream and sends records to the function.
+  Lambda -> Search index [store: OpenSearch] : upsert document | The function updates the derived view.
+  Lambda -x> Stream : error, retry batch | If the function fails, the same batch is tried again.
+  Lambda ~> Failure queue [queue: SQS] : after retries | A batch that keeps failing is sent to a queue for review.
+ref: docs | Change data capture with DynamoDB Streams | AWS documentation | https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html
+
+== Global tables for active-active regions
+kind: multi-region, crdt
+when: Users on several continents need low-latency writes in their own region, and the app can accept eventual consistency between regions.
+how: A global table is a set of replica tables in several regions. An app writes to the table in its own region with a normal write, and DynamoDB replicates it to the others, usually within a second.
+Each region accepts writes at the same time. If two regions write the same item at nearly the same time, the write with the later timestamp wins (last writer wins). Writes in the same region are strongly consistent if you ask for it, but a read in another region may not yet see them. A newer multi-Region strong consistency mode also exists.
+The app should route a user to one home region, so conflicts are rare. During a regional failure, traffic moves to another region, and reads there may miss the last second of writes.
+used: Global consumer apps, session and profile stores on AWS, and active-active disaster recovery.
+avoid: When two regions must update the same counter or balance correctly; use a single writer region, or a strongly consistent database.
+flow:
+  EU user [user] -> EU table [db: eu-west-1] : PutItem cart | The user writes to the table in the nearest region.
+  EU table ~> US table [db: us-east-1] : replicate under 1 s | The change is copied to the other region in the background.
+  US user [user] -> US table : GetItem cart | A US user reads the item from the local replica.
+  US user -> US table : PutItem same item | Another write to the same item happens in the US.
+  * US table: last writer wins | The write with the later timestamp is kept in all regions.
+  EU table -x> US table : region outage | A regional outage stops replication until the region returns.
+ref: docs | Global tables | AWS documentation | https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GlobalTables.html
+
+@@ fdb
+== Layers on an ordered transactional key-value store
+kind: layered-arch, polyglot-persistence
+when: You need several data models (records, queues, documents) with strong consistency, and you want one storage cluster to operate.
+how: FoundationDB gives only a small, sorted key-value API with ACID transactions across any keys. It has no SQL and no schema. Data models are built as layers, which are stateless libraries or services on top. A layer maps its model to keys, for example a record plus its index entries, and updates them in one transaction.
+Because every index update happens in the same transaction as the record, the layer cannot leave an index out of date. Ordered keys give cheap range reads, so tuples like (table, index, value, id) work as indexes. Tuple encoding keeps keys sortable.
+Operations stay simple: one cluster, one kind of server to monitor, backup and scale. The limits are transactions of at most 5 seconds and about 10 MB of changes, and values of at most 100 KB.
+used: Apple's CloudKit is built on the FoundationDB Record Layer; Snowflake stores its metadata in FoundationDB; Tigris and others build on it.
+avoid: When you need ready-made SQL, large blobs or very long transactions; use PostgreSQL, CockroachDB or an object store.
+flow:
+  App [client] -> Record layer [svc: stateless library] : save record | The app saves a record through the layer.
+  Record layer -> FDB cluster [db: ordered KV] : one transaction | The layer writes the record and its index keys together.
+  FDB cluster -> Record layer : commit version 5102 | Both succeed or neither does, so the index is always right.
+  App -> Record layer : find by email | A query uses an index.
+  Record layer -> FDB cluster : range read on index | One ordered range read finds the matching keys.
+  Record layer -> App : records | The layer fetches the records and returns them.
+ref: paper | FoundationDB: A Distributed Unbundled Transactional Key Value Store | Zhou et al., SIGMOD 2021 | https://www.foundationdb.org/files/fdb-paper.pdf
+
+== Unbundled commit pipeline with optimistic concurrency
+kind: wal
+when: A distributed database must give strictly serializable transactions, and its roles must scale and fail independently.
+how: A client reads at a read version from a sequencer, and keeps its reads and writes in memory. At commit, it sends them to a proxy. The proxy gets a commit version from the sequencer and sends the read and write sets to resolvers.
+Resolvers check for conflicts: if another transaction wrote a key this transaction read after its read version, this one is rejected, and the client retries. This is optimistic concurrency, with no locks held during the transaction. If there is no conflict, the proxy writes the mutations to the transaction logs, and replies after all log replicas have saved them. Storage servers pull the log and apply it later.
+If a role fails, the cluster runs recovery: a coordinator picks a new set of roles, and a new generation starts. Recovery is usually done within seconds. Storage is separate from the log, so each can scale on its own.
+used: FoundationDB at Apple and Snowflake; the paper describes this design.
+avoid: When many transactions write the same hot keys, since conflicts cause many retries; use a design that spreads writes.
+flow:
+  Client [client] -> Sequencer [svc: version source] : get read version | A new transaction receives a read version.
+  Client -> Proxy [svc: commit proxy] : commit with key sets | The client sends the keys it read and wrote.
+  Proxy -> Resolver [svc: conflict check] : check ranges | The resolver checks if any read key changed since the read version.
+  Resolver -x> Client : conflict | If a key changed, the transaction is rejected and the client retries.
+  Proxy -> Transaction log [log: 3 replicas] : mutations | With no conflict, the mutations are saved on all log replicas.
+  Transaction log ~> Storage server [db: sorted data] : pull and apply | Storage servers read the log later and apply the changes.
+ref: paper | FoundationDB: A Distributed Unbundled Transactional Key Value Store | Zhou et al., SIGMOD 2021 | https://www.foundationdb.org/files/fdb-paper.pdf
+
+== Deterministic simulation testing
+kind: none
+when: A distributed system has rare, timing-dependent bugs, and normal tests cannot find them or replay them.
+how: FoundationDB runs its real database code inside a single-threaded simulator. All sources of non-determinism are replaced: network, disk, clocks and random numbers. The simulator controls time and the order of events, so the same random seed always gives the same run.
+The simulator then injects faults: dropped and delayed packets, machine and disk failures, network splits, and even a bad operator action. A workload checks invariants all the time, for example that transactions stay serializable. Thousands of simulated cluster-hours run for each hour of real time.
+When a seed finds a bug, any developer can replay it exactly and step through it. The price is discipline: all code uses abstract interfaces, so the code can be run in the simulator.
+used: FoundationDB; the idea is copied by TigerBeetle and by Antithesis, which sells a deterministic testing platform.
+avoid: When the system depends heavily on third-party code that cannot run in a simulator.
+flow:
+  Seed 8123 [note: random seed] -> Simulator [svc: single thread] : start run | One seed decides the whole run.
+  Simulator -> Simulated cluster [svc: real FDB code] : fake network and disk | Real database code runs on fake network, disk and time.
+  Simulator -x> Simulated cluster : kill nodes, drop packets | The simulator injects crashes, delays and network splits.
+  Workload [svc: invariant checker] -> Simulated cluster : transactions | A workload keeps issuing transactions and checks them.
+  Workload -x> Simulator : invariant broken | A violated rule is reported with the seed.
+  Developer [user] -> Simulator : replay seed 8123 | The developer reruns the same seed and gets the same failure to debug.
+ref: paper | FoundationDB: A Distributed Unbundled Transactional Key Value Store | Zhou et al., SIGMOD 2021 | https://www.foundationdb.org/files/fdb-paper.pdf
+
+@@ memcached
+== Cache-aside with client-side consistent hashing
+kind: cache-aside, consistent-hashing
+when: A database is slow or overloaded by repeated reads, and the data can be rebuilt if it is lost.
+how: The app looks in memcached first. On a miss it reads the database, then sets the value with a TTL, for example 5 minutes. On a write, the app updates the database, then deletes the cache key. The next read refills it.
+Servers do not know each other. The client library hashes each key onto a ring of servers, so the same key always goes to the same server, and adding a server moves only about 1/n of the keys. A cluster of 20 servers with 64 GB each gives about 1.2 TB of cache.
+Eviction is by LRU within slab classes. If a server dies, only its keys are lost, and the database serves those misses. This is why capacity planning must keep the database able to handle the miss rate.
+used: Facebook, Wikipedia and Twitter have run large memcached tiers; the standard first cache for many web sites.
+avoid: When data must survive restarts or needs data structures and replication; use Redis, or a database with its own cache.
+flow:
+  App [client] -> Memcached client [svc: hash ring] : get user:42 | The app asks the client library for a key.
+  Memcached client -> Server 7 [cache: slab and LRU] : get user:42 | The library hashes the key and picks the server.
+  Server 7 -x> App : miss | The key is not in cache.
+  App -> Database [db: MySQL] : SELECT user 42 | The app reads from the database.
+  App -> Server 7 : set user:42 TTL 300 | The app stores the value for next time.
+  App -> Database : UPDATE user 42 | On a write, the app updates the database first.
+  App -> Server 7 : delete user:42 | Then it deletes the cache key, so the next read loads fresh data.
+ref: paper | Scaling Memcache at Facebook | Nishtala et al., NSDI 2013 | https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala
+
+== Proxy tier with pools and failover
+kind: bulkhead, active-passive
+when: Many web servers talk to hundreds of cache servers, and you need failover and separation of workloads without changing the apps.
+how: A proxy such as mcrouter, Facebook's open-source memcached router, sits between the app and the cache servers. The app talks to one local address using the plain memcached protocol. The proxy owns the routing rules.
+Servers are grouped into pools by workload, for example a pool for sessions and a pool for large objects, so a noisy workload cannot evict the others. A hot pool can be copied to several replicas, and the proxy sends reads to one and writes to all.
+When a server fails, the proxy sends its keys to a small gutter pool for a short TTL, so the database does not take all the misses at once. Connections from thousands of web servers are merged into few connections per cache server.
+used: Facebook's memcache fleet, described in the NSDI 2013 paper; mcrouter users; twemproxy (Twitter) is a similar proxy.
+avoid: For a small cache of a few servers, where client-side hashing is enough.
+flow:
+  Web server [client] -> Proxy [svc: mcrouter] : get session:9 | The app uses one local address and the plain protocol.
+  Proxy -> Session pool [cache: 6 servers] : route by prefix | Session keys go to the pool made for them.
+  Proxy -> Object pool [cache: 20 servers] : route by prefix | Large objects use another pool, so they cannot evict sessions.
+  Session pool -x> Proxy : server 3 down | One server fails and its requests time out.
+  Proxy -> Gutter pool [cache: 2 servers] : retry with short TTL | The proxy asks a small standby pool, and its short TTL limits stale data.
+  Gutter pool -> Proxy : value or miss | The database sees only the misses that remain.
+ref: paper | Scaling Memcache at Facebook | Nishtala et al., NSDI 2013 | https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala
+
+== Stampede protection with a lock key
+kind: lease, cache-aside
+when: A popular key expires, and thousands of requests would hit the database at the same moment to rebuild it.
+how: When a request gets a miss, it tries add lock:key with a TTL of a few seconds. Add succeeds only if the key does not exist, so exactly one request wins. The winner reads the database, sets the cache value and deletes the lock.
+The other requests do not go to the database. They wait for 20 to 50 ms and read the cache again, or serve a slightly stale copy kept under a second key. The lock has a TTL, so if the winner dies, the lock expires and another request takes over. This is a lease.
+Facebook's modified memcached has leases built in: a miss returns a lease token, only the holder can set the value, and a delete invalidates the token. This also stops a stale set from overwriting newer data. Stock memcached needs the add-based lock instead.
+used: Facebook memcache leases; many web apps that guard hot keys such as home pages, product pages or leaderboards.
+avoid: When rebuilds are cheap or keys are not hot; a plain cache-aside is enough.
+flow:
+  Request 1, Request 2 [client: 5,000 per s] -> Memcached [cache: key expired] : get home:page | Many requests miss the same expired key.
+  Request 1 -> Memcached : add lock:home TTL 5 | Request 1 wins the add and holds the lock.
+  Request 2 -x> Memcached : add fails | Other requests lose the add and do not touch the database.
+  Request 1 -> Database [db: MySQL] : rebuild query | Only the winner runs the costly query.
+  Request 1 -> Memcached : set home:page, delete lock | The winner fills the cache and releases the lock.
+  Request 2 ~> Memcached : wait 30 ms and retry get | The others retry the cache and now get a hit.
+ref: paper | Scaling Memcache at Facebook | Nishtala et al., NSDI 2013 | https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala

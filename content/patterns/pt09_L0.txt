@@ -1,0 +1,800 @@
+@@ kafka-connect
+== Database to lake with source and sink connectors
+kind: cdc, etl-elt
+when: Operational database changes must reach a data lake or warehouse, and you do not want to write and run custom consumer code.
+how: A source connector (for example Debezium for Postgres) runs inside Kafka Connect and reads the database change log. It writes one event per row change to a Kafka topic. The framework stores the connector's read position in an internal topic, so a restart resumes where it stopped.
+A sink connector (for example the S3 or Iceberg sink) runs in the same cluster as its own consumer group. It reads the topic, batches records, for example 10,000 records or 10 minutes, and writes one file per batch. Converters turn records into Avro or JSON on the way in and out.
+Both sides are only configuration sent to the Connect REST API. You scale by raising tasks.max, and Connect spreads the tasks over the workers. The raw files are the bronze layer; later jobs clean them.
+used: Debezium plus S3 or Iceberg sinks, common in data platforms; Confluent and Amazon MSK Connect run the same framework as managed services.
+avoid: When you need heavy per-record logic or joins; do that in Kafka Streams or Flink, and keep Connect for plain data movement.
+flow:
+  Orders DB [db: Postgres] -> Debezium source [svc: Kafka Connect] : WAL changes | The source connector reads committed row changes from the database log.
+  Debezium source -> orders.cdc [log: 6 partitions] : change events | It writes one event per change and saves its position in a Connect offsets topic.
+  orders.cdc -> S3 sink [svc: Kafka Connect] : poll | The sink connector reads the topic as an ordinary consumer group.
+  S3 sink -> Data lake [lake: bronze files] : file per 10,000 records | The sink writes one file per batch and then commits its offsets.
+  Ops [client] -> S3 sink : PUT config via REST | An operator changes the connector configuration without deploying code.
+ref: docs | Kafka Connect | Apache Kafka documentation | https://kafka.apache.org/documentation/#connect
+
+== Dead letter queue for bad records
+kind: dead-letter, idempotent-consumer
+when: One malformed record must not stop a sink connector that moves millions of good records per hour.
+how: By default a sink connector stops its task when it cannot convert or write a record. This protects data, but one bad message can block a whole pipeline. You can set errors.tolerance to all, so the task skips bad records.
+Then set errors.deadletterqueue.topic.name. Connect writes each failed record to that topic, with headers that hold the error text, the source topic, partition and offset (turn on errors.deadletterqueue.context.headers.enable for this). Retries with a delay can be set first for temporary errors.
+A person or a repair job reads the dead-letter topic, fixes the data or the schema, and replays the records to the main topic. Watch the size of the dead-letter topic: it is the alarm for a real problem. The dead-letter queue works for sink connectors only.
+used: Any production sink to S3, Elasticsearch or a warehouse in the Kafka Connect ecosystem; documented in the Apache Kafka and Confluent guides.
+avoid: When every record is critical and the pipeline must stop on the first error; keep errors.tolerance at none and alert.
+flow:
+  Events topic [log] -> JDBC sink [svc: Kafka Connect] : poll batch | The sink task reads a batch of records from the topic.
+  JDBC sink -> Warehouse [db] : insert good rows | Good records are written to the target database.
+  JDBC sink -x> Warehouse : bad row rejected | One record breaks a type rule, so the write fails for that record.
+  JDBC sink -> Events DLQ [log: dead letters] : failed record + headers | Connect sends the record and the error context to the dead-letter topic.
+  Data engineer [user] -> Events DLQ : inspect and replay | A person fixes the cause and replays the records to the main topic.
+ref: blog | Kafka Connect Deep Dive: Error Handling and Dead Letter Queues | Robin Moffatt, Confluent, 2019 | https://www.confluent.io/blog/kafka-connect-deep-dive-error-handling-dead-letter-queues/
+
+== Distributed workers with automatic task rebalance
+kind: checkpoint-restart, heartbeat
+when: Integration jobs must keep running when a node fails, and you want to add capacity without stopping connectors.
+how: In distributed mode, all workers share the same group.id and three internal topics: one for connector configs, one for offsets and one for status. A connector is split into tasks. One worker is elected leader of the group, and it assigns connectors and tasks to the workers.
+When a worker dies, its heartbeat stops. The group rebalances, and the lost tasks move to the live workers. Each task reads its last committed offset from the offsets topic and continues. A sink task uses the consumer group offset; a source task uses the offsets topic.
+Delivery is at least once for most connectors. Exactly-once source support exists since Kafka 3.3, and it needs support from the connector. Since Kafka 2.3, incremental cooperative rebalancing lets healthy tasks keep running during a rebalance.
+used: Self-managed Connect clusters on Kubernetes (for example with the Strimzi operator); Confluent Cloud and Amazon MSK Connect run the same model.
+avoid: For a single small job on one machine; standalone mode keeps offsets in a local file and is simpler.
+flow:
+  Worker 1 [svc: leader] -> Worker 2 [svc], Worker 3 [svc] : assign tasks | The leader of the Connect group gives tasks to the workers.
+  Worker 2 -> connect-offsets [log: internal topic] : commit offsets | Each task saves its position in Kafka, not on local disk.
+  Worker 2 -x> Worker 1 : heartbeat lost | Worker 2 crashes, so its heartbeat stops.
+  * Worker 1: rebalancing | The group starts a rebalance to move the lost tasks.
+  connect-offsets -> Worker 3 : last offsets | Worker 3 receives the lost tasks and resumes from the saved offsets.
+ref: docs | Kafka Connect: distributed mode | Apache Kafka documentation | https://kafka.apache.org/documentation/#connect_running
+
+@@ kafka-streams
+== Stream-table join for event enrichment
+kind: stream-table-join, materialized-view
+when: Each event needs extra fields from reference data that changes slowly, and a remote lookup per event would be too slow.
+how: Read the changing reference data, for example user profiles, from a compacted topic as a KTable. The library keeps the table in a local RocksDB store on each instance. Read the event stream, for example clicks, as a KStream.
+A stream-table join looks up each event in the local store by key. No network call is needed, so the join costs microseconds. Both topics must have the same number of partitions and the same key, so the matching rows live on the same instance (co-partitioning).
+The join is not time travel: an event uses the table value at the moment it is processed. If the table is large, use a GlobalKTable (a full copy on each instance) only when it is small enough.
+used: Common in Kafka-based event pipelines for user, account and product enrichment; the Kafka Streams documentation describes the join types.
+avoid: When the reference data is huge and changes fast on both sides; use a stream-stream join with a time window, or a lookup service.
+flow:
+  profiles topic [log: compacted] -> Streams app [svc: RocksDB store] : table updates | The app loads profile changes into a local state store.
+  clicks topic [log] -> Streams app : click events | The app reads clicks with the same key and partition count.
+  Streams app -> enriched topic [log] : click + local profile | Each click is joined with the local store by user id, with no remote call, and written out.
+  * Streams app: store updated | A newer profile arrives, so later clicks use the new value.
+ref: docs | Kafka Streams: joins | Apache Kafka documentation | https://kafka.apache.org/documentation/streams/developer-guide/dsl-api.html#joining
+
+== Windowed aggregation with grace period
+kind: windowed-agg, materialized-view
+when: You need counts or sums per time window, such as impressions per campaign per minute, and events arrive late or out of order.
+how: Group the stream by key, then call windowedBy with a tumbling window of 1 minute and a grace period of, for example, 5 minutes. Each record falls in a window by its event timestamp, not by the time it arrives.
+The aggregate for each window is kept in a local state store. Every update emits a new result downstream. A late record inside the grace period updates its old window. A record later than the grace period is dropped and counted in a metric.
+To get one final result per window, add suppress with untilWindowCloses. It holds results back until the window and its grace period end. Wider grace gives more correct data but more delay and more state.
+used: Common for impression and click counting, fraud counters and operational metrics on Kafka; shown in the Apache Kafka Streams tutorials.
+avoid: When you need complex event-time features such as session logic with large state and custom triggers; Apache Flink gives more control.
+flow:
+  impressions topic [log] -> Streams app [svc: windowed count] : events with timestamps | The app reads impressions in order of partition offset.
+  Streams app -> Window store [store: RocksDB] : count per minute | Each event updates the count of the window that holds its timestamp.
+  Streams app -> counts topic [log] : updated count | Each update is emitted, so a reader sees running values.
+  impressions topic -> Streams app : late event, 3 min old | A late event arrives inside the grace period.
+  Streams app -> Window store : update old window | The old window is updated, and a corrected count is emitted.
+  impressions topic -x> Streams app : event 9 min late | An event later than the grace period is dropped.
+ref: docs | Kafka Streams: windowing | Apache Kafka documentation | https://kafka.apache.org/documentation/streams/developer-guide/dsl-api.html#windowing
+
+== Local state with changelog topics and standby replicas
+kind: checkpoint-restart, wal
+when: A stream job keeps state in local disk for speed, and it must recover quickly when an instance fails.
+how: Each stateful operator keeps its state in a RocksDB store on the instance that owns the partition. Every write to the store is also appended to a changelog topic in Kafka. The changelog is the write-ahead log of the state, and it is replicated like any topic.
+If an instance dies, the group rebalances and another instance takes the partition. It rebuilds the store by reading the changelog from the start. This can take minutes for large state.
+To cut recovery time, set num.standby.replicas to 1 or more. A standby instance keeps a warm copy of the store by reading the changelog all the time. Failover then takes seconds. Exactly-once processing is available with processing.guarantee set to exactly_once_v2, which uses Kafka transactions.
+used: Kafka Streams applications in production at many companies; the state recovery design is described in the official Kafka documentation.
+avoid: When state is very large and recovery time must be near zero; consider a managed state backend such as Flink with incremental checkpoints.
+flow:
+  Streams app A [svc: owns partition 3] -> RocksDB A [store] : update count | The instance writes the new state to its local store.
+  Streams app A -> changelog topic [log: replicated] : same update | The same change is appended to the changelog topic.
+  changelog topic -> Standby B [svc: warm copy] : tail changelog | A standby instance applies the changes in the background.
+  Streams app A -x> changelog topic : instance crashes | Instance A stops and its partition has no owner.
+  * Standby B: promoted | The group gives partition 3 to the standby.
+  Standby B -> changelog topic : catch up small gap | The standby reads only the last few changes and resumes processing.
+ref: docs | Kafka Streams: fault tolerance and state | Apache Kafka documentation | https://kafka.apache.org/documentation/streams/architecture.html
+
+@@ kinesis
+== Stream ingestion with Firehose delivery to S3
+kind: load-leveling, etl-elt
+when: Many producers send events, and you want them stored in S3 for analytics without running consumer servers.
+how: Producers put records in a Kinesis Data Stream with a partition key. The stream is the buffer: it keeps data for 24 hours by default, and up to 365 days with extended retention. One shard accepts up to 1 MB per second or 1,000 records per second.
+Amazon Data Firehose reads the stream as a consumer. It buffers by size or time, for example 128 MB or 300 seconds, converts records to Parquet if you set a schema, and writes files to S3 under date prefixes.
+Athena or Glue then query the files. Producers never wait for the lake, and a slow downstream does not push back on them. The cost to watch is the number of shards, and the delay of the buffer.
+used: Common for clickstream, application logs and IoT telemetry on AWS; AWS documents the Kinesis Data Streams to Firehose to S3 path.
+avoid: When many independent consumers need replay and ecosystem tools; consider Kafka (or MSK). When you only need files in S3, you can send straight to Firehose.
+flow:
+  App servers [client] -> Clickstream [log: 4 shards] : PutRecords | Producers send batches of records with a partition key.
+  Clickstream -> Firehose [svc: buffer 128 MB / 5 min] : read records | Firehose reads as a consumer and buffers the records.
+  Firehose -> S3 lake [lake: Parquet by date] : one file per buffer | When the buffer is full or old, Firehose writes a file.
+  Analyst [user] -> Athena [svc: SQL] : SELECT | The analyst writes SQL over the files.
+  Athena -> S3 lake : scan files | Athena reads only the date partitions that the query needs.
+ref: docs | Amazon Kinesis Data Streams concepts | AWS documentation | https://docs.aws.amazon.com/streams/latest/dev/key-concepts.html
+
+== Enhanced fan-out for many consumers
+kind: pubsub, bulkhead
+when: Several applications read the same stream, and they must not compete for the shared read limit of each shard.
+how: A shard gives 2 MB per second of read throughput. With shared throughput, all consumers on a shard split this. Five consumers get about 400 KB per second each, and they poll with GetRecords, which adds delay.
+With enhanced fan-out, each registered consumer gets its own 2 MB per second per shard. AWS pushes records over HTTP/2 through SubscribeToShard, so latency is about 70 ms in typical use. The Kinesis Client Library can use this mode.
+The limit is 20 registered consumers per stream by default, and there is an extra cost per consumer-shard hour and per GB read. Use it for the few consumers that need low latency, and let batch readers use shared mode.
+used: AWS describes it for real-time analytics, fraud checks and alerting that read the same Kinesis stream.
+avoid: When one or two consumers read the stream and 200 ms delay is fine; shared throughput is cheaper.
+flow:
+  Producers [client] -> Orders stream [log: 2 shards] : PutRecords | Producers write events once.
+  Orders stream -> Fraud checker [svc: enhanced fan-out] : push, 2 MB/s | The fraud checker has its own pipe, pushed over HTTP/2.
+  Orders stream -> Alerting [svc: enhanced fan-out] : push, 2 MB/s | Alerting also has its own pipe.
+  Orders stream ~> Nightly ETL [svc: shared mode] : GetRecords poll | The batch job uses the shared limit and polls.
+  * Nightly ETL: throttled | If shared readers exceed 2 MB/s per shard they are throttled, but the fan-out consumers are not.
+ref: docs | Develop enhanced fan-out consumers | AWS documentation | https://docs.aws.amazon.com/streams/latest/dev/enhanced-consumers.html
+
+== Partition key design and shard splitting
+kind: sharding, consistent-hashing
+when: Throughput grows, and one hot key or one full shard throttles writes.
+how: Kinesis hashes the partition key with MD5 to a 128-bit number. Each shard owns a range of this number. All records with one key go to one shard, so order is kept per key.
+If a key is hot, such as one big advertiser id, its shard hits 1 MB per second and writers get ProvisionedThroughputExceeded. Fix it by adding a random suffix to the key, for example 0 to 9, which spreads the load but loses strict order for that key.
+To add capacity in provisioned mode, split a shard in two with SplitShard. The old shard closes and two child shards take its hash range. Consumers read the parent to its end first, then the children, so order is kept. On-demand mode does this scaling for you.
+used: Standard practice in AWS Kinesis producers; the AWS guide on resharding and partition keys describes the method.
+avoid: When you need strict order for one very hot key above 1 MB per second; one shard is the hard limit, so redesign the key or batch before sending.
+flow:
+  Producers [client] -> Stream [log: 1 shard] : PutRecord, key=adv-7 | All records for one advertiser land on the same shard.
+  Stream -x> Producers : throttled at 1 MB/s | The hot shard is full, so writes fail and must retry.
+  Ops [user] -> Stream : SplitShard | An operator, or an autoscaler, splits the hot shard.
+  * Stream: 2 child shards | The parent closes and two children share its hash range.
+  Producers -> Stream : key=adv-7#3 | A salted key spreads the hot advertiser over both shards.
+  Stream -> Consumer [svc: KCL] : parent, then children | The consumer finishes the parent shard before the children, so per-key order is kept.
+ref: docs | Resharding, scaling and parallel processing | AWS documentation | https://docs.aws.amazon.com/streams/latest/dev/kinesis-using-sdk-java-resharding.html
+
+@@ pulsar
+== Stateless brokers over BookKeeper with tiered offload
+kind: tiered-storage, consensus-log
+when: You want to scale serving and storage separately, and keep years of topic data cheaply.
+how: A Pulsar broker holds no message data on its own disk. It receives a message and writes it to Apache BookKeeper, a separate cluster of bookies. A write goes to several bookies at once, for example ensemble 3, write quorum 3, ack quorum 2. The broker acknowledges when 2 bookies have the entry on disk.
+Because brokers are stateless, a failed broker is replaced fast: the topic is simply assigned to another broker. To add storage, add bookies; to add serving capacity, add brokers.
+Old segments (ledgers) can be offloaded to S3, GCS or Azure Blob by a tiered storage policy, for example after 24 hours. Readers still use the same topic; the broker reads old data from the object store. The cost is two systems to run, plus ZooKeeper or a metadata store such as etcd.
+used: Pulsar clusters at Yahoo (its origin), Tencent and many telecom and fintech platforms; StreamNative runs it as a service.
+avoid: When one team wants the smallest possible setup; a single-binary log such as Redpanda or Kafka is simpler to run.
+flow:
+  Producer [client] -> Broker A [svc: stateless] : publish | The producer sends to the broker that owns the topic.
+  Broker A -> Bookie 1 [store], Bookie 2 [store], Bookie 3 [store] : write entry | The broker writes the entry to three bookies at once.
+  Bookie 1, Bookie 2 -> Broker A : ack | Two acks are enough, so the broker acks the producer.
+  Broker A -> S3 offload [lake: old ledgers] : offload after 24 h | Old ledgers move to object storage to save cost.
+  Broker B [svc: takes over] -> Bookie 1 : read from ledger | If Broker A fails, Broker B reads the same ledgers; no data is copied.
+ref: docs | Pulsar architecture overview | Apache Pulsar documentation | https://pulsar.apache.org/docs/next/concepts-architecture-overview/
+
+== Key_Shared subscription for ordered parallel work
+kind: competing-consumers, pubsub
+when: You want many workers to share one topic, but all events of one key, such as one user, must be handled in order.
+how: Pulsar has four subscription types. Exclusive and Failover give one active consumer and keep topic order. Shared sends messages round-robin to many consumers, like a work queue, but order is lost.
+Key_Shared is in between. Pulsar hashes each message key and gives each consumer a range of the hash space. All messages with one key go to the same consumer, so order is kept per key, and the work spreads across many consumers.
+Each message is acknowledged one by one, which is different from the offset commit in Kafka. When a consumer joins or leaves, the hash ranges move. Pulsar keeps order during this change by holding new messages for a key until older ones are acknowledged.
+used: Pulsar deployments that use it as both a stream and a queue, for example per-account event handling in finance and telecom platforms.
+avoid: When order does not matter at all; the Shared type is simpler. When keys are heavily skewed, one consumer becomes the bottleneck.
+flow:
+  Producer [client] -> events topic [topic: key = user id] : send(key=u1) | Each message carries a key.
+  events topic -> Worker 1 [svc: hash 0-32767] : u1, u3 messages | Worker 1 owns the first half of the hash range.
+  events topic -> Worker 2 [svc: hash 32768-65535] : u2 messages | Worker 2 owns the second half.
+  Worker 1 -> events topic : ack one by one | Each message is acked alone; unacked ones are redelivered.
+  Worker 2 -x> events topic : worker leaves | Worker 2 disconnects.
+  * Worker 1: owns all ranges | Pulsar moves the whole hash range to Worker 1, and holds new messages until older ones are acked.
+ref: docs | Pulsar subscriptions: Key_Shared | Apache Pulsar documentation | https://pulsar.apache.org/docs/next/concepts-messaging/#key_shared
+
+== Geo-replication across clusters
+kind: multi-region, active-passive
+when: Data must be available in two or more regions, for disaster recovery or for low-latency local reads.
+how: Pulsar has geo-replication built in. You attach clusters to one Pulsar instance, then set a namespace replication policy that lists the clusters, for example us-east and eu-west.
+A producer writes to its local cluster. The local broker replicates each message to the other clusters in the background, using internal replicator producers. Consumers read from their own local cluster. Replication is asynchronous, so a regional failure can lose the last few messages that were not yet copied.
+Replication can be one way or two way. Two-way replication allows writes in both regions, but then order across regions is not global, and the same key may be written in both places. Plan for this with idempotent consumers.
+used: Pulsar documents it for multi-region disaster recovery; large Pulsar users such as Tencent run multi-cluster setups.
+avoid: When you need zero data loss on regional failure; async replication has a gap. Use one synchronous cluster across zones instead.
+flow:
+  EU producer [client] -> eu-west cluster [svc: Pulsar] : publish | A producer writes to its nearest cluster.
+  eu-west cluster ~> us-east cluster [svc: Pulsar] : replicate async | A replicator copies each message to the other cluster in the background.
+  US producer [client] -> us-east cluster : publish | Two-way replication also allows writes in the other region.
+  us-east cluster ~> eu-west cluster : replicate async | US messages are copied to EU as well.
+  eu-west cluster -x> EU consumer [client] : region down | The EU cluster fails, so the consumer cannot read from it.
+  EU consumer -> us-east cluster : fail over | The consumer reconnects to the other region and reads the replica.
+ref: docs | Geo-replication | Apache Pulsar documentation | https://pulsar.apache.org/docs/next/concepts-replication/
+
+@@ rabbitmq
+== Work queue with acknowledgements and prefetch
+kind: competing-consumers, load-leveling
+when: Slow jobs, such as sending email or resizing images, must be shared by many workers and never lost when a worker crashes.
+how: The web app publishes each job to a durable queue (a quorum queue for safety). Many workers consume from the same queue. RabbitMQ gives each message to one worker only.
+Each worker uses manual acknowledgement. The broker keeps a message as unacked until the worker confirms it. If the worker dies or its connection drops, the broker puts the message back in the queue for another worker. This gives at-least-once delivery, so handlers should be idempotent.
+Set a prefetch (basic.qos) of, for example, 10. Without it, the broker pushes the whole backlog to the first worker, and slow jobs wait while other workers sit idle. A small prefetch gives fair sharing; a larger one gives more throughput for fast jobs.
+used: Background job processing behind web apps; Celery and many Spring AMQP systems use RabbitMQ in this way.
+avoid: When many consumers must replay history or read the same message; use a log such as Kafka or a stream. For zero ops on AWS, SQS does the same job.
+flow:
+  Web app [svc] -> jobs queue [queue: quorum] : publish job | The app publishes the job with persistent delivery and does not wait for the work.
+  jobs queue -> Worker A [svc: prefetch 10], Worker B [svc: prefetch 10] : deliver | The broker gives each job to one worker, up to 10 unacked jobs per worker.
+  Worker A -> jobs queue : ack | The worker acks after the job is done, and the broker deletes it.
+  Worker B -x> jobs queue : connection lost | Worker B crashes before it acks its jobs.
+  jobs queue -> Worker A : redeliver | The broker puts the unacked jobs back, and Worker A takes them.
+ref: docs | Consumer acknowledgements and publisher confirms | RabbitMQ documentation | https://www.rabbitmq.com/docs/confirms
+
+== Retry with dead-letter exchange and delay queue
+kind: dead-letter, retry-backoff
+when: A consumer fails on some messages because of temporary errors, and you want delayed retries and a final parking place for bad messages.
+how: Declare the main queue with a dead-letter exchange (DLX). When a consumer rejects a message with requeue set to false, RabbitMQ sends it to the DLX instead of dropping it.
+The DLX routes it to a retry queue that has no consumers and a message TTL, for example 30 seconds. When the TTL ends, the message is dead-lettered again, this time back to the main exchange, so the worker tries once more. The message carries an x-death header that counts how many times it went around.
+After, for example, 5 tries, the worker publishes the message to a parking queue for manual review. Quorum queues also offer a delivery-limit setting, which dead-letters a message after a set number of redeliveries.
+used: Standard RabbitMQ retry design for payment callbacks and order events; the RabbitMQ documentation describes dead-letter exchanges and TTL.
+avoid: When you need many different delay times; per-message TTL on a queue only expires from the head. Use a delayed-message plugin or a scheduler.
+flow:
+  orders queue [queue: main] -> Consumer [svc] : deliver | The consumer receives an order message.
+  Consumer -x> orders queue : reject, no requeue | A temporary error occurs, so the consumer rejects the message.
+  orders queue -> retry queue [queue: TTL 30 s] : via DLX | The dead-letter exchange routes the message to the retry queue.
+  retry queue -> orders queue : TTL expired, via DLX | After 30 seconds the message returns to the main queue.
+  Consumer -> parking queue [queue: after 5 tries] : publish for review | After 5 tries the consumer parks the message for a person.
+ref: docs | Dead Letter Exchanges | RabbitMQ documentation | https://www.rabbitmq.com/docs/dlx
+
+== Topic exchange routing to per-service queues
+kind: pubsub, event-driven
+when: Several services need different subsets of the same events, and the publisher must not know who listens.
+how: Publishers send to a topic exchange with a routing key such as order.eu.created. Each service declares its own queue and binds it with a pattern. The star matches one word and the hash matches zero or more words. A queue bound with order.*.created gets all created orders; one bound with order.eu.# gets all EU order events.
+The exchange copies a message into every queue whose binding matches. Each service reads its own queue at its own speed, and the queue holds messages while the service is down.
+Adding a new service means declaring a new queue and binding. The publisher does not change. Unlike a log, a message is removed from a queue once acked, so a new service cannot read old events.
+used: Microservice event buses on RabbitMQ; the RabbitMQ tutorials show this routing as the standard example.
+avoid: When new consumers must replay old events, or the volume is very high; use Kafka or Pulsar.
+flow:
+  Order service [svc] -> orders exchange [svc: topic exchange] : key order.eu.created | The publisher sends one message with a routing key.
+  orders exchange -> Billing queue [queue: order.*.created], EU tax queue [queue: order.eu.#] : copy per match | The exchange copies the message to every queue whose pattern matches.
+  orders exchange -x> Audit queue [queue: payment.#] : no match | A queue with a different pattern gets no copy.
+  Billing queue -> Billing service [svc] : deliver | Billing reads at its own pace.
+  EU tax queue -> Tax service [svc] : deliver | Tax reads independently, even if billing is slow.
+ref: docs | RabbitMQ tutorial: topics | RabbitMQ documentation | https://www.rabbitmq.com/tutorials/tutorial-five-python
+
+@@ redpanda
+== Kafka-compatible log with Raft per partition
+kind: consensus-log, leader-follower
+when: You want Kafka clients and tools, but less to operate: no JVM, no ZooKeeper and fewer moving parts.
+how: Redpanda is one C++ binary that speaks the Kafka API. Existing producers, consumers, Kafka Connect and Kafka Streams apps work by changing only the bootstrap address.
+Each partition is a Raft group, usually with 3 replicas. The leader appends to its log and acknowledges after a majority has the entry. With acks=all, a committed record survives the loss of one node. Metadata also uses Raft, so there is no separate ZooKeeper or controller cluster.
+The engine uses a thread-per-core design (the Seastar framework): each core owns its partitions, so there is little locking and tail latency is lower. Redpanda also includes a schema registry and HTTP proxy in the same binary.
+used: Redpanda is used as a drop-in Kafka replacement for low-latency streaming, for example in trading and observability pipelines.
+avoid: When you depend on a Kafka feature or ecosystem tool that is not yet in the Kafka API compatibility list; test first.
+flow:
+  Producer [client: Kafka client] -> Redpanda leader [svc: partition 0 leader] : produce acks=all | An unchanged Kafka client writes to the partition leader.
+  Redpanda leader -> Follower 1 [svc], Follower 2 [svc] : Raft append | The leader replicates the entry to two followers.
+  Follower 1 -> Redpanda leader : ack | One follower is enough for a majority of three.
+  Redpanda leader -> Producer : commit ok | The leader acks after a majority has the entry.
+  Redpanda leader -x> Follower 2 : node fails | One node is lost, but two of three still form a majority.
+  * Follower 1: new leader | The followers elect a new leader without any external service.
+ref: docs | Redpanda architecture | Redpanda documentation | https://docs.redpanda.com/current/get-started/architecture/
+
+== Tiered storage for long retention and replay
+kind: tiered-storage, backfill-replay
+when: You need weeks or months of event history for replay, but local NVMe disks for all of it would cost too much.
+how: Enable tiered storage on a topic. Redpanda keeps recent segments on local disk and uploads closed segments to object storage such as S3, GCS or Azure Blob. A local retention setting, for example 2 days, controls how long data also stays on disk.
+Older data is read from the object store when a consumer asks for an old offset. The consumer API does not change. Because history is in S3, a new job can replay 90 days without large disks on the brokers, and adding brokers needs less data movement.
+Reads from the object store are slower than from NVMe, so a replay is a throughput job, not a low-latency one. A feature called remote read replica topics lets another cluster read the same data in read-only form for analytics.
+used: Redpanda documents it for long retention and disaster recovery; Kafka (KIP-405) and Pulsar offer similar tiering.
+avoid: When all reads are of fresh data and retention is short; the extra object-store cost and complexity give no gain.
+flow:
+  Producer [client] -> Redpanda broker [svc: local NVMe] : produce | New records land on local disk.
+  Redpanda broker -> Object store [lake: S3 segments] : upload closed segment | Closed segments are copied to object storage in the background.
+  * Redpanda broker: local retention 2 d | Segments older than the local limit are removed from disk.
+  Backfill job [svc: new group] -> Redpanda broker : fetch offset 0 | A new job asks for the earliest offset.
+  Redpanda broker -> Object store : read old segments | The broker fetches old data from object storage and streams it to the job.
+  Redpanda broker -> Backfill job : old records | The job sees one log and does not know which tier held the data.
+ref: docs | Tiered Storage | Redpanda documentation | https://docs.redpanda.com/current/manage/tiered-storage/
+
+== Data transforms inside the broker
+kind: pipes-filters, event-driven
+when: A simple per-record change, such as removing personal fields or routing by type, should happen without running a separate stream processor.
+how: Redpanda data transforms run WebAssembly code inside the broker. You write a function, compile it to Wasm and deploy it with rpk. It reads an input topic and writes to an output topic.
+Each record is passed to your function, which returns zero, one or more records. The work happens on the same node as the data, so no network hop and no extra consumer group are needed. The transform keeps track of its own position, so it resumes after a restart.
+The code is stateless and sandboxed, so it cannot do joins or windows, and it cannot call outside services. Use it for filter, mask, format change and routing. Use Flink or Kafka Streams when you need state.
+used: Redpanda documents it for masking, validation and format conversion close to the data; the feature is specific to Redpanda.
+avoid: When logic needs state, joins or calls to other systems; use Kafka Streams or Flink.
+flow:
+  App [client] -> raw-events topic [log] : produce | Applications write raw events with personal fields.
+  raw-events topic -> Wasm transform [svc: runs in broker] : each record | The broker passes each record to the Wasm function.
+  Wasm transform -> clean-events topic [log] : masked record | The function removes the email field and returns the record.
+  Wasm transform -x> raw-events topic : bad record skipped | A record that fails validation is dropped by the function.
+  clean-events topic -> Analytics [svc] : consume | Analysts read only the masked topic.
+ref: docs | Data transforms | Redpanda documentation | https://docs.redpanda.com/current/develop/data-transforms/
+
+@@ schemareg
+== Compatibility gate between producers and consumers
+kind: none
+when: Many teams share Kafka topics, and a producer change must not break consumers that deploy at a different time.
+how: Each topic value has a subject in the registry, for example orders-value, with versions of an Avro, Protobuf or JSON Schema. Each subject has a compatibility mode. BACKWARD means new schema versions can read old data. FORWARD means old readers can read new data. FULL means both.
+In CI, the producer team calls the registry compatibility endpoint with the new schema. If the check fails, the build stops before any bad message exists. Adding a field with a default value passes; removing a required field fails.
+The mode also sets the deploy order. With BACKWARD (the default in Confluent Schema Registry), upgrade consumers first, then producers. With FORWARD, upgrade producers first. The registry is the contract that teams negotiate.
+used: Confluent Schema Registry in Kafka platforms; Apicurio Registry and the Redpanda registry offer similar rules.
+avoid: For topics with one producer and one consumer owned by one team; a shared library may be enough.
+flow:
+  Producer team [user] -> CI pipeline [svc] : new schema v2 | A developer changes the schema and opens a pull request.
+  CI pipeline -> Schema Registry [svc: BACKWARD mode] : POST /compatibility | CI asks whether v2 can read data written with v1.
+  Schema Registry -x> CI pipeline : incompatible | A removed required field breaks old data, so the build fails.
+  CI pipeline -> Schema Registry : register v2 | After a fix with a default value, the check passes and v2 is registered.
+  Schema Registry -> orders-value [store: v1 and v2] : save version | The registry stores the version in its backing Kafka topic.
+ref: docs | Schema evolution and compatibility | Confluent documentation | https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html
+
+== Schema id in every message with a client cache
+kind: cache-aside, claim-check
+when: Each message must be readable years later, but you cannot afford to store the full schema in every message.
+how: The producer serializer registers the schema once and gets a small integer id. Each message is written as one magic byte (0), the 4-byte schema id and then the compact Avro bytes. The schema itself is not in the message.
+The consumer deserializer reads the id and looks in a local cache. On a miss it calls the registry once, then keeps the schema in memory. After warm-up, nearly no registry calls happen, so the registry is not on the hot path.
+This saves space: a record with 20 fields may carry a schema of 1 KB, and the id costs 5 bytes. It also means the reader always uses the exact writer schema, then resolves it to its own version. Keep the registry highly available, because a cold consumer cannot decode without it.
+used: Confluent Avro, Protobuf and JSON Schema serializers; Debezium and Kafka Connect converters use the same wire format.
+avoid: When messages are rare and tiny, or are self-describing JSON that nobody validates; the extra component adds little.
+flow:
+  Producer [client: Avro serializer] -> Schema Registry [svc] : register schema | On first send, the serializer registers the schema.
+  Schema Registry -> Producer : id = 42 | The registry returns a small integer id.
+  Producer -> orders topic [log] : 0x00 + id 42 + bytes | Each message holds the id and compact data, not the schema.
+  orders topic -> Consumer [svc: schema cache] : message | The consumer reads the id from the first bytes.
+  Consumer -> Schema Registry : GET schema 42 | On a cache miss, the consumer fetches the schema once.
+  * Consumer: id 42 cached | Later messages with id 42 need no registry call.
+ref: docs | Wire format | Confluent documentation | https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html#wire-format
+
+== Governed change events from database to sinks
+kind: cdc, pubsub
+when: Database changes stream to many sinks, and a column change in the source must not silently break the warehouse load.
+how: A Debezium connector reads the source database log and converts each change with the Avro converter. The converter registers the row schema in the registry and writes the schema id with each event. Topic name and subject follow one naming rule, so each table has a subject.
+When a developer adds a nullable column, the next event carries schema version 2. The registry checks compatibility at registration time. If the change is allowed, events flow, and sink connectors (S3, Snowflake, Elasticsearch) fetch version 2 and adapt their target tables.
+If the change breaks the rule, registration fails and the connector task stops. This is useful: the pipeline stops loudly at the source, instead of loading wrong data into the warehouse.
+used: Debezium with Confluent or Apicurio registries is a common CDC stack; Debezium documents Avro with a registry.
+avoid: When the source schema changes without review every day; consider a looser mode or a raw JSON bronze layer first.
+flow:
+  Orders DB [db: Postgres] -> Debezium [svc: Avro converter] : row change | Debezium reads an insert from the database log.
+  Debezium -> Schema Registry [svc] : register v2 | A new nullable column creates schema version 2.
+  Debezium -> orders.cdc [log] : id 7 + Avro bytes | The event holds the schema id and the data.
+  orders.cdc -> Warehouse sink [svc: Connect sink] : poll | The sink reads the events.
+  Warehouse sink -> Schema Registry : GET schema 7 | The sink fetches version 2 and adds the column in the warehouse.
+  Debezium -x> Schema Registry : incompatible change | A breaking change is refused, and the connector task fails.
+ref: docs | Debezium Avro serialization | Debezium documentation | https://debezium.io/documentation/reference/stable/configuration/avro.html
+
+@@ sns
+== Fan-out from one topic to many SQS queues
+kind: pubsub, competing-consumers
+when: One event must trigger several independent actions, and each action needs its own retries and its own rate.
+how: A publisher sends one message to an SNS topic. Each subscribed SQS queue gets its own copy. Each service has one queue, and many workers can read from it.
+The services are decoupled in two ways. They fail alone: if the email service is down, its queue holds messages for up to 14 days, and the others are not affected. They also scale alone, as each service reads at its own speed.
+Give every queue a dead-letter queue for poison messages. The publisher does only one call, and adding a new subscriber does not change it. SNS tries delivery to SQS reliably, so lost messages are rare, and consumers still need idempotent handling because delivery is at least once.
+used: A standard AWS design for order and upload events; AWS names it the fanout scenario in the SNS documentation.
+avoid: When consumers must replay old events or read from an offset; use Kinesis or Kafka. If there is only one consumer, send directly to SQS.
+flow:
+  Order service [svc] -> order-events [topic: SNS] : Publish OrderPlaced | The service publishes once and does not know the subscribers.
+  order-events -> Email queue [queue: SQS], Billing queue [queue: SQS], Search queue [queue: SQS] : copy per queue | SNS copies the message to each subscribed queue.
+  Email queue -> Email workers [svc] : receive | Email workers pull at their own speed.
+  Billing queue -> Billing workers [svc] : receive | Billing workers read their own queue.
+  Search queue -x> Search workers [svc: down] : consumer outage | The search service is down, and its queue just grows.
+  * Search queue: 4,200 waiting | Messages wait safely until the workers return; the other services are not affected.
+ref: docs | Common SNS scenarios: fanout | AWS documentation | https://docs.aws.amazon.com/sns/latest/dg/sns-common-scenarios.html
+
+== Message filtering with subscription policies
+kind: pubsub, event-driven
+when: Subscribers each need only some of the events on a topic, and you do not want a topic per event type.
+how: The publisher sets message attributes, for example eventType=refund and region=eu. Each subscription has a filter policy, a JSON document such as eventType in refund or chargeback. SNS checks the policy and delivers only matching messages.
+A filter policy can also look in the message body (payload-based filtering), so publishers need not copy fields into attributes. Matching happens in SNS, so unwanted messages are not delivered and not billed as deliveries to that subscriber.
+This keeps one topic as a single entry point and moves routing rules to the subscribers. Test the policies: a typo in an attribute name means the subscriber silently receives nothing.
+used: Common in AWS event systems for routing by event type, tenant or region; the SNS documentation describes both filter scopes.
+avoid: When routing needs complex rules, joins or content transforms; use EventBridge, which has richer rules and transforms.
+flow:
+  Payments service [svc] -> payment-events [topic: SNS] : eventType=refund | The publisher adds attributes to the message.
+  payment-events -> Refund queue [queue: filter refund] : matches | The refund queue policy matches, so it gets a copy.
+  payment-events -x> Fraud queue [queue: filter chargeback] : no match | The policy does not match, so no copy is sent.
+  Refund queue -> Refund worker [svc] : receive | The worker handles only refunds.
+  Payments service -> payment-events : eventType=chargeback | Later, a chargeback event is published.
+  payment-events -> Fraud queue : matches | Now the fraud queue gets a copy, and the refund queue does not.
+ref: docs | Amazon SNS message filtering | AWS documentation | https://docs.aws.amazon.com/sns/latest/dg/sns-message-filtering.html
+
+== Ordered fan-out with FIFO topics
+kind: pubsub, idempotent-consumer
+when: Several consumers need the same events in order per entity, such as all changes of one account, with no duplicates.
+how: An SNS FIFO topic delivers to SQS FIFO queues. The publisher sets a MessageGroupId, for example the account id, and either a deduplication id or content-based deduplication. Messages with the same group id are delivered in the order they were published.
+Deduplication works within a 5-minute window, so a retried publish does not make a duplicate. Different groups are processed in parallel, so throughput scales with the number of groups.
+Each FIFO queue keeps the order per group for its consumer. Throughput limits are lower than standard topics, so check the current quotas. Consumers still process by group in order, and a slow message blocks only its own group.
+used: Ledger, inventory and account-update flows on AWS where order per entity matters; documented in the SNS FIFO guide.
+avoid: When order does not matter; standard topics give higher throughput and simpler scaling.
+flow:
+  Account service [svc] -> account-events [topic: SNS FIFO] : group=acct-9, dedup id | The publisher sets the account id as the message group.
+  account-events -> Ledger queue [queue: SQS FIFO], Notify queue [queue: SQS FIFO] : ordered copy | Each FIFO queue receives the events of acct-9 in order.
+  Account service -x> account-events : retry, same dedup id | A retried publish with the same id is dropped as a duplicate.
+  Ledger queue -> Ledger worker [svc] : deposit, then withdraw | The worker gets messages of one group in order.
+  Notify queue -> Notify worker [svc] : same order | Notifications see the same order too.
+ref: docs | Amazon SNS FIFO topics | AWS documentation | https://docs.aws.amazon.com/sns/latest/dg/sns-fifo-topics.html
+
+@@ sqs
+== Queue-based load leveling with autoscaled workers
+kind: load-leveling, autoscaling
+when: Traffic comes in bursts, and a slow backend, such as a database or a rate-limited API, must not be overloaded.
+how: The front end puts a job in an SQS queue and returns at once, for example with HTTP 202. Workers pull jobs with long polling (up to 20 seconds) and process them at a safe rate.
+The queue absorbs the burst. A spike of 50,000 jobs in a minute sits in the queue, and workers drain it over 10 minutes. The backend sees steady load. A standard queue stores messages for up to 14 days and has almost unlimited throughput.
+Scale the workers by queue depth. A common signal is the number of visible messages divided by the number of workers, which gives backlog per worker. Scale out when it is high and in when it is low. Lambda can also read SQS directly and scale its concurrency with the backlog.
+used: Common AWS design for image processing, email sending and ad-report generation; AWS describes SQS as a buffer between components.
+avoid: When the caller needs the result immediately; use a synchronous call, or add a reply channel. When many readers need the same event, use SNS or a log.
+flow:
+  Web API [svc] -> jobs queue [queue: SQS standard] : SendMessage | The API stores the job and returns 202 to the user.
+  jobs queue -> Workers [svc: autoscaled] : ReceiveMessage, long poll | Workers pull jobs at the rate that the backend can handle.
+  Workers -> Partner API [svc: 100 req/s limit] : call | The load on the slow dependency stays steady.
+  jobs queue -> Autoscaler [svc: CloudWatch alarm] : backlog metric | The queue depth is the scaling signal.
+  Autoscaler -> Workers : add instances | When backlog per worker is high, more workers start.
+  * jobs queue: 50,000 waiting | The burst waits in the queue instead of crashing the backend.
+ref: docs | Amazon SQS: standard queues | AWS documentation | https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues.html
+
+== Visibility timeout, retries and dead-letter queue
+kind: dead-letter, retry-backoff
+when: Workers can crash or fail on some messages, and no job may be lost or retried forever.
+how: When a worker receives a message, SQS hides it for the visibility timeout (30 seconds by default). The worker deletes the message after success. If it crashes, the timer ends and the message becomes visible again, so another worker retries it.
+Set the timeout longer than the job time, or the job runs twice at once. For long jobs, extend the timeout while working. Each receive increases the receive count of the message.
+A redrive policy sets maxReceiveCount, for example 5. After 5 failed receives, SQS moves the message to a dead-letter queue. Set an alarm on the dead-letter queue depth. After the bug is fixed, use the redrive feature to move the messages back to the source queue. Delivery is at least once, so workers must be idempotent.
+used: Standard practice for AWS job systems; documented in the SQS developer guide.
+avoid: When you need exactly-once processing without idempotent handlers; use a FIFO queue with deduplication, and still keep handlers safe.
+flow:
+  jobs queue [queue: SQS] -> Worker [svc] : receive, hidden 30 s | The worker gets a job, and the job is hidden from other workers.
+  Worker -x> jobs queue : crash, no delete | The worker dies before it deletes the message.
+  * jobs queue: visible again | After 30 seconds the job is visible, and the receive count rises.
+  jobs queue -> Worker : receive again | A worker tries once more.
+  jobs queue -> jobs DLQ [queue: after 5 receives] : move poison message | After maxReceiveCount the message goes to the dead-letter queue.
+  On-call [user] -> jobs DLQ : alarm, then redrive | A person fixes the bug and redrives messages to the source queue.
+ref: docs | Amazon SQS dead-letter queues | AWS documentation | https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html
+
+== Claim check for large payloads
+kind: claim-check, valet-key
+when: Messages are bigger than the SQS size limit, or you do not want to pay to move large bodies through the queue.
+how: The sender writes the large body, such as a video file or a big JSON report, to S3. It then sends a small SQS message that holds the S3 bucket, key and perhaps a checksum.
+The worker receives the pointer, reads the object from S3 and processes it. The queue stays fast and small, and retries cost little because only the pointer is re-sent. The Amazon SQS Extended Client Library (Java and Python) does this for you, and supports payloads up to 2 GB.
+Add an S3 lifecycle rule to delete old objects, and delete the object only after the job succeeds. For untrusted senders, give them a pre-signed upload URL so they write to S3 directly.
+used: Used for media, document and large event workflows on AWS; AWS provides the Extended Client Library for this pattern.
+avoid: When messages are small, which is most of the time; the extra S3 call adds delay and one more thing to fail.
+flow:
+  Uploader [client] -> S3 bucket [lake: payloads] : PUT 200 MB file | The sender stores the large body in S3 first.
+  Uploader -> media queue [queue: SQS] : bucket + key | It sends a small pointer message.
+  media queue -> Transcoder [svc] : receive pointer | The worker gets the pointer, not the file.
+  Transcoder -> S3 bucket : GET object | The worker reads the file straight from S3.
+  Transcoder -> media queue : delete message | After success the worker deletes the message.
+  * S3 bucket: expires in 7 days | A lifecycle rule removes old payloads.
+ref: docs | Managing large Amazon SQS messages using Amazon S3 | AWS documentation | https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-s3-messages.html
+
+@@ arrow
+== Zero-copy exchange between engines and languages
+kind: none
+when: Two systems, such as a JVM engine and a Python library, must pass large tables to each other without a slow serialize-and-parse step.
+how: Arrow defines one columnar memory layout. Each column is a contiguous buffer with a validity bitmap, and every language reads it the same way. A table is sent as record batches, for example 64,000 rows each.
+Within one process, libraries share the buffers through the Arrow C Data Interface, so no data is copied. Between processes, the Arrow IPC format writes the buffers as they are in memory, and the reader can memory-map them. There is no row-by-row parsing.
+Apache Spark uses this for pandas UDFs: the JVM sends Arrow batches over a socket to a Python worker, which sees them as pandas or pyarrow data. This is often many times faster than pickling rows. The cost is that all consumers must accept the Arrow layout and types.
+used: Spark pandas UDFs and toPandas; DuckDB, Polars and pandas exchange data through Arrow; Snowflake and BigQuery clients can return Arrow results.
+avoid: For long-term storage; Arrow is a memory format, so write Parquet for files. For tiny messages, plain JSON or Protobuf is simpler.
+flow:
+  Spark JVM [svc: executor] -> Arrow batches [store: columnar buffers] : build 64k-row batch | The executor puts rows from a partition into columnar buffers.
+  Arrow batches -> Python worker [svc: pyarrow] : IPC stream over socket | The buffers are sent as they are, with no row encoding.
+  Python worker -> Arrow batches : result batch | The worker views the buffers as pandas data without copying, runs the UDF and writes the result in the same layout.
+  Arrow batches -> Spark JVM : read result | The JVM reads the result columns directly.
+ref: docs | Arrow columnar format | Apache Arrow documentation | https://arrow.apache.org/docs/format/Columnar.html
+
+== Arrow Flight for parallel bulk data transfer
+kind: scatter-gather, data-locality
+when: Clients pull large result sets from a data service, and a single JDBC or REST stream is the bottleneck.
+how: A client calls GetFlightInfo with a query or a dataset name. The service replies with a list of endpoints, each with a ticket and a location. The endpoints can be different servers that each hold a part of the result.
+The client opens a DoGet call to every endpoint at the same time, over gRPC. Each stream carries Arrow record batches, so the data stays columnar from the server memory to the client memory. There is no conversion to rows and back.
+Flight SQL adds a standard SQL interface on top, with ADBC drivers for clients. Parallel streams use many network links and many cores. The system needs gRPC support and tickets that expire, so plan for authentication and retries.
+used: Dremio and InfluxDB 3 expose Flight endpoints; the Arrow project defines Flight and Flight SQL for data services.
+avoid: When results are small, or clients only speak JDBC; the standard drivers are simpler.
+flow:
+  Analyst client [client: pyarrow] -> Flight service [svc: coordinator] : GetFlightInfo(query) | The client sends the query and asks where to read the result.
+  Flight service -> Analyst client : 3 endpoints + tickets | The service answers with three endpoints that hold parts of the result.
+  Analyst client -> Node 1 [svc], Node 2 [svc], Node 3 [svc] : DoGet(ticket) | The client opens three streams at the same time.
+  Node 1, Node 2, Node 3 -> Analyst client : Arrow record batches | Each node streams batches in columnar form.
+  * Analyst client: table assembled | The client joins the three streams into one table, with no row conversion.
+ref: docs | Arrow Flight RPC | Apache Arrow documentation | https://arrow.apache.org/docs/format/Flight.html
+
+== Dataset scan from Parquet into Arrow batches for ML
+kind: batching, data-locality
+when: A training or analytics job reads a large Parquet dataset on object storage, and only some columns and rows are needed.
+how: The pyarrow dataset API scans a folder of Parquet files on S3. It reads the footers first, keeps only the files and row groups that pass the filter, and reads only the chosen columns. Several reads run at once to hide the object-store delay.
+Data arrives as Arrow record batches, for example 131,072 rows. A batch can feed a vectorized engine, or be converted to NumPy or a tensor with little copying. The loader can produce batches while the training step uses the previous one.
+Memory use is bounded by the batch size, not by the dataset size, so a 500 GB dataset can stream through a 16 GB machine. Shuffling is the hard part: it needs a buffer or a prior shuffle of files.
+used: Hugging Face datasets stores data as memory-mapped Arrow files; Ray Data and pandas read Parquet through Arrow.
+avoid: When the dataset fits in memory and is used once; reading one file with pandas is enough.
+flow:
+  Training job [svc: pyarrow dataset] -> Lake [lake: Parquet on S3] : read footers | The job reads file footers to find row-group statistics.
+  Training job -> Lake : read 3 columns | Only needed columns and row groups are fetched, in parallel.
+  Lake -> Arrow batches [store: 131k rows] : decode to Arrow | Parquet pages are decoded straight into Arrow buffers.
+  Arrow batches -> GPU trainer [svc: PyTorch] : tensors | The trainer takes each batch with little copying.
+  * Training job: next batch prefetched | The loader decodes the next batch while the GPU works.
+ref: docs | Tabular datasets | Apache Arrow documentation | https://arrow.apache.org/docs/python/dataset.html
+
+@@ delta
+== Medallion layers on Delta tables
+kind: medallion, open-table-format
+when: Raw data from many sources must become trusted tables for BI and ML, with the quality rules visible at each step.
+how: Raw events land in bronze Delta tables with almost no change, so the original data can be replayed. A job cleans, deduplicates and applies types to make silver tables. A second job joins and aggregates silver into gold tables for dashboards, such as daily revenue per campaign.
+Each layer is a Delta table, so every write is an ACID commit. A reader sees either the old version or the new one, never half-written files. Structured Streaming can read one Delta table and write the next, and it saves its progress in a checkpoint.
+Quality rules, such as not-null and range checks (constraints and expectations), stop or quarantine bad rows between layers. If a bug is found in silver, fix the code and rebuild silver and gold from bronze.
+used: Databricks recommends this layout for its lakehouse; many ad-tech and retail data platforms use the same three layers.
+avoid: For a small team with a single source and one report; two or three well-modelled tables may be enough.
+flow:
+  Kafka topics [log] -> Bronze events [lake: Delta raw] : append stream | Raw events are appended with no change and kept for replay.
+  Bronze events -> Silver events [lake: Delta clean] : dedupe + cast | A stream job removes duplicates and fixes types.
+  Silver events -> Gold daily revenue [lake: Delta aggregate] : aggregate by day | A job builds the business table.
+  Gold daily revenue -> BI dashboard [client] : SQL | Analysts query only the gold table.
+  Silver events -x> Quarantine [lake: bad rows] : failed quality check | Rows that break a rule are set aside, not loaded.
+  Bronze events ~> Silver events : rebuild after bug fix | After a fix, silver is recomputed from the raw bronze data.
+ref: docs | What is the medallion lakehouse architecture? | Databricks documentation | https://docs.databricks.com/aws/en/lakehouse/medallion
+
+== MERGE upserts with optimistic concurrency
+kind: open-table-format, cdc
+when: A data lake table must mirror an operational table, applying inserts, updates and deletes safely while readers query it.
+how: A Delta table is Parquet files plus a transaction log, the _delta_log folder. Each commit is a numbered JSON file that lists files added and removed. A reader finds the latest version from the log, and sees a consistent snapshot.
+A MERGE statement joins a batch of change records (for example from Kafka and CDC) with the table by key. It rewrites only the files that hold matching rows, and commits one log entry that removes the old files and adds the new ones.
+Writers use optimistic concurrency. A writer reads the table version, does its work, and tries to create the next numbered log file. If another writer won, Delta checks for conflicting changes. If none, it retries; if the files overlap, the commit fails. Checkpoint files in Parquet, by default every 10 commits, speed up reading the log.
+used: Databricks and many open-source Spark pipelines for CDC upserts into Delta; described in the Delta Lake VLDB 2020 paper.
+avoid: For very high update rates on a few rows per second per key; use an OLTP database, or a format with merge-on-read such as Hudi.
+flow:
+  CDC topic [log] -> Spark job [svc: MERGE INTO] : batch of changes | The job collects a micro-batch of change records.
+  Spark job -> customers table [lake: Delta v41] : read snapshot v41 | The job reads the latest table version to find files that match the keys.
+  Spark job -> customers table : write new Parquet files | It writes new files that hold updated and inserted rows.
+  Spark job -> _delta_log [log: commit files] : create 42.json | It adds a commit that removes old files and adds new ones.
+  Other writer [svc] -x> _delta_log : 42.json already exists | A second writer lost the race and must check for conflicts.
+  BI query [client] -> customers table : read v42 | Readers see the new snapshot only after the commit file exists.
+ref: paper | Delta Lake: High-Performance ACID Table Storage over Cloud Object Stores | Armbrust et al., VLDB 2020 |
+
+== Change Data Feed for incremental downstream tables
+kind: materialized-view, cdc
+when: Downstream tables must update from only the rows that changed in a Delta table, not from a full rescan.
+how: Turn on the change data feed (delta.enableChangeDataFeed) for a table. After that, each commit also records the row-level changes, with a type: insert, update_preimage, update_postimage or delete, plus the commit version and timestamp.
+A downstream job reads the feed from the last version it processed, using readChangeFeed with a starting version. It applies the changes to a gold table, a search index or another system. Only changed rows are read, so cost follows the change volume, not the table size.
+The job stores the last version it handled. Reading by version makes reruns safe. The feed takes extra storage, and it is kept only as long as table history is kept, so run downstream jobs before the files are cleaned up with VACUUM.
+used: Databricks documents it for incremental ETL and audit trails; open-source Delta supports the same feature.
+avoid: When downstream always recomputes the whole table anyway, or when the table is append-only; read new files with a plain streaming read.
+flow:
+  Silver customers [lake: Delta with CDF] -> Change feed [log: row changes] : commit v57 | Each commit also records inserts, updates and deletes with their type.
+  Change feed -> Incremental job [svc: from v57] : readChangeFeed | The job reads only changes after its saved version.
+  Incremental job -> Gold segments [lake: Delta] : MERGE changes | It applies updates and deletes to the gold table.
+  Incremental job -> Search index [store] : upsert and delete docs | The same changes keep the search index in step.
+  * Incremental job: saved v58 | The job saves the last processed version, so a rerun starts from it.
+ref: docs | Use Delta Lake change data feed | Databricks documentation | https://docs.databricks.com/aws/en/delta/delta-change-data-feed
+
+@@ hms
+== One shared catalog for many query engines
+kind: none
+when: Spark, Trino, Hive and other engines must see the same tables over files in a data lake, with the same names and schemas.
+how: The Hive Metastore (HMS) is a service that stores table metadata: database and table names, columns and types, the file location, the file format and partition lists. It exposes a Thrift API and keeps its data in a relational database such as MySQL or PostgreSQL.
+Each engine is set to use the HMS URI. When a Spark job creates a table, the definition goes to HMS. A Trino query or a Hive query can then find it by name and read the same files in S3 or HDFS. Data is not copied and no engine owns the table.
+HMS holds only metadata. It does not enforce access control by itself; add Ranger or a similar tool. It is a single point of failure for all queries, so run more than one instance and back up the database.
+used: Hive, Spark, Trino, Presto, Impala and Flink use HMS as the shared catalog; many lakehouses still rely on it or on AWS Glue Data Catalog as a compatible alternative.
+avoid: For new Iceberg-only platforms that want a cloud-neutral API; consider an Iceberg REST catalog.
+flow:
+  Spark ETL [svc] -> Hive Metastore [svc: Thrift API] : create_table(sales) | Spark registers the table name, columns, format and S3 path.
+  Hive Metastore -> Metastore DB [db: PostgreSQL] : store metadata | HMS saves the definition in its relational database.
+  Trino [svc] -> Hive Metastore : get_table(sales) | Another engine looks up the same table by name.
+  Hive Metastore -> Trino : schema + location | HMS returns the columns and the S3 location.
+  Trino -> Data lake [lake: Parquet on S3] : read files | Trino reads the data files directly; HMS is not on the data path.
+ref: docs | Hive Metastore (AdminManual) | Apache Hive documentation | https://cwiki.apache.org/confluence/display/Hive/AdminManual+Metastore+Administration
+
+== Partition pruning through metastore lookups
+kind: index-table
+when: A table has thousands of date partitions, and a query for one day must not scan or list all of them.
+how: A partitioned Hive table stores its data in folders such as dt=2026-10-27/hour=05. HMS records each partition and its location. The planner of Hive, Spark or Trino sends the filter (dt = a date) to HMS, using a call like get_partitions_by_filter.
+HMS answers with only the matching partitions. The engine then lists or reads those folders only. Without this, the engine would have to list all folders in object storage, which is slow and costly.
+There is a cost. A table with millions of partitions makes HMS and its database slow, and a wide filter returns a huge list. Keep partitions coarse, for example by day, and use partition projection or an open table format such as Iceberg to avoid very large partition lists.
+used: Hive and Spark planners on HMS-backed tables; AWS Athena offers partition projection as a way to avoid metastore calls.
+avoid: When data is partitioned by a high-cardinality column; this creates too many small partitions. Use bucketing or an Iceberg hidden partition.
+flow:
+  Query engine [svc: Trino] -> Hive Metastore [svc] : partitions: dt = 27 Oct | The planner asks for only the partitions that match the filter.
+  Hive Metastore -> Metastore DB [db: partition table] : indexed lookup | HMS looks up matching rows by key in its database.
+  Hive Metastore -> Query engine : 24 hourly partitions | HMS returns 24 locations out of 20,000.
+  Query engine -> Data lake [lake: S3 folders] : read 24 folders | The engine reads only those folders.
+  Query engine -x> Data lake : skip 19,976 folders | All other partitions are pruned and never listed.
+ref: docs | Hive Metastore (AdminManual) | Apache Hive documentation | https://cwiki.apache.org/confluence/display/Hive/AdminManual+Metastore+Administration
+
+== Scaled metastore service with Iceberg commit pointer
+kind: horizontal-scale, open-table-format
+when: The catalog must stay up for the whole data platform and also serve as the atomic commit point for Iceberg tables.
+how: HMS servers are stateless. Run several of them behind a load balancer, and give them one shared highly available database, such as an RDS Multi-AZ instance. Add a connection pool and watch database load.
+Iceberg's HiveCatalog stores one pointer per table: the location of the current metadata file. A writer creates new metadata and data files, then asks HMS to change the pointer from the old metadata file to the new one. HMS holds a table lock during the swap, so only one writer wins at a time.
+Readers read the pointer and then the metadata files in object storage. HMS handles a few small calls per commit, so it is not on the data path. Keep an eye on lock timeouts when many writers commit to the same table.
+used: Iceberg's Hive catalog is documented for use with HMS; many on-premises lakehouses run it this way.
+avoid: When commit rates per table are very high, or when you want multi-table commits and credential vending; use a REST catalog.
+flow:
+  Spark writer [svc] -> Data lake [lake: S3] : write data + metadata v8 | The writer saves new data files and a new metadata file.
+  Spark writer -> Load balancer [svc] : commit: v7 to v8 | The writer asks to change the table pointer.
+  Load balancer -> Hive Metastore [svc: 1 of 3 instances] : route | Any HMS instance can serve the request.
+  Hive Metastore -> Metastore DB [db: Multi-AZ] : lock, swap pointer | HMS locks the table row and updates the pointer to v8.
+  Other writer [svc] -x> Hive Metastore : expected v7, found v8 | A second writer used old metadata, so its commit is refused and retried.
+ref: docs | Iceberg Hive catalog | Apache Iceberg documentation | https://iceberg.apache.org/docs/latest/hive/
+
+@@ hudi
+== Merge-on-read upserts for CDC data
+kind: open-table-format, lsm-compaction, cdc
+when: A lake table must receive frequent updates and deletes from a database, and reads can accept a small delay or a merge cost.
+how: Hudi tables are split into file groups, found through a record key and an index. In merge-on-read (MOR) tables, an incoming update goes to a small log file next to the base Parquet file of its file group. This is a cheap append, so write latency stays low.
+A snapshot query merges base and log files at read time, so it sees the newest data. A read-optimized query reads only base files, so it is faster but shows older data. Compaction runs later, and merges the log files into a new base file.
+Compaction can run inline, or asynchronously as a separate job so ingest does not stall. The table keeps a timeline of commits, compactions and cleans in the .hoodie folder. The price is operational: you tune compaction and cleaning.
+used: Hudi was created at Uber for updating trip data in its lake; also used with Spark and Flink pipelines for CDC.
+avoid: When data is append-only; plain Parquet with Iceberg or Delta is simpler. When reads must be fastest, use copy-on-write.
+flow:
+  CDC stream [log] -> Hudi writer [svc: Spark or Flink] : upserts and deletes | The writer receives changed rows with record keys.
+  Hudi writer -> Index [store: record key to file group] : find file group | The index tells which file group holds each key.
+  Hudi writer -> Log file [lake: row log] : append updates | Updates are appended to a log file of that group.
+  Compactor [svc: async job] -> Base file [lake: Parquet] : merge log into base | Later, a separate job merges logs into a new base file.
+  BI engine [client] -> Base file : snapshot query | A snapshot query merges base and log, and sees the newest data.
+ref: docs | Hudi table types | Apache Hudi documentation | https://hudi.apache.org/docs/table_types
+
+== Incremental queries to feed downstream tables
+kind: materialized-view, etl-elt
+when: A downstream table must be built from only the records that changed since its last run, with no full table scan.
+how: Every Hudi commit has an instant time on the timeline, and each record stores the commit time that wrote it. An incremental query takes a begin instant and returns only the records that changed after it.
+A downstream ETL job reads from its last saved instant to the latest, transforms the rows, and writes them to its own table. Then it saves the new instant. A daily job over a 5 TB table that changes 2% per day reads about 100 GB, not 5 TB.
+Deletes and updates both flow through, so the second table stays in step. Keep the cleaner policy in mind: if old file versions are cleaned before the job runs, the incremental read fails and you need a full read.
+used: Hudi documents incremental pulls for chained ETL; the model matches Uber's use of incremental processing.
+avoid: When the downstream needs to read changes from many tables at once with strict joins in time; use streaming with a log such as Kafka.
+flow:
+  Orders Hudi table [lake: Hudi] -> Timeline [log: .hoodie commits] : commit 20261027103000 | Each write adds an instant to the timeline.
+  Report job [svc: Spark] -> Timeline : changes since last instant | The job asks for the instants after its last saved one.
+  Timeline -> Report job : changed records only | Hudi returns the records written after that instant, not the whole table.
+  Report job -> Daily report [lake: Hudi] : upsert result | The job transforms and upserts into the downstream table.
+  * Report job: saved instant ...103000 | The job saves the new instant for the next run.
+  Report job -x> Timeline : commit cleaned | If the old files were cleaned, the job must do a full read.
+ref: docs | Hudi querying data: incremental query | Apache Hudi documentation | https://hudi.apache.org/docs/sql_queries
+
+== Streaming ingestion with checkpoints in commits
+kind: checkpoint-restart, etl-elt
+when: You want a ready-made job that loads Kafka or file data into a Hudi table continuously, with restart safety.
+how: HoodieStreamer (formerly DeltaStreamer) is a Spark application shipped with Hudi. It reads from a source such as Kafka, JSON files in S3 or a database, applies an optional SQL or Java transform and writes to the Hudi table.
+In each round it reads a batch from the last checkpoint, for example Kafka offsets 1,000 to 5,000. It writes the batch as one Hudi commit and puts the new checkpoint in the commit metadata. Data and checkpoint are saved together, so a crash cannot make them disagree.
+On restart the job reads the checkpoint from the last commit and continues. This gives exactly-once results for upserts with a record key. Run it in continuous mode, with async compaction and clustering in the same job.
+used: Hudi users run HoodieStreamer for Kafka to lake ingestion, as shown in the Hudi documentation.
+avoid: When you already run Flink or Spark Streaming with your own sink logic; use their Hudi writers directly.
+flow:
+  Kafka topic [log] -> HoodieStreamer [svc: Spark continuous] : read from checkpoint | The job reads the next range of offsets after its checkpoint.
+  HoodieStreamer -> Hudi table [lake: Hudi] : commit with checkpoint | After a transform and dedupe by key, one commit holds both the data and the new offsets.
+  HoodieStreamer -x> Hudi table : crash before commit | The job stops, and the incomplete commit is rolled back.
+  * HoodieStreamer: restarted | On restart the job reads the checkpoint from the last good commit.
+  Kafka topic -> HoodieStreamer : replay from offset 5,000 | The same batch is read again, so no data is lost or doubled.
+ref: docs | HoodieStreamer | Apache Hudi documentation | https://hudi.apache.org/docs/hoodie_streaming_ingestion
+
+@@ iceberg
+== Snapshot commits with an atomic catalog swap
+kind: open-table-format, copy-on-write
+when: Many writers and readers use the same table on object storage, and each reader needs a consistent view.
+how: An Iceberg table is a tree. The catalog holds a pointer to the current metadata file. The metadata file lists snapshots. A snapshot points to a manifest list, which points to manifest files, which list the data files with column statistics.
+A writer never changes files in place. It writes new data files, new manifests and a new metadata file. Then it asks the catalog to swap the pointer from the old metadata file to the new one, in one atomic step. If another writer already changed the pointer, the swap fails, and the writer rebuilds its commit on top of the new snapshot and retries.
+Readers use the snapshot that was current when their query started, so they never see a half-written change. Old snapshots remain until you expire them, which gives time travel and rollback.
+used: Netflix created Iceberg; it is used with Spark, Flink, Trino and Snowflake, and supported by AWS, Google and Databricks.
+avoid: For many tiny commits per second to one table; each commit writes metadata. Batch the writes, or use a database.
+flow:
+  Writer A [svc: Spark] -> Object store [lake: data + metadata] : write data + manifests | The writer saves new files; nothing existing is changed.
+  Writer A -> Catalog [svc: pointer v12] : swap v12 to v13 | The writer asks to move the table pointer to the new metadata.
+  Writer B [svc: Flink] -x> Catalog : swap v12 to v13 refused | Writer B started from v12 too, and lost the race.
+  Writer B -> Object store : rebase and write v14 | Writer B rebuilds its change on v13 and tries again.
+  Reader [client: Trino] -> Catalog : get current metadata | A reader finds the current pointer.
+  Reader -> Object store : read snapshot files | The reader scans files of one snapshot only.
+ref: spec | Iceberg table spec | Apache Iceberg | https://iceberg.apache.org/spec/
+
+== Multi-engine lakehouse on a REST catalog
+kind: control-data-plane, open-table-format
+when: Several engines and teams must share governed tables on object storage without being tied to one vendor.
+how: The Iceberg REST catalog is a standard HTTP API for table operations: list, create, load, commit. A catalog service such as Polaris, Nessie or Unity Catalog implements it. Engines such as Spark, Trino and Flink use one client protocol.
+The catalog is the control plane. It stores the table pointers, checks who may read or write, and can hand out short-lived storage credentials for a table (credential vending). The engines are the data plane: they read and write files in object storage on their own.
+This removes the need for each engine to hold broad bucket keys. Governance is in one place, and a new engine only needs the catalog URL. The catalog becomes a critical service, so run it with high availability.
+used: Apache Polaris, Project Nessie and Unity Catalog implement the REST API; cloud services such as AWS Glue and Snowflake Open Catalog also expose it.
+avoid: For one engine and one team; a simple catalog such as Hive Metastore or Glue may be enough.
+flow:
+  Spark [svc: ETL] -> REST catalog [svc: Polaris or Nessie] : loadTable(sales) | The engine asks the catalog for the table and for access.
+  REST catalog -> Spark : metadata + temp keys | The catalog returns the metadata location and short-lived credentials.
+  Spark -> Object store [lake: Parquet + metadata] : write files | Spark writes data files with the temporary credentials.
+  Spark -> REST catalog : commit table update | The catalog applies the commit atomically and checks permissions.
+  Trino [svc: BI] -> REST catalog : loadTable(sales) | Another engine uses the same API.
+  Trino -> Object store : read files | Trino reads the same files, so no copy is needed.
+ref: spec | Iceberg REST catalog API | Apache Iceberg | https://iceberg.apache.org/rest-catalog-spec/
+
+== Write-audit-publish with branches
+kind: copy-on-write, blue-green
+when: Bad data must never reach consumers, so new data is checked before readers can see it.
+how: Iceberg supports branches and tags, which are named references to snapshots. The main branch is what readers query. An ingest job writes new data to an audit branch, not to main. Main is not changed.
+A check job queries the audit branch. It tests row counts, nulls, duplicates and ranges. If the checks pass, the job publishes: it moves main to the audit snapshot with a fast-forward, which is a metadata change only. No data is copied, and readers see the new data at once.
+If checks fail, you drop the branch. Readers never saw the bad rows. Tags, for example month-end-2026-09, keep a named snapshot for audit and reports. Branches add metadata, so expire old ones.
+used: The Iceberg documentation describes branching and tagging for audit workflows; Spark supports writing to a branch.
+avoid: When data must be visible within seconds and the checks are slow; use streaming validation before the write.
+flow:
+  Ingest job [svc: Spark] -> audit branch [store: branch of orders] : write new files | New data goes to the audit branch; main stays unchanged.
+  Audit job [svc: checks] -> audit branch : count and null tests | The job runs quality checks on the branch.
+  Audit job -> main branch [store: branch of orders] : fast-forward main | The checks pass, so main moves to the audit snapshot.
+  Dashboard [client] -> main branch : query | Readers see the new data after the publish.
+  Audit job -x> audit branch : checks fail, drop branch | If checks fail, the branch is dropped and main never changed.
+ref: docs | Iceberg branching and tagging | Apache Iceberg documentation | https://iceberg.apache.org/docs/latest/branching/
+
+@@ orc
+== Hive ACID tables with base and delta files
+kind: lsm-compaction, copy-on-write
+when: A Hive warehouse needs row-level updates and deletes on files in HDFS or object storage, with consistent reads.
+how: A transactional Hive table stores ORC files. A new insert, update or delete does not rewrite files. It writes a delta directory with new ORC rows, and a delete_delta directory with the row ids of deleted rows. Each delta belongs to a transaction id.
+A reader opens the base files and the deltas that are valid for its snapshot, and merges them, skipping deleted rows. The cost of reads grows with the number of deltas.
+The compactor runs in the background. Minor compaction merges many small deltas into one. Major compaction rewrites base plus deltas into a new base. Old files are removed after no reader needs them. This is the same idea as an LSM tree, with ORC files as the sorted runs.
+used: Apache Hive transactional tables, used for warehouses and for streaming ingest into Hive; the design is documented by the Hive project.
+avoid: When the platform is Spark and Iceberg or Delta already exist; those formats are better supported there.
+flow:
+  Update job [svc: Hive] -> Delta dir [lake: delta_0005 ORC] : insert new row versions | The update writes only new rows in a delta directory.
+  Update job -> Delete delta [lake: delete_delta_0005] : ids of replaced rows | Row ids of old versions go to a delete delta.
+  Reader [client: Hive query] -> Base files [lake: base_0003 ORC] : read base | A reader opens the base files first.
+  Reader -> Delta dir : merge deltas for snapshot | It merges the valid deltas and skips deleted rows.
+  Compactor [svc: Metastore thread] -> Base files : major compaction | A background job rewrites base and deltas into base_0005.
+  * Delta dir: cleaned | Old deltas are removed after no reader needs them.
+ref: docs | Hive transactions | Apache Hive documentation | https://cwiki.apache.org/confluence/display/Hive/Hive+Transactions
+
+== Stripe and index pruning for selective scans
+kind: none
+when: Queries filter on a few columns of very large tables, and most of the data in the files is not needed.
+how: An ORC file is split into stripes, with a default size of about 64 MB. Each stripe stores columns separately, so a query reads only the columns it uses. The file footer has statistics (min, max, count, nulls) for each column, for the whole file and for each stripe.
+Inside a stripe, a light index holds the same statistics for each group of 10,000 rows. You can also add Bloom filters on chosen columns. The reader tests the filter, for example user_id = 42, against these statistics and skips the stripes and row groups that cannot match.
+If the data is sorted or clustered on the filter column before it is written, the min and max ranges are narrow, and skipping is very effective. With random order, nothing can be skipped.
+used: Hive, Trino and Spark push filters to ORC readers; ORC was created by Hortonworks and Facebook for Hive.
+avoid: When the filter column is random in every stripe, or when queries read most rows; the index gives no gain.
+flow:
+  Query engine [svc: Trino] -> ORC footer [store: file statistics] : read footer | The engine reads the footer first, which is small.
+  ORC footer -> Query engine : stripe min/max stats | Statistics show which stripes may contain date = 2026-10-27.
+  Query engine -x> Stripe 1 [lake: no match] : skip | Stripe 1 cannot match, so it is not read.
+  Query engine -> Stripe 3 [lake: possible match] : read 2 columns | Only the needed columns of stripe 3 are read.
+  Stripe 3 -> Query engine : row-group index | The index and Bloom filter skip row groups of 10,000 rows.
+ref: spec | ORC specification v1 | Apache ORC | https://orc.apache.org/specification/ORCv1/
+
+== Parallel scan by stripe near the data
+kind: scatter-gather, data-locality
+when: A large table in HDFS or object storage must be scanned fast by many workers at once.
+how: The engine plans splits from the files. An ORC file is naturally split at stripe boundaries, so each worker gets one or more whole stripes. Workers need no coordination while scanning.
+On HDFS, the scheduler (Tez or Spark) tries to place each task on a node that holds the block, so data is read from local disk. On S3 there is no locality, but many parallel range reads give high throughput.
+Each worker applies filters and partial aggregates to its stripes and sends small results to a final step that merges them. A 100 GB file with 64 MB stripes gives about 1,600 independent tasks. Very small stripes add overhead, so write files with proper stripe size.
+used: Hive on Tez, Spark and Trino scan ORC in this way; ORC is a common format in Hive-based warehouses.
+avoid: When the files are tiny (many files under 10 MB); compact them first, or the planning cost dominates.
+flow:
+  Coordinator [svc: query planner] -> Worker 1 [svc], Worker 2 [svc], Worker 3 [svc] : assign stripe ranges | The planner gives each worker a range of stripes.
+  Worker 1, Worker 2, Worker 3 -> ORC files [lake: HDFS or S3] : read stripes | Each worker reads its own stripes, with no coordination.
+  Worker 1, Worker 2, Worker 3 -> Coordinator : partial aggregates | Each worker sends a small partial result, not rows.
+  * Coordinator: merged result | The coordinator combines partial results into the final answer.
+ref: docs | ORC specification: stripes | Apache ORC | https://orc.apache.org/specification/ORCv1/
+
+@@ parquet
+== Column projection and predicate pushdown
+kind: none
+when: Analytic queries touch a few columns of wide tables, and reading whole rows would waste I/O.
+how: A Parquet file holds row groups, usually 128 MB to 1 GB. Inside a row group each column is stored in its own column chunk, split into pages with compression and encoding such as dictionary encoding. The footer at the end of the file lists all chunks with min and max statistics.
+A reader fetches the footer, then reads only the needed column chunks. This is projection: a query on 3 of 100 columns reads about 3% of the bytes. Then it compares the filter, for example country = 'DE', against the min and max of each row group, and skips groups that cannot match. This is predicate pushdown.
+Compression works well because values of one column are alike, so files are often 3 to 10 times smaller than CSV. The cost is slow single-row lookups and no cheap in-place updates.
+used: Spark, Trino, DuckDB, Athena, BigQuery and Snowflake read Parquet; it is the default file format of most data lakes.
+avoid: For row-by-row transactional access or small messages; use a row format such as Avro or a database.
+flow:
+  Query engine [svc: Athena] -> Parquet file [lake: S3 object] : read footer | The engine fetches the footer with the schema and statistics.
+  Parquet file -> Query engine : row group stats | Min and max values per row group are returned.
+  Query engine -x> Parquet file : skip 6 of 8 row groups | Groups with no matching min/max are not read.
+  Query engine -> Parquet file : range read: 3 columns | Only the three needed column chunks of two groups are read.
+  Query engine -> Analyst [user] : result | The query reads a small part of the file's bytes.
+ref: docs | Parquet file format | Apache Parquet documentation | https://parquet.apache.org/docs/file-format/
+
+== Partitioned lake layout for event logs
+kind: etl-elt, sharding
+when: Billions of events per day, such as ad impressions, are stored cheaply and queried mostly by date or by tenant.
+how: A job writes events as Parquet files under a path such as impressions/dt=2026-10-27/hour=14/. A query with a date filter reads only those folders. The engine finds the partitions from folder names or from a catalog.
+Target file sizes of 128 MB to 1 GB. Many tiny files make queries slow, since each file costs a request and a footer read. A compaction job merges small files after each hour.
+Choose partition columns that queries really filter and that have low cardinality. Date works well. A user id would create millions of folders. Sort inside the files by a second column such as campaign id, so row-group statistics skip well.
+used: Ad-tech and web analytics lakes on S3 with Athena, Trino or Spark; the Hive partition layout is a de facto standard.
+avoid: When many writers update the same data or you need row updates; use Iceberg, Delta or Hudi on top of Parquet.
+flow:
+  Stream sink [svc: Flink or Firehose] -> S3 hour folder [lake: dt=2026-10-27/hour=14] : write Parquet files | The sink writes one folder per hour.
+  Compactor [svc: Spark job] -> S3 hour folder : merge small files | After the hour, a job merges 500 small files into 8 larger ones.
+  Analyst [user] -> Query engine [svc: Athena] : WHERE dt = 2026-10-27 | The analyst filters on the partition column.
+  Query engine -> S3 hour folder : read 24 folders | Only the folders of that date are read.
+  Query engine -x> S3 old folders [lake: 400 days] : pruned | The other days are never listed or read.
+ref: docs | Athena: partitioning data | AWS documentation | https://docs.aws.amazon.com/athena/latest/ug/partitions.html
+
+== Data files under an open table format
+kind: open-table-format, lsm-compaction
+when: You need transactions, schema change and time travel on the lake, and want to keep Parquet as the storage format.
+how: Iceberg, Delta and Hudi do not replace Parquet. They keep Parquet files as the data and add a metadata layer that lists which files belong to the table version. A commit adds a new Parquet file and updates the file list.
+Because Parquet files are immutable, an update writes a new file and marks the old one as removed. Small commits create many small files. A compaction job rewrites them into files near the target size, for example 256 MB, and commits the swap.
+The metadata keeps file-level statistics, so engines skip files before they read any Parquet footer. Old files are deleted only after they are out of the time-travel window. Parquet gives efficient scans; the table format gives safe changes.
+used: Iceberg, Delta Lake and Hudi all use Parquet as their main data file format; Spark, Trino and Flink compact these tables.
+avoid: For write-once logs with no updates or readers who need transactions; plain partitioned Parquet is simpler.
+flow:
+  Streaming writer [svc: Flink] -> Table metadata [log: file list] : commit +file-0001.parquet | Each small commit adds a Parquet file to the list.
+  Streaming writer -> Table metadata : commit +file-0002.parquet | Hundreds of commits make hundreds of small files.
+  Compaction job [svc: Spark] -> Lake [lake: Parquet files] : rewrite 200 files into 2 | The job merges small files into larger ones.
+  Compaction job -> Table metadata : commit swap | One commit removes the old files and adds the new ones.
+  Query engine [client] -> Table metadata : plan with file statistics | The engine prunes files using the statistics in metadata.
+ref: docs | Iceberg maintenance: compaction | Apache Iceberg documentation | https://iceberg.apache.org/docs/latest/maintenance/

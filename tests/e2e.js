@@ -582,6 +582,30 @@ const shots = process.argv[3] || null;
   await vp.fill('[data-alin="key"]', '42'); await vp.press('[data-alin="key"]', 'Enter');
   ok(/^insert 42: start at the root/.test(await vp.textContent('#av-msg')) && (await vp.getAttribute('[data-aact="play"]', 'aria-pressed')) === 'false', 'reduced motion: Insert (Enter) jumps to the new key without playing');
   await vctx.close();
+  // architecture patterns: a read section with one tab and one animated diagram per pattern, and the catalog view
+  await page.goto(base + '#pattern/kafka/2'); await page.waitForSelector('#reader #rs-apat .ap-panel:not([hidden]) svg');
+  const npat = await page.evaluate(() => window.__dts.DATA.patterns.filter(x => x.concept === 'kafka').length);
+  ok(npat >= 3 && await page.locator('#rs-apat .ap-tab').count() === npat && await page.locator('#rs-apat .ap-panel').count() === npat, 'kafka read: one tab and one panel per pattern (' + npat + ')');
+  ok(await page.locator('#rs-apat .ap-panel:not([hidden])').count() === 1 && (await page.getAttribute('#rs-apat .ap-tab[data-aptab="1"]', 'aria-selected')) === 'true', 'deep link #pattern/kafka/2 opens the second pattern');
+  ok(await page.locator('#reader .toc a[data-jump="rs-apat"]').count() === 1, 'contents list has "Architecture patterns"');
+  ok(await page.locator('#rs-apat .ap-panel:not([hidden]) .ap-scene .scene').count() === 1 && await page.locator('#rs-apat .ap-scene .scene').count() === 1, 'only the open pattern mounts a scene player');
+  await page.focus('#rs-apat .ap-tab[data-aptab="1"]'); await page.keyboard.press('ArrowRight'); await page.waitForTimeout(150);
+  ok((await page.getAttribute('#rs-apat .ap-tab[data-aptab="2"]', 'aria-selected')) === 'true' && /#pattern\/kafka\/3$/.test(page.url()), 'arrow keys move between pattern tabs and update the address');
+  await page.click('#rs-apat .ap-panel:not([hidden]) .ap-scene [data-sc="next"]'); await page.waitForTimeout(100);
+  ok(/step 2 of/.test(await page.textContent('#rs-apat .ap-panel:not([hidden]) .sc-k')), 'pattern diagram steps with Next');
+  const kind = await page.getAttribute('#rs-apat .ap-panel:not([hidden]) .ap-kind', 'data-pkind');
+  await page.click('#rs-apat .ap-panel:not([hidden]) .ap-kind'); await page.waitForSelector('#v-architecture .ap-cat.on');
+  ok(await page.locator('#reader').isHidden() && (await page.getAttribute('#v-architecture .ap-cat.on', 'id')) === 'apc-' + kind && page.url().endsWith('#architecture/' + kind), 'pattern chip opens the catalog at ' + kind);
+  const ncat = await page.evaluate(() => window.__dts.DATA.pcatalog.length);
+  ok(await page.locator('#v-architecture .ap-cat').count() === ncat && await page.locator('.tabs [data-view="architecture"][aria-pressed="true"]').count() === 1, 'Patterns view lists the whole catalog (' + ncat + ')');
+  await page.click('#v-architecture [data-pfam="Resilience & reliability"]');
+  const fams = await page.$$eval('#v-architecture .ysec', h => h.map(x => x.textContent));
+  ok(fams.length === 1 && /resilience/i.test(fams[0]), 'family filter shows one family');
+  await page.click('#v-architecture [data-pfam=""]');
+  await page.click('#apc-' + kind + ' [data-patopen^="kafka/"]'); await page.waitForSelector('#reader #rs-apat .ap-panel:not([hidden]) svg');
+  ok(/#pattern\/kafka\/\d$/.test(page.url()), 'a concept in the catalog opens its read at that pattern');
+  await page.click('#reader [data-rclose]');
+  if (shots) await page.screenshot({ path: shots + '/9-patterns.png' });
   // mobile
   await page.setViewportSize({ width: 390, height: 844 }); await page.goto(base + '#explore'); await page.waitForSelector('.col .item');
   const sw = await page.evaluate(() => document.documentElement.scrollWidth);
@@ -589,7 +613,7 @@ const shots = process.argv[3] || null;
   if (shots) await page.screenshot({ path: shots + '/5-mobile.png' });
   const sceneHashes = (await page.evaluate(() => (window.__dts.SCENES || []).some(s => s.id === 'sample-tcp-handshake'))) ? ['#animations', '#scene/sample-tcp-handshake', '#scene/sample-lru-eviction'] : [];
   for (const h of ['#design', '#algo/merge', '#algo/dijkstra', '#algo/btree', '#algo/raft', '#practice/list', '#design/url-shortener',
-                   '#algo/monostack', '#algo/window2', '#algo/backtrack', '#algo/treedfs', '#algo/dp1d', '#algo/prefix', '#algo/segtree', '#algo/fastslow', '#algo/bsanswer', '#algo/mst', '#algo/dp2d', '#algo/sweep', '#algo/kmp', '#algo/topk', '#algo/sieve', '#patterns', '#practice/two-sum'].concat(sceneHashes)) {
+                   '#algo/monostack', '#algo/window2', '#algo/backtrack', '#algo/treedfs', '#algo/dp1d', '#algo/prefix', '#algo/segtree', '#algo/fastslow', '#algo/bsanswer', '#algo/mst', '#algo/dp2d', '#algo/sweep', '#algo/kmp', '#algo/topk', '#algo/sieve', '#patterns', '#practice/two-sum', '#architecture', '#pattern/kafka/1'].concat(sceneHashes)) {
     await page.goto(base + h); await page.waitForTimeout(350);
     const w = await page.evaluate(() => Math.max(document.documentElement.scrollWidth, document.getElementById('reader').hidden ? 0 : document.getElementById('reader').scrollWidth));
     ok(w <= 392, 'no horizontal page scroll on phone width at ' + h + ' (' + w + ')');

@@ -1,0 +1,837 @@
+@@ milvus
+== RAG retrieval with metadata filters
+kind: rag
+when: An LLM answer must be grounded in private documents, and each user may see only some of them.
+how: Offline, a loader splits documents into chunks of about 500 tokens, calls an embedding model, and inserts each chunk into a Milvus collection. A row holds the vector, the text, and scalar fields such as tenant_id and doc_type.
+At question time the app embeds the question and asks Milvus for the top 20 vectors with a filter such as tenant_id == "acme". The filter runs inside the index search, so results are already limited to allowed rows. A reranker can then cut 20 chunks to 5, and these go into the LLM prompt.
+Filtering inside the search matters. If you filter after taking the top 20, a strict filter can leave you with zero results.
+used: Common in enterprise chat and document search products; Milvus is a vector store option in LangChain and LlamaIndex.
+avoid: When the corpus is small (under about 100,000 chunks) and you already run Postgres; pgvector is simpler. Also when exact keyword match matters most; use a search engine, or hybrid search.
+flow:
+  Loader [svc: chunk + embed] -> Milvus [db: collection docs] : insert vector + text | The loader inserts each chunk with its vector and its tenant_id.
+  User [user] -> Chat app [svc] : question | A user asks a question in the chat app.
+  Chat app -> Embedding model [model] : embed question | The app turns the question into a vector with the same model that was used for the documents.
+  Chat app -> Milvus : top 20, filter tenant | Milvus searches its index and applies the tenant filter in the same pass.
+  Milvus -> Chat app : 20 chunks | Milvus returns the closest chunks with scores.
+  Chat app -> LLM [model] : question + 5 chunks | The app keeps the best chunks and sends them to the LLM, which writes a grounded answer.
+ref: docs | Milvus documentation | Zilliz and the Milvus community | https://milvus.io/docs
+
+== Candidate retrieval for recommendations
+kind: two-tower-retrieval, online-offline
+when: A catalogue has millions of items, and a ranking model can score only a few hundred of them per request.
+how: Offline, a two-tower model is trained on clicks. The item tower creates one embedding per item, and these are loaded into Milvus with an ANN index such as HNSW. The user tower is served online and makes a user vector from recent behaviour.
+At request time the service computes the user vector and asks Milvus for the 300 nearest items, with a filter such as in_stock == true and region == "IN". A ranking model then scores these 300 with richer features, and the top 20 are shown.
+New items are inserted continuously and are searchable within seconds. The index must be rebuilt or compacted in the background as data grows. Recall is approximate, so measure it against exact search on a sample.
+used: Common in e-commerce and video recommender stacks; the retrieve-then-rank design is described in YouTube's 2016 recommender paper.
+avoid: When the candidate set can be a simple rule (top sellers, same category); a key-value lookup is cheaper.
+flow:
+  Training job [svc: two-tower] -> Milvus [db: item vectors] : item embeddings | The job exports one vector per item, and a bulk import loads them into a collection.
+  App [client] -> Recommender [svc] : get feed(user 7) | The app asks for a feed for user 7.
+  Recommender -> User tower [model: online] : recent clicks | The user tower turns recent clicks into one vector.
+  Recommender -> Milvus : top 300, in_stock | Milvus returns the 300 nearest items that pass the filter.
+  Recommender -> Ranker [model: GBDT or DNN] : 300 candidates | The ranker scores the 300 candidates with many features.
+  Ranker -> App : top 20 | The best 20 items are returned to the app.
+ref: paper | Deep Neural Networks for YouTube Recommendations | Covington, Adams & Sargin, RecSys 2016 |
+
+== Disaggregated log, object store and query nodes
+kind: wal, tiered-storage, control-data-plane
+when: Writes and searches must scale on their own, and the data is far bigger than the RAM of one machine.
+how: Milvus 2.x splits its roles. A proxy receives requests. Writes go first to a log broker (Pulsar or Kafka, or the built-in Woodpecker in newer releases), which acts as the write-ahead log. Data nodes read this log and flush it to object storage such as S3 as immutable segments.
+Index nodes build ANN indexes on sealed segments and store them in object storage too. Query nodes load segments from object storage into memory (or use disk indexes such as DiskANN) and also read the log tail, so fresh rows are searchable before they are indexed. A coordinator tracks which node holds which segment, and etcd holds the metadata.
+Because the state lives in the log and in object storage, query nodes are almost stateless. You add query nodes to serve more traffic and data nodes to ingest faster, independently.
+used: Milvus distributed mode on Kubernetes, including the managed Zilliz Cloud service.
+avoid: For a small corpus on one machine; Milvus Lite or Standalone mode, or pgvector, has far fewer moving parts.
+flow:
+  Client [client] -> Proxy [svc] : insert, search | Clients talk only to the proxy, which checks and routes each request.
+  Proxy -> Log broker [log: WAL] : append insert | Each insert is appended to the log first, so it is durable.
+  Log broker -> Data node [svc] : read log | Data nodes read the log and group rows into segments.
+  Data node -> Object store [lake: S3 segments] : flush sealed segment | A full segment is written to object storage as an immutable file.
+  Object store -> Query node [svc: in memory] : load segment + index | Query nodes load sealed segments and their indexes.
+  Log broker ~> Query node : tail of log | Query nodes also read the log tail, so new rows can be found before indexing.
+  Proxy -> Query node : search | Searches fan out to the query nodes that hold the segments, and the proxy merges results.
+ref: docs | Milvus architecture overview | Milvus documentation | https://milvus.io/docs/architecture_overview.md
+
+@@ mongodb
+== Replica set with automatic failover
+kind: leader-follower, leader-election, active-passive
+when: A document database must survive the loss of one machine without losing acknowledged writes or needing a manual step.
+how: A MongoDB replica set has an odd number of voting members, usually three, in different availability zones. One is the primary and takes all writes. It records each change in the oplog, and the secondaries copy and apply it.
+With write concern majority, the primary acknowledges a write only after most members have it. If the primary dies, the secondaries notice missed heartbeats (10 seconds by default) and hold an election using a Raft-style protocol. The new primary is usually ready in a few seconds, and the drivers find it by themselves and retry.
+Reads go to the primary by default. Reading from secondaries adds capacity but can return stale data.
+used: MongoDB Atlas clusters, which are replica sets by default; most self-managed production MongoDB.
+avoid: When a majority of members could be lost together (two members in one zone); place members across zones. Also avoid secondary reads for data that must be fresh.
+flow:
+  App [client: driver] -> Primary [db: term 1] : insert, w: majority | The driver sends the write to the primary and asks for majority acknowledgement.
+  Primary -> Secondary A [db], Secondary B [db] : oplog entries | The secondaries pull the oplog and apply the change in order.
+  Secondary A -> Primary : ack | Once one secondary confirms, 2 of 3 members have the write, and the primary replies to the app.
+  Primary -x> Secondary A : heartbeat lost | The primary crashes. The secondaries stop receiving its heartbeat.
+  * Secondary A: primary, term 2 | Secondary A wins the election, because it has the newest oplog and a majority vote.
+  App -> Secondary A : retry write | The driver discovers the new primary and retries the write once.
+ref: docs | Replication | MongoDB Manual | https://www.mongodb.com/docs/manual/replication/
+
+== Sharded cluster with a hashed shard key
+kind: sharding, consistent-hashing, scatter-gather
+when: One replica set cannot hold the data or take the write rate, and most queries include a known key.
+how: A sharded cluster has many shards, each one a replica set. The collection is split into chunks by shard key range. Application servers talk to mongos routers. Config servers keep the map from key ranges to shards.
+A router reads the shard key from the query. A query on one key goes to exactly one shard. A query without the key is sent to all shards and the router merges the answers, which is slow. A balancer moves chunks between shards to keep sizes even.
+Choosing the key is the main design decision. A key that always grows, such as a timestamp or an ObjectId, sends all inserts to one shard. A hashed key spreads writes evenly, but range queries then touch all shards.
+used: Large MongoDB deployments on Atlas and self-managed clusters, often sharded by tenant id or user id.
+avoid: When one replica set is enough; sharding adds routers, config servers and key-design risk. Scale up first.
+flow:
+  App [client] -> mongos [svc: router] : find user 42 | The app sends all queries to a mongos router.
+  mongos -> Config servers [db: chunk map] : which chunk? | The router uses its cached map of key ranges to shards, and refreshes it from the config servers.
+  mongos -> Shard 2 [db: replica set] : find user 42 | A query with the shard key goes to one shard only.
+  Shard 2 -> mongos : document | The shard returns the result.
+  mongos -> Shard 1 [db: replica set], Shard 2, Shard 3 [db: replica set] : find by email | A query without the shard key goes to every shard.
+  Shard 1 -> mongos : partial result | The router waits for all shards and merges their answers.
+ref: docs | Sharding | MongoDB Manual | https://www.mongodb.com/docs/manual/sharding/
+
+== Change streams to drive downstream services
+kind: cdc, event-driven, materialized-view
+when: Other systems (a search index, a cache, a notification service) must react to changes in MongoDB without polling.
+how: A change stream is a cursor over the oplog. An app opens it with watch() on a collection, and MongoDB sends an event for each insert, update or delete, in commit order. Each event carries a resume token.
+A small worker reads the stream, updates a search index or cache, and saves the latest resume token. After a crash it restarts the stream from the saved token, so no change is skipped. Delivery is at least once, so the target write must be idempotent, for example an upsert by document id.
+If the worker stays down longer than the oplog window, the token expires and a full resync is needed. Size the oplog for the longest outage you accept.
+used: Common for syncing MongoDB to Elasticsearch or OpenSearch and to Kafka; the MongoDB Kafka Connector uses change streams.
+avoid: When you need the full history for audit; keep an explicit events collection instead. The oplog is a window, not an archive.
+flow:
+  App [svc] -> MongoDB [db: orders] : update order 9 | The app updates an order in the normal way.
+  MongoDB -> Sync worker [svc: change stream] : change event + token | The change stream sends an update event with a resume token.
+  Sync worker -> Search index [store: OpenSearch] : upsert doc 9 | The worker upserts the document by id, so a replay is harmless.
+  Sync worker -> Token store [db: resume token] : save token | After each batch the worker saves the token.
+  Sync worker -x> MongoDB : crash | The worker crashes and stops reading.
+  * Sync worker: resumed from token | On restart the worker opens the stream with the saved token and continues without a gap.
+ref: docs | Change Streams | MongoDB Manual | https://www.mongodb.com/docs/manual/changeStreams/
+
+@@ mysql
+== Primary with read replicas
+kind: read-replicas, leader-follower
+when: Reads are much more frequent than writes, and one MySQL server can no longer serve all queries.
+how: One primary takes all writes and records them in the binary log. Each replica has an I/O thread that copies the binary log into a relay log, and an SQL thread that replays it. The replicas then serve read-only queries.
+An app or a proxy (ProxySQL, MySQL Router) sends writes to the primary and spreads reads over the replicas. Replication is asynchronous by default, so a replica can be seconds behind. A user who just wrote data and then reads it from a replica may not see it.
+To handle this, send reads to the primary for a short time after a write, or read from replicas only for data that can be stale. Semi-synchronous replication waits for one replica to receive each change, which reduces loss on failover.
+used: Very common in web backends; Meta, Booking.com and many others run large MySQL fleets with replicas.
+avoid: When the write rate itself is the limit; replicas do not help. Shard the data, or use a distributed SQL database.
+flow:
+  App [client] -> Proxy [svc: ProxySQL] : write, read | The app sends all SQL to a proxy that knows the roles.
+  Proxy -> Primary [db: binlog] : INSERT order | Writes go to the primary, which commits and writes the binary log.
+  Primary -> Replica 1 [db], Replica 2 [db] : binlog events | Each replica copies the binary log and replays it.
+  * Replica 2: lag 4 s | Replica 2 is busy and falls four seconds behind.
+  Proxy -> Replica 1 : SELECT products | Read-only queries are spread over replicas.
+  Proxy -x> Replica 2 : skipped, lag too high | The proxy stops sending reads to a replica that is too far behind.
+ref: docs | MySQL Replication | MySQL Reference Manual | https://dev.mysql.com/doc/refman/8.4/en/replication.html
+
+== Sharded MySQL with a routing layer
+kind: sharding, polyglot-persistence
+when: A single primary cannot hold the data or the write rate, but the team wants to keep MySQL and its tools.
+how: The data is split by a shard key such as user id across many MySQL primaries, each with its own replicas. A routing layer knows the map from key to shard. Vitess is the best-known open-source system for this: VTGate routes queries, and VTTablet runs beside each MySQL server.
+A query with the shard key goes to one shard. A query across shards is sent to all of them and merged. Transactions across shards are costly and weaker, so the design should keep related rows on the same shard.
+Resharding is the hard part. Vitess copies data to the new shards, keeps them in sync with the binary log, and then switches traffic, so the application keeps running.
+used: Vitess was built at YouTube and is used at Slack and GitHub; PlanetScale offers it as a service.
+avoid: When one big server with replicas is enough; sharding costs a lot in complexity. Or use a distributed SQL database (TiDB, Spanner) that shards for you.
+flow:
+  App [client] -> VTGate [svc: router] : SELECT user 77 | The app speaks the MySQL protocol to the router.
+  VTGate -> Topology [db: key map] : which shard? | The router checks the map from key range to shard.
+  VTGate -> Shard 2 [db: MySQL primary] : SELECT user 77 | One shard serves the query.
+  Shard 2 -> Shard 2 replicas [db: MySQL replicas] : binlog | Each shard has its own replicas for reads and failover.
+  VTGate -> Shard 1 [db: MySQL primary], Shard 2 : SELECT count(*) | A query without the key goes to all shards.
+  Shard 1 -> VTGate : partial counts | The router adds up the partial counts.
+ref: docs | Vitess documentation | The Vitess project | https://vitess.io/docs/
+
+== Binlog CDC into a warehouse or search index
+kind: cdc, outbox, etl-elt
+when: Analytics and search must follow an OLTP MySQL database, and heavy queries must stay off the primary.
+how: MySQL writes every committed change to the binary log in row format. A CDC tool such as Debezium acts like a replica: it connects, asks for the binary log from a saved position, and turns each row change into an event on Kafka.
+Consumers load the events into a warehouse (raw tables first, then cleaned tables), into Elasticsearch, or into a cache. An initial snapshot copies the existing rows, and the stream then continues from the log position taken at the snapshot, so there is no gap.
+Row format and a binary log retention of at least a few days are required. Events can be delivered twice after a restart, so loaders should upsert by primary key. Schema changes (ALTER TABLE) must be handled by the pipeline.
+used: Debezium with MySQL is a common source for Kafka pipelines; managed tools such as AWS DMS and Fivetran also read the binary log.
+avoid: When a nightly dump is fresh enough; use a replica and a batch export. Or when the load would slow the primary too much.
+flow:
+  App [svc] -> MySQL [db: binlog ROW] : INSERT, UPDATE | The application writes as usual; MySQL logs each row change.
+  MySQL -> Debezium [svc: Kafka Connect] : binlog stream | Debezium reads the binary log like a replica would.
+  Debezium -> Kafka [log: table topics] : row change events | One topic per table, with before and after values.
+  Kafka -> Warehouse loader [svc: upsert by key] : events | The loader merges changes into raw warehouse tables.
+  Warehouse loader -> Warehouse [lake: raw tables] : MERGE batch | Analysts query the warehouse, not the primary.
+  Kafka ~> Search indexer [svc] : events | A second consumer keeps a search index current.
+ref: docs | Debezium connector for MySQL | Debezium documentation | https://debezium.io/documentation/reference/stable/connectors/mysql.html
+
+@@ neo4j
+== Graph store beside the system of record
+kind: polyglot-persistence, cdc, materialized-view
+when: A relational database holds the facts, but questions about relationships (who is connected to whom, in how many hops) are too slow as SQL joins.
+how: The system of record stays in a relational or document database. A sync job streams changes into Neo4j, where entities become nodes and relationships become edges with properties. Neo4j stores edges as direct pointers, so following a relationship costs about the same however big the graph is.
+A query such as "friends of friends who bought this item" is written in Cypher and walks pointers from a start node. An equivalent SQL query needs a join per hop, and its cost grows quickly with depth.
+The graph is a derived view. If it is wrong or lost, you rebuild it from the source. Keep writes going to the system of record only, and treat Neo4j as read-optimised.
+used: Common for recommendation, fraud rings, network and IT impact analysis, and knowledge graphs; Neo4j Connector for Kafka is one way to sync.
+avoid: When most queries are simple lookups or aggregates over many rows; a relational or columnar database is faster for those.
+flow:
+  App [svc] -> Postgres [db: system of record] : write order | All writes go to the source database.
+  Postgres -> Sync job [svc: CDC] : change events | A CDC job reads the change log.
+  Sync job -> Neo4j [db: graph] : MERGE nodes, edges | The job upserts nodes and relationships by id.
+  Web app [client] -> Recommender [svc] : who to suggest? | A user opens a page that needs related items.
+  Recommender -> Neo4j : MATCH 2-hop path | A Cypher query walks two hops from the user node.
+  Neo4j -> Recommender : 10 related items | The answer comes back in milliseconds, without joins.
+ref: docs | Neo4j documentation | Neo4j | https://neo4j.com/docs/
+
+== Fraud ring detection with graph queries
+kind: identity-graph
+when: Fraud shows up as shared details (a device, phone number or address) among accounts that look unrelated.
+how: Accounts, devices, cards, phone numbers and addresses are nodes. An edge links an account to each detail it uses. A new application is written to the graph, and a query looks at the connected component around it.
+For example: find accounts within 3 hops that share a device with a known fraud account. A tight cluster of new accounts around one device is a strong signal. The score from the query goes to a decision service next to other features.
+Online checks should be short, with depth limits and indexes on the start node, or a dense node (a shared public Wi-Fi address) can blow up the query. Heavy work, such as community detection, runs offline with Graph Data Science and writes scores back as node properties.
+used: Common in banks, payments and marketplaces for fraud and anti-money-laundering analysis.
+avoid: When rules on single events are enough; or when the data is not connected enough to repay the cost of a graph.
+flow:
+  Signup API [svc] -> Neo4j [db: identity graph] : add account + device | A new account and its device and phone become nodes and edges.
+  Signup API -> Risk query [svc: Cypher] : check account 501 | The API asks for a risk check.
+  Risk query -> Neo4j : 3-hop MATCH, LIMIT | The query finds accounts that share a device with known fraud.
+  Neo4j -> Risk query : 4 linked fraud accounts | Four linked accounts are found.
+  Risk query -> Decision service [svc: rules + model] : graph features | The graph result becomes a feature for the decision.
+  Decision service -x> Signup API : block signup | The signup is blocked or sent for review.
+  Neo4j ~> Offline job [svc: graph algorithms] : nightly export | A nightly job finds communities and writes risk scores back.
+ref: docs | Cypher manual | Neo4j | https://neo4j.com/docs/cypher-manual/current/
+
+== GraphRAG: vector search then graph expansion
+kind: rag
+when: An LLM question needs facts spread over linked entities, which plain chunk search misses.
+how: Documents are processed by an LLM, which extracts entities and relations. These are stored in Neo4j as nodes and edges, and each chunk keeps a link to the entities it mentions. Chunks and entities also get embeddings in Neo4j's vector index.
+At question time the app finds the closest chunks by vector search. It then follows edges from the entities in those chunks, to neighbours and to other chunks that mention them. This adds context that is related but not similar in wording.
+The retrieved text and relations go into the prompt. The cost is extraction: running an LLM over the whole corpus is slow and expensive, and the extracted graph must be checked for quality.
+used: Neo4j supports vector indexes and GraphRAG tooling; Microsoft's GraphRAG project uses a related idea.
+avoid: When questions are about one passage; plain RAG is cheaper. Or when the corpus changes every hour and re-extraction cannot keep up.
+flow:
+  Ingest job [svc: LLM extract] -> Neo4j [db: graph + vectors] : entities, edges, chunks | An LLM finds entities and relations, and the job stores them with chunk embeddings.
+  User [user] -> RAG app [svc] : multi-hop question | The user asks a question that needs several linked facts.
+  RAG app -> Neo4j : vector search top 5 | Neo4j finds the five closest chunks.
+  RAG app -> Neo4j : expand 2 hops | The app follows entity edges to related chunks and facts.
+  Neo4j -> RAG app : chunks + relations | The context is returned with its paths.
+  RAG app -> LLM [model] : question + context | The LLM answers using the linked context.
+ref: docs | Neo4j GraphRAG | Neo4j | https://neo4j.com/docs/neo4j-graphrag-python/current/
+
+@@ pgvector
+== Vectors in the same row as the business data
+kind: polyglot-persistence, rag
+when: A product already runs on Postgres and needs semantic search or RAG over data that is changed by normal transactions.
+how: Add a column of type vector(1536) to the table that holds the text. The app computes the embedding and writes it in the same INSERT or UPDATE as the other columns. The row and its vector commit together, so they cannot disagree.
+A query orders by distance, for example ORDER BY embedding <=> $1 LIMIT 10, and can include normal SQL: WHERE tenant_id = 7 AND status = 'published', or a join to a permissions table. An HNSW index makes the search approximate and fast. Without an index, Postgres scans every row and gives exact results.
+There is no second system to run, back up or keep in sync. The limit is scale: memory for large HNSW indexes, and a filter that removes most rows can make an approximate index return too few results.
+used: Common in startups and enterprise apps that add RAG to an existing Postgres; managed Postgres services such as Supabase, Neon and Amazon RDS offer the extension.
+avoid: When you have hundreds of millions of vectors or very high query rates; use a dedicated vector database (Milvus, Pinecone).
+flow:
+  App [svc] -> Embedding model [model] : embed text | The app turns a document into a vector.
+  App -> Postgres [db: vector column] : INSERT row + vector | The row, its metadata and its vector are written in one transaction.
+  Postgres -> HNSW index [store: ANN graph] : add vector | The index is updated as part of the same write.
+  User [user] -> App : question | A user asks a question.
+  App -> Postgres : ORDER BY <=> LIMIT 10 | The query filters by tenant and orders by vector distance.
+  Postgres -> App : 10 rows | The app gets rows with text and metadata, ready for the prompt.
+ref: docs | pgvector README | Andrew Kane and contributors | https://github.com/pgvector/pgvector
+
+== Hybrid search: full text and vectors in one query
+kind: rag, scatter-gather
+when: Users search with both exact words (product codes, names) and meaning, and one ranking method misses part of the answer.
+how: Keep a tsvector column with a GIN index for keyword search, and a vector column with an HNSW index for meaning. Run both searches in one SQL statement, each in its own common table expression, each returning the top 50 ids with a rank.
+Merge the two lists with reciprocal rank fusion: for each id, add 1 / (60 + rank) from each list, and sort by the sum. This needs no score tuning, since ranks from different scales are combined. An optional reranking model can then reorder the top 20.
+Keyword search finds the exact code that an embedding blurs. Vector search finds the page that uses different words for the same idea.
+used: Documented pattern for pgvector with Postgres full-text search; also common in Elasticsearch and OpenSearch hybrid search.
+avoid: When only one signal matters; a pure keyword or pure vector search is simpler to tune.
+flow:
+  User [user] -> Search API [svc] : query text | A user searches for "error E1042 timeout".
+  Search API -> Postgres [db: tsvector + vector] : one SQL statement | The API sends one statement with two sub-queries.
+  Postgres -> GIN index [store: keywords] : tsquery | The keyword part finds exact matches.
+  Postgres -> HNSW index [store: vectors] : nearest 50 | The vector part finds meaning matches.
+  Postgres -> Search API : fused top 20 | A fusion step adds 1/(60+rank) for each list and sorts.
+  Search API -> Reranker [model: cross-encoder] : 20 candidates | An optional model reorders the final list.
+  Reranker -> User : top 5 results | The user sees the best five.
+ref: docs | Hybrid search with pgvector | pgvector project | https://github.com/pgvector/pgvector#hybrid-search
+
+== Partitioned vectors with per-tenant filtering
+kind: sharding, index-table
+when: A multi-tenant app stores vectors for thousands of customers, and each query must see only one customer's data.
+how: Partition the table by tenant_id (list or hash partitioning), and build an HNSW index on each partition. A query with tenant_id = 7 touches only that partition and its small index, so search is fast and filter results are complete.
+Without partitioning, a global index plus a filter is a risk. The index returns its top candidates first, and the filter then removes rows. For a small tenant this can return fewer rows than asked for. Recent pgvector versions have iterative index scans that keep searching until enough rows pass the filter.
+Many tiny partitions have a cost: Postgres plans slower with thousands of partitions. Group small tenants in hash partitions, and give large tenants their own.
+used: A common design for SaaS RAG on Postgres; Row Level Security can add a second layer of isolation.
+avoid: When there are few tenants and each is large; separate tables or databases are simpler and isolate better.
+flow:
+  App [svc] -> Postgres [db: partitioned table] : INSERT tenant 7 | The row goes to the partition for tenant 7.
+  Postgres -> Partition t7 [store: rows + HNSW] : write + index | That partition has its own small index.
+  User [user] -> App : question for tenant 7 | A user from tenant 7 asks a question.
+  App -> Postgres : WHERE tenant_id = 7 | The query includes the tenant id.
+  Postgres -> Partition t7 : search index | The planner prunes all other partitions.
+  Partition t7 -> App : 10 nearest rows | The result is complete and only from tenant 7.
+ref: docs | pgvector filtering | pgvector project | https://github.com/pgvector/pgvector#filtering
+
+@@ pinecone
+== Namespace per tenant for RAG
+kind: rag, sharding
+when: A SaaS product runs RAG for many customers, and each customer's data must be searched in isolation and be easy to delete.
+how: A Pinecone serverless index is split into namespaces. Each customer gets one namespace. Upserts and queries name the namespace, so a query touches only that customer's vectors. Searching one small namespace is fast, and it never returns another customer's data.
+The ingestion service embeds chunks and upserts them in batches (for example 100 vectors per call) with metadata such as source and page. At question time the app embeds the question, queries the namespace for the top 10, and sends the text to an LLM.
+Deleting a customer is one delete-namespace call. Cost follows storage and read units, so many small or idle namespaces are cheap.
+used: Pinecone documents namespaces as the multitenancy method; common in SaaS assistants and document chat.
+avoid: When you need to search across all customers at once; query without a namespace is not possible, so use a shared namespace with a metadata filter.
+flow:
+  Ingest service [svc] -> Embedding model [model] : chunks | The service turns each chunk into a vector.
+  Ingest service -> Pinecone [db: serverless index] : upsert, namespace acme | Vectors go into the namespace for customer acme.
+  User [user] -> Chat app [svc] : question from acme | A user of acme asks a question.
+  Chat app -> Pinecone : query, namespace acme | Pinecone searches only inside the namespace for acme.
+  Pinecone -> Chat app : top 10 + metadata | The matches come back with their text and source.
+  Chat app -> LLM [model] : question + context | The LLM writes the answer from the context.
+  Chat app -x> Pinecone : delete namespace | When acme leaves, all its vectors are removed in one call.
+ref: docs | Implement multitenancy using namespaces | Pinecone documentation | https://docs.pinecone.io/guides/index-data/implement-multitenancy
+
+== Hybrid dense and sparse retrieval with rerank
+kind: rag, two-tower-retrieval
+when: Pure embedding search misses exact terms such as part numbers, and keyword search misses paraphrases.
+how: Each document gets two vectors: a dense embedding for meaning and a sparse vector (for example from BM25 or a learned sparse model) for exact terms. Both are stored in Pinecone. A query is encoded both ways and the scores are combined, with a weight such as 0.7 dense and 0.3 sparse.
+The first stage returns about 100 candidates cheaply. A second stage, a reranking model (a cross-encoder), reads the query and each candidate together and gives a better score. Only the top 5 to 10 go to the LLM.
+This follows the retrieve-then-rerank idea: a fast and rough first step, then a slow and accurate step on few items. Rerank cost grows with the candidate count, so keep it to a hundred or fewer.
+used: Pinecone supports sparse-dense vectors and offers hosted reranking; hybrid retrieval with reranking is common in search and RAG products.
+avoid: When the corpus has only natural-language prose and one embedding model works well; skip sparse vectors and rerank to save cost.
+flow:
+  Search service [svc] -> Encoders [model: dense + sparse] : query | The query becomes a dense vector and a sparse vector.
+  Search service -> Pinecone [db: dense + sparse] : hybrid query, top 100 | Pinecone scores documents on both parts.
+  Pinecone -> Search service : 100 candidates | Rough results come back.
+  Search service -> Reranker [model: cross-encoder] : query + 100 texts | The reranker scores each pair together.
+  Reranker -> Search service : top 8 | The best eight are kept.
+  Search service -> LLM [model] : top 8 chunks | The LLM answers from the best chunks.
+ref: docs | Hybrid search | Pinecone documentation | https://docs.pinecone.io/guides/search/hybrid-search
+
+== Batch upsert pipeline from the data lake
+kind: etl-elt, batching, online-offline
+when: Embeddings are computed from a large dataset in batch, and the search index must be refreshed on a schedule.
+how: A Spark or Ray job reads the new or changed rows from the lake, calls an embedding model in large batches on GPUs, and writes vectors and metadata as Parquet. A loader then upserts them to Pinecone in parallel batches. Pinecone also supports bulk import from object storage for large loads.
+Each vector has a stable id (for example the product id), so a re-run overwrites the old vector. This makes the job idempotent. Deleted source rows must be removed by id, or old items stay searchable.
+Freshness is the job interval plus the time for new writes to become visible, which for serverless is short but not zero. Store the embedding model name in the metadata, because a model change requires re-embedding everything into a new index.
+used: Common for catalogue search and recommendations where items change daily; Pinecone documents batch upsert and import.
+avoid: When updates must be searchable within a second and arrive one by one; use a streaming path with small upserts instead.
+flow:
+  Lake [lake: product table] -> Embed job [svc: Spark + GPU] : changed rows | A nightly job reads rows changed since the last run.
+  Embed job -> Staging [lake: Parquet vectors] : id, vector, metadata | Vectors are written to files with stable ids.
+  Staging -> Loader [svc] : read files | The loader reads the files in parallel.
+  Loader -> Pinecone [db: index v3] : upsert 100 per call | Batches of vectors overwrite older ones by id.
+  Loader -x> Pinecone : delete removed ids | Items removed from the lake are deleted from the index.
+  Search API [svc] -> Pinecone : query | Search reads the refreshed index.
+ref: docs | Import data | Pinecone documentation | https://docs.pinecone.io/guides/index-data/import-data
+
+@@ postgres
+== Streaming replication with read replicas and failover
+kind: leader-follower, read-replicas, active-passive
+when: A single Postgres server must survive a crash and also serve heavy read traffic.
+how: The primary writes every change to the write-ahead log (WAL) before the data files. A standby connects and streams the WAL, and replays it continuously. In synchronous mode the primary waits for a standby to confirm each commit, so no acknowledged commit is lost. In asynchronous mode it does not wait, which is faster but can lose the last moments.
+Standbys accept read-only queries (hot standby), so reports and search can use them. A long query on a standby can conflict with replay, so it may be cancelled or delay replay.
+Postgres does not choose a new primary by itself. A tool such as Patroni, with etcd or Consul, runs the election, promotes one standby, and moves a virtual IP or proxy. Without fencing, the old primary could return and accept writes (split brain).
+used: Patroni-based clusters, managed services such as Amazon RDS, Cloud SQL and Azure Database for PostgreSQL.
+avoid: When writes exceed one machine; replicas only add read capacity. Shard, or use a distributed SQL database.
+flow:
+  App [client] -> Proxy [svc: HAProxy] : write, read | The app connects to a proxy, not to a fixed server.
+  Proxy -> Primary [db: WAL] : INSERT | Writes go to the current primary, which logs them in the WAL.
+  Primary -> Standby 1 [db: hot standby], Standby 2 [db] : WAL stream | Standbys receive the WAL and replay it.
+  Proxy -> Standby 1 : SELECT report | Read-only queries go to a standby.
+  Primary -x> Patroni [svc: with etcd] : heartbeat lost | The primary crashes and stops renewing its lease in etcd.
+  * Standby 2: new primary | Patroni promotes the most advanced standby; the proxy sends writes to it.
+ref: docs | High availability, load balancing, and replication | PostgreSQL documentation | https://www.postgresql.org/docs/current/high-availability.html
+
+== Logical decoding for outbox and CDC
+kind: outbox, cdc
+when: Changes in Postgres must reach Kafka, a search index or a warehouse without dual writes.
+how: With wal_level = logical, Postgres can decode the WAL into row changes through a logical replication slot. A tool such as Debezium reads the slot and publishes each committed change to Kafka. The slot remembers the position, so a restart continues without a gap.
+For events, the app writes the business row and an outbox row in one transaction. Only committed outbox rows appear in the stream, so events match the data.
+A slot has a risk. Postgres keeps WAL until the consumer confirms it. A stalled consumer makes the WAL fill the disk. Monitor slot lag and set max_slot_wal_keep_size. Logical replication with publications and subscriptions uses the same mechanism between two Postgres servers, for example for zero-downtime upgrades.
+used: Debezium for PostgreSQL; native logical replication; managed CDC tools such as AWS DMS.
+avoid: When the table is small and a periodic query is enough; or when a consumer is unreliable and cannot be monitored.
+flow:
+  App [svc] -> Postgres [db: wal_level logical] : business row + outbox row | One transaction writes both rows.
+  Postgres -> Slot [store: replication slot] : decode WAL | The slot keeps the decoded changes until they are confirmed.
+  Slot -> Debezium [svc: Kafka Connect] : committed changes | Debezium streams only committed changes.
+  Debezium -> Kafka [log: events] : OrderPlaced | The event is published, and Debezium keeps the log position.
+  Debezium -x> Slot : stalled, no confirm | If Debezium stops confirming, the slot holds back the WAL.
+  * Postgres: WAL growing, lag 40 GB | Disk use grows until the consumer is fixed, which is why lag must be monitored.
+ref: docs | Logical decoding | PostgreSQL documentation | https://www.postgresql.org/docs/current/logicaldecoding.html
+
+== Declarative partitioning for time-series and retention
+kind: sharding, tiered-storage
+when: A table grows by millions of rows per day, queries mostly hit recent data, and old data must be dropped cheaply.
+how: Declare the table PARTITION BY RANGE on a timestamp, with one partition per day or month. A scheduler (pg_partman or a cron job) creates future partitions and detaches old ones. Each partition is a normal table with its own indexes, which stay small.
+A query with a time filter reads only the matching partitions, called partition pruning. Deleting a month of data is DROP TABLE on one partition, which takes milliseconds. A DELETE of the same rows would create dead tuples and a heavy vacuum.
+Old partitions can be moved to cheaper tablespaces or exported to Parquet on object storage. A unique key must include the partition key, which affects design.
+used: Widely used for events, logs, audit tables and metrics in Postgres; TimescaleDB builds on the same idea with automatic chunks.
+avoid: When the table is small, or queries rarely filter by the partition key; they would scan every partition.
+flow:
+  Ingest app [svc] -> events [db: partitioned parent] : INSERT row | The app inserts into the parent table.
+  events -> events_2026_10 [store: current partition] : route by timestamp | Postgres routes each row to the partition for its month.
+  Scheduler [svc: pg_partman] -> events : create next month | A job creates next month's partition ahead of time.
+  Dashboard [client] -> events : last 7 days | A query with a time filter is run.
+  events -> events_2026_10 : prune others | Only the partitions in the range are read.
+  Scheduler -> Archive [lake: Parquet on S3] : detach and export 2025_10 | An old partition is exported and then dropped in one cheap step.
+ref: docs | Table partitioning | PostgreSQL documentation | https://www.postgresql.org/docs/current/ddl-partitioning.html
+
+@@ redis
+== Cache-aside with TTL
+kind: cache-aside
+when: A database or API is slow or costly, and many requests read the same data that may be a little stale.
+how: The app first does GET on Redis with a key such as product:42. On a hit it returns at once, in well under a millisecond on a local network. On a miss it reads the database, writes the result with SET and an expiry (EX 300), and returns it.
+On a write, the app updates the database and deletes the cache key, so the next read loads fresh data. Deleting is safer than updating, because two racing updates can leave an old value in the cache.
+Add random jitter to TTLs, so many keys do not expire together. For one very hot key, a short lock or request coalescing stops hundreds of requests from hitting the database at the same moment (a cache stampede). Set maxmemory with an eviction policy such as allkeys-lru.
+used: Used in front of databases by a very large share of web companies, such as Twitter, GitHub and Instagram in their public engineering posts.
+avoid: When data must always be exact, such as an account balance used in a decision; read the database, or use write-through carefully.
+flow:
+  App [client] -> Redis [cache: TTL 300 s] : GET product:42 | The app asks the cache first.
+  Redis -> App : miss | The key is not there.
+  App -> Postgres [db] : SELECT product 42 | The app reads the source of truth.
+  App -> Redis : SET EX 300 + jitter | The app stores the result with an expiry.
+  App -> Postgres : UPDATE product 42 | Later, a write changes the database.
+  App -> Redis : DEL product:42 | The app deletes the cache key, so the next read loads fresh data.
+ref: docs | Redis documentation | Redis | https://redis.io/docs/latest/
+
+== Rate limiter and counters at the edge
+kind: rate-limit, load-shedding
+when: An API must limit each client to a fixed number of requests, even when many gateway servers run at once.
+how: Each gateway server needs a shared counter. Redis provides one with fast atomic commands. A simple fixed window uses INCR on a key such as rl:client9:minute123 and EXPIRE 60. If the count passes 100, the request gets HTTP 429.
+For a token bucket, a small Lua script reads the tokens and last refill time, adds tokens for elapsed time, takes one, and writes back. The script runs as one atomic step, because Redis executes commands one at a time on its main thread. No two servers can race.
+Redis is now on the request path. Set a timeout of a few milliseconds, and decide what to do if Redis is down: fail open (allow) for most APIs, or fail closed for sensitive ones.
+used: Common in API gateways and in open-source limiters built on Redis; Stripe has written about its Redis-based rate limiters.
+avoid: When a rough local limit per server is enough; an in-process limiter has no network cost.
+flow:
+  Client [client] -> Gateway A [svc], Gateway B [svc] : request | Requests from one client reach different gateways.
+  Gateway A -> Redis [cache: token buckets] : EVAL bucket script | Gateway A runs the Lua script for client 9.
+  Redis -> Gateway A : allowed, 12 left | The script took one token and left 12.
+  Gateway B -> Redis : EVAL bucket script | Gateway B runs the same script on the same key.
+  Redis -x> Gateway B : denied | The bucket is empty, so Gateway B answers 429.
+  Gateway A -> Backend [svc] : forward | Allowed requests go to the backend.
+ref: docs | Rate limiting with Redis | Redis | https://redis.io/tutorials/howtos/ratelimiting/
+
+== Streams with consumer groups as a work queue
+kind: competing-consumers, load-leveling
+when: Tasks must be handled by a pool of workers, with retries, and the team already runs Redis.
+how: A producer adds jobs with XADD to a stream. Workers in one consumer group call XREADGROUP; Redis gives each entry to exactly one worker in the group and records it as pending. After finishing, the worker sends XACK.
+If a worker dies, its entries stay pending. Another worker uses XAUTOCLAIM to take entries idle for more than, say, 60 seconds, and retries them. Delivery is at least once, so jobs must be idempotent. Entries that fail many times can be moved to a dead-letter stream.
+Redis streams live in memory, with persistence from AOF or snapshots. This suits short queues and light jobs. For very long retention or huge volume, Kafka is a better fit.
+used: Used for background jobs and event pipelines in many apps; libraries such as BullMQ build job queues on Redis.
+avoid: When no job may ever be lost, even if a node dies: async replication can drop acknowledged entries. Use a durable broker (Kafka, SQS, RabbitMQ).
+flow:
+  API [svc] -> jobs stream [log: Redis stream] : XADD job 88 | The API appends a job to the stream.
+  jobs stream -> Worker 1 [svc: group workers], Worker 2 [svc: group workers] : XREADGROUP | Each job goes to one worker in the group.
+  Worker 1 -> jobs stream : XACK 88 | Worker 1 finishes and acknowledges, so the job leaves the pending list.
+  Worker 2 -x> jobs stream : crash on job 89 | Worker 2 dies, and job 89 stays pending.
+  Worker 1 -> jobs stream : XAUTOCLAIM idle 60 s | Worker 1 takes over the idle job and runs it again.
+  Worker 1 ~> Dead letter [log: failed jobs] : after 5 tries | Jobs that keep failing are moved aside for review.
+ref: docs | Redis Streams | Redis | https://redis.io/docs/latest/develop/data-types/streams/
+
+@@ rocksdb
+== Embedded storage engine inside a database
+kind: lsm-compaction, wal
+when: A database or service needs a fast local key-value store for heavy writes, and does not want to write its own storage engine.
+how: RocksDB is a library, linked into the process. Each write goes to the write-ahead log and to an in-memory memtable. When the memtable is full (for example 64 MB), it is flushed as an immutable sorted file (SST) on disk. Background threads merge SST files level by level; this is compaction.
+Reads check the memtable, then the SST files, using Bloom filters to skip files that cannot hold the key. A block cache keeps hot blocks in memory.
+The database above RocksDB adds the network, replication and query layers. Compaction trades write amplification (each byte is rewritten many times, often 10 or more) for fast writes and sequential disk use. Tuning compaction is the main operating task.
+used: MyRocks (MySQL at Meta), TiKV (under TiDB), YugabyteDB's DocDB, and Kafka Streams state stores.
+avoid: When reads are mostly range scans on data that rarely changes and write speed does not matter; a B-tree engine has less write amplification and simpler tuning.
+flow:
+  Database layer [svc: SQL layer] -> RocksDB [db: LSM tree] : Put key, value | The database above sends a write to its local engine.
+  RocksDB -> WAL [log: on disk] : append record | The write is appended to the log first, for crash recovery.
+  RocksDB -> Memtable [cache: sorted in RAM] : insert | The same write is added to the sorted in-memory table.
+  Memtable -> L0 SST files [lake: sorted files] : flush at 64 MB | A full memtable is written as an immutable file.
+  L0 SST files -> L1 SST files [lake: merged] : compaction | Background threads merge files and drop old versions.
+  Database layer -> RocksDB : Get key | A read checks memtable, then files, with Bloom filters to skip files.
+ref: docs | RocksDB wiki | RocksDB project | https://github.com/facebook/rocksdb/wiki
+ref: paper | The log-structured merge-tree (LSM-tree) | O'Neil, Cheng, Gawlick & O'Neil, Acta Informatica, 1996 |
+
+== State store for a stream processor
+kind: checkpoint-restart, windowed-agg
+when: A streaming job keeps large per-key state (counters, windows, join tables) that does not fit in memory.
+how: Flink's RocksDB state backend and Kafka Streams keep the state of each key in a local RocksDB instance. Reads and writes stay on local disk, so state can be much bigger than the heap and does not cause garbage-collection pauses.
+Flink takes periodic checkpoints. Because SST files are immutable, an incremental checkpoint uploads only the new files to object storage. After a failure, a task restores its RocksDB files from the last checkpoint and replays the input from the matching offset.
+Kafka Streams instead writes each state change to a compacted changelog topic in Kafka, and rebuilds the store from that topic on a new machine. Local access to state costs microseconds, compared with a network call to an external database.
+used: Apache Flink (RocksDB state backend), Kafka Streams default persistent stores.
+avoid: When state is small; an in-memory backend is faster. Or when many jobs must share and query the same state; use an external store.
+flow:
+  Events topic [log] -> Stream task [svc: Flink operator] : keyed events | The task receives events for its key range.
+  Stream task -> RocksDB [db: local state] : get, put counter | State is read and updated on local disk.
+  Stream task -> Result topic [log] : window result | Finished windows are emitted downstream.
+  RocksDB -> Checkpoint store [lake: S3] : new SST files only | At each checkpoint only the files added since the last one are uploaded.
+  Stream task -x> RocksDB : node lost | The machine fails and its local state is gone.
+  Checkpoint store -> Stream task : restore files + offset | A new task downloads the files and replays input from the saved offset.
+ref: docs | State backends | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/state/state_backends/
+
+== Raft-replicated key-value shards on RocksDB
+kind: consensus-log, sharding, lsm-compaction
+when: A distributed database needs many small replicated ranges, each stored in a fast local engine.
+how: The key space is cut into regions of about 96 MB (TiKV) or ranges (CockroachDB). Each region has three replicas on different machines, and the replicas run a Raft group. The leader appends client writes to the Raft log; when a majority has the entry, it is committed and applied to the local RocksDB.
+Each node holds thousands of regions in a few RocksDB instances, using column families to separate data, locks and the Raft log. A region that grows too big is split, and a placement service moves regions to balance load.
+RocksDB gives each node fast sequential writes. Raft gives durability across nodes. Each layer does one job. The cost is that every write is written twice on the node, once in the Raft log and once in the state machine, plus compaction.
+used: TiKV in TiDB; YugabyteDB DocDB (a RocksDB fork); CockroachDB used RocksDB before moving to its own Pebble engine.
+avoid: When one node is enough; use RocksDB or SQLite embedded without Raft.
+flow:
+  Client [client] -> Region leader [svc: node 1] : Put k, v | A client sends a write to the leader of the key's region.
+  Region leader -> Follower 2 [svc], Follower 3 [svc] : Raft AppendEntries | The leader copies the log entry to two followers.
+  Follower 2 -> Region leader : ack | One ack makes a majority of three.
+  Region leader -> Node 1 RocksDB [db: applies entry] : apply committed write | The entry is applied to the local engine, and the client gets an answer.
+  Follower 2 -> Node 2 RocksDB [db] : apply | Followers apply the same entry in the same order.
+  Placement service [svc] ~> Region leader : split, move region | When a region is too big or hot, it is split or moved.
+ref: docs | TiKV architecture | TiKV project |
+
+@@ scylla
+== Shard-per-core wide-column store with a token ring
+kind: consistent-hashing, sharding, gossip
+when: A service needs very high write and read rates on key-based data, with predictable low latency.
+how: ScyllaDB is a Cassandra-compatible database in C++. Data is placed by hashing the partition key to a token on a ring. Each node owns many token ranges (virtual nodes), and every row is stored on several nodes by the replication factor, usually 3. Any node can take a request and acts as the coordinator for it.
+Inside each node, ScyllaDB gives every CPU core its own shard of the data, with its own memory and its own share of the network and disk queues. Cores do not share locks, so adding cores adds throughput almost in a line.
+The driver is token-aware: it sends the request straight to a replica core that owns the key, avoiding an extra hop. Nodes share topology by gossip, and Raft is now used for schema and topology changes in newer versions.
+used: Discord moved its message store from Cassandra to ScyllaDB; Discord and others have written about it; common in ad-tech and messaging for low latency at high volume.
+avoid: When you need joins, ad-hoc queries or multi-row transactions; use a relational or distributed SQL database.
+flow:
+  App [client: shard-aware driver] -> Node A [db: replica, RF 3] : write key u42 | The driver hashes the key and picks a replica node and core that own it.
+  Node A -> Node B [db], Node C [db] : replicate | The coordinator sends the write to the other two replicas.
+  Node B -> Node A : ack | A quorum of two out of three has the write.
+  Node A -> App : ok | The app gets an answer after the quorum, in a few milliseconds.
+  Node C ~> Node A : gossip state | Nodes share who is alive by gossip.
+  Node C -x> Node A : ack lost | One replica is down; the write still succeeds with quorum, and repair fills the gap later.
+ref: docs | ScyllaDB architecture | ScyllaDB documentation | https://docs.scylladb.com/manual/stable/architecture/
+
+== Query-first table design for time-series and feeds
+kind: index-table, fan-out-write
+when: Reads follow a few known query shapes, and each must be answered by reading one partition.
+how: In a wide-column database, you design one table for each query, not one model for all data. For "latest 50 messages in a channel", the table has primary key ((channel_id, day_bucket), message_id) with message_id clustering by time. One query reads one partition in order.
+The same event is written to several tables, one for each read pattern, by the application or a batch. This is denormalisation: more writes and more storage, in exchange for one-partition reads.
+Partitions must stay bounded. An unbounded partition (all messages ever in a channel) grows too big and becomes a hot spot, so include a time bucket in the key. Use TTL for data with a retention limit, and a compaction strategy suited to time series.
+used: Messaging history, IoT and ad-event stores on Cassandra and ScyllaDB; Discord's message table is bucketed by channel and time window.
+avoid: When query shapes change often; a relational database with indexes adapts more easily.
+flow:
+  App [svc] -> Scylla [db: messages_by_channel] : INSERT msg 981 | A new message is written with its channel and day bucket.
+  App -> Scylla : INSERT messages_by_user | The same message is also written to a second table for the user view.
+  Scylla -> Partition [store: ch7, 2026-10-28] : append by time | The row lands in one partition, sorted by message id.
+  Client [client] -> App : latest 50 in ch7 | A client opens a channel.
+  App -> Scylla : SELECT ... LIMIT 50 | The query names the full partition key.
+  Scylla -> App : 50 rows | One partition is read in order, with no scatter.
+ref: docs | Data modeling | ScyllaDB documentation |
+
+== Multi-datacenter replication with tunable consistency
+kind: multi-region, quorum
+when: A service runs in two or more regions, must stay up if one region fails, and can choose per request how strong a read must be.
+how: Define the keyspace with NetworkTopologyStrategy and a replication factor per datacenter, for example 3 in each of two regions. Every write is sent to the replicas in both regions.
+The client picks a consistency level for each request. LOCAL_QUORUM waits for 2 of 3 replicas in the local datacenter only, so latency stays low and the other region is updated in the background. QUORUM across datacenters waits for a majority of all replicas, which is stronger but slower. Reads and writes with LOCAL_QUORUM overlap in the local region, so a read sees the last write there.
+If a region is lost, the other keeps serving. Anti-entropy repair and hinted handoff bring replicas back in line. Conflicts are resolved by the newest write timestamp.
+used: Common for global user, session and feed data on Cassandra and ScyllaDB.
+avoid: When two regions must never see different data, for example money transfers; use a database with consensus (Spanner, CockroachDB).
+flow:
+  App EU [client] -> DC EU nodes [db: RF 3] : write, LOCAL_QUORUM | The EU app writes and waits for 2 of 3 local replicas.
+  DC EU nodes -> App EU : ok in 4 ms | The local quorum answers fast.
+  DC EU nodes ~> DC US nodes [db: RF 3] : async replicate | The same write is sent to the US datacenter in the background.
+  App US [client] -> DC US nodes : read, LOCAL_QUORUM | A US app reads from its own region.
+  DC EU nodes -x> DC US nodes : link down | The link between regions fails.
+  * DC US nodes: hints stored | Each side keeps serving; missed writes are stored as hints and replayed when the link returns.
+ref: docs | Consistency levels | ScyllaDB documentation | https://docs.scylladb.com/manual/stable/cql/consistency.html
+
+@@ spanner
+== Externally consistent global transactions
+kind: consensus-log, two-phase-commit, multi-region
+when: A global system needs SQL transactions that stay correct across regions, without the application handling conflicts.
+how: Spanner splits tables into ranges. Each range is replicated by Paxos across zones or regions, and one replica is the leader. A transaction that touches one range commits with its Paxos group. A transaction across several ranges uses two-phase commit between the Paxos leaders.
+Spanner gives each commit a timestamp from TrueTime, a clock API backed by GPS and atomic clocks that returns a time interval, not a single time. The leader picks a timestamp and then waits out the uncertainty, a few milliseconds, before it makes the commit visible. This is commit wait.
+Thanks to it, if transaction A finishes before B starts, A has the smaller timestamp. Snapshot reads at a timestamp need no locks. The price is latency: writes wait for cross-region quorum and commit wait.
+used: Google internal systems and Google Cloud Spanner customers; the idea of timestamps without atomic clocks is copied in CockroachDB and YugabyteDB with weaker guarantees.
+avoid: When one region and a standard Postgres are enough; cross-region commits cost tens of milliseconds.
+flow:
+  App [client] -> Range A leader [svc: Paxos leader] : write row, txn 1 | The app updates rows in two ranges in one transaction.
+  Range A leader -> Range B leader [svc: Paxos leader] : prepare | The coordinator asks the other range to prepare the commit.
+  Range B leader -> Range B replicas [db: 3 zones] : Paxos log entry | A majority of replicas store the prepare record.
+  Range A leader -> TrueTime [note: interval of time] : choose timestamp s | The coordinator picks commit timestamp s from the TrueTime clock.
+  * Range A leader: commit wait 7 ms | The leader waits until the true time is certainly after s.
+  Range A leader -> App : committed at s | The commit becomes visible and the app is told.
+ref: paper | Spanner: Google's Globally-Distributed Database | Corbett et al., OSDI 2012 | https://research.google/pubs/spanner-googles-globally-distributed-database-2/
+
+== Stale and snapshot reads for low-latency reads
+kind: read-replicas, multi-region
+when: Many reads can accept slightly old data, and they should be served by the nearest replica without a trip to the leader.
+how: A strong read in Spanner asks the leader, or a replica that checks with the leader, to be sure it sees every committed write. This can cost a cross-region trip.
+A stale read picks a timestamp in the past, for example 10 seconds ago, or a maximum staleness bound. Any replica that has applied the log up to that time can answer from its local multi-version data, with no lock and no leader contact. The result is a consistent snapshot, not a mix of states.
+Pages, catalogues and reports usually tolerate 10 seconds of staleness. This cuts latency from tens of milliseconds to a few and lets read-only replicas in other regions add capacity. Writes and transactions that must see the latest data still use strong reads.
+used: Spanner documents stale reads and read-only replicas as the way to scale reads across regions.
+avoid: When a user must see their own write at once; use a strong read, or read at the commit timestamp of their write.
+flow:
+  App EU [client] -> Read replica EU [db: read-only] : read, 10 s stale | The app reads at a timestamp ten seconds in the past.
+  Read replica EU -> App EU : rows at T-10 s, 3 ms | The local replica has applied the log past that time, so it answers alone.
+  App EU -> Leader US [svc: leader region] : write order | A write goes to the leader region.
+  Leader US -> Read replica EU : replicate log | The replica receives the log and applies it.
+  App EU -> Read replica EU : strong read | A strong read needs the latest data.
+  Read replica EU -> Leader US : ask safe time | The replica asks the leader for the safe time, which costs a cross-region trip.
+ref: docs | Read data (stale and strong reads) | Google Cloud Spanner documentation | https://cloud.google.com/spanner/docs/reads
+
+== Interleaved tables and splits for locality
+kind: sharding, data-locality
+when: Parent and child rows are used together, and the database must keep them on the same machine to avoid cross-range transactions.
+how: In Spanner, a child table can be interleaved in its parent: Orders rows are stored physically next to their Customer row, sharing the key prefix customer_id. A split holds a contiguous key range, so one customer and all its orders stay together in one split.
+A transaction that changes a customer and its orders then touches one Paxos group, so it avoids two-phase commit and is faster. Reads of one customer's orders are a short range scan.
+Key choice decides load. Monotonic keys (timestamps, sequences) send all inserts to the last split, which becomes a hot spot. Use a hashed or UUID prefix, or a bit-reversed sequence. Spanner splits big or hot ranges by itself and moves them for balance.
+used: Spanner schema design guidance; same locality idea in CockroachDB interleaving (now deprecated) and in Bigtable row-key design.
+avoid: When child rows are very many and accessed on their own; a separate table with its own key may balance better.
+flow:
+  App [client] -> Spanner [db: Paxos groups] : insert customer 8 + orders | One transaction inserts a customer and its orders.
+  Spanner -> Split k [store: customer 8 range] : write parent + child rows | Both rows have the key prefix 8 and live in one split.
+  Split k -> Split k replicas [db: 3 zones] : one Paxos round | One Paxos round commits both rows, with no two-phase commit.
+  Spanner -> App : committed | The app gets the answer with lower latency.
+  App -> Spanner : read orders of customer 8 | A report reads all orders of one customer.
+  Spanner -> Split k : range scan | The scan reads one contiguous range from one split.
+ref: docs | Schema and data model | Google Cloud Spanner documentation | https://cloud.google.com/spanner/docs/schema-and-data-model
+
+@@ sqlite
+== Embedded database in the app process
+kind: layered-arch, wal
+when: An app (mobile, desktop, browser, edge device) needs reliable structured storage with SQL, and no separate server.
+how: SQLite is a library. The whole database is one file, and the app calls it as a function, with no network, no accounts and no server to run. A query is parsed and compiled to bytecode and run by a virtual machine over B-tree pages in the file.
+It is fully ACID. In WAL mode, writers append changed pages to a write-ahead log file and readers keep reading the old pages, so readers do not block the writer. A checkpoint copies the log back into the main file. There is one writer at a time, which is fine for one app.
+Backups are a file copy (done safely with the backup API or VACUUM INTO). Deployment is easy; concurrency across machines is not possible, since the file is local.
+used: Android and iOS apps, Chrome and Firefox profile data, macOS and Windows apps, and many embedded devices; SQLite says it is likely the most used database engine.
+avoid: When many machines write to the same data over a network, or when write concurrency is high; use Postgres or MySQL.
+flow:
+  App [client: your code] -> SQLite library [svc: in-process] : INSERT ... | The app calls SQLite as a library function.
+  SQLite library -> WAL file [log: app.db-wal] : append changed pages | In WAL mode the changes are appended to the log file.
+  SQLite library -> App : commit ok | The commit is durable after one fsync of the log.
+  App -> SQLite library : SELECT ... | A reader starts at the same time.
+  SQLite library -> Database file [store: app.db] : read pages | The reader sees the last committed snapshot and is not blocked.
+  WAL file ~> Database file : checkpoint | Later, a checkpoint copies the log pages into the main file.
+ref: docs | Write-Ahead Logging | SQLite documentation | https://www.sqlite.org/wal.html
+
+== Per-tenant SQLite files with replication to object storage
+kind: sharding, tiered-storage, deployment-stamp
+when: A multi-tenant app has many small tenants, and a database per tenant gives isolation and simple operations.
+how: Each tenant gets its own SQLite file on the local disk of the server that handles it. A router maps tenant id to server. A query touches only that small file, so it is fast and cannot leak data from another tenant. Moving a tenant is copying one file.
+To survive disk loss, a replication tool (Litestream, or LiteFS for live read replicas) streams the WAL to object storage like S3, within seconds. After a crash, a new server restores the file from the stream and continues.
+One writer per file and one server per tenant keep it simple. The limits are one tenant larger than a server, cross-tenant queries (they need a separate analytics copy) and failover time, which is not instant.
+used: Litestream and LiteFS are used by small SaaS teams; Cloudflare Durable Objects with SQLite storage and Turso use the same database-per-tenant idea.
+avoid: When tenants are huge, or you need cross-tenant transactions and instant failover; use a client-server database.
+flow:
+  Client [client] -> Router [svc: tenant map] : request for tenant 12 | A request arrives with a tenant id.
+  Router -> App server [svc: owns tenant 12] : forward | The router sends it to the server that holds the tenant's file.
+  App server -> tenant12.db [db: SQLite + WAL] : SQL | The app queries the small local file.
+  tenant12.db -> Litestream [svc: WAL shipper] : new WAL frames | Litestream follows the WAL.
+  Litestream -> S3 bucket [lake: backups] : upload segments | It uploads changes to object storage every second or so.
+  S3 bucket -> App server : restore tenant12.db | After a failure a replacement server restores the file and takes over.
+ref: docs | Litestream documentation | Litestream | https://litestream.io/
+
+== Local-first sync with an on-device database
+kind: cdc, event-driven
+when: An app must work offline and feel instant, and sync later with a server.
+how: The app reads and writes a local SQLite database, so the UI never waits for the network. Every change is also recorded in a local outbox table (or changes are tracked with triggers or a sync extension).
+When the network is back, a sync engine sends the pending changes to the server and gets new changes since the last sync token. The server database (often Postgres) is the shared truth. Conflicts need a rule, such as last-writer-wins by timestamp, or a CRDT for fields that merge.
+Changes are applied in one transaction on the device, so the local database always stays consistent. Define schema migrations carefully, because old app versions will still sync.
+used: Mobile apps with offline mode; sync products and libraries such as PowerSync, ElectricSQL and cr-sqlite build on this pattern.
+avoid: When data must be current to the second for all users, such as live inventory; call the server directly.
+flow:
+  UI [user: app screen] -> Local SQLite [db: on device] : write note | The user edits a note; it is saved at once, even offline.
+  Local SQLite -> Outbox [store: pending changes] : record change | The change is also written to a pending-changes table.
+  Outbox -x> Sync server [svc] : offline | The network is down, so changes wait on the device.
+  Outbox -> Sync server : push 5 changes | The network returns and the engine pushes pending changes.
+  Sync server -> Postgres [db: shared truth] : apply, resolve conflicts | The server applies them and resolves conflicts by its rule.
+  Sync server -> Local SQLite : changes since token | The device pulls changes from other devices and applies them.
+ref: docs | Local-first software | Kleppmann et al., Ink & Switch, 2019 | https://www.inkandswitch.com/local-first/
+
+@@ tidb
+== HTAP: row store for writes, columnar replica for analytics
+kind: cqrs, leader-follower
+when: The same fresh data must serve transactions and heavy analytical queries, without an ETL pipeline between two databases.
+how: TiDB keeps tables in TiKV, a row store with Raft replication. TiFlash adds a columnar copy of chosen tables. It joins each Raft group as a learner: it receives the Raft log but does not vote, so it cannot slow down commits.
+When a query arrives, the TiDB SQL layer's optimizer decides, by cost, whether to read rows from TiKV (point lookups, short ranges) or columns from TiFlash (scans, joins, aggregates). One query may use both. Hints and session settings can force a choice.
+TiFlash reads are consistent. It asks the leader for the latest commit position and waits until it has applied it. Analytics therefore see fresh data, and a heavy scan uses TiFlash nodes, not the transaction nodes.
+used: PingCAP customers for real-time dashboards and risk reporting on live transaction data; TiDB documents this as its HTAP design.
+avoid: When analytics runs on terabytes joined with many external sources; a warehouse (BigQuery, Snowflake, ClickHouse) fits better.
+flow:
+  App [client] -> TiDB server [svc: SQL layer] : INSERT order | The app sends SQL over the MySQL protocol.
+  TiDB server -> TiKV [db: row store] : Raft write | The row is committed in TiKV by a Raft majority.
+  TiKV -> TiFlash [db: column replica] : Raft log to learner | The learner copies the log and turns rows into columns.
+  Analyst [user] -> TiDB server : SELECT sum GROUP BY | An analyst runs a large aggregate.
+  TiDB server -> TiFlash : columnar scan | The optimizer picks TiFlash, because the query scans many rows.
+  TiFlash -> TiKV : read index check | TiFlash checks that it has the latest committed data before it answers.
+ref: paper | TiDB: a Raft-based HTAP database | Huang et al., VLDB 2020 |
+
+== Scale-out MySQL-compatible OLTP
+kind: sharding, consensus-log, control-data-plane
+when: A MySQL application has outgrown one primary, and the team wants more write capacity without manual sharding.
+how: The application connects to stateless TiDB servers with a normal MySQL driver. Data lives in TiKV, split into regions of about 96 MB. Each region has three Raft replicas on different nodes. The Placement Driver (PD) keeps the region map, splits and moves regions, and issues global timestamps for transactions.
+A transaction uses Percolator-style two-phase commit across the regions it touches, with start and commit timestamps from PD. To add capacity, you add TiKV nodes, and PD moves regions to them while traffic continues. To add SQL capacity, you add TiDB servers behind a load balancer.
+Compatibility is high but not complete. Check features such as stored procedures, some locking behaviour and the cost of cross-region transactions before migrating.
+used: Companies that moved from sharded MySQL to TiDB report it in public case studies, such as Pinterest and Shopee; Cloud versions run on TiDB Cloud.
+avoid: When one MySQL primary still has room; it has lower latency per transaction. Or when keys are hot and sequential without care.
+flow:
+  App [client] -> Load balancer [svc] : MySQL protocol | The app connects as if to MySQL.
+  Load balancer -> TiDB server [svc: stateless] : SQL | Any TiDB server can take any query.
+  TiDB server -> PD [svc: map + timestamps] : get timestamp, region map | PD gives a start timestamp and the location of the regions.
+  TiDB server -> TiKV node 1 [db: region leader], TiKV node 2 [db: region leader] : prewrite | The transaction writes locks in both regions.
+  TiDB server -> TiKV node 1 : commit | After all prewrites succeed, the commit is made visible.
+  PD ~> TiKV node 2 : move hot region | When a node is overloaded, PD moves regions away from it.
+ref: docs | TiDB architecture | PingCAP documentation | https://docs.pingcap.com/tidb/stable/tidb-architecture
+
+== Online migration from MySQL, then replicate out with TiCDC
+kind: strangler-fig, cdc, blue-green
+when: A MySQL system must move to TiDB with little downtime, and downstream systems must keep receiving changes.
+how: Data Migration (DM) first copies the full MySQL data into TiDB. It then reads the MySQL binary log and applies changes, so TiDB follows the source in near real time. DM can merge several sharded MySQL instances into one TiDB table.
+Teams check the data with a diff tool, send a small share of read traffic to TiDB, and then switch writes in a short window. A reverse replication stream back to MySQL is a common safety net for rollback.
+After the move, TiCDC reads changes from TiKV and sends them to Kafka, MySQL, or object storage. This feeds search indexes, warehouses and caches. Delivery is at least once, so downstream writes must be idempotent.
+used: DM and TiCDC are PingCAP's tools for this; the approach is also common to other MySQL-compatible migrations.
+avoid: When a one-time dump during a maintenance window is acceptable; skip the live sync.
+flow:
+  MySQL [db: source] -> DM [svc: Data Migration] : full dump, then binlog | DM copies existing rows and then follows the binary log.
+  DM -> TiDB [db: target cluster] : apply changes | TiDB stays a few seconds behind MySQL.
+  Checker [svc: data diff] -> TiDB : compare with source | A diff tool compares rows between source and target.
+  App [client] -> TiDB : cut over reads, writes | After checks, traffic moves in steps.
+  TiDB ~> MySQL : reverse sync | Changes flow back to MySQL, so rollback stays possible.
+  TiDB -> TiCDC [svc: change feed] : row changes | After cutover TiCDC reads the change feed.
+  TiCDC -> Kafka [log: change events] : at least once | Downstream systems read from Kafka and must be idempotent.
+ref: docs | TiDB Data Migration overview | PingCAP documentation | https://docs.pingcap.com/tidb/stable/dm-overview
+
+@@ valkey
+== Cluster with hash slots and replica failover
+kind: sharding, leader-follower, gossip
+when: One in-memory server has too little RAM or too little throughput, and the cache must survive the loss of a node.
+how: A Valkey cluster divides the key space into 16,384 hash slots. A key goes to slot CRC16(key) mod 16384, and each primary owns a range of slots. Each primary has one or more replicas, in other availability zones.
+A smart client keeps the slot map and talks to the right node directly. If the map is stale, the node replies MOVED and the client updates its map. Nodes check each other by gossip over a cluster bus. If most primaries agree that a primary is down, one of its replicas is promoted.
+Replication is asynchronous, so a failover can lose the last writes. Multi-key commands work only if all keys are in one slot; hash tags such as {user42} force that.
+used: Valkey is the Linux Foundation fork of Redis 7.2, supported by AWS (ElastiCache and MemoryDB), Google Cloud and others; same cluster design as Redis Cluster.
+avoid: When the data fits in one node; a primary with replicas and Sentinel is simpler, and multi-key commands work freely.
+flow:
+  App [client: cluster aware] -> Primary 1 [cache: slots 0-5460] : GET user:9 | The client hashes the key and sends it to the node for that slot.
+  Primary 1 -> App : MOVED 5500 node 2 | The slot has moved, so the node tells the client where to go.
+  App -> Primary 2 [cache: slots 5461-10922] : GET user:9 | The client retries on the right node and updates its map.
+  Primary 2 -> Replica 2 [cache: copy of node 2] : replication stream | The primary copies each write to its replica.
+  Primary 2 -x> Primary 1 : gossip ping lost | Node 2 crashes and the others stop hearing it.
+  * Replica 2: promoted to primary | A majority of primaries agree, and the replica takes over slots 5461-10922.
+ref: docs | Valkey cluster specification | Valkey project | https://valkey.io/topics/cluster-spec/
+
+== Shared session store for stateless web servers
+kind: horizontal-scale, cache-aside
+when: Web servers must be stateless so you can add or replace them freely, but users have login sessions.
+how: At login, the server creates a random session id, stores the session data in Valkey under that key with a TTL of, say, 30 minutes, and sends the id in a secure cookie. Each later request carries the cookie. Any server reads the session from Valkey, so the load balancer needs no sticky sessions.
+Each request that reads a session can reset the TTL (a sliding expiry), so active users stay logged in and idle sessions disappear on their own. A hash holds the fields of one session, and one command updates a field.
+The session store is now a shared dependency. Use replicas and a clear plan if it is lost: users log in again. Keep the data small, and never put secrets in it that you could not rebuild.
+used: Very common in web frameworks; Rails, Django, Spring Session and Express session stores support Redis-compatible servers such as Valkey.
+avoid: When sessions can be a signed token in the cookie (JWT); then no server-side store is needed, but revocation is harder.
+flow:
+  Browser [client] -> Load balancer [svc] : POST /login | A user logs in.
+  Load balancer -> Web server A [svc: stateless] : request | Any web server can take the request.
+  Web server A -> Valkey [cache: sessions] : HSET sess:ab12, EXPIRE | The server stores the session with an expiry.
+  Web server A -> Browser : Set-Cookie ab12 | The browser gets only the session id.
+  Browser -> Web server B [svc: stateless] : GET /cart, cookie ab12 | The next request lands on a different server.
+  Web server B -> Valkey : HGETALL sess:ab12 | Server B finds the session and renews the TTL.
+ref: docs | Valkey documentation | Valkey project | https://valkey.io/docs/
+
+== Leaderboard with sorted sets
+kind: precompute, fan-out-write
+when: A game or app needs live rankings with millions of scores, and the top-N and the rank of a user must be instant.
+how: A sorted set keeps members ordered by score, in a skip list plus a hash table. ZADD board 4200 user:7 inserts or updates a score in O(log n). ZREVRANGE board 0 9 WITHSCORES returns the top 10. ZREVRANK returns the rank of one user.
+Game servers send score events. A worker updates the sorted set, or the game server updates it directly. Several boards (daily, weekly, per region) are separate keys, and each can expire at the end of its period. ZUNIONSTORE can combine boards.
+One sorted set lives in one node, so one board with hundreds of millions of members can become a hot key. Split by region or by score range, and merge in the app. Durable truth stays in a database; the board can be rebuilt.
+used: Common for game leaderboards, trending lists and rate-ranked feeds on Redis-compatible servers.
+avoid: When rankings need complex filters or joins; use a database or a search engine.
+flow:
+  Game server [svc] -> Score topic [log] : score event | The game publishes score events.
+  Score topic -> Ranker worker [svc] : event | A worker reads the events in order.
+  Ranker worker -> Valkey [cache: sorted sets] : ZADD board:daily | The worker updates the daily and weekly boards.
+  Player [user] -> API [svc] : my rank + top 10 | A player opens the leaderboard screen.
+  API -> Valkey : ZREVRANGE, ZREVRANK | Two commands return the top 10 and the player's rank in microseconds.
+  Ranker worker ~> Scores DB [db: truth] : durable write | Scores are also saved in a database, so a board can be rebuilt.
+ref: docs | Sorted sets | Valkey documentation | https://valkey.io/topics/sorted-sets/
+
+@@ tlaplus
+== Model-check the protocol design before writing code
+kind: none
+when: A new replication, locking or transaction protocol is planned, and a design bug would be costly to find in production.
+how: An engineer writes a short TLA+ spec of the core idea. It has variables, an Init predicate, a Next action for each step (including message loss, delay and node crash), and invariants such as "two nodes never both hold the lock". The TLC model checker explores every reachable state of a small model, for example 3 nodes and 2 values.
+If an invariant fails, TLC prints the exact sequence of steps, often 10 to 30 long, that leads to the bug. The team fixes the design and runs again. A spec of 100 to 400 lines often finds bugs that tests and reviews missed.
+The model is small, so a pass is not a proof for any size. It is strong evidence, because most protocol bugs need only 3 nodes. Liveness checking needs fairness assumptions, and it is slower.
+used: Amazon Web Services (DynamoDB, S3 and others, as described in the 2014 CACM paper); Microsoft Azure Cosmos DB; MongoDB and Elastic have published TLA+ specs.
+avoid: For UI code, simple CRUD, or code with no concurrency; tests are enough there.
+flow:
+  Engineer [user] -> Spec [note: TLA+ module] : Init, Next, invariants | The engineer writes the design as a state machine with properties.
+  Spec -> TLC [svc: model checker] : model 3 nodes | TLC loads the spec with small constants, then visits each reachable state and checks every invariant.
+  TLC -x> Engineer : invariant broken, 17 steps | TLC finds a bad state and prints the trace that leads to it.
+  Engineer -> Spec : fix the design | The engineer changes the protocol and not only the code.
+  TLC -> Engineer : no error, 8.2 M states | After the fix, TLC finds no violation in the whole model.
+ref: paper | Use of Formal Methods at Amazon Web Services | Newcombe, Rath, Zhang, Munteanu, Brooker & Deardeuff, 2014 |
+ref: book | Specifying Systems | Leslie Lamport, 2002 |
+
+== Refinement from a simple spec to a detailed protocol
+kind: none
+when: A protocol is complex, and you want to prove the detailed version still obeys the simple rules of the abstract one.
+how: First write a very small spec that says what the system must do, for example a single register or a single log that everyone agrees on. Then write a second spec with the real mechanism, such as leader election, replicas and messages.
+The detailed spec declares that it implements the abstract one by mapping its variables to the abstract ones. TLC checks that every behaviour of the detailed spec is also an allowed behaviour of the abstract spec. TLA+ allows stuttering steps, so internal steps that change no abstract variable are fine.
+This keeps the key promise short and readable, while the mechanism can grow. Optimisations are added as new levels and checked against the older level.
+used: Used in Paxos and Raft specs, which show that the protocol implements a simple replicated log; Raft's TLA+ spec is by Diego Ongaro.
+avoid: When the system is small enough that one spec with invariants says everything.
+flow:
+  Abstract spec [note: one agreed log] -> Detailed spec [note: Raft messages] : variable mapping | The detailed spec maps its state to the abstract log.
+  Detailed spec -> TLC [svc: refinement check] : check implication | TLC checks the detailed spec against the abstract one.
+  TLC -> Detailed spec : explore states | TLC explores messages, elections and crashes.
+  TLC -x> Detailed spec : step breaks abstract rule | A leader change that drops a committed entry is found.
+  Detailed spec -> TLC : fixed version | The design is repaired by keeping committed entries on the new leader.
+  TLC -> Abstract spec : refinement holds | Every detailed behaviour is a valid abstract behaviour.
+ref: book | Specifying Systems | Leslie Lamport, 2002 |
+ref: paper | In Search of an Understandable Consensus Algorithm | Ongaro & Ousterhout, USENIX ATC 2014 |
+
+== Trace validation of the real implementation
+kind: none
+when: The code may drift from the verified design, and you want a check that real executions still follow the spec.
+how: The implementation logs each important event (a message sent, a state change) with the variable values, in a format that maps to the spec. Tests, simulations or chaos runs produce many traces.
+A checker then asks, for each trace, whether the spec allows that sequence of states. TLC can check traces, and the TLA+ tools have trace-validation support. A trace that the spec forbids means a bug in the code or an error in the spec; both are valuable.
+Logging must capture a consistent view of the state, and in a distributed system the order of events across nodes is hard to record. Teams use logical clocks or a single test harness that controls the order.
+used: Published for the Raft-based and other distributed systems in research on TLA+ trace validation; MongoDB engineers have written about checking implementation traces against specs.
+avoid: When the system has too many internal details to map to the spec; then use model-based tests on a smaller part.
+flow:
+  Test harness [svc: chaos run] -> Implementation [svc: 3 nodes] : inject faults | The harness runs the system and injects crashes and delays.
+  Implementation -> Trace log [log: events + state] : state at each step | Each node records events with its variable values.
+  Trace log -> Trace checker [svc: TLC] : one trace | The checker loads one execution.
+  Spec [note: TLA+] -> Trace checker : allowed steps | The spec defines which steps are allowed.
+  Trace checker -x> Engineer [user] : step 9 not allowed | A step the spec forbids is reported, so a code or spec bug is found.
+  Trace checker -> Engineer : trace accepted | If all steps match, the run is a valid behaviour.
+ref: paper | Validating Traces of Distributed Programs Against TLA+ Specifications | Cirstea, Kuppe, Loillier & Merz, 2024 |
+
+@@ amdgpu
+== Serving a large LLM on one big-memory GPU
+kind: continuous-batching, offload-accelerator
+when: A model with tens of billions of parameters must be served at low cost, and splitting it across several GPUs adds complexity.
+how: An MI300X has 192 GB of HBM. A 70-billion-parameter model in 8-bit form needs about 70 GB for weights, so it fits on one GPU with much room left for the key-value cache of many conversations. An inference server such as vLLM runs on ROCm and uses HIP kernels.
+The scheduler joins new requests into the running batch at every token step (continuous batching), so the GPU stays busy. The KV cache is kept in paged blocks, so memory is not wasted on empty space.
+With one GPU there is no cross-GPU communication in the token path, which reduces latency and failure points. The limit is memory bandwidth: each generated token reads all weights once, so bandwidth sets the speed for small batches.
+used: vLLM and SGLang support ROCm on Instinct GPUs; cloud providers such as Microsoft Azure and Oracle offer MI300X instances.
+avoid: When the model or its KV cache is larger than one GPU; then split it with tensor parallelism across 8 GPUs in a node.
+flow:
+  Client [client] -> API server [svc: vLLM] : prompt | A request arrives at the inference server.
+  API server -> Scheduler [svc: continuous batch] : queue request | The scheduler adds the request to the running batch.
+  Scheduler -> MI300X [model: 192 GB HBM] : launch HIP kernels | Each step runs attention and matrix multiplies on the GPU.
+  MI300X -> KV cache [cache: paged in HBM] : read, write blocks | Keys and values for each conversation are kept in paged blocks.
+  MI300X -> Scheduler : next tokens | One new token per request is returned each step.
+  Scheduler -> Client : stream tokens | Tokens are streamed back as they are made.
+ref: docs | ROCm documentation | AMD | https://rocm.docs.amd.com/
+
+== Data-parallel training with RCCL all-reduce
+kind: data-parallel
+when: A model fits on one GPU, and you want to train faster by splitting the batch across many GPUs and nodes.
+how: Each GPU holds a full copy of the model and processes its own slice of the global batch. After the backward pass, the gradients must be averaged. RCCL, AMD's collective library (like NCCL), runs an all-reduce across all GPUs.
+Inside a node, MI300X GPUs are linked by Infinity Fabric in an all-to-all mesh. Between nodes, the traffic goes over Ethernet or InfiniBand network cards. All-reduce is done in rings or trees, and it overlaps with the backward pass, so communication hides behind compute.
+Frameworks such as PyTorch (DDP or FSDP) and JAX use RCCL through the same API as on NVIDIA. If the model is too big, FSDP shards weights, gradients and optimizer states across GPUs, which trades more communication for less memory.
+used: Frontier and El Capitan supercomputers use Instinct GPUs; AMD publishes PyTorch training recipes for MI300X.
+avoid: When network bandwidth is low and the model is small; the all-reduce can cost more than the compute saved.
+flow:
+  Data loader [svc] -> GPU 0 [model: model copy], GPU 1 [model: model copy] : micro-batch slices | Each GPU gets a different slice of the batch.
+  GPU 0 -> RCCL [svc: all-reduce] : local gradients | After forward and backward on its own slice, each GPU sends its gradients to the collective library.
+  GPU 1 -> RCCL : local gradients | The other GPUs do the same.
+  RCCL -> GPU 0, GPU 1 : averaged gradients | All GPUs get the same average, over Infinity Fabric and the network.
+  GPU 0 -> Checkpoint store [lake: object store] : save every 1000 steps | Rank 0 saves a checkpoint so a failed job can restart.
+ref: docs | RCCL documentation | AMD ROCm | https://rocm.docs.amd.com/projects/rccl/en/latest/
+
+== Porting CUDA code through a HIP compatibility layer
+kind: anti-corruption, offload-accelerator
+when: A team has GPU code written for NVIDIA CUDA and wants to run it on AMD GPUs without a full rewrite.
+how: HIP is a C++ API that closely follows CUDA. The hipify tools convert CUDA calls (cudaMalloc, kernel launches) to HIP calls (hipMalloc and so on) by mostly mechanical rewriting. The same HIP source can then be compiled for AMD GPUs with hipcc, or for NVIDIA GPUs through a thin layer.
+Libraries have counterparts: cuBLAS to rocBLAS and hipBLAS, cuDNN to MIOpen, NCCL to RCCL. Most deep learning users never see this, because PyTorch and JAX have ROCm builds that call these libraries underneath.
+Work remains. Warp size differs (64 lanes per wavefront on CDNA, 32 in an NVIDIA warp), so code that assumes 32 lanes needs changes, and performance must be tuned for the new hardware.
+used: AMD ROCm; PyTorch's ROCm backend; scientific codes ported to Frontier through HIP.
+avoid: When a framework already supports ROCm; use the framework and avoid writing kernels. Or when code uses CUDA-only features without a counterpart.
+flow:
+  CUDA source [note: .cu files] -> hipify [svc: converter] : cudaMalloc, kernels | The tool rewrites CUDA calls to HIP calls.
+  hipify -> HIP source [note: portable C++] : hipMalloc, hipLaunch | The result is HIP code that compiles for AMD or NVIDIA.
+  HIP source -> hipcc [svc: compiler] : target gfx942 | The compiler builds for the MI300 architecture.
+  hipcc -> Binary [store: GPU code object] : device code | The output has code for the GPU.
+  Binary -> rocBLAS, MIOpen, RCCL [svc: ROCm libraries] : library calls | The program calls AMD's math, deep learning and communication libraries.
+  rocBLAS, MIOpen, RCCL -x> HIP source : warp-size assumption fails | Code that assumes 32 threads per warp must be fixed for 64.
+ref: docs | HIP documentation | AMD ROCm | https://rocm.docs.amd.com/projects/HIP/en/latest/

@@ -8,6 +8,8 @@ Serves the web app from web/ and a JSON API:
   GET  /api/graph                      every concept (summary), links, tours, layer essays (summary), stats
   GET  /api/read/<id>                  full read for a concept or a layer essay (L0..L5); concepts include "scenes" (animated scenes, full)
   GET  /api/scenes?concept=<id>        every animated scene in full (or one concept's); summaries are in /api/graph -> scenes
+  GET  /api/patterns?concept=<id>      every architecture pattern in full, with its scene (or one concept's); summaries and the
+                                       pattern catalog are in /api/graph -> patterns, pcatalog; each read carries "patterns" in full
   GET  /api/search?q=...&limit=20      full-text search over every read (SQLite FTS5, BM25 ranking)
   GET  /api/library?kind=book          every source in the map, grouped by work, with the concepts that cite it
   GET  /api/me                         your progress, bookmarks, notes counts, reading time
@@ -135,6 +137,17 @@ class Content:
         for s_ in self.scenes: by_concept.setdefault(s_["concept"], []).append(s_)
         for n in nodes: self.reads[n["id"]]["scenes"] = by_concept.get(n["id"], [])
         scene_list = [dict(id=s_["id"], concept=s_["concept"], title=s_.get("title", ""), n=len(s_.get("steps", []))) for s_ in self.scenes]
+        # architecture patterns (content/patterns/*.txt): full bodies (with the compiled scene) in each concept's read,
+        # summaries and the canonical catalog in the graph
+        pats = {}
+        if "patterns" in has:
+            for r in db.execute("SELECT concept, body FROM patterns ORDER BY concept, ord"): pats.setdefault(r[0], []).append(json.loads(r[1]))
+        self.patterns = [x for n in nodes for x in pats.get(n["id"], [])]
+        for n in nodes: self.reads[n["id"]]["patterns"] = pats.get(n["id"], [])
+        pattern_list = [dict(concept=x["concept"], i=i, title=x["title"], kinds=x["kinds"], when=x["when"], n=len(x["scene"]["steps"]))
+                        for n in nodes for i, x in enumerate(pats.get(n["id"], []))]
+        row = db.execute("SELECT value FROM meta WHERE key='pcatalog'").fetchone()
+        pcatalog = json.loads(row[0]) if row else []
         # problem map: the compact form is served as is; full entries per problem answer /api/problem/<n>
         self.pm_json, self.pm_gz, self.pm, self.pm_ideas, pm_summary = None, None, {}, {}, None
         if "pm_problems" in has:
@@ -147,7 +160,7 @@ class Content:
                 self.pm_ideas = {r[0]: json.loads(r[1]) for r in db.execute("SELECT id, body FROM pm_ideas ORDER BY ord")}
         db.close()
         self.ids = set(self.reads)
-        self.graph = dict(nodes=nodes, edges=edges, side=side, tours=tours, layers=layers, curriculum=curriculum, designs=design_list, practice=practice, templates=self.templates, scenes=scene_list, stats=self.stats, built_at=self.built_at, mode="server", problemmap=pm_summary)
+        self.graph = dict(nodes=nodes, edges=edges, side=side, tours=tours, layers=layers, curriculum=curriculum, designs=design_list, practice=practice, templates=self.templates, scenes=scene_list, patterns=pattern_list, pcatalog=pcatalog, stats=self.stats, built_at=self.built_at, mode="server", problemmap=pm_summary)
         self.graph_json = json.dumps(self.graph, ensure_ascii=False, separators=(",", ":")).encode()
         self.graph_gz = gzip.compress(self.graph_json, 6)
         self.local = threading.local()
@@ -342,6 +355,10 @@ def make_handler(app, allowed_hosts):
                     cid = (qs.get("concept") or [None])[0]
                     if cid is not None and not self.known(cid): return
                     return self.send(200, [s_ for s_ in c.scenes if cid is None or s_["concept"] == cid])
+                if p == "/api/patterns":
+                    cid = (qs.get("concept") or [None])[0]
+                    if cid is not None and not self.known(cid): return
+                    return self.send(200, [x for x in c.patterns if cid is None or x["concept"] == cid])
                 m = re.fullmatch(r"/api/read/([A-Za-z0-9-]+)", p)
                 if m:
                     if not self.known(m.group(1)): return
