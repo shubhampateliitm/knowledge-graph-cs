@@ -1,6 +1,6 @@
 # Fact-check pass on deep reads
 
-Root: /tmp/claude-0/-home-claude/0dc6e862-1194-53b2-88f9-ad8a3966ed3c/scratchpad/kgcs
+Root: <repo root>
 Files: content/reads/long/d_rNN_*.txt (the DSL is described in content/WRITING.md).
 
 For each claim in your list:

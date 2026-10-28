@@ -1,9 +1,9 @@
 # Maths markup pass
 
-Root: /tmp/claude-0/-home-claude/0dc6e862-1194-53b2-88f9-ad8a3966ed3c/scratchpad/kgcs
+Root: <repo root>
 Read content/FORMAT.md first (the `\( \)` inline and `\[ \]` display LaTeX syntax, rendered with Temml to MathML).
 
-Input: /tmp/claude-0/-home-claude/0dc6e862-1194-53b2-88f9-ad8a3966ed3c/scratchpad/tmp_math/cand_K.tsv (K = your chunk). Each line: `path:line<TAB>the current text of that line`.
+Input: <your scratch folder>/tmp_math/cand_K.tsv (K = your chunk). Each line: `path:line<TAB>the current text of that line`.
 Each line is one paragraph of a deep read (it may start with a section key such as `how: ` or `terms: `).
 
 Task: for each line, decide whether it contains a real formula (a definition, law, theorem, model equation,
@@ -23,7 +23,7 @@ spans as `\( LaTeX \)`. Keep every other word exactly as it is.
   \le, \ge, \approx, \in, \to, \infty, \cdot, \times, Greek letters (\lambda, \sigma, \mu, \varepsilon, \varphi).
   Variables italic (default); words inside formulas with \text{...}. No $ signs.
 
-Output: write /tmp/claude-0/-home-claude/0dc6e862-1194-53b2-88f9-ad8a3966ed3c/scratchpad/tmp_math/out_K.tsv with one line per CHANGED paragraph: `path:line<TAB>new text`
+Output: write <your scratch folder>/tmp_math/out_K.tsv with one line per CHANGED paragraph: `path:line<TAB>new text`
 (if you split into display lines, write them in the same field separated by ` ⏎ `; never use a literal backslash-n,
 because LaTeX has \nabla, \neq). Do not include unchanged lines. Do not edit any file under content/ yourself.
 

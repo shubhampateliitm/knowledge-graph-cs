@@ -1,5 +1,5 @@
 # Converting practice problems to Python-first + Go, C++, Rust, Scala
-Root: /tmp/claude-0/-home-claude/0dc6e862-1194-53b2-88f9-ad8a3966ed3c/scratchpad/kgcs
+Root: <repo root>
 Read content/PRACTICE_LANGS.md completely and follow it exactly (schema, type grammar, starter/solution rules,
 Scala rules, error table). Your batch K is one line of content/drafts/practice_langs_list.txt (`K | id [hints] ; ...`).
 Look at content/drafts/practice_langs_0.json (the pilot) for finished examples.

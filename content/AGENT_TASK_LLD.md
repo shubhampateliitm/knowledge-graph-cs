@@ -1,6 +1,6 @@
 # Writing object-oriented (low-level) design problems (v9)
 
-Root: /tmp/claude-0/-home-claude/0dc6e862-1194-53b2-88f9-ad8a3966ed3c/scratchpad/kgcs
+Root: <repo root>
 These use the same block format as system design questions (content/NEW_CONTENT.md section 2; checked by
 tools/checkdesign.py), with `category: Object-oriented design` and `level: Mid / Senior`. Read content/FORMAT.md
 (code blocks, **bold**, callouts) and content/WRITING.md (plain easy English, short sentences).

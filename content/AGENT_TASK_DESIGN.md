@@ -1,6 +1,6 @@
 # Writing system design questions (v9)
 
-Root: /tmp/claude-0/-home-claude/0dc6e862-1194-53b2-88f9-ad8a3966ed3c/scratchpad/kgcs
+Root: <repo root>
 Read first: content/NEW_CONTENT.md section 2 (design format), content/FORMAT.md (rich text: LaTeX, ```sql/```json code
 blocks, **bold**, callouts), content/WRITING.md (style: plain easy English, short sentences, concrete numbers,
 mechanism over adjectives; never Al Jazeera or The Wire), and one existing design as a model:

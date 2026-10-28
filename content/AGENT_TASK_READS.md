@@ -1,6 +1,6 @@
 # Task: write deep reads for a batch of concepts
 
-Project root: /tmp/claude-0/-home-claude/0dc6e862-1194-53b2-88f9-ad8a3966ed3c/scratchpad/kgcs
+Project root: <repo root>
 1. Read content/WRITING.md fully (spec, including the "Required since v7" section at the end) and
    content/reads/long/d_gold.txt (the model read: match its depth, tone and format).
 2. Run `python3 tools/brief.py <ids>` for your concepts (current read, links with reasons, neighbours, courses).

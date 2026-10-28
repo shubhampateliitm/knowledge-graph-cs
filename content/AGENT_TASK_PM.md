@@ -1,5 +1,5 @@
 # Problem-map family writer
-Root: /tmp/claude-0/-home-claude/0dc6e862-1194-53b2-88f9-ad8a3966ed3c/scratchpad/kgcs
+Root: <repo root>
 Read content/problemmap/WRITERS.md completely and follow it exactly. Your family (or families) is given in your prompt.
 Use your own knowledge of the problems (titles are enough). Never fetch or copy editorial text from any site.
 Write content/drafts/pm_<family>.json and validate with `python3 tools/check_problemmap.py <family>` until it reports

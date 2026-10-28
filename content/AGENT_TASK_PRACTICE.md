@@ -1,6 +1,6 @@
 # Writing practice problems (v9)
 
-Root: /tmp/claude-0/-home-claude/0dc6e862-1194-53b2-88f9-ad8a3966ed3c/scratchpad/kgcs
+Root: <repo root>
 Format: content/NEW_CONTENT.md section 4 (read it), and look at 3 existing entries in content/practice/problems.json.
 Your lines of content/drafts/practice_v9_list.txt are given in your prompt; each is `pattern | Title URL ; Title URL ; ...`.
 For every problem on your lines write one JSON object. Rules:

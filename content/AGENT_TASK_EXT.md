@@ -1,6 +1,6 @@
 # Task: add trade-offs and interview sections to existing deep reads
 
-Project root: /tmp/claude-0/-home-claude/0dc6e862-1194-53b2-88f9-ad8a3966ed3c/scratchpad/kgcs
+Project root: <repo root>
 Read the "Required since v7" section at the end of content/WRITING.md. For each concept in your batch, run
 `python3 tools/brief.py <id>` (it prints the current full read) and write an extension block:
     @@+ <id>
