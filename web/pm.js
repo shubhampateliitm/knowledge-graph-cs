@@ -65,7 +65,7 @@ function build(raw){
 }
 
 /* ---------------- state ---------------- */
-function S(){ const st = app().state; if(!st.pm) st.pm = {idea:null, prob:null, fam:-1, diff:-1, worked:false, q:"", concept:null, z:0, more:{}}; return st.pm; }
+function S(){ const st = app().state; if(!st.pm) st.pm = {idea:null, prob:null, fam:-1, diff:-1, worked:false, q:"", concept:null, z:0, more:{}, mode:"road", open:{}}; return st.pm; }
 function hash(){ const s = S(); return s.prob ? "#problems/" + s.prob : s.idea ? "#problems/idea/" + s.idea : "#problems"; }
 function setHash(){ const A = app(); if(A.state.view==="problems" && !A.R.open) try{ history.replaceState(null, "", hash()); }catch(e){} }
 const doneSet = () => {
@@ -98,6 +98,60 @@ function ideaMatch(d, s, qm){
   if(s.concept && !(d.c.includes(s.concept) || d.probs.some(q=>q.c.includes(s.concept)))) return false;
   if(qm && !(qm.ideas.includes(d) || qm.probs.some(q=>q.i===d.i))) return false;
   return true;
+}
+
+/* ---------------- roadmap: the default view ----------------
+   The same DAG, told as a route: families in the order their prerequisites allow, each family as numbered stages
+   (stage k = level k-1), each idea with a status computed from what you solved. The cross-section stays as "Full map". */
+// an idea is "started" with one solved problem and "done" with its anchor plus three solved (or all, if it has fewer)
+function ideaState(d, done){
+  const n = d.probs.length, k = d.probs.filter(q=>done.has(q.n)).length;
+  const started = id => I.byId[id].probs.some(q=>done.has(q.n));
+  const need = d.b.filter(id=>!started(id));
+  const st = n && k >= Math.min(n, 3) && (!d.a || done.has(d.a) || k===n) ? "done" : k ? "started" : need.length ? "locked" : "ready";
+  return {st, k, n, need};
+}
+// families ordered so that a family comes after the families its ideas build on (ties keep the file order)
+function famOrder(){
+  if(I.famOrd) return I.famOrd;
+  const deps = I.fams.map(f=>new Set(f.ideas.flatMap(d=>d.b.map(b=>I.byId[b].f)).filter(g=>g!==f.i)));
+  const out = [], seen = new Set();
+  while(out.length < I.fams.length){
+    const free = I.fams.filter(f=>!seen.has(f.i)).map(f=>({f, left:[...deps[f.i]].filter(g=>!seen.has(g)).length}));
+    free.sort((a,b)=>a.left-b.left || a.f.i-b.f.i); const pick = free[0].f; seen.add(pick.i); out.push(pick);
+  }
+  I.famDeps = deps; return I.famOrd = out;
+}
+const STAT = {done:["✓","Done"], started:["◐","Started"], ready:["●","Ready"], locked:["○","Needs"]};
+function roadHTML(s, qm){
+  const done = doneSet(), fams = famOrder(), solved = I.P.filter(q=>done.has(q.n)).length;
+  const nx = nextList(done, 3), first = nx[0];
+  let h = `<section class="pm-you" aria-label="Your progress"><div class="pm-yt"><b>${fmt(solved)}</b> of ${fmt(I.P.length)} problems solved<span class="pm-bar" aria-hidden="true"><span style="width:${(100*solved/I.P.length).toFixed(2)}%"></span></span></div>
+    ${first ? `<button type="button" class="pm-nextbig" data-pmprob="${first.q.n}" style="--c:${famVar(first.q.f)}"><span class="pm-nk">${solved ? "Your next problem" : "Start here"}</span><span class="pm-nt">#${first.q.n} ${esc(first.q.t)}</span><span class="pm-nw">${esc(I.ideas[first.q.i].name)} · ${DIFF[first.q.d]} · ${esc(first.why)}</span></button>` : ""}
+    ${nx.length>1 ? `<p class="pm-also">Or: ${nx.slice(1).map(x=>pref(x.q.n)).join(" · ")}</p>` : ""}
+    <p class="pm-legend" aria-label="Idea status"><span class="pm-ir done"><span class="pm-is">✓</span>done</span><span class="pm-ir started"><span class="pm-is">◐</span>started</span><span class="pm-ir ready"><span class="pm-is">●</span>ready to start</span><span class="pm-ir locked"><span class="pm-is">○</span>needs another idea first</span><span><span class="pm-mix" aria-hidden="true"><i class="easy" style="flex:1"></i><i class="medium" style="flex:1"></i><i class="hard" style="flex:1"></i></span> easy, medium, hard</span></p></section>`;
+  const fs = fams.filter(f=>s.fam<0 || f.i===s.fam), filt = s.fam>=0 || s.diff>=0 || s.worked || s.concept || qm;
+  h += `<ol class="pm-fams">` + fs.map((f, k)=>{
+    const ideas = f.ideas.filter(d=>ideaMatch(d, s, qm)); if(filt && !ideas.length) return "";
+    const fk = f.ideas.reduce((a,d)=>a + d.probs.filter(q=>done.has(q.n)).length, 0), pos = g => fams.indexOf(I.fams[g]);
+    const before = [...I.famDeps[f.i]].filter(g=>pos(g) < pos(f.i)).map(g=>I.fams[g]), later = [...I.famDeps[f.i]].filter(g=>pos(g) > pos(f.i)).map(g=>I.fams[g]);
+    const names = (list, n) => list.slice(0, n).map(g=>esc(g.name)).join(", ") + (list.length > n ? ` and ${list.length - n} more` : "");
+    const dep = (before.length ? `Builds on ${names(before, 3)}.` : "Start here: needs no earlier family.") + (later.length ? ` A few later stages also use ${names(later, 2)}.` : "");
+    const open = s.open[f.id]!==undefined ? s.open[f.id] : (filt || (!solved && k===0) || ideas.some(d=>d.id===s.idea) || (solved && fk>0 && fk<f.probs));
+    const levels = [...new Set(ideas.map(d=>d.l))].sort((a,b)=>a-b);
+    const body = levels.map(l=>`<li class="pm-stage-l"><p class="pm-sl"><span class="pm-sn">${l+1}</span>Stage ${l+1}${l===0?" · foundations":""}</p><ul class="pm-ideas">${ideas.filter(d=>d.l===l).sort((a,b)=>a.name.localeCompare(b.name)).map(d=>{
+        const x = ideaState(d, done), t = d.probs.length || 1;
+        return `<li><button type="button" class="pm-ir ${x.st}${d.id===s.idea?" sel":""}" data-pmidea="${d.id}" aria-pressed="${d.id===s.idea}" aria-label="${esc(d.name)}: ${STAT[x.st][1]}, ${x.k} of ${x.n} solved">
+          <span class="pm-is" aria-hidden="true">${STAT[x.st][0]}</span><span class="pm-ib"><span class="pm-in1">${esc(d.name)}</span><span class="pm-in2">${esc(d.s)}</span>
+          ${x.st==="locked" ? `<span class="pm-need">Needs: ${x.need.map(id=>esc(I.byId[id].name)).join(", ")}</span>` : ""}</span>
+          <span class="pm-im"><span class="mono">${x.k}/${x.n}</span><span class="pm-mix" title="${d.diff[0]} easy, ${d.diff[1]} medium, ${d.diff[2]} hard" aria-hidden="true">${d.diff.map((c,i)=>c?`<i class="${DIFF[i].toLowerCase()}" style="flex:${c/t}"></i>`:"").join("")}</span></span></button></li>`; }).join("")}</ul></li>`).join("");
+    return `<li class="pm-fcard${open?" open":""}" style="--c:${famVar(f.i)}"><button type="button" class="pm-fh" data-pmopen="${f.id}" aria-expanded="${open}">
+      <span class="pm-fno mono">${k+1}</span><span class="pm-fb"><span class="pm-fn">${esc(f.name)}</span><span class="pm-fd">${esc(f.description||"")}</span>
+      <span class="pm-fm"><span class="pm-bar"><span style="width:${(100*fk/Math.max(1,f.probs)).toFixed(1)}%"></span></span><span class="mono">${fk}/${f.probs}</span><span>${f.ideas.length} ideas · ${levels.length} stage${levels.length===1?"":"s"}</span></span>
+      <span class="pm-fdep">${dep}</span></span><span class="pm-chev" aria-hidden="true">▾</span></button>
+      ${open ? `<ol class="pm-stages">${body}</ol>` : ""}</li>`;
+  }).join("") + `</ol>`;
+  return h;
 }
 
 /* ---------------- layout: a cross-section, one column (lane) per family, level 0 at the bottom ---------------- */
@@ -189,7 +243,8 @@ function build_view(el){
   const miss = (st.missing_families||[]).map(id=>(I.fams.find(f=>f.id===id)||{name:id}).name);
   el.innerHTML = `<div class="pm">
     <div class="pm-head"><h2 class="vh">Problem map</h2>
-      <p class="vsub">${fmt(I.P.length)}${I.P.length<cat?` of ${fmt(cat)}`:""} LeetCode problems, built from the ground up. Each one is pinned to one of ${I.ideas.length} ideas, and each idea builds on the ideas below it. Pick an idea to climb its problems, easiest first.${miss.length?` Still being mapped: ${esc(miss.join(", "))}.`:""}</p></div>
+      <p class="vsub">${fmt(I.P.length)}${I.P.length<cat?` of ${fmt(cat)}`:""} LeetCode problems, built from the ground up. Each one is pinned to one of ${I.ideas.length} ideas (techniques), grouped in ${I.fams.length} families. Work down the roadmap: each family is a set of stages, and each idea opens its problems as a ladder, easiest first.${miss.length?` Still being mapped: ${esc(miss.join(", "))}.`:""}</p></div>
+    <div class="filters pm-mode" role="group" aria-label="View"><button type="button" data-pmmode="road" aria-pressed="true">Roadmap</button><button type="button" data-pmmode="map" aria-pressed="false">Full map</button></div>
     <div class="pm-tools">
       <div class="pm-search"><label for="pm-q" class="sr">Find an idea or a problem</label><input id="pm-q" type="search" placeholder="Find an idea or a problem (name or number)" value="${esc(s.q)}" autocomplete="off" spellcheck="false"><div class="pm-sres" id="pm-sres" hidden></div></div>
       <div class="filters pm-diff" role="group" aria-label="Difficulty">${["All"].concat(DIFF).map((d,k)=>`<button type="button" data-pmdiff="${k-1}" aria-pressed="false">${d}</button>`).join("")}</div>
@@ -197,11 +252,14 @@ function build_view(el){
       <label class="pm-fam" id="pm-famw"><span class="sw" aria-hidden="true"></span><span class="sr">Family</span><select id="pm-fam"><option value="-1">All ${I.fams.length} families</option>${I.fams.map(f=>`<option value="${f.i}">${esc(f.name)}</option>`).join("")}</select></label>
       <span id="pm-concept"></span>
     </div>
+    <div id="pm-road"></div>
+    <div id="pm-mapw">
     <div class="pm-stage">
       <div class="pm-frame" id="pm-frame">${mapSVG()}</div>
       <div class="pm-zoom" role="group" aria-label="Zoom"><button type="button" class="btn" data-pmzoom="out" aria-label="Zoom out">−</button><button type="button" class="btn" data-pmzoom="in" aria-label="Zoom in">+</button><button type="button" class="btn" data-pmzoom="fit">Fit</button><button type="button" class="btn" data-pmzoom="ground">Foundations</button></div>
     </div>
     <p class="pm-cap" id="pm-cap" aria-live="polite"></p>
+    </div>
     <details class="pm-list"><summary>Every idea as a list, by family</summary><div class="pm-listb">${I.fams.map(f=>`<div class="pm-lg" style="--c:${famVar(f.i)}"><div class="uh"><span class="sw"></span>${esc(f.name)} · ${f.probs} problems</div><div class="chips">${f.ideas.slice().sort((a,b)=>a.l-b.l||a.name.localeCompare(b.name)).map(d=>`<button type="button" class="chip" data-pmidea="${d.id}" style="--c:${famVar(f.i)}"><span class="sw"></span>${esc(d.name)} <span class="mono pm-cn">L${d.l} · ${d.probs.length}</span></button>`).join("")}</div></div>`).join("")}</div></details>
   </div>`;
   el.__pm = true;
@@ -245,6 +303,11 @@ function refresh(){
   if(cap){ const filtered = s.fam>=0 || s.diff>=0 || s.worked || s.concept || qm;
     cap.innerHTML = (filtered ? `<b>${nIdeas} of ${I.ideas.length} ideas</b> match, with ${fmt(nProbs)} problems. <button type="button" class="linkish" data-pmclear>Clear filters</button> ` : `${I.ideas.length} ideas in ${I.fams.length} families. `) +
       `Lines run from an idea down to the ideas it builds on. Drag or scroll to move; Ctrl + wheel, pinch or the buttons zoom.`; }
+  const road = s.mode!=="map", rw = $("pm-road"), mw = $("pm-mapw");
+  EL.querySelectorAll("[data-pmmode]").forEach(b=>b.setAttribute("aria-pressed", String((b.dataset.pmmode==="road")===road)));
+  if(rw){ rw.hidden = !road; if(road) rw.innerHTML = roadHTML(s, qm); }
+  if(mw){ const was = mw.hidden; mw.hidden = road; if(was && !road) requestAnimationFrame(()=>{ const fr = $("pm-frame"); if(fr && !s.sx) fr.scrollTop = fr.scrollHeight; }); }
+  const pl = EL.querySelector(".pm-list"); if(pl) pl.hidden = road;
   searchResults(qm);
 }
 function searchResults(qm){
@@ -388,8 +451,9 @@ function panel(el){
 }
 function introPanel(){
   const done = doneSet();
-  return `<div class="pm-intro"><h2>How to read the map</h2>
-    <p class="mech">Read it from the bottom up. Level 0 holds the foundations: scan an array, use a hash set, recurse. Every idea above builds on the ideas its lines reach down to. Each column is one family of techniques.</p>
+  const road = S().mode!=="map";
+  return `<div class="pm-intro"><h2>How to use the map</h2>
+    <p class="mech">${road ? "The roadmap lists the 18 families in the order their prerequisites allow. Inside a family, stage 1 holds the foundations (scan an array, use a hash set, recurse) and each later stage builds on the ones before it. Every idea shows how many of its problems you solved and whether you are ready for it." : "Read the full map from the bottom up. Level 0 holds the foundations: scan an array, use a hash set, recurse. Every idea above builds on the ideas its lines reach down to. Each column is one family of techniques."}</p>
     <ol class="pm-how"><li>Pick an idea to see its problems as a ladder: start with the first step, then climb.</li><li>Pick a problem to see what it builds on (below) and what it unlocks (above), and the shortest path to it from the foundations.</li><li>Mark problems as solved; the You tab then suggests the problems whose prerequisites you have all solved.</li></ol>
     <h3>Next problems for you</h3>${nextHTML(done, 6)}</div>`;
 }
@@ -541,7 +605,7 @@ function vizLink(id){ if(!available()) return ""; if(!I) return later(); return 
 /* ---------------- clicks ---------------- */
 document.addEventListener("click", async e=>{
   if(dragged && e.target.closest && e.target.closest("#pm-frame")){ e.preventDefault(); e.stopPropagation(); return; }
-  const t = e.target.closest && e.target.closest("[data-pmidea],[data-pmprob],[data-pmdone],[data-pmpractice],[data-pmfam],[data-pmdiff],[data-pmworked],[data-pmzoom],[data-pmconcept],[data-pmclear],[data-pmclose],[data-pmmore],[data-pmpintab],[data-pmpinmore]");
+  const t = e.target.closest && e.target.closest("[data-pmidea],[data-pmprob],[data-pmdone],[data-pmpractice],[data-pmfam],[data-pmdiff],[data-pmworked],[data-pmzoom],[data-pmconcept],[data-pmclear],[data-pmclose],[data-pmmore],[data-pmpintab],[data-pmpinmore],[data-pmmode],[data-pmopen]");
   if(!t) return;
   const d = t.dataset, A = app(); if(!A) return;
   try{
@@ -550,17 +614,22 @@ document.addEventListener("click", async e=>{
     if(d.pmdone!==undefined){ const n = +d.pmdone, on = !doneSet().has(n);
       if(!on && !(A.Store.me.problems||{})[n]){ A.toast("Solved as a worked practice problem: undo it there"); return; }
       await A.Store.setPmSolved(n, on); A.toast(on ? "Marked as solved" : "Marked as not solved");
-      if(A.state.view==="problems") A.renderPanel(); else if(A.state.view==="you") A.render(false); return; }
+      if(A.state.view==="problems"){ A.renderPanel(); refresh(); } else if(A.state.view==="you") A.render(false); return; }
     if(d.pmpractice){ if(A.R.open) A.closeRead(); A.state.algo.tab = "practice"; A.state.algo.prob = d.pmpractice; return A.setView("algorithms"); }
     if(d.pmconcept!==undefined){ await ensure(); return go(s=>{ s.concept = d.pmconcept || null; if(s.concept){ s.idea = null; s.prob = null; } }); }
     if(d.pmpintab){ PINS[d.pmc] = Object.assign(PINS[d.pmc]||{}, {tab:d.pmpintab, n:8}); return fillPins(t.closest(".rd-sec") || document); }
     if(d.pmpinmore){ const st = PINS[d.pmpinmore]; st.n = st.n<=8 ? 60 : st.n + 60; return fillPins(t.closest(".rd-sec") || document); }
     const s = S();
+    if(d.pmmode){ s.mode = d.pmmode; refresh(); return A.renderPanel(); }
+    if(d.pmopen){ const li = t.closest(".pm-fcard"); s.open[d.pmopen] = !(li && li.classList.contains("open")); refresh();
+      const b = EL && EL.querySelector(`[data-pmopen="${CSS.escape(d.pmopen)}"]`); if(b) b.focus({preventScroll:true}); return; }
     if(d.pmfam!==undefined){ s.fam = (+d.pmfam===s.fam) ? -1 : +d.pmfam; refresh(); return A.renderPanel(); }
     if(d.pmdiff!==undefined){ s.diff = +d.pmdiff; refresh(); return A.renderPanel(); }
     if(d.pmworked!==undefined){ s.worked = !s.worked; refresh(); return A.renderPanel(); }
     if(d.pmclear!==undefined){ s.fam = -1; s.diff = -1; s.worked = false; s.q = ""; s.concept = null; const q = $("pm-q"); if(q) q.value = ""; refresh(); return A.renderPanel(); }
-    if(d.pmclose!==undefined){ s.idea = null; s.prob = null; refresh(); A.renderPanel(); return setHash(); }
+    if(d.pmclose!==undefined){ const was = s.idea; s.idea = null; s.prob = null; refresh(); A.renderPanel(); setHash();
+      // on a phone the panel sits below the roadmap: go back to the idea's row
+      const row = was && EL && EL.querySelector(`#pm-road [data-pmidea="${CSS.escape(was)}"]`); if(row && narrow()){ row.scrollIntoView({block:"center", behavior:reduced()?"auto":"smooth"}); row.focus({preventScroll:true}); } return; }
     if(d.pmmore==="up"){ s.more.up = true; return A.renderPanel(); }
     if(d.pmmore){ s.more[d.pmmore] = (s.more[d.pmmore] || (d.pmmore==="ladder"?30:d.pmmore==="used"?8:6)) + (d.pmmore==="ladder"?40:d.pmmore==="used"?30:20); return A.renderPanel(); }
     if(d.pmzoom){ if(d.pmzoom==="in") setZoom(s.z*1.25); else if(d.pmzoom==="out") setZoom(s.z/1.25); else if(d.pmzoom==="fit") fitZoom();

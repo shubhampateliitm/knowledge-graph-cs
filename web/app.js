@@ -383,7 +383,7 @@ function renderCourses(){
   const progBtn = p => `<button type="button" data-program="${esc(p.id)}" aria-pressed="${p.id===prog.id}" title="${esc(p.name)}">${esc(p.short||p.id.toUpperCase())}</button>`;
   $("v-courses").innerHTML = `<div class="tlist">${SCHOOLS.filter(x=>CUR.programs.some(p=>(p.school||"stanford")===x.id)).map(x=>`<div class="filters sch-row" role="group" aria-label="${esc(x.short)} programs" style="margin:0 0 4px"><span class="sch">${esc(x.short)}</span>${CUR.programs.filter(p=>(p.school||"stanford")===x.id).map(progBtn).join("")}</div>`).join("")}
     <p class="ts" style="font-size:12px;color:var(--muted);margin:0 0 6px">${esc(prog.name)} · ${esc(prog.year)}. ${esc(prog.summary)} <a href="${esc(prog.url)}" target="_blank" rel="noopener noreferrer" style="color:var(--muted)">Requirements ↗</a></p>
-    ${prog.groups.map(g=>`<div class="cat" style="position:static;padding:8px 0 2px" title="${esc(g.note)}">${esc(g.name)}</div>${g.courses.map(card).join("")}`).join("")}</div>
+    <div class="tcards">${prog.groups.map(g=>`<div class="cat" style="position:static;padding:8px 0 2px" title="${esc(g.note)}">${esc(g.name)}</div>${g.courses.map(card).join("")}`).join("")}</div></div>
   <div class="tsteps">${c?`<h2>${esc(courseLabel(c.code))}: ${esc(c.title)}</h2><p class="sub">${c.concepts.length} concepts in this map · ${esc(c.text)}${c.term&&c.term!=="—"?` · latest public term: ${esc(c.term)}`:""}${c.url?` · <a href="${esc(c.url)}" target="_blank" rel="noopener noreferrer" style="color:inherit">course site ↗</a>`:" · course site not verified"}</p>
     <div class="under" role="img" aria-label="Concepts by layer" style="margin:0 0 6px">${lays.map((k,l)=>k?`<span style="background:${lc(l)};flex:${k}" title="L${l}: ${k}"></span>`:"").join("")}</div>
     <div class="btnrow" style="margin:6px 0 14px"><button type="button" class="btn primary" data-rcourse="${c.code}">Study this course · ${c.concepts.reduce((s,id)=>s+N[id].rm,0)} min</button></div>
@@ -701,6 +701,7 @@ function patternsHTML(id, list){
 function patTab(wrap, i){
   const list = (READS[wrap.dataset.pats]||{}).patterns||[]; if(!list[i]) return null;
   wrap.querySelectorAll(".ap-tab").forEach((b,j)=>{ b.setAttribute("aria-selected", String(j===i)); b.tabIndex = j===i?0:-1; });
+  const cur = wrap.querySelectorAll(".ap-tab")[i], bar = cur && cur.parentNode; if(bar && bar.scrollWidth > bar.clientWidth) bar.scrollTo({left: cur.offsetLeft - 8, behavior: "auto"});
   wrap.querySelectorAll(".ap-panel").forEach((p,j)=>{ p.hidden = j!==i; });
   wrap.querySelectorAll(".ap-scene").forEach(h=>{ const old = h.firstElementChild && h.firstElementChild.__player; if(old) old.destroy(); h.innerHTML=""; });
   const host = wrap.querySelector(`[data-apscene="${i}"]`);
@@ -984,6 +985,8 @@ function render(scrollCols){
   renderStrip();
   const v = state.view;
   document.querySelectorAll(".tabs button").forEach(b=>b.setAttribute("aria-pressed", String(b.dataset.view===v)));
+  const tb = document.querySelector('.tabs button[aria-pressed="true"]'), bar = tb && tb.parentNode;
+  if(tb && bar.scrollWidth > bar.clientWidth) bar.scrollTo({left: tb.offsetLeft - (bar.clientWidth - tb.offsetWidth)/2, behavior: "auto"});
   $("v-explore").hidden = v!=="explore"; $("cols").hidden = v!=="explore";
   $("v-design").hidden = v!=="design"; $("v-algorithms").hidden = v!=="algorithms"; $("v-architecture").hidden = v!=="architecture"; $("v-problems").hidden = v!=="problems";
   document.querySelector(".desk").classList.toggle("wide", v==="design"||v==="algorithms"||v==="architecture");
@@ -1071,6 +1074,24 @@ document.addEventListener("keydown", e=>{
   if(an && (e.key==="ArrowLeft"||e.key==="ArrowRight") && !/INPUT|TEXTAREA/.test(e.target.tagName)){ e.preventDefault(); animAct(an.id, e.key==="ArrowLeft"?"prev":"next"); }
   if(e.key==="/" && !/INPUT|TEXTAREA/.test(document.activeElement.tagName)){ e.preventDefault(); if(R.open) closeRead(); $("q").focus(); }
 });
+
+/* ---------------- swipe ---------------- */
+// a horizontal swipe on a drawing presses its Back or Next button; vertical movement keeps scrolling the page
+(function(){
+  let t0 = null;
+  const target = el => el && el.closest && el.closest(".sc-stage, #av-stage, .an-stage");
+  document.addEventListener("touchstart", e=>{ const el = target(e.target); if(!el || e.touches.length!==1){ t0 = null; return; }
+    const t = e.touches[0]; t0 = {el, x:t.clientX, y:t.clientY, at:Date.now(), scroll: el.scrollWidth > el.clientWidth + 1}; }, {passive:true});
+  document.addEventListener("touchend", e=>{ if(!t0) return; const s = t0; t0 = null; const t = e.changedTouches[0];
+    const dx = t.clientX - s.x, dy = t.clientY - s.y;
+    if(s.scroll || Date.now() - s.at > 700 || Math.abs(dx) < 45 || Math.abs(dy) > Math.abs(dx) * 0.6) return;
+    const fwd = dx < 0, el = s.el; let b = null;
+    if(el.classList.contains("sc-stage")){ const r = el.closest(".scene"); b = r && r.querySelector(fwd ? '[data-sc="next"]' : '[data-sc="back"]'); }
+    else if(el.id === "av-stage") b = document.querySelector(fwd ? '[data-aact="next"]' : '[data-aact="back"]');
+    else { const a = el.closest(".anim"); b = a && a.querySelector(fwd ? '[data-anim="next"]' : '[data-anim="prev"]'); }
+    if(b && !b.disabled) b.click(); }, {passive:true});
+  document.addEventListener("touchcancel", ()=>{ t0 = null; }, {passive:true});
+})();
 
 /* ---------------- search ---------------- */
 const q=$("q"), sres=$("sres"); let hits=[], hi=0, sq=0;
