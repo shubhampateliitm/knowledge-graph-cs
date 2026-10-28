@@ -604,6 +604,10 @@ const shots = process.argv[3] || null;
   await vp.fill('[data-alin="key"]', '42'); await vp.press('[data-alin="key"]', 'Enter');
   ok(/^insert 42: start at the root/.test(await vp.textContent('#av-msg')) && (await vp.getAttribute('[data-aact="play"]', 'aria-pressed')) === 'false', 'reduced motion: Insert (Enter) jumps to the new key without playing');
   await vctx.close();
+  // hands-on practice links: a section near the end of a read, each link opens in a new tab
+  await page.goto(base + '#read/dimmodel'); await page.waitForSelector('#reader #rs-handson .ho');
+  const ho = await page.evaluate(() => [...document.querySelectorAll('#rs-handson a.ho')].map(a => [a.target, a.rel, /^https?:/.test(a.href), !!a.querySelector('.ho-a')]));
+  ok(ho.length >= 2 && ho.every(x => x[0] === '_blank' && /noopener/.test(x[1]) && x[2] && x[3]) && await page.locator('#reader .toc a[data-jump="rs-handson"]').count() === 1, 'read: "Practice it yourself" lists ' + ho.length + ' links (new tab, access label) with a TOC entry');
   // "Taught in" names each school: Raft is taught at Stanford and at MIT (6.5840)
   await page.goto(base + '#read/raft'); await page.waitForSelector('#reader .ladder-cap');
   const taught = await page.$$eval('#reader .ladder-cap', ps => ps.map(p => p.textContent).find(t => /^Taught in/.test(t)) || '');

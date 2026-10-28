@@ -213,6 +213,16 @@ class API(unittest.TestCase):
         s, r = self.get("/api/read/L4"); self.assertNotIn("patterns", r)                            # layer essays have none
         s, h = self.get("/api/search?q=consumer%20lag%20retention%20slowest%20useful%20reader"); self.assertIn("kafka", [x["id"] for x in h["results"]])   # pattern text is indexed
 
+    def test_handson(self):
+        s, g = self.get("/api/graph"); self.assertGreater(g["stats"]["handson"], 200)
+        s, r = self.get("/api/read/dimmodel"); self.assertEqual(s, 200)
+        self.assertGreaterEqual(len(r["handson"]), 2)
+        for x in r["handson"]:
+            self.assertEqual(x["concept"], "dimmodel"); self.assertTrue(x["u"].startswith("http") and x["t"] and x["d"])
+            self.assertIn(x["kind"], ("playground", "simulator", "puzzles", "exercises", "lab", "ctf", "game", "dataset", "kata"))
+            self.assertIn(x["access"], ("open-source", "free", "free-tier"))
+        s, r = self.get("/api/read/L4"); self.assertNotIn("handson", r)
+
     def test_schools(self):
         s, g = self.get("/api/graph"); cur = g["curriculum"]
         sch = {x["id"]: x for x in cur["schools"]}

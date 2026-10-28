@@ -27,6 +27,8 @@ Every L0–L3 concept also has **Architecture patterns**: the 1–3 common ways 
 
 On phones (up to 700 px wide) the view tabs move to a bottom bar within thumb reach, the header shrinks to the title and search, Explore snaps one column per swipe, and courses and tours are swipeable rows. On touch screens every control is at least 40 px tall (the tabs 44 px), inputs use 16 px text so iOS does not zoom, and a horizontal swipe on an animated scene or visualizer steps it forward or back. All of this is plain CSS and Pointer/Touch events: the app stays one offline file with no extra library.
 
+Where a good one exists (329 concepts, 423 links), a read ends with **Practice it yourself**: playgrounds, simulators, puzzle and exercise sets, autograded labs, CTFs and datasets where you can try the idea (for example a TPC-DS star schema in DuckDB and the Jaffle Shop dbt project for dimensional modelling, Cryptopals for cryptography, MIT 6.5840 labs for Raft). Free and open-source first; every URL was checked in October 2026 (`content/handson/*.txt`, format in `content/handson/README.md`).
+
 A **Courses** view maps three schools' computer science programs onto the graph: Stanford (BS and MS, CS 103 to CS 349D), MIT (Course 6-3 SB and the 6-P MEng, 6.1010 to 6.8611) and Caltech (the CS option, CS 1 to CS 182). Program buttons are grouped by school; pick a course and study its concepts in order. Every read says where its concept is taught ("Taught in Stanford CS 244B; MIT 6.5840").
 
 Today: 775 concepts in six layers, 2,865 links (each with its own reason), 41 tours, 91 courses from Stanford, MIT and Caltech, 1,665 architecture patterns on all 664 L0–L3 concepts, about 3.26 million words and 5,590 sources.
