@@ -54,6 +54,9 @@ CREATE TABLE templates (pattern TEXT PRIMARY KEY, ord INTEGER NOT NULL, body TEX
 -- animated scenes (content/anim/*.json, format in content/anim/README.md): one JSON object per row, in file order
 CREATE TABLE scenes (id TEXT PRIMARY KEY, concept TEXT NOT NULL REFERENCES nodes(id), ord INTEGER NOT NULL, title TEXT NOT NULL, steps INTEGER NOT NULL, body TEXT NOT NULL);
 CREATE INDEX scenes_concept ON scenes(concept, ord);
+-- architecture patterns (content/patterns/*.txt, spec in content/patterns/README.md): one JSON object per pattern, with its
+-- compiled scene; the canonical pattern catalog (content/patterns/catalog.txt) is in meta ('pcatalog')
+CREATE TABLE patterns (concept TEXT NOT NULL REFERENCES nodes(id), ord INTEGER NOT NULL, title TEXT NOT NULL, kinds TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (concept, ord));
 -- problem map (content/problemmap/map.json, built by tools/merge_problemmap.py): one full JSON entry per problem;
 -- the compact form the app loads (/api/problemmap, the standalone page) and its per-concept summary are in meta
 -- ('problemmap', 'problemmap_summary'). Absent when there is no map.json.
@@ -84,12 +87,15 @@ def write_db(data, path):
     for i, n in enumerate(data["nodes"]):
         db.execute("INSERT INTO nodes VALUES (?,?,?,?,?,?,?,?,?,?,?)", (n["id"], n["l"], n["label"], n["cat"], n["y"], n["st"], n["m"], int(n["deep"]), n["w"], n["rm"], i))
     owners = [(n["id"], n) for n in data["nodes"]] + [(r["id"], r) for r in data["layers"]]
+    pats = {}
+    for x in data.get("patterns", []): pats.setdefault(x["concept"], []).append(x)
     for owner, r in owners:
         db.executemany("INSERT INTO paragraphs VALUES (?,?,?,?)", owner_rows(owner, r))
         db.executemany("INSERT INTO sources (owner, ord, kind, title, who, url, work_key) VALUES (?,?,?,?,?,?,?)",
                        [(owner, j, x["k"], x["t"], x["w"], x["u"], work_key(x)) for j, x in enumerate(r["refs"])])
         label = r.get("label") or r.get("n"); mech = r.get("m") or r.get("d")
-        db.execute("INSERT INTO search VALUES (?,?,?,?)", (owner, label, mech, "\n".join(p for ps in r["rd"].values() for p in ps)))
+        ptext = [" ".join([x["title"], x["when"]] + x["how"] + [x["used"]]) for x in pats.get(owner, [])]
+        db.execute("INSERT INTO search VALUES (?,?,?,?)", (owner, label, mech, "\n".join([p for ps in r["rd"].values() for p in ps] + ptext)))
     db.executemany("INSERT INTO edges VALUES (?,?,?,?)", [(e["s"], e["t"], e["k"], e["r"]) for e in data["edges"]])
     db.executemany("INSERT INTO side_links VALUES (?,?,?,?)", [(s["a"], s["b"], s["t"], s["r"]) for s in data["side"]])
     for i, t in enumerate(data["tours"]):
@@ -114,6 +120,9 @@ def write_db(data, path):
         db.execute("INSERT INTO templates VALUES (?,?,?)", (name, i, json.dumps(t, ensure_ascii=False)))
     for i, s in enumerate(data.get("scenes", [])):
         db.execute("INSERT INTO scenes VALUES (?,?,?,?,?,?)", (s["id"], s["concept"], i, s.get("title", ""), len(s["steps"]), json.dumps(s, ensure_ascii=False)))
+    for c, ps in pats.items():
+        db.executemany("INSERT INTO patterns VALUES (?,?,?,?,?)", [(c, i, x["title"], ",".join(x["kinds"]), json.dumps(x, ensure_ascii=False)) for i, x in enumerate(ps)])
+    db.execute("INSERT INTO meta VALUES (?,?)", ("pcatalog", json.dumps(data.get("pcatalog", []), ensure_ascii=False)))
     pm = data.get("problemmap_full")
     if pm:
         db.executemany("INSERT INTO pm_problems VALUES (?,?,?,?,?,?)", [(q["n"], q["idea"], q["family"], q["depth"], q["slug"], json.dumps(q, ensure_ascii=False)) for q in pm["problems"]])
@@ -301,6 +310,14 @@ def load_scenes(node_ids):
             seen[s["id"]] = where; out.append(s)
     return out, errs
 
+def load_patterns(node_ids):
+    """Architecture patterns (content/patterns/*.txt): (flat list in concept order, catalog list, errors)."""
+    import patterns
+    pats, cat, errs = patterns.load(node_ids)
+    errs += patterns.check_scenes(pats, node_ids)
+    catalog = [dict(c, n=sum(1 for ps in pats.values() for x in ps if c["id"] in x["kinds"])) for c in cat.values()]
+    return [x for c in pats for x in pats[c]], catalog, errs
+
 def main():
     args = sys.argv[1:]
     t0 = time.time()
@@ -319,6 +336,11 @@ def main():
     if aerrs:
         print("ANIMATION ERRORS (fix them, or check one file with python3 tools/checkanim.py <file>):\n  " + "\n  ".join(aerrs), file=sys.stderr); sys.exit(1)
     data["stats"]["scenes"] = len(data["scenes"])
+    data["patterns"], data["pcatalog"], perrs2 = load_patterns({n["id"] for n in data["nodes"]})
+    if perrs2:
+        print("PATTERN ERRORS (check one file with python3 tools/checkpatterns.py <file>):\n  " + "\n  ".join(perrs2), file=sys.stderr); sys.exit(1)
+    data["stats"]["patterns"] = len(data["patterns"])
+    data["stats"]["pattern_concepts"] = len({x["concept"] for x in data["patterns"]})
     pm, pmerrs = load_problemmap()
     for e in pmerrs: print("problem map: skipped " + e, file=sys.stderr)
     if pm:
@@ -329,6 +351,7 @@ def main():
     print(f"content ok: {st['nodes']} concepts {st['per_layer']}, {st['edges']} links, {st['side']} side links, "
           f"{st['tours']} tours, {st['courses']} courses, {st['words']:,} words, {st['refs']} sources ({st['urls']} with direct links), {st['deep']} deep reads, "
           f"{st['designs']} design questions, {st['practice']} practice problems, {st['templates']} pattern templates, {st['scenes']} animated scenes, "
+          f"{st['patterns']} architecture patterns on {st['pattern_concepts']} concepts ({len(data['pcatalog'])} in the catalog), "
           f"{st['problemmap']} problems in the problem map" + ("" if pm else " (no content/problemmap/map.json yet)"))
     if "--check" in args: return
     os.makedirs(os.path.join(ROOT, "data"), exist_ok=True); os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)
