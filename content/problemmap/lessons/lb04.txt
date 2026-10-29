@@ -1,0 +1,825 @@
+@@ levelorder
+what: Level-order traversal visits a tree one depth at a time using a queue. At the start of each round, read the queue length n. That n is exactly the number of nodes on this level, so you pop n nodes and push their children for the next round. This avoids storing depths with every node.
+signals: "level by level" or "each level" ; "average, sum or maximum of each row" ; "left to right, then next row" ; "right side view" or "zigzag" ; minimum depth of a tree
+code:
+```python
+from collections import deque
+
+def average_of_levels(root: "TreeNode | None") -> list[float]:
+    if not root:
+        return []
+    out: list[float] = []
+    q = deque([root])
+    while q:
+        n = len(q)            # freeze the size: this is one level
+        total = 0
+        for _ in range(n):
+            node = q.popleft()
+            total += node.val
+            if node.left:
+                q.append(node.left)
+            if node.right:
+                q.append(node.right)
+        out.append(total / n)
+    return out
+```
+walk: #637 Average of Levels in Binary Tree
+step: Tree is 3 with children 9 and 20, and 20 has children 15 and 7. Queue = [3].
+step: Round 1: n = 1. Pop 3, total = 3, push 9 and 20. Average 3.0.
+step: Round 2: n = 2. Pop 9 and 20, total = 29, push 15 and 7. Average 14.5.
+step: Round 3: n = 2. Pop 15 and 7, total = 22, nothing to push. Average 11.0.
+step: The queue is empty, so the answer is [3.0, 14.5, 11.0].
+bugs: Reading len(q) again inside the level loop, after pushes, so levels get mixed ; Using a list with pop(0), which costs O(n) per pop ; Forgetting the empty-tree check, so deque([None]) crashes ; Dividing by the queue length after the loop, when it has already changed
+cost: O(n) time because each node enters and leaves the queue once; O(w) extra space, where w is the widest level.
+
+@@ serialize
+what: To serialize a tree, write it in one fixed traversal order and mark every empty child so the shape is not lost. Without the markers, different trees can give the same text. A recursive preorder walk builds the text, and the same order lets you read it back. Collect pieces in a list and join once at the end for speed.
+signals: "construct string from tree" or "tree to string" ; "serialize and deserialize" ; "encode the tree so it can be rebuilt" ; "unique representation" of a tree shape ; find duplicate subtrees by their text
+code:
+```python
+def tree2str(root: "TreeNode | None") -> str:
+    if not root:
+        return ""
+    s = str(root.val)
+    if root.left or root.right:
+        # an empty left child must still print "()" if a right child exists
+        s += "(" + tree2str(root.left) + ")"
+    if root.right:
+        s += "(" + tree2str(root.right) + ")"
+    return s
+```
+walk: #606 Construct String from Binary Tree
+step: Tree is 1 with left child 2 and right child 3, and 2 has a left child 4.
+step: At node 4: no children, so the text is "4".
+step: At node 2: it has a left child, so the text is "2" + "(4)" = "2(4)".
+step: At node 3: no children, so the text is "3".
+step: At node 1: left part is "(2(4))" and right part is "(3)". The answer is "1(2(4))(3)".
+bugs: Dropping the "()" for a missing left child when a right child exists, so the tree cannot be rebuilt ; Adding "()" for a leaf's two empty children, which is not needed here ; Building the string with += in a deep recursion over a large tree ; Using a delimiter that can appear inside a value, such as a comma in a string tree
+cost: O(n) time because each node is visited once; O(h) recursion space for the stack, plus the output string.
+
+@@ treebuild
+what: To build a balanced search tree from sorted data, pick the middle item as the root. Everything left of it goes in the left subtree and everything right goes in the right subtree. Repeat on each half. Halving each time keeps the height near log n, instead of a chain of height n.
+signals: "sorted array to balanced BST" ; "height-balanced" tree wanted ; sorted linked list turned into a tree ; "build a tree from the sorted values" ; "minimal height" tree
+code:
+```python
+def sorted_array_to_bst(nums: list[int]) -> "TreeNode | None":
+    def build(lo: int, hi: int) -> "TreeNode | None":
+        if lo > hi:
+            return None
+        mid = (lo + hi) // 2          # middle item becomes the root
+        node = TreeNode(nums[mid])
+        node.left = build(lo, mid - 1)
+        node.right = build(mid + 1, hi)
+        return node
+    return build(0, len(nums) - 1)
+```
+walk: #108 Convert Sorted Array to Binary Search Tree
+step: nums = [-10, -3, 0, 5, 9]. Call build(0, 4): mid = 2, so the root is 0.
+step: Left half build(0, 1): mid = 0, so the node is -10, and its right child comes from build(1, 1), which is -3.
+step: Right half build(3, 4): mid = 3, so the node is 5, and its right child comes from build(4, 4), which is 9.
+step: Empty ranges such as build(0, -1) return None.
+step: The tree is 0 with left -10 (right child -3) and right 5 (right child 9). Heights differ by at most 1.
+bugs: Slicing the list in each call, which copies data and costs O(n log n) ; Writing (lo + hi) / 2 and getting a float ; Using mid as the end of the left range, so the same item is used twice ; Starting with hi = len(nums) when the code expects an inclusive end
+cost: O(n) time because each value becomes one node; O(log n) recursion space, since the tree is balanced.
+
+@@ treedown
+what: Some answers depend on the path from the root, such as a running sum or the allowed value range. Pass that information down as an extra argument. Each child gets an updated copy. The decision is then made at a node using only what arrived from above.
+signals: "root-to-leaf path" with a sum or product ; "valid BST" with bounds ; depth is needed at each node ; "good nodes" compared to the path maximum ; values change as you go down
+code:
+```python
+def has_path_sum(root: "TreeNode | None", target_sum: int) -> bool:
+    if not root:
+        return False
+    left = target_sum - root.val      # what the path below must still add up to
+    if not root.left and not root.right:
+        return left == 0              # only leaves can end a path
+    return has_path_sum(root.left, left) or has_path_sum(root.right, left)
+```
+walk: #112 Path Sum
+step: Tree is 5 with children 4 and 8; 4 has a left child 11; 11 has children 7 and 2. Target is 22.
+step: At 5: remaining = 22 - 5 = 17. Go to 4: remaining = 13. Go to 11: remaining = 2.
+step: At 7: it is a leaf and 2 - 7 = -5, which is not 0, so this branch gives False.
+step: At 2: it is a leaf and 2 - 2 = 0, so this branch gives True.
+step: The "or" returns True up to the root. The path 5, 4, 11, 2 sums to 22.
+bugs: Checking "remaining == 0" at a non-leaf node, which accepts a path that stops early ; Treating a node with one child as a leaf ; Changing a shared list or counter without undoing it, so siblings see wrong state ; Forgetting that an empty tree has no path, even for target 0
+cost: O(n) time because each node is visited once; O(h) recursion space for the call stack.
+
+@@ treefromorders
+what: Preorder lists the root first, so its first unused value is the root. In the inorder list, everything left of that root belongs to the left subtree, and everything right belongs to the right. Store each value's inorder index in a hash map so the split is O(1). Then rebuild the left subtree first, then the right, consuming preorder in order.
+signals: "construct tree from preorder and inorder" ; "inorder and postorder" given together ; values are unique ; "rebuild the binary tree" from two lists ; one traversal alone is not enough
+code:
+```python
+def build_tree(preorder: list[int], inorder: list[int]) -> "TreeNode | None":
+    pos = {v: i for i, v in enumerate(inorder)}   # value -> inorder index
+    it = iter(preorder)
+    def build(lo: int, hi: int) -> "TreeNode | None":
+        if lo > hi:
+            return None
+        val = next(it)                # next unused preorder value is the root
+        node = TreeNode(val)
+        mid = pos[val]
+        node.left = build(lo, mid - 1)
+        node.right = build(mid + 1, hi)
+        return node
+    return build(0, len(inorder) - 1)
+```
+walk: #105 Construct Binary Tree from Preorder and Inorder Traversal
+step: preorder = [3, 9, 20, 15, 7], inorder = [9, 3, 15, 20, 7]. Map: 9 to 0, 3 to 1, 15 to 2, 20 to 3, 7 to 4.
+step: build(0, 4): the next preorder value is 3, at inorder index 1. Root is 3.
+step: Left build(0, 0): next value is 9. It is a leaf.
+step: Right build(2, 4): next value is 20, at index 3. Its left build(2, 2) takes 15, and its right build(4, 4) takes 7.
+step: The tree is 3 with left 9 and right 20 (children 15 and 7).
+bugs: Building the right subtree before the left, so preorder is consumed in the wrong order ; Searching inorder with .index() in each call, which makes the whole build O(n²) ; Slicing both lists in each call, which copies O(n) data each time ; Using this with duplicate values, when the split position is not unique
+cost: O(n) time because the map gives each split in O(1); O(n) extra space for the map, plus O(h) recursion.
+
+@@ treeiter
+what: Recursion uses the call stack to remember where to return. You can do the same job with your own list used as a stack. For preorder, pop a node, record it, then push the right child and then the left child. The left child is popped first because the stack gives last-in first-out order. This avoids recursion depth limits on very deep trees.
+signals: "without recursion" or "iteratively" ; "do it with a stack" ; very deep or skewed tree where recursion may overflow ; "implement an iterator over the tree" ; "inorder traversal, one step at a time"
+code:
+```python
+def preorder_traversal(root: "TreeNode | None") -> list[int]:
+    out: list[int] = []
+    stack = [root] if root else []
+    while stack:
+        node = stack.pop()
+        out.append(node.val)          # visit the node first
+        if node.right:                # right goes in first ...
+            stack.append(node.right)
+        if node.left:                 # ... so left comes out first
+            stack.append(node.left)
+    return out
+```
+walk: #144 Binary Tree Preorder Traversal
+step: Tree is 1 with no left child; its right child is 2; and 2 has a left child 3. Stack = [1].
+step: Pop 1 and record it: out = [1]. Push its right child 2. Stack = [2].
+step: Pop 2 and record it: out = [1, 2]. It has no right child. Push its left child 3.
+step: Pop 3 and record it: out = [1, 2, 3]. The stack is empty.
+step: The answer is [1, 2, 3].
+bugs: Pushing left before right, which gives a mirrored order ; Starting the stack with [root] when root is None, so the code reads None.val ; Pushing None children and then crashing on them ; Using the same code for inorder, which needs a different loop that goes left first
+cost: O(n) time because each node is pushed and popped once; O(h) extra space for the stack, up to O(n) for a skewed tree.
+
+@@ treereturn
+what: Often a node must return one thing to its parent, such as its height, but the answer you want is a different thing, such as the longest path through that node. So each call returns what the parent needs, and also updates a shared best value. This computes both in one pass instead of re-walking the subtree at every node.
+signals: "longest path" between any two nodes ; "diameter" of a tree ; "maximum path sum" where the path may bend ; answer does not have to pass through the root ; "balanced" check that needs heights
+code:
+```python
+def diameter_of_binary_tree(root: "TreeNode | None") -> int:
+    best = 0
+    def height(node: "TreeNode | None") -> int:
+        nonlocal best
+        if not node:
+            return 0
+        l = height(node.left)
+        r = height(node.right)
+        best = max(best, l + r)       # longest path bending at this node
+        return 1 + max(l, r)          # what the parent needs
+    height(root)
+    return best
+```
+walk: #543 Diameter of Binary Tree
+step: Tree is 1 with children 2 and 3; 2 has children 4 and 5. Diameter counts edges.
+step: Leaves 4, 5 and 3 each have l = 0 and r = 0. Each returns height 1. best stays 0.
+step: At node 2: l = 1 and r = 1, so best = 2. It returns height 2.
+step: At node 1: l = 2 and r = 1, so best = max(2, 3) = 3. It returns height 3.
+step: The longest path is 4, 2, 1, 3 with 3 edges, so the answer is 3.
+bugs: Returning the best path instead of the height, which breaks the parent's math ; Forgetting that the best path may not pass through the root ; Counting nodes instead of edges ; Calling a separate height function at every node, which makes the code O(n²) on a skewed tree
+cost: O(n) time because each node is visited once; O(h) recursion space for the call stack.
+
+@@ twotrees
+what: To compare or combine two trees, walk both at the same time with one function that takes two nodes. The base cases cover when one or both nodes are missing. Otherwise you compare the two values and recurse on the matching children. This is simpler than flattening both trees and comparing the lists.
+signals: "same tree" or "identical" ; "subtree of another tree" ; "symmetric" or "mirror" ; "merge two binary trees" ; "flip equivalent" trees
+code:
+```python
+def is_same_tree(p: "TreeNode | None", q: "TreeNode | None") -> bool:
+    if not p and not q:
+        return True               # both empty: equal
+    if not p or not q:
+        return False              # only one empty: different shape
+    if p.val != q.val:
+        return False
+    return is_same_tree(p.left, q.left) and is_same_tree(p.right, q.right)
+```
+walk: #100 Same Tree
+step: p is 1 with children 2 and 3. q is 1 with children 2 and 4.
+step: Compare the roots: 1 and 1 match, so go on to both pairs of children.
+step: Compare the left children: 2 and 2 match. Their children are all empty, so each pair returns True.
+step: Compare the right children: 3 and 4 differ, so return False.
+step: "and" gives False at the root. The trees are not the same.
+bugs: Checking only values and not the shape, so a missing child is treated as equal ; Reading p.val before checking that p exists ; Comparing p.left with q.right by mistake when the task is plain equality ; Writing the two "empty" checks in the wrong order, so the both-empty case is lost
+cost: O(min(n, m)) time because the walk stops at the first difference or the smaller tree's end; O(h) recursion space.
+
+@@ adjlist
+what: An adjacency list stores, for each node, the list of its neighbours. You build it in one pass over the edges: for each edge a-b, add b to a's list and a to b's list. Then you can find the neighbours of any node in time proportional to their count, instead of scanning all edges each time.
+signals: input is a list of edges or pairs ; "undirected graph" with n nodes ; "connections between cities" ; you need the neighbours or degree of a node ; "prerequisites" given as pairs
+code:
+```python
+def find_center(edges: list[list[int]]) -> int:
+    n = len(edges) + 1                    # a star has n nodes and n - 1 edges
+    adj = [[] for _ in range(n + 1)]      # nodes are numbered 1..n
+    for a, b in edges:
+        adj[a].append(b)                  # undirected: add both ways
+        adj[b].append(a)
+    for node in range(1, n + 1):
+        if len(adj[node]) == n - 1:       # the center touches every other node
+            return node
+    return -1
+```
+walk: #1791 Find Center of Star Graph
+step: edges = [[1,2],[2,3],[4,2]]. There are 3 edges, so n = 4. Start with 5 empty lists.
+step: Edge [1,2]: adj[1] = [2] and adj[2] = [1].
+step: Edge [2,3]: adj[2] = [1,3] and adj[3] = [2].
+step: Edge [4,2]: adj[4] = [2] and adj[2] = [1,3,4].
+step: Node 1 has 1 neighbour, but we need n - 1 = 3. Node 2 has 3 neighbours, so return 2.
+bugs: Adding the edge in one direction only for an undirected graph ; Making the list size n when nodes start at 1, which gives an index error ; Using [[]] * n, which shares one list among all nodes ; Using an adjacency matrix for a sparse graph, which wastes O(n²) space
+cost: O(V + E) time and O(V + E) extra space, because each edge is stored twice and each node has one list.
+
+@@ bfsgrid
+what: Breadth-first search with a queue explores a graph in rings: all cells at distance 1, then distance 2, and so on. So the first time you reach a cell is by a shortest path, and you can mark it visited at once. Depth-first search gives no such guarantee. Store the distance in the queue with each cell.
+signals: "minimum number of steps" or "shortest path" with equal-cost moves ; grid with walls or blocked cells ; "fewest moves to reach" ; "nearest" cell of some kind ; unweighted graph
+code:
+```python
+from collections import deque
+
+def shortest_path_binary_matrix(grid: list[list[int]]) -> int:
+    n = len(grid)
+    if grid[0][0] or grid[n - 1][n - 1]:
+        return -1
+    q = deque([(0, 0, 1)])            # row, col, path length so far
+    grid[0][0] = 1                    # mark visited when pushed
+    while q:
+        r, c, d = q.popleft()
+        if r == n - 1 and c == n - 1:
+            return d
+        for dr in (-1, 0, 1):         # 8 directions
+            for dc in (-1, 0, 1):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < n and 0 <= nc < n and grid[nr][nc] == 0:
+                    grid[nr][nc] = 1
+                    q.append((nr, nc, d + 1))
+    return -1
+```
+walk: #1091 Shortest Path in Binary Matrix
+step: grid = [[0,0,0],[1,1,0],[1,1,0]]. Start: queue = [(0,0,1)], and (0,0) is marked.
+step: Pop (0,0,1). Only (0,1) is open, so push (0,1,2).
+step: Pop (0,1,2). Push (0,2,3) and the diagonal (1,2,3).
+step: Pop (0,2,3). Its open neighbours are already marked. Pop (1,2,3) and push (2,2,4).
+step: Pop (2,2,4). It is the goal, so return 4.
+bugs: Marking a cell visited only when popped, so it enters the queue many times ; Using DFS and expecting the shortest path ; Forgetting to check the start and end cells for walls ; Counting steps as edges when the problem counts cells, which is off by one
+cost: O(n²) time for an n by n grid, because each cell enters the queue once with 8 checks; O(n²) extra space for the queue.
+
+@@ floodfill
+what: Flood fill starts at one cell and spreads to every connected cell with the same value. Use DFS (recursion) or BFS (queue). Change each cell as you visit it, so you never visit it twice and no separate visited set is needed. The same spread-and-mark pattern counts islands or finds region sizes.
+signals: "connected region" of the same colour or value ; "number of islands" ; "paint" or "fill" an area ; "surrounded regions" ; start cell is given and the area around it matters
+code:
+```python
+def flood_fill(image: list[list[int]], sr: int, sc: int, color: int) -> list[list[int]]:
+    old = image[sr][sc]
+    if old == color:                  # same colour: stop, or it never ends
+        return image
+    rows, cols = len(image), len(image[0])
+    def dfs(r: int, c: int) -> None:
+        if not (0 <= r < rows and 0 <= c < cols) or image[r][c] != old:
+            return
+        image[r][c] = color           # painting also marks it visited
+        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            dfs(r + dr, c + dc)
+    dfs(sr, sc)
+    return image
+```
+walk: #733 Flood Fill
+step: image = [[1,1,1],[1,1,0],[1,0,1]], start (1,1), new colour 2. The old colour is 1.
+step: Paint (1,1) with 2. Its down neighbour (2,1) is 0, so it stops there.
+step: Spread up to (0,1), then to (0,0) and (0,2), painting each one.
+step: Spread from (1,1) to the left, (1,0), then down to (2,0). Both are painted.
+step: Cell (1,2) is 0 and cell (2,2) is not reachable by 4 directions. Result: [[2,2,2],[2,2,0],[2,0,1]].
+bugs: Not returning early when the new colour equals the old one, which loops forever ; Checking the bounds after reading the cell, which gives an index error ; Moving diagonally when only 4 directions are allowed ; Using deep recursion on a huge grid, when a queue is safer
+cost: O(R * C) time because each cell is painted at most once; O(R * C) recursion space in the worst case.
+
+@@ cooldown
+what: When equal tasks must be at least n slots apart, the most frequent task decides the length. Lay it out in blocks of n + 1 slots, with the last block holding only the tasks that tie for the top count. Other tasks fit into the gaps. If there are enough different tasks to fill every gap, no idle time is needed and the answer is just the task count.
+signals: "cooldown" or "at least n apart" ; "same task cannot run twice in a row" ; "rearrange so equal items are separated" ; "minimum time to finish all tasks" ; "idle" slots
+code:
+```python
+from collections import Counter
+
+def least_interval(tasks: list[str], n: int) -> int:
+    counts = Counter(tasks)
+    top = max(counts.values())                       # highest frequency
+    ties = sum(1 for v in counts.values() if v == top)
+    # (top - 1) full blocks of n + 1 slots, then one last partial block
+    return max(len(tasks), (top - 1) * (n + 1) + ties)
+```
+walk: #621 Task Scheduler
+step: tasks = A,A,A,B,B,B and n = 2. Counts: A is 3 and B is 3.
+step: The top count is 3, and 2 tasks (A and B) share it, so ties = 2.
+step: There are top - 1 = 2 full blocks of size n + 1 = 3, which is 6 slots.
+step: Add the last block with the 2 tied tasks: 6 + 2 = 8. The layout is A B idle A B idle A B.
+step: The task count is 6, and max(6, 8) = 8.
+bugs: Forgetting the max with len(tasks), which gives too small an answer when there are many different tasks ; Adding 1 for the last block instead of the number of ties ; Using n instead of n + 1 for the block size ; Counting the idle slots but not the tasks
+cost: O(T) time to count T tasks; O(1) extra space, since there are at most 26 distinct letters.
+
+@@ eventsim
+what: In an event simulation, things happen at known times and you must handle them in time order. Keep waiting events in a heap ordered by the key that decides who goes next. When nothing is ready, jump the clock to the next arrival time instead of ticking one unit at a time. This makes the cost depend on the number of events, not on the size of the time values.
+signals: tasks with enqueue time and duration ; "CPU picks the shortest task available" ; "process events in order of time" ; clock values up to 10^9 ; "when the server is idle"
+code:
+```python
+import heapq
+
+def get_order(tasks: list[list[int]]) -> list[int]:
+    order = sorted(range(len(tasks)), key=lambda i: tasks[i][0])  # by enqueue time
+    heap: list[tuple[int, int]] = []         # (duration, index)
+    out: list[int] = []
+    t = i = 0
+    while len(out) < len(tasks):
+        if not heap and tasks[order[i]][0] > t:
+            t = tasks[order[i]][0]           # idle: jump to the next arrival
+        while i < len(order) and tasks[order[i]][0] <= t:
+            j = order[i]
+            heapq.heappush(heap, (tasks[j][1], j))
+            i += 1
+        dur, j = heapq.heappop(heap)         # shortest duration, ties by index
+        t += dur
+        out.append(j)
+    return out
+```
+walk: #1834 Single-Threaded CPU
+step: tasks = [[1,2],[2,4],[3,2],[4,1]], as [enqueue, duration]. At t = 0 the heap is empty, so jump to t = 1.
+step: Push task 0. Pop it and run it: t = 3, out = [0].
+step: Tasks 1 and 2 have arrived. Heap holds (4,1) and (2,2). Pop (2,2): t = 5, out = [0,2].
+step: Task 3 arrives and is pushed. Heap holds (4,1) and (1,3). Pop (1,3): t = 6, out = [0,2,3].
+step: Pop (4,1), the last task. The answer is [0,2,3,1].
+bugs: Ticking the clock one unit at a time, which is too slow for big times ; Not jumping the clock when the heap is empty, which loops forever ; Dropping the original index, so the output order cannot be reported ; Forgetting the tie rule: equal durations are ordered by index
+cost: O(n log n) time to sort and for n heap pushes and pops; O(n) extra space for the heap and the order list.
+
+@@ exchange
+what: An exchange argument proves a greedy order. Take two neighbours that are out of key order and show that swapping them never makes the total worse. Then sorting by that key is optimal. To find the key, compute how much each choice costs or saves in total when the two items change places.
+signals: "minimum total cost" when sending or assigning every item ; "split people between two options" ; a sort key that is not obvious ; "order the jobs" to minimise a sum ; pairs of values per item
+code:
+```python
+def two_city_sched_cost(costs: list[list[int]]) -> int:
+    # sending person i to A instead of B changes the total by a - b,
+    # so those with the smallest a - b should go to A
+    ranked = sorted(costs, key=lambda c: c[0] - c[1])
+    half = len(ranked) // 2
+    return sum(c[0] for c in ranked[:half]) + sum(c[1] for c in ranked[half:])
+```
+walk: #1029 Two City Scheduling
+step: costs = [[10,20],[30,200],[400,50],[30,20]]. The differences a - b are -10, -170, 350 and 10.
+step: Sorted by difference: [30,200], [10,20], [30,20], [400,50].
+step: The half is 2. The first two go to city A: 30 + 10 = 40.
+step: The last two go to city B: 20 + 50 = 70.
+step: The total is 40 + 70 = 110.
+bugs: Sorting by a alone or b alone, which ignores the alternative cost ; Sorting by a + b, which is not what a swap changes ; Using the wrong half for each city when the sizes must be equal ; Trying all splits by brute force, which is exponential
+cost: O(n log n) time for the sort; O(n) extra space for the sorted copy.
+
+@@ huffman
+what: When merging two items costs the sum of their sizes, and the merged item can be merged again, always merge the two smallest first. Small items then get merged early and are added into the cost few times. Large items are merged late. A min-heap gives the two smallest in O(log n) each. This is the idea behind Huffman coding.
+signals: "cost of joining two pieces is their sum" ; "connect all ropes or sticks with minimum cost" ; "merge files" ; combined result goes back into the pool ; "repeatedly take the two smallest"
+code:
+```python
+import heapq
+
+def connect_sticks(sticks: list[int]) -> int:
+    heap = list(sticks)               # copy so the input is not changed
+    heapq.heapify(heap)
+    total = 0
+    while len(heap) > 1:
+        a = heapq.heappop(heap)       # two smallest
+        b = heapq.heappop(heap)
+        total += a + b                # pay for this merge
+        heapq.heappush(heap, a + b)   # the new stick joins the pool
+    return total
+```
+walk: #1167 Minimum Cost to Connect Sticks
+step: sticks = [2, 4, 3]. Heap holds 2, 3, 4. total = 0.
+step: Pop 2 and 3. Pay 5, so total = 5. Push 5. Heap holds 4 and 5.
+step: Pop 4 and 5. Pay 9, so total = 14. Push 9. Heap holds 9.
+step: Only one stick is left, so the loop ends.
+step: The answer is 14. Merging 3 and 4 first would cost 7 + 9 = 16, which is worse.
+bugs: Merging in sorted order from left to right, which is not the same as always taking the two smallest ; Forgetting to push the merged stick back ; Returning the last merged size instead of the total cost ; Not handling a single stick, which should cost 0
+cost: O(n log n) time because there are n - 1 merges, each with heap operations of O(log n); O(n) extra space for the heap.
+
+@@ kmerge
+what: To merge k sorted lists, keep one pointer per list and put each list's current head in a min-heap. Pop the smallest, add it to the output, and push the next item from the same list. The heap never holds more than k items, so each step costs O(log k) instead of scanning all k heads.
+signals: "merge k sorted" lists or arrays ; "smallest range" covering lists ; "k-th smallest in a sorted matrix" ; several sorted streams combined into one ; each list is already in order
+code:
+```python
+import heapq
+
+def merge_k_lists(lists: list["ListNode | None"]) -> "ListNode | None":
+    # the list index breaks ties, so nodes are never compared
+    heap = [(n.val, i, n) for i, n in enumerate(lists) if n]
+    heapq.heapify(heap)
+    dummy = tail = ListNode(0)
+    while heap:
+        _, i, node = heapq.heappop(heap)
+        tail.next = node
+        tail = node
+        if node.next:                 # push the next head of the same list
+            heapq.heappush(heap, (node.next.val, i, node.next))
+    return dummy.next
+```
+walk: #23 Merge k Sorted Lists
+step: lists = [1,4,5], [1,3,4], [2,6]. The heap holds the heads: (1,list 0), (1,list 1), (2,list 2).
+step: Pop (1, list 0). Output is 1. Push the next of list 0, which is 4.
+step: Pop (1, list 1). Output is 1, 1. Push 3. Then pop (2, list 2), push 6. Output is 1, 1, 2.
+step: Pop 3, then 4 (list 0), then 4 (list 1). Output is 1, 1, 2, 3, 4, 4.
+step: Pop 5, then 6. The heap is empty. Output: 1, 1, 2, 3, 4, 4, 5, 6.
+bugs: Pushing (val, node) with no tie-breaker, so equal values make Python compare nodes and crash ; Pushing all items at the start, which loses the O(k) heap size ; Forgetting to skip empty lists ; Losing the head by not using a dummy node
+cost: O(N log k) time for N total items, because each pop and push is O(log k); O(k) extra space for the heap.
+
+@@ lazyheap
+what: A heap can only remove its top item quickly. To delete or change an item from the middle, do not search for it. Leave the old entry in the heap and record the true value elsewhere, such as in a hash map. When a stale entry reaches the top, check it against the map and throw it away. Each entry is discarded at most once.
+signals: values can be updated or corrected later ; "remove an arbitrary element" from a priority queue ; "sliding window maximum" with expiring items ; need max and min after changes ; design problem with update and query
+code:
+```python
+import heapq
+
+class StockPrice:
+    def __init__(self):
+        self.price: dict[int, int] = {}     # timestamp -> true price
+        self.latest = 0
+        self.lo: list[tuple[int, int]] = []  # (price, time) min-heap
+        self.hi: list[tuple[int, int]] = []  # (-price, time) max-heap
+
+    def update(self, timestamp: int, price: int) -> None:
+        self.price[timestamp] = price
+        self.latest = max(self.latest, timestamp)
+        heapq.heappush(self.lo, (price, timestamp))
+        heapq.heappush(self.hi, (-price, timestamp))   # old entries stay
+
+    def current(self) -> int:
+        return self.price[self.latest]
+
+    def maximum(self) -> int:
+        while -self.hi[0][0] != self.price[self.hi[0][1]]:
+            heapq.heappop(self.hi)          # stale: price was corrected
+        return -self.hi[0][0]
+
+    def minimum(self) -> int:
+        while self.lo[0][0] != self.price[self.lo[0][1]]:
+            heapq.heappop(self.lo)
+        return self.lo[0][0]
+```
+walk: #2034 Stock Price Fluctuation
+step: update(1, 10) and update(2, 5). The max heap top is (-10, t1). current() gives price at time 2, which is 5.
+step: maximum() checks the top: price[1] is 10, which matches, so it returns 10.
+step: update(1, 3) corrects time 1. The heaps now also hold (3, t1) and (-3, t1). The old entries stay.
+step: maximum() sees the top (-10, t1), but price[1] is now 3. It is stale, so pop it. The next top is (-5, t2), valid. Return 5.
+step: minimum() sees the top (3, t1), and price[1] is 3, so it is valid. Return 3.
+bugs: Searching the heap for the old entry, which costs O(n) ; Checking only the price and not the timestamp when testing for stale entries ; Updating latest with the newest call instead of the largest timestamp ; Forgetting that the stale check must repeat in a loop, not just once
+cost: O(log n) per update and amortised O(log n) per query, because each entry is pushed and popped at most once; O(n) extra space.
+
+@@ reach
+what: Scan left to right and keep the farthest index you can reach so far. At each index, if it is beyond that reach, you are stuck and the answer is no. Otherwise update the reach with i + nums[i]. You never need to try each jump separately, because any index up to the reach is reachable.
+signals: "can you reach the last index" ; each value is a maximum jump length ; "minimum jumps" to the end ; covering a range with intervals or segments ; "farthest" position you can get to
+code:
+```python
+def can_jump(nums: list[int]) -> bool:
+    far = 0                           # farthest index reachable so far
+    for i, x in enumerate(nums):
+        if i > far:                   # a gap we cannot cross
+            return False
+        far = max(far, i + x)
+    return True
+```
+walk: #55 Jump Game
+step: nums = [3, 2, 1, 0, 4]. Start with far = 0.
+step: i = 0: it is within reach, so far = max(0, 0 + 3) = 3.
+step: i = 1, 2 and 3: they are within reach, but i + x is 3, 3 and 3, so far stays 3.
+step: i = 4: 4 is greater than far = 3, so we cannot reach it. Return False.
+step: For [2, 3, 1, 1, 4], far grows to 2, then 4, and never gets stuck, so the answer is True.
+bugs: Forgetting the stuck check inside the loop, so a gap is jumped over ; Using a jump of exactly nums[i] instead of up to nums[i] ; Trying every jump with recursion, which is exponential ; Mishandling a single-element array, which is always True
+cost: O(n) time for one pass; O(1) extra space for the reach variable.
+
+@@ regret
+what: Make the cheap greedy choice now, but remember it in a heap. If a later choice shows that an earlier one was a poor use of a limited resource, take the earlier one back and swap it. Here, ladders are limited, so they should cover the largest climbs. Keep the biggest climbs on ladders. When there are too many, the smallest climb in the heap is paid with bricks.
+signals: limited special resource such as ladders or skips ; "choose which ones to use it on" ; decisions can be undone later ; "maximise how far you get" ; a heap holds past choices
+code:
+```python
+import heapq
+
+def furthest_building(heights: list[int], bricks: int, ladders: int) -> int:
+    heap: list[int] = []              # climbs currently covered by ladders
+    for i in range(len(heights) - 1):
+        climb = heights[i + 1] - heights[i]
+        if climb <= 0:
+            continue
+        heapq.heappush(heap, climb)   # first give this climb a ladder
+        if len(heap) > ladders:       # too many: take back the smallest
+            bricks -= heapq.heappop(heap)
+            if bricks < 0:
+                return i              # cannot cross from i to i + 1
+    return len(heights) - 1
+```
+walk: #1642 Furthest Building You Can Reach
+step: heights = [4,2,7,6,9,14,12], bricks = 5, ladders = 1. Moves 4 to 2 and 7 to 6 are free (no climb).
+step: Step 2 to 7 has climb 5. Push 5. The heap has 1 item, which fits 1 ladder.
+step: Step 6 to 9 has climb 3. Push 3. The heap now has 2 items, so pop the smallest, 3, and pay with bricks: bricks = 2.
+step: Step 9 to 14 has climb 5, at i = 4. Push 5, heap is [5, 5]. Pop 5 and pay: bricks = 2 - 5 = -3.
+step: Bricks are negative, so return i = 4. We cannot go past building 4.
+bugs: Spending bricks first and ladders last, which cannot undo a bad early choice ; Using a max-heap, which would take back the biggest climb instead of the smallest ; Counting drops (negative differences) as costs ; Returning i + 1 or the wrong index when bricks run out
+cost: O(n log L) time for n buildings and L ladders, since the heap holds at most L + 1 items; O(L) extra space.
+
+@@ resetstart
+what: Walk along a circle while keeping a running balance from a chosen start. If the balance drops below zero at some position, no start between the old start and here can work, because each of those starts had a balance at least as large when it reached this point. So restart at the next position. Together with a check that the total is not negative, one pass finds the answer.
+signals: "circular route" where you may start anywhere ; "gas station" or fuel that must never run out ; running total cannot go below zero ; "find the starting point" ; the answer is unique if it exists
+code:
+```python
+def can_complete_circuit(gas: list[int], cost: list[int]) -> int:
+    if sum(gas) < sum(cost):          # not enough fuel in total
+        return -1
+    start = tank = 0
+    for i in range(len(gas)):
+        tank += gas[i] - cost[i]
+        if tank < 0:                  # no start up to i can work
+            start = i + 1
+            tank = 0
+    return start
+```
+walk: #134 Gas Station
+step: gas = [1,2,3,4,5], cost = [3,4,5,1,2]. Totals are 15 and 15, so a trip may exist. The net gains are -2, -2, -2, 3, 3.
+step: i = 0: tank = -2, below zero. Restart: start = 1, tank = 0.
+step: i = 1 and i = 2: tank = -2 each time. Restart each time, so start becomes 2 and then 3.
+step: i = 3: tank = 3. i = 4: tank = 6. Neither is negative, so start stays 3.
+step: The answer is 3. The total check already guaranteed that the first part of the circle is covered.
+bugs: Skipping the total-fuel check, which can return a start that fails ; Resetting the tank but not moving start to i + 1 ; Trying every start with a full lap, which is O(n²) ; Not resetting tank to 0 after a restart
+cost: O(n) time for one pass plus the sums; O(1) extra space.
+
+@@ rooms
+what: Sort meetings by start time. A min-heap holds the end time of every room in use, so its top is the room that frees up first. For a new meeting, if the earliest end is not after its start, reuse that room. Otherwise open a new one. The heap size at the end is the number of rooms needed.
+signals: "minimum number of rooms" or "platforms" ; "maximum overlapping intervals" ; intervals with start and end times ; "can a person attend all meetings" ; "how many at the same time"
+code:
+```python
+import heapq
+
+def min_meeting_rooms(intervals: list[list[int]]) -> int:
+    ends: list[int] = []              # end times of rooms in use
+    for s, e in sorted(intervals):
+        if ends and ends[0] <= s:     # earliest room is free: reuse it
+            heapq.heapreplace(ends, e)
+        else:
+            heapq.heappush(ends, e)   # all rooms busy: open a new one
+    return len(ends)
+```
+walk: #253 Meeting Rooms II
+step: intervals = [[0,30],[5,10],[15,20]]. They are already sorted by start. ends = [].
+step: Meeting [0,30]: no rooms yet, so open one. ends = [30].
+step: Meeting [5,10]: the earliest end is 30, which is after 5, so open a second room. ends = [10, 30].
+step: Meeting [15,20]: the earliest end is 10, which is at most 15, so reuse that room. ends = [20, 30].
+step: Two rooms are used, so the answer is 2.
+bugs: Using "<" instead of "<=", so a meeting that starts exactly when another ends needs an extra room ; Not sorting by start time first ; Pushing the new end without removing the old one when reusing a room ; Comparing with the latest end instead of the earliest
+cost: O(n log n) time for sorting and heap work; O(n) extra space for the heap in the worst case.
+
+@@ topk
+what: To track the k largest values, keep a min-heap of size k. Its top is the smallest of the k best, so it is the k-th largest. A new value that beats the top replaces it. Anything smaller is ignored. The heap never grows past k, so each update costs O(log k) instead of sorting everything again.
+signals: "k-th largest" or "k-th smallest" ; "top k frequent" elements ; a stream of values with repeated queries ; "k closest points" ; you only need the best k, not a full sort
+code:
+```python
+import heapq
+
+class KthLargest:
+    def __init__(self, k: int, nums: list[int]):
+        self.k = k
+        self.heap: list[int] = []
+        for x in nums:
+            self.add(x)
+
+    def add(self, val: int) -> int:
+        heapq.heappush(self.heap, val)
+        if len(self.heap) > self.k:
+            heapq.heappop(self.heap)  # drop the smallest of k + 1
+        return self.heap[0]           # the k-th largest
+```
+walk: #703 Kth Largest Element in a Stream
+step: k = 3 and nums = [4, 5, 8, 2]. Adding 4, 5 and 8 gives the heap [4, 5, 8].
+step: Adding 2 makes 4 items, so pop the smallest, 2. The heap is [4, 5, 8].
+step: add(3): push, then pop 3. The top is 4, so return 4.
+step: add(5): push 5 and pop 4. The heap is [5, 5, 8], so return 5.
+step: add(10): push and pop 5. The heap is [5, 8, 10], so return 5. Then add(9) gives 8 and add(4) gives 8.
+bugs: Using a max-heap, which makes the k-th largest hard to read ; Letting the heap grow past k, so the top is wrong ; Sorting the whole list on each add, which costs O(n log n) each time ; Reading heap[0] before the heap holds k items, when the problem promises k items
+cost: O(log k) per add, and O(n log k) to build; O(k) extra space for the heap.
+
+@@ twoheaps
+what: Keep the lower half of the numbers in a max-heap and the upper half in a min-heap. Their tops are the two middle values. After each insert, balance the sizes so the lower half is equal to or one larger than the upper half. The median is then the top of the lower heap, or the mean of both tops, in O(1).
+signals: "median" of a stream ; "find median" after each insertion ; "sliding window median" ; split data into a small half and a large half ; balance two groups by size
+code:
+```python
+import heapq
+
+class MedianFinder:
+    def __init__(self):
+        self.lo: list[int] = []       # max-heap of the lower half (stored negated)
+        self.hi: list[int] = []       # min-heap of the upper half
+
+    def addNum(self, num: int) -> None:
+        heapq.heappush(self.lo, -num)
+        heapq.heappush(self.hi, -heapq.heappop(self.lo))  # biggest of lower moves up
+        if len(self.hi) > len(self.lo):                   # keep lo the same size or bigger
+            heapq.heappush(self.lo, -heapq.heappop(self.hi))
+
+    def findMedian(self) -> float:
+        if len(self.lo) > len(self.hi):
+            return float(-self.lo[0])
+        return (-self.lo[0] + self.hi[0]) / 2
+```
+walk: #295 Find Median from Data Stream
+step: addNum(1): push to lo, move it to hi, then hi is bigger, so move it back. lo = [1], hi = []. Median 1.0.
+step: addNum(2): push to lo, move the biggest of lo (which is 2) to hi. lo = [1], hi = [2]. Sizes match.
+step: findMedian() averages the tops: (1 + 2) / 2 = 1.5.
+step: addNum(3): push to lo, move 3 to hi. hi = [2, 3] is bigger, so move 2 back. lo = [1, 2], hi = [3].
+step: findMedian(): lo is bigger, so the median is its top, 2.0.
+bugs: Forgetting to negate values for the max-heap, since heapq is a min-heap ; Pushing straight to one heap, which breaks the rule that every lower value is at most every upper value ; Not rebalancing, so the sizes drift apart ; Returning an integer division for an even count
+cost: O(log n) per insert and O(1) per median query; O(n) extra space for both heaps.
+
+@@ unlock-best
+what: Some options only become available once a limit is reached, such as enough capital. Sort the options by that limit. As your limit grows, move every newly unlocked option into a max-heap by value. Then always take the best option in the heap. Your limit grows, which may unlock more options.
+signals: "need at least X to start" for each item ; taking an item raises your budget or level ; "at most k projects" or picks ; "maximise final capital" ; "unlock" or "available once you have"
+code:
+```python
+import heapq
+
+def find_maximized_capital(k: int, w: int, profits: list[int], capital: list[int]) -> int:
+    projects = sorted(zip(capital, profits))     # cheapest to start first
+    heap: list[int] = []                         # profits of affordable projects
+    i = 0
+    for _ in range(k):
+        while i < len(projects) and projects[i][0] <= w:
+            heapq.heappush(heap, -projects[i][1])    # unlock: max-heap by profit
+            i += 1
+        if not heap:
+            break                                    # nothing affordable
+        w += -heapq.heappop(heap)                    # take the best one
+    return w
+```
+walk: #502 IPO
+step: k = 2, w = 0, profits = [1,2,3], capital = [0,1,1]. Sorted projects: (0,1), (1,2), (1,3).
+step: Round 1: w = 0, so only the project with capital 0 is unlocked. Push profit 1.
+step: Pop profit 1. Now w = 1.
+step: Round 2: w = 1 unlocks both projects with capital 1. Push profits 2 and 3.
+step: Pop the best profit, 3. Now w = 4, so the answer is 4.
+bugs: Picking the cheapest project instead of the most profitable affordable one ; Rescanning all projects each round, which is O(k * n) ; Not stopping when the heap is empty ; Comparing capital with "<" so projects needing exactly w are missed
+cost: O(n log n) time to sort and for the heap work; O(n) extra space for the sorted list and heap.
+
+@@ combos
+what: To choose k items from n without repeats, build each combination in a path and only pick items after the last picked one. The start index makes each set appear once, in increasing order, instead of once per ordering. This avoids generating every permutation and then removing duplicates.
+signals: "all combinations" or "choose k from n" ; order does not matter ; "unique subsets of size k" ; "combination sum" with candidates ; "return all possible" sets
+code:
+```python
+def combine(n: int, k: int) -> list[list[int]]:
+    out: list[list[int]] = []
+    path: list[int] = []
+    def go(start: int) -> None:
+        if len(path) == k:
+            out.append(path[:])       # save a copy of the path
+            return
+        for x in range(start, n + 1):
+            path.append(x)
+            go(x + 1)                 # only larger numbers next
+            path.pop()                # undo the choice
+    go(1)
+    return out
+```
+walk: #77 Combinations
+step: n = 4 and k = 2. go(1) tries x = 1 first, so path = [1], then calls go(2).
+step: In go(2), x = 2 gives path [1, 2], which has k items. Save [1, 2], then undo to [1].
+step: x = 3 saves [1, 3] and x = 4 saves [1, 4]. Back at the top, path is [].
+step: Try x = 2: the next picks start at 3, so save [2, 3] and [2, 4]. Then x = 3 saves [3, 4].
+step: The answer is [[1,2],[1,3],[1,4],[2,3],[2,4],[3,4]], which has 6 sets.
+bugs: Appending path without a copy, so every saved answer changes later ; Calling go(start + 1) instead of go(x + 1), which repeats items ; Forgetting to pop after the recursive call ; Starting the range at 0 when the numbers go from 1 to n
+cost: O(k * C(n, k)) time because there are C(n, k) answers and each copy costs k; O(k) extra space for the path and recursion.
+
+@@ perms
+what: To build every ordering, fill one position at a time. At each position, try every item that is not yet used. Mark it used, recurse for the next position, then unmark it when you return. The used mark lets the same list be reused for all branches, so no copies are made until a full permutation is ready.
+signals: "all permutations" or "all orderings" ; order matters ; "rearrangements" of a list ; "next arrangement" search by brute force ; n is small, such as 8 or less
+code:
+```python
+def permute(nums: list[int]) -> list[list[int]]:
+    out: list[list[int]] = []
+    path: list[int] = []
+    used = [False] * len(nums)
+    def go() -> None:
+        if len(path) == len(nums):
+            out.append(path[:])
+            return
+        for i, x in enumerate(nums):
+            if used[i]:
+                continue
+            used[i] = True            # choose
+            path.append(x)
+            go()
+            path.pop()                # undo the choice
+            used[i] = False
+    go()
+    return out
+```
+walk: #46 Permutations
+step: nums = [1, 2, 3]. At position 0 try 1: used = [T, F, F], path = [1].
+step: At position 1 try 2, then at position 2 only 3 is left. Path [1, 2, 3] is full, so save it.
+step: Undo 3 and 2. At position 1 try 3, then 2. Save [1, 3, 2].
+step: Undo everything and try 2 first, which gives [2, 1, 3] and [2, 3, 1]. Then 3 first gives [3, 1, 2] and [3, 2, 1].
+step: The answer has 6 lists, which is 3 factorial.
+bugs: Forgetting to reset used[i] after the call, so later branches skip items ; Saving path without a copy ; Using "if x in path" for the check, which costs O(n) each time ; Using this on a list with duplicate values and expecting no repeated answers
+cost: O(n * n!) time because there are n! answers and each copy costs n; O(n) extra space for the path and used marks.
+
+@@ memo
+what: Many recursions solve the same small problem again and again. Memoisation saves each answer in a dictionary the first time it is computed, and returns it from there afterwards. Each distinct state is then solved once. A call tree that is exponential becomes a count of states times the work per state.
+signals: recursion that calls itself with the same arguments many times ; "number of ways" to reach a target ; the answer for n depends on smaller n ; "overlapping subproblems" ; a plain recursive solution is too slow
+code:
+```python
+def climb_stairs(n: int) -> int:
+    memo: dict[int, int] = {}
+    def ways(i: int) -> int:
+        if i <= 1:
+            return 1                  # base cases: one way to stand at 0 or 1
+        if i not in memo:
+            memo[i] = ways(i - 1) + ways(i - 2)   # compute once, then store
+        return memo[i]
+    return ways(n)
+```
+walk: #70 Climbing Stairs
+step: n = 5. ways(5) needs ways(4) and ways(3). It goes down to ways(1) = 1 and ways(0) = 1.
+step: ways(2) = 1 + 1 = 2. Save it in memo.
+step: ways(3) = ways(2) + ways(1) = 2 + 1 = 3. The value for 2 comes from memo.
+step: ways(4) = 3 + 2 = 5. Later, ways(3) is already in memo, so it costs nothing.
+step: ways(5) = 5 + 3 = 8. Each value from 2 to 5 was computed exactly once.
+bugs: Skipping the memo check, which keeps the tree exponential ; Using a mutable default argument as the cache, which shares it between calls ; Forgetting to store the result before returning ; Recursion depth too high for large n, when a loop is better
+cost: O(n) time because each of the n states is solved once; O(n) extra space for the memo and the recursion stack.
+
+@@ expand
+what: A palindrome reads the same both ways, so it has a centre. Try every possible centre, which is one letter or the gap between two letters, giving 2n - 1 centres. From each centre, move two pointers outward while the letters match. This needs no extra table and is simpler than checking every substring.
+signals: "longest palindromic substring" ; "count palindromic substrings" ; "reads the same forwards and backwards" ; a palindrome inside a larger string ; both odd and even lengths count
+code:
+```python
+def longest_palindrome(s: str) -> str:
+    best = ""
+    for c in range(2 * len(s) - 1):   # centres: letters and gaps
+        l = c // 2
+        r = l + c % 2                 # odd centre: l == r; even centre: r = l + 1
+        while l >= 0 and r < len(s) and s[l] == s[r]:
+            l -= 1
+            r += 1
+        if r - l - 1 > len(best):     # the match is s[l+1 : r]
+            best = s[l + 1:r]
+    return best
+```
+walk: #5 Longest Palindromic Substring
+step: s = "babad". Centre 0 is the letter b at index 0: it cannot grow, so the best is "b".
+step: Centre 1 is the gap between b and a: the letters differ, so the length is 0.
+step: Centre 2 is the letter a at index 1. Neighbours b and b match, so the range grows to "bab".
+step: The next step goes out of range at the left end, so stop. The length 3 beats the best of 1, so best = "bab".
+step: Later centres give at most "aba", also of length 3, which does not beat it. The answer is "bab".
+bugs: Checking only odd centres, so "abba" is missed ; Slicing s[l:r] instead of s[l+1:r] after the loop moved one step too far ; Using the brute force of checking all substrings, which is O(n³) ; Forgetting the empty string, where range(2n - 1) is empty and "" is correct
+cost: O(n²) time because there are 2n - 1 centres and each can grow O(n) steps; O(1) extra space.
+
+@@ naivematch
+what: To find a pattern in a text, try the pattern at every start position. Compare letters left to right and stop at the first mismatch. If all letters match, report the start. It is simple and fast on typical input. Worst-case inputs such as "aaaa...ab" can make it slow.
+signals: "find the first occurrence" of a string in another ; "index of needle in haystack" ; "does s contain t as a substring" ; implement strStr or indexOf ; small input sizes, so a fancy algorithm is not required
+code:
+```python
+def str_str(haystack: str, needle: str) -> int:
+    n, m = len(haystack), len(needle)
+    for i in range(n - m + 1):        # last useful start is n - m
+        j = 0
+        while j < m and haystack[i + j] == needle[j]:
+            j += 1
+        if j == m:                    # all letters matched
+            return i
+    return -1
+```
+walk: #28 Find the Index of the First Occurrence in a String
+step: haystack = "mississippi" and needle = "issip". There are 11 - 5 + 1 = 7 starts to try.
+step: Start 0 is "m", which differs from "i" at once. Start 1 matches "issi" and then fails on "s" against "p".
+step: Starts 2 and 3 fail on the first letter ("s" against "i").
+step: Start 4 matches "i", "s", "s", "i", "p", so j reaches 5 which is m.
+step: Return 4. If no start had matched, the answer would be -1.
+bugs: Looping i up to n instead of n - m, which reads past the end ; Not stopping at the first mismatch, which wastes time ; Not handling an empty needle, which should return 0 ; Restarting j incorrectly, such as reusing j from the previous start
+cost: O(n * m) time in the worst case, because each start can compare up to m letters; O(1) extra space.
+
+@@ rle
+what: Run-length encoding replaces each run of equal characters with the character and its count. A read pointer finds the end of each run, and a write pointer stores the result in the same array. The write pointer never passes the read pointer, so the work is done in place. Length-prefixed encoding is the same idea: write the length first so the reader knows where each item ends.
+signals: "compress" a string by counting repeats ; "group of consecutive characters" ; "encode and decode a list of strings" ; in-place with O(1) extra space ; counts of 10 or more need several digits
+code:
+```python
+def compress(chars: list[str]) -> int:
+    write = read = 0
+    while read < len(chars):
+        ch, start = chars[read], read
+        while read < len(chars) and chars[read] == ch:
+            read += 1                 # find the end of the run
+        chars[write] = ch
+        write += 1
+        if read - start > 1:          # a count is written only when above 1
+            for d in str(read - start):
+                chars[write] = d
+                write += 1
+    return write
+```
+walk: #443 String Compression
+step: chars = a, a, b, b, c, c, c. read = 0, write = 0.
+step: The run of a has length 2. Write "a" and "2". Now write = 2 and read = 2.
+step: The run of b has length 2. Write "b" and "2". Now write = 4 and read = 4.
+step: The run of c has length 3. Write "c" and "3". Now write = 6 and read = 7.
+step: The array starts with a, 2, b, 2, c, 3, and the function returns 6.
+bugs: Writing a count of 1 for a single character, which the problem does not want ; Writing a count of 12 as one character instead of "1" and "2" ; Moving the read pointer by one instead of to the end of the run ; Building a new string, which breaks the in-place rule
+cost: O(n) time because the read pointer moves over each character once; O(1) extra space, since only a few pointers and a short count string are used.
