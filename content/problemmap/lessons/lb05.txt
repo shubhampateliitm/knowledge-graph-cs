@@ -1,0 +1,968 @@
+@@ trie
+what: A trie stores words one letter at a time along paths in a tree, so words with the same prefix share the same path. To find a word or a prefix you walk one node per letter, so the cost depends on the word length, not on how many words are stored. A flag on a node marks where a whole word ends.
+signals: "prefix" or "starts with" queries on many words ; autocomplete or dictionary lookup ; "implement insert, search and startsWith" ; match many words against a board or text letter by letter ; longest common prefix of a group of words
+code:
+```python
+class Trie:
+    def __init__(self):
+        self.root: dict = {}              # each node maps a letter to a child node
+
+    def insert(self, word: str) -> None:
+        node = self.root
+        for ch in word:
+            node = node.setdefault(ch, {})   # create the child if it is missing
+        node["$"] = True                  # mark: a word ends here
+
+    def _walk(self, s: str):
+        node = self.root
+        for ch in s:
+            if ch not in node:
+                return None
+            node = node[ch]
+        return node
+
+    def search(self, word: str) -> bool:
+        node = self._walk(word)
+        return node is not None and "$" in node
+
+    def starts_with(self, prefix: str) -> bool:
+        return self._walk(prefix) is not None
+```
+walk: #208 Implement Trie (Prefix Tree)
+step: Start with an empty trie. insert("apple") creates the path a, p, p, l, e and puts the end mark on the last node.
+step: search("apple") walks the same five letters and finds the end mark, so it returns True.
+step: search("app") walks a, p, p fine, but the node has no end mark yet, so it returns False.
+step: starts_with("app") only needs the walk to succeed, so it returns True.
+step: insert("app") walks the existing path and adds an end mark on the second p.
+step: search("app") now finds the mark and returns True. The answer to the last call is True.
+bugs: Forgetting the end mark, so search("app") wrongly returns True after only "apple" is inserted ; Returning True from search when the walk succeeds, which turns it into starts_with ; Building a new node for every letter instead of reusing an existing child, which loses the shared prefix ; Using a 26-slot array per node for a huge alphabet, which wastes memory
+cost: O(L) time per insert or lookup, where L is the word length, and O(total letters) extra space, because each letter of each word adds at most one node.
+
+@@ fastpow
+what: To compute x to the power n, write n in binary. Square the base on every step and multiply it into the result only when the current bit of n is 1. This needs about log2(n) multiplications instead of n.
+signals: "compute x^n" with a huge n ; "pow(x, n)" or "modular power" ; the exponent is up to 10^9 or more ; repeat the same step n times where n is huge ; raise a matrix to a large power
+code:
+```python
+def my_pow(x: float, n: int) -> float:
+    if n < 0:                  # x^-n is (1/x)^n
+        x, n = 1 / x, -n
+    result = 1.0
+    while n:
+        if n & 1:              # this bit of n is 1: use the current base
+            result *= x
+        x *= x                 # base becomes x^2, x^4, x^8, ...
+        n >>= 1                # move to the next bit
+    return result
+```
+walk: #50 Pow(x, n)
+step: Input x = 2, n = 10. In binary 10 is 1010. Start with result = 1.
+step: n = 10, the last bit is 0, so skip. Square the base: x = 4. Shift: n = 5.
+step: n = 5, the last bit is 1, so result = 1 * 4 = 4. Then x = 16, n = 2.
+step: n = 2, the last bit is 0, so skip. Then x = 256, n = 1.
+step: n = 1, the last bit is 1, so result = 4 * 256 = 1024. Then x = 65536, n = 0.
+step: The loop ends and the answer is 1024, which is 2^2 * 2^8 = 2^10. Only 4 rounds were needed, not 10.
+bugs: Negative n: forgetting to invert the base, or doing -n on the most negative int in a language with fixed width ; Recursing without a base case for n = 0 ; Overflowing or losing precision when multiplying without taking a modulus in the modular version ; Using n % 2 == 1 for negative n in languages where the remainder is negative
+cost: O(log n) time and O(1) extra space, because the exponent loses one bit each round.
+
+@@ inclexcl
+what: To count items in a union of sets, add the sizes of single sets, subtract the sizes of every pair overlap, add back every triple overlap, and so on. This fixes the double counting that a plain sum makes. For "divisible by a, b or c", each overlap is the multiples of the lcm.
+signals: "divisible by a, b or c" ; count numbers that satisfy at least one of several conditions ; the answer is too big to list one by one ; "nth number" divisible by one of a few values ; count items that avoid all of several bad properties
+code:
+```python
+from math import gcd
+
+def nth_ugly_number(n: int, a: int, b: int, c: int) -> int:
+    def lcm(x: int, y: int) -> int:
+        return x * y // gcd(x, y)
+    ab, ac, bc = lcm(a, b), lcm(a, c), lcm(b, c)
+    abc = lcm(ab, c)
+
+    def count(m: int) -> int:       # how many of 1..m divide by a, b or c
+        return (m // a + m // b + m // c
+                - m // ab - m // ac - m // bc
+                + m // abc)
+
+    lo, hi = 1, 2 * 10**9
+    while lo < hi:                  # smallest m with count(m) >= n
+        mid = (lo + hi) // 2
+        if count(mid) >= n:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+```
+walk: #1201 Ugly Number III
+step: Input n = 3, a = 2, b = 3, c = 5. The lcms are ab = 6, ac = 10, bc = 15, abc = 30.
+step: count(10) = 5 + 3 + 2 - 1 - 1 - 0 + 0 = 8. The numbers are 2, 3, 4, 5, 6, 8, 9, 10, so 8 is right.
+step: Without the subtractions the sum would be 10, and 6 and 10 would be counted twice.
+step: count(3) = 1 + 1 + 0 = 2, which is less than 3. So the answer is above 3.
+step: count(4) = 2 + 1 + 0 = 3, which is at least 3. Binary search lands on the smallest such m.
+step: The answer is 4.
+bugs: Using a*b instead of lcm(a, b) for the overlap, which is wrong when a and b share a factor ; Forgetting to add back the triple overlap ; Computing lcm(a, b, c) as lcm(a, b) * c, which is wrong when c shares a factor ; Setting the search upper bound too small for the answer
+cost: O(log(answer)) time and O(1) extra space, because each binary search step evaluates the count formula in constant time.
+
+@@ nim
+what: In a game with optimal play, a position is winning if some move leads to a losing position. A position is losing if every move leads to a winning one. Work out small cases by hand or with a short brute force, then look for the repeating pattern of losing positions.
+signals: two players take turns and both play optimally ; "can you win the game?" ; players remove 1 to k stones or items ; the last player to move wins or loses ; the input is huge, so you cannot simulate it
+code:
+```python
+def brute(n: int) -> list[bool]:
+    # win[i] is True if the player to move can force a win with i stones
+    win = [False] * (n + 1)          # 0 stones: the player to move has lost
+    for i in range(1, n + 1):
+        win[i] = any(not win[i - k] for k in (1, 2, 3) if k <= i)
+    return win
+
+def can_win_nim(n: int) -> bool:
+    # brute shows the losing positions are 0, 4, 8, 12, ...
+    return n % 4 != 0
+```
+walk: #292 Nim Game
+step: With 1, 2 or 3 stones you take them all and win. So positions 1, 2, 3 are winning.
+step: With 4 stones every move leaves 3, 2 or 1 for the opponent, and they win. So 4 is losing.
+step: With 5, 6 or 7 stones you take 1, 2 or 3 and leave 4. So 5, 6, 7 are winning. With 8 stones every move leaves 5, 6 or 7, so 8 is losing.
+step: The pattern repeats: losing exactly when n is a multiple of 4. Your move can always restore a multiple of 4.
+step: For n = 4, 4 % 4 == 0, so can_win_nim(4) is False. For n = 5 it is True.
+bugs: Simulating the game with recursion on a huge n, which times out ; Reading the pattern from too few small cases ; Mixing up who moves first, so the answer is flipped ; Forgetting that the losing test depends on the move set (1 to 3 gives mod 4)
+cost: O(1) time and O(1) space for the formula; the brute force that finds the pattern is O(n) time and O(n) space.
+
+@@ permrank
+what: There are (n-1)! permutations that start with each fixed first item. So dividing the zero-based rank k by (n-1)! tells you which remaining item comes first. The remainder is the rank inside that block, and you repeat with the next smaller factorial. This builds the answer in n steps instead of listing permutations.
+signals: "k-th permutation" ; find the permutation at a given rank without listing all ; n up to 9 or more with k up to n! ; "the rank of this permutation" ; lexicographic order of arrangements
+code:
+```python
+from math import factorial
+
+def get_permutation(n: int, k: int) -> str:
+    items = [str(i) for i in range(1, n + 1)]   # sorted, still unused
+    k -= 1                                      # make the rank 0-based
+    out = []
+    for size in range(n, 0, -1):
+        block = factorial(size - 1)             # permutations per first item
+        idx, k = divmod(k, block)
+        out.append(items.pop(idx))              # take that item out
+    return "".join(out)
+```
+walk: #60 Permutation Sequence
+step: Input n = 3, k = 3. The permutations in order are 123, 132, 213, 231, 312, 321. Make k zero-based: k = 2. items = [1, 2, 3].
+step: size 3: block = 2! = 2. divmod(2, 2) gives idx = 1, k = 0. Take items[1] = 2. items = [1, 3].
+step: size 2: block = 1! = 1. divmod(0, 1) gives idx = 0, k = 0. Take 1. items = [3].
+step: size 1: block = 0! = 1. idx = 0. Take 3.
+step: The answer is "213", the third permutation in the list.
+bugs: Forgetting to subtract 1 from k, so every answer is off by one rank ; Not removing the used item from the list ; Using factorial(size) instead of factorial(size - 1) as the block size ; Keeping k unchanged instead of using the remainder
+cost: O(n^2) time and O(n) extra space, because each of the n picks removes from a list in O(n); this is fine for small n.
+
+@@ sieve
+what: Start with every number marked prime. For each prime p, cross out its multiples starting at p*p, because smaller multiples were already crossed out by smaller primes. What is left uncrossed is prime. This costs about n log log n steps, far less than testing each number alone.
+signals: "count primes less than n" ; list all primes up to a limit ; you need many primality answers for the same range ; n up to a few million ; smallest prime factor for every number
+code:
+```python
+def count_primes(n: int) -> int:
+    if n < 3:
+        return 0
+    is_prime = [True] * n
+    is_prime[0] = is_prime[1] = False
+    p = 2
+    while p * p < n:                    # larger p have no new multiples to cross
+        if is_prime[p]:
+            for m in range(p * p, n, p):
+                is_prime[m] = False
+        p += 1
+    return sum(is_prime)
+```
+walk: #204 Count Primes
+step: Input n = 10. We count primes below 10. Make a list for 0 to 9, all True, then mark 0 and 1 as False.
+step: p = 2 and 2 * 2 = 4 < 10. 2 is still marked prime, so cross out 4, 6, 8.
+step: p = 3 and 3 * 3 = 9 < 10. 3 is prime, so cross out 9.
+step: p = 4 gives 16, which is not below 10, so the loop stops.
+step: Uncrossed numbers are 2, 3, 5, 7. The answer is 4.
+bugs: Starting the inner loop at 2*p instead of p*p, which is correct but does extra work ; Counting n itself, when the problem asks for primes strictly less than n ; Forgetting to mark 0 and 1 as not prime ; Running p up to n instead of the square root
+cost: O(n log log n) time and O(n) extra space for the flag list, because each prime p crosses out about n/p numbers.
+
+@@ slopehash
+what: Two points lie on the same line through a base point when their direction (dy, dx) is equal after reduction. Divide both parts by their gcd and fix the sign, so every equal direction gets the same key. A hash map then counts how many points share each direction. This avoids float division and its rounding errors.
+signals: "maximum points on a line" ; count points that are collinear ; group pairs by slope or direction ; equal ratios must be treated as equal ; vertical lines must be handled too
+code:
+```python
+from math import gcd
+
+def max_points(points: list[list[int]]) -> int:
+    n = len(points)
+    if n <= 2:
+        return n
+    best = 0
+    for i in range(n):
+        x1, y1 = points[i]
+        slopes: dict[tuple[int, int], int] = {}
+        for j in range(i + 1, n):
+            dx, dy = points[j][0] - x1, points[j][1] - y1
+            g = gcd(dx, dy)                   # gcd is never negative
+            dx, dy = dx // g, dy // g
+            if dx < 0 or (dx == 0 and dy < 0):
+                dx, dy = -dx, -dy             # one sign for each direction
+            slopes[(dy, dx)] = slopes.get((dy, dx), 0) + 1
+        if slopes:
+            best = max(best, max(slopes.values()) + 1)   # +1 for the base point
+    return best
+```
+walk: #149 Max Points on a Line
+step: Input points = [[1,1],[2,2],[3,3]]. Take the base point i = 0, which is (1, 1).
+step: Point (2, 2): dx = 1, dy = 1, gcd = 1. Key (1, 1) gets count 1.
+step: Point (3, 3): dx = 2, dy = 2, gcd = 2. Reduced to (1, 1). The same key now has count 2.
+step: The best count for this base is 2, plus the base point itself gives 3.
+step: Bases 1 and 2 give at most 2 points. The answer is 3.
+bugs: Using dy / dx as a float key, where close slopes can collide or differ by rounding ; Dividing by dx and crashing on vertical lines ; Not fixing the sign, so (1, -2) and (-1, 2) become two keys ; Forgetting to count the base point itself ; Sharing one map across all base points
+cost: O(n^2 log C) time and O(n) extra space, because each base point checks n other points with a gcd, and the map is rebuilt for each base.
+
+@@ maskenum
+what: A set of n items can be written as an n-bit number, where bit i says whether item i is chosen. Looping mask from 0 to 2^n - 1 visits every subset exactly once. It is simple and has no recursion, and it works when n is small, up to about 20.
+signals: n is at most 15 to 20 ; "count subsets" or "all subsets" with a property ; try every combination of choose or skip ; "maximum bitwise OR" over subsets ; the constraint is small enough for 2^n work
+code:
+```python
+def count_max_or_subsets(nums: list[int]) -> int:
+    n = len(nums)
+    best, count = 0, 0
+    for mask in range(1, 1 << n):         # skip 0, the empty subset
+        cur = 0
+        for i in range(n):
+            if mask >> i & 1:             # item i is in this subset
+                cur |= nums[i]
+        if cur > best:
+            best, count = cur, 1
+        elif cur == best:
+            count += 1
+    return count
+```
+walk: #2044 Count Number of Maximum Bitwise-OR Subsets
+step: Input nums = [3, 1], so n = 2 and masks run from 1 to 3.
+step: mask = 1 (binary 01) picks only 3. OR = 3 beats best = 0, so best = 3, count = 1.
+step: mask = 2 (binary 10) picks only 1. OR = 1 is below best, so nothing changes.
+step: mask = 3 (binary 11) picks both. OR = 3 | 1 = 3 equals best, so count = 2.
+step: The answer is 2.
+bugs: Looping to 1 << n minus 1 inclusive, or to 1 << n, so the range is off by one ; Using mask & i instead of mask >> i & 1 ; Counting the empty subset when the problem asks for non-empty ones ; Using this when n is 40, where 2^n is far too large
+cost: O(2^n * n) time and O(1) extra space, because there are 2^n masks and each one scans n bits.
+
+@@ perbit
+what: Sometimes a rule acts on every bit position alone. Count how many numbers have bit b set, for each of the 32 positions. A count that does not fit the repeating group size (for example, not a multiple of 3) must come from the single odd number.
+signals: every number appears 3 times except one ; "single number" with a group size other than 2 ; count set bits at each position ; sum of Hamming distances over all pairs ; the answer is built from independent bits
+code:
+```python
+def single_number(nums: list[int]) -> int:
+    result = 0
+    for bit in range(32):
+        total = sum((x >> bit) & 1 for x in nums)   # how many have this bit set
+        if total % 3:                               # the single number has it
+            result |= 1 << bit
+    if result >= 1 << 31:                           # bit 31 set: a negative number
+        result -= 1 << 32
+    return result
+```
+walk: #137 Single Number II
+step: Input nums = [2, 2, 3, 2]. In binary: 10, 10, 11, 10.
+step: Bit 0: the values give 0, 0, 1, 0, so total = 1. 1 % 3 = 1, so bit 0 is set in the answer.
+step: Bit 1: the values give 1, 1, 1, 1, so total = 4. 4 % 3 = 1, so bit 1 is set too.
+step: Bits 2 to 31 all have total 0, so they are not set.
+step: The result is binary 11, which is 3. The answer is 3. The number 2 appears three times, so its bits cancel out mod 3.
+bugs: Forgetting to convert bit 31 back to a negative number in Python ; Using % 2, which is the rule for pairs, not for triples ; Looping over fewer than 32 bits and losing the high bits ; Mixing up the group size and the count of the single number
+cost: O(32 * n) time, which is O(n), and O(1) extra space, because each of the 32 bit positions needs one pass and one counter.
+
+@@ prefixxor
+what: Let prefix[i] be the XOR of the first i items. Because x ^ x = 0, the XOR of items l to r is prefix[r+1] ^ prefix[l]. The shared part cancels. This is the same trick as prefix sums, with XOR in place of plus and minus.
+signals: XOR of a subarray ; many range XOR queries ; "subarray with XOR equal to k" ; count pairs of prefixes with a given XOR ; XOR plays the role of sum in a range problem
+code:
+```python
+def xor_queries(arr: list[int], queries: list[list[int]]) -> list[int]:
+    prefix = [0]                          # prefix[i] = XOR of arr[0..i-1]
+    for x in arr:
+        prefix.append(prefix[-1] ^ x)
+    # XOR of arr[l..r]: the shared start cancels out
+    return [prefix[r + 1] ^ prefix[l] for l, r in queries]
+```
+walk: #1310 XOR Queries of a Subarray
+step: Input arr = [1, 3, 4, 8]. Build prefix: 0, 1, 1^3 = 2, 2^4 = 6, 6^8 = 14. So prefix = [0, 1, 2, 6, 14].
+step: Query [0, 1]: prefix[2] ^ prefix[0] = 2 ^ 0 = 2. Check: 1 ^ 3 = 2.
+step: Query [1, 2]: prefix[3] ^ prefix[1] = 6 ^ 1 = 7. Check: 3 ^ 4 = 7.
+step: Query [0, 3]: prefix[4] ^ prefix[0] = 14.
+step: Query [3, 3]: prefix[4] ^ prefix[3] = 14 ^ 6 = 8, the single item.
+step: The answers are [2, 7, 14, 8].
+bugs: Using prefix[r] ^ prefix[l] with an off-by-one, which drops item r ; Forgetting the leading 0 in prefix, so queries starting at 0 break ; Computing each query with a loop, which is O(n) per query ; Thinking you need a subtract step, when XOR undoes itself
+cost: O(n + q) time and O(n) extra space, because the prefix array is built once and each query is O(1).
+
+@@ xorsplit
+what: If a and b are two different numbers, a ^ b has at least one bit set, and a and b differ at that bit. Use that bit to split all numbers into two groups. Each group holds one unique number plus pairs, so XOR of a group cancels the pairs and leaves the unique number.
+signals: exactly two numbers appear once, all others twice ; "find the two single numbers" ; XOR of everything gives a ^ b, not one answer ; need two answers in O(1) space ; split the data by one bit
+code:
+```python
+def single_number(nums: list[int]) -> list[int]:
+    xor_all = 0
+    for x in nums:
+        xor_all ^= x                  # pairs cancel, leaving a ^ b
+    low = xor_all & -xor_all          # lowest set bit: a and b differ here
+    a = 0
+    for x in nums:
+        if x & low:                   # group with this bit set
+            a ^= x
+    return [a, xor_all ^ a]
+```
+walk: #260 Single Number III
+step: Input nums = [1, 2, 1, 3, 2, 5]. XOR of all items: pairs of 1 and 2 cancel, leaving 3 ^ 5 = 6, which is binary 110.
+step: The lowest set bit of 6 is 2 (binary 010). The two answers differ at this bit.
+step: Group with this bit set: 2, 3, 2. Group without it: 1, 1, 5.
+step: XOR of the first group is 2 ^ 3 ^ 2 = 3. So a = 3.
+step: The other answer is xor_all ^ a = 6 ^ 3 = 5.
+step: The answer is [3, 5], in either order.
+bugs: Using any set bit but computing it wrongly, such as xor_all & 1, which can be 0 ; Forgetting that a ^ b is nonzero only because the two numbers are different ; XORing both groups into one variable ; Overflow of -xor_all in languages with fixed-width ints when xor_all is the minimum value
+cost: O(n) time and O(1) extra space, because the array is scanned twice and only three variables are kept.
+
+@@ classdesign
+what: A design problem asks for a class, not one function. Keep the state in fields and make each method read or change those fields in the time the problem needs. Think first about which operations are called most, and pick fields that make those cheap.
+signals: "Design a ... class" ; "implement the class with methods ..." ; a sequence of operations is called on one object ; limits such as O(1) per call ; the constructor takes the starting capacity or values
+code:
+```python
+class ParkingSystem:
+    def __init__(self, big: int, medium: int, small: int):
+        # free[type] = free slots; index 0 is unused so types 1..3 map directly
+        self.free = [0, big, medium, small]
+
+    def add_car(self, car_type: int) -> bool:
+        if self.free[car_type] == 0:
+            return False
+        self.free[car_type] -= 1
+        return True
+```
+walk: #1603 Design Parking System
+step: Create ParkingSystem(1, 1, 0). The fields are free = [0, 1, 1, 0].
+step: add_car(1): free[1] is 1, so decrease it to 0 and return True.
+step: add_car(2): free[2] is 1, so decrease it to 0 and return True.
+step: add_car(3): free[3] is 0, so return False and change nothing.
+step: add_car(1): free[1] is now 0, so return False. The answers are True, True, False, False.
+bugs: Not storing state in self, so each call forgets earlier calls ; Changing the state even when the call fails ; Choosing a slow field, such as a list scan, when a counter or map is enough ; Mixing up the 1-based type numbers and the 0-based list index
+cost: O(1) time per call and O(1) extra space, because the state is three counters.
+
+@@ fenwick
+what: A Fenwick tree stores in slot i the sum of a block of items that ends at i. The block length is the lowest set bit of i. A prefix sum adds a few blocks by stepping i -= i & -i. An update touches the blocks that cover the item by stepping i += i & -i. Both take O(log n).
+signals: array with point updates and range sum queries ; "update and query many times" ; prefix sums that change over time ; count smaller items to the right while inserting ; need a short code that is faster than recomputing sums
+code:
+```python
+class NumArray:
+    def __init__(self, nums: list[int]):
+        self.n = len(nums)
+        self.nums = [0] * self.n
+        self.tree = [0] * (self.n + 1)       # 1-based Fenwick array
+        for i, v in enumerate(nums):
+            self.update(i, v)
+
+    def update(self, index: int, val: int) -> None:
+        delta = val - self.nums[index]
+        self.nums[index] = val
+        i = index + 1
+        while i <= self.n:
+            self.tree[i] += delta
+            i += i & -i                      # go to the next block covering i
+
+    def _prefix(self, i: int) -> int:        # sum of the first i items
+        total = 0
+        while i > 0:
+            total += self.tree[i]
+            i -= i & -i                      # drop the lowest set bit
+        return total
+
+    def sum_range(self, left: int, right: int) -> int:
+        return self._prefix(right + 1) - self._prefix(left)
+```
+walk: #307 Range Sum Query - Mutable
+step: Input nums = [1, 3, 5]. Building: update(0, 1) adds 1 to tree[1] and tree[2]. update(1, 3) adds 3 to tree[2]. update(2, 5) adds 5 to tree[3].
+step: tree = [0, 1, 4, 5]. Slot 2 holds 1 + 3, slot 3 holds only item 3 (value 5).
+step: sum_range(0, 2) = prefix(3) - prefix(0). prefix(3) = tree[3] + tree[2] = 5 + 4 = 9, since 3 - 1 = 2 and 2 - 2 = 0.
+step: update(1, 2): delta = 2 - 3 = -1. Add it to tree[2]; the next slot 4 is beyond n. Now tree[2] = 3.
+step: sum_range(0, 2) = tree[3] + tree[2] = 5 + 3 = 8. The answer is 8.
+bugs: Using index 0 in the tree, where i & -i is 0 and the loop never ends ; Adding the new value instead of the difference on update ; Computing prefix(right) - prefix(left) and dropping an item ; Not keeping a copy of nums, so the old value is unknown and the delta cannot be computed
+cost: O(log n) time per update or query and O(n) extra space, because each step changes i by its lowest set bit, so there are at most log n steps.
+
+@@ randomset
+what: Keep the values in an array for fast random picks, and keep a map from each value to its array index. To delete in O(1), move the last array item into the deleted slot and pop the end. The map is updated for the moved item. Order does not matter, so the swap is safe.
+signals: "insert, delete and getRandom in O(1)" ; random pick from a changing set ; all operations must be average O(1) ; pick uniformly at random from the current items ; need both fast lookup and random access by position
+code:
+```python
+import random
+
+class RandomizedSet:
+    def __init__(self):
+        self.vals: list[int] = []
+        self.pos: dict[int, int] = {}          # value -> index in vals
+
+    def insert(self, val: int) -> bool:
+        if val in self.pos:
+            return False
+        self.pos[val] = len(self.vals)
+        self.vals.append(val)
+        return True
+
+    def remove(self, val: int) -> bool:
+        if val not in self.pos:
+            return False
+        i, last = self.pos[val], self.vals[-1]
+        self.vals[i] = last                    # move the last item into the hole
+        self.pos[last] = i
+        self.vals.pop()
+        del self.pos[val]                      # after the update, so val == last works
+        return True
+
+    def get_random(self) -> int:
+        return random.choice(self.vals)
+```
+walk: #380 Insert Delete GetRandom O(1)
+step: insert(1): not in pos, so vals = [1], pos = {1: 0}. Return True.
+step: remove(2): 2 is not in pos, so return False.
+step: insert(2): vals = [1, 2], pos = {1: 0, 2: 1}. Return True.
+step: remove(1): index i = 0, last = 2. Set vals[0] = 2, pos[2] = 0, pop the end, and delete pos[1]. Now vals = [2], pos = {2: 0}. Return True.
+step: insert(2): already in pos, so return False. get_random returns 2, the only item.
+bugs: Deleting from the middle of the list with pop(i), which costs O(n) ; Forgetting to update the map entry of the moved item ; Deleting the map entry before the update, which breaks when the removed value is the last one ; Picking random from the dict keys, which is O(n) in many languages
+cost: O(1) average time per operation and O(n) extra space, because the map and the array each hold n items and every step is a constant number of hash or index operations.
+
+@@ segtree
+what: A segment tree stores in each node a summary, such as the sum, of one range of the array. The root covers everything, and the two children cover the left and right halves. A point update fixes the nodes on one path to the root. A range query combines O(log n) nodes. This version uses the bottom-up array layout with leaves at n to 2n-1.
+signals: range query with point updates ; "sum, min or max of a range" that changes over time ; update and query are both called many times ; the summary must combine in any order, like sum, min, max, gcd ; later problems add lazy range updates
+code:
+```python
+class NumArray:
+    def __init__(self, nums: list[int]):
+        self.n = len(nums)
+        self.tree = [0] * (2 * self.n)
+        self.tree[self.n:] = nums                    # leaves
+        for i in range(self.n - 1, 0, -1):           # parents from the bottom
+            self.tree[i] = self.tree[2 * i] + self.tree[2 * i + 1]
+
+    def update(self, index: int, val: int) -> None:
+        i = index + self.n
+        self.tree[i] = val
+        while i > 1:                                 # fix the path to the root
+            i //= 2
+            self.tree[i] = self.tree[2 * i] + self.tree[2 * i + 1]
+
+    def sum_range(self, left: int, right: int) -> int:
+        lo, hi = left + self.n, right + self.n + 1   # half-open [lo, hi)
+        total = 0
+        while lo < hi:
+            if lo & 1:                               # lo is a right child: take it
+                total += self.tree[lo]
+                lo += 1
+            if hi & 1:                               # hi - 1 is a right child: take it
+                hi -= 1
+                total += self.tree[hi]
+            lo //= 2
+            hi //= 2
+        return total
+```
+walk: #307 Range Sum Query - Mutable
+step: Input nums = [1, 3, 5], n = 3. Leaves go to tree[3], tree[4], tree[5] = 1, 3, 5. Then tree[2] = 3 + 5 = 8 and tree[1] = 8 + 1 = 9.
+step: sum_range(0, 2): lo = 3, hi = 6. lo is odd, so total = 1 and lo = 4. hi is even. Move up: lo = 2, hi = 3.
+step: lo = 2 is even. hi = 3 is odd, so hi = 2 and total = 1 + tree[2] = 9. Move up: lo = 1, hi = 1, so stop. The sum is 9.
+step: update(1, 2): i = 4, set tree[4] = 2. Then i = 2, tree[2] = 2 + 5 = 7. Then i = 1, tree[1] = 7 + 1 = 8.
+step: sum_range(0, 2) takes tree[3] = 1 and then tree[2] = 7, so the answer is 8.
+bugs: Using a half-open range for the query but passing the closed right end without adding 1 ; Forgetting to rebuild the parent nodes after a point update ; Using the bottom-up layout for a non-commutative combine without care ; Allocating a tree of size n and indexing out of range
+cost: O(n) to build, O(log n) per update or query, and O(n) extra space, because the tree has 2n nodes and each walk climbs about log n levels.
+
+@@ skiplist
+what: A skip list is a sorted linked list with extra "express" lanes above it. Each new node gets a random height. On a high lane the search jumps over many nodes, then drops down a lane when the next jump is too far. With random heights, a search takes O(log n) steps on average, without any tree balancing.
+signals: "Design a skiplist" ; sorted data with insert, delete and search, and no built-in tree allowed ; "O(log n) expected" using random levels ; duplicates are allowed in the structure ; a linked list that must be searched faster than one step at a time
+code:
+```python
+import random
+
+class Node:
+    def __init__(self, val: int, level: int):
+        self.val = val
+        self.next: list = [None] * level      # one forward link per lane
+
+class Skiplist:
+    MAX = 16
+
+    def __init__(self):
+        self.head = Node(-1, self.MAX)
+
+    def _find_prev(self, num: int) -> list:
+        prev, cur = [self.head] * self.MAX, self.head
+        for lv in range(self.MAX - 1, -1, -1):          # top lane first
+            while cur.next[lv] and cur.next[lv].val < num:
+                cur = cur.next[lv]                      # jump ahead on this lane
+            prev[lv] = cur                              # last node below num here
+        return prev
+
+    def search(self, target: int) -> bool:
+        node = self._find_prev(target)[0].next[0]
+        return node is not None and node.val == target
+
+    def add(self, num: int) -> None:
+        prev = self._find_prev(num)
+        level = 1
+        while level < self.MAX and random.random() < 0.5:   # coin flips
+            level += 1
+        node = Node(num, level)
+        for lv in range(level):
+            node.next[lv] = prev[lv].next[lv]
+            prev[lv].next[lv] = node
+
+    def erase(self, num: int) -> bool:
+        prev = self._find_prev(num)
+        node = prev[0].next[0]
+        if node is None or node.val != num:
+            return False
+        for lv in range(len(node.next)):
+            if prev[lv].next[lv] is node:
+                prev[lv].next[lv] = node.next[lv]
+        return True
+```
+walk: #1206 Design Skiplist
+step: add(1), add(2), add(3). Each node gets a random height. Say 2 gets height 2, the others height 1. The bottom lane is head, 1, 2, 3 and the top lane is head, 2.
+step: search(0): on the top lane, 2 is not below 0, so drop to the bottom lane. There 1 is not below 0 either. The node after the stop is 1, which is not 0, so return False.
+step: add(4) is linked in on the bottom lane after 3 and on any lane its height reaches.
+step: search(1): top lane: 2 is not below 1, drop. Bottom lane: 1 is not below 1, so stop. The next node is 1, so return True.
+step: erase(0) finds node 1, which is not 0, and returns False. erase(1) relinks head to 2 on the bottom lane and returns True.
+step: search(1) now finds node 2, which is not 1, so return False.
+bugs: Searching only the bottom lane, which is a plain list scan ; Not recording the previous node at every lane, so insert and erase cannot relink ; Erasing every duplicate instead of one copy ; Using a fixed height for every node, which gives no speedup ; Letting the random height grow without a cap
+cost: O(log n) expected time per operation and O(n) expected extra space, because the expected number of nodes per lane halves going up, so there are about 2n links.
+
+@@ cyclesim
+what: A deterministic simulation with a limited number of states must repeat after some steps. Remember when each state was first seen. When a state repeats, the days since last seen give the cycle length, so you skip whole cycles with a modulo. Then simulate only the few remaining steps.
+signals: "after n days" with n up to 10^9 ; the next state depends only on the current state ; the number of possible states is small ; simulation is correct but too slow ; "repeat the process k times" on a small board
+code:
+```python
+def prison_after_n_days(cells: list[int], n: int) -> list[int]:
+    def step(c: tuple) -> tuple:
+        # ends have only one neighbour, so they become empty
+        return (0,) + tuple(int(c[i - 1] == c[i + 1]) for i in range(1, 7)) + (0,)
+
+    seen: dict[tuple, int] = {}          # state -> days left when first seen
+    state = tuple(cells)
+    while n > 0:
+        if state in seen:
+            n %= seen[state] - n         # skip whole cycles
+            if n == 0:
+                break
+        seen[state] = n
+        state = step(state)
+        n -= 1
+    return list(state)
+```
+walk: #957 Prison Cells After N Days
+step: Input cells = [1,0,0,1,0,0,1,0], n = 1000000000. Day 0 is stored with 1000000000 days left. Step one day at a time.
+step: Day 1 gives [0,0,0,1,0,0,1,0] and it is new. Cells 0 and 7 are 0 from now on, so states are few.
+step: On day 15 the state equals the day 1 state. Days left now: 1000000000 - 15. Stored for day 1: 1000000000 - 1. The cycle length is 14.
+step: n becomes (1000000000 - 15) % 14 = 5. We only need 5 more steps from this state.
+step: Five steps give day 6 of the cycle: [0,0,1,1,1,1,1,0]. That is the answer.
+bugs: Simulating all n steps when n is 10^9 ; Storing states as lists, which cannot be dictionary keys ; Forgetting that day 0 may not be part of the cycle, since the first step changes the ends ; Using modulo n % 14 from day 0 instead of from the day the repeat is found ; Continuing to step when the remainder is 0
+cost: O(S) time and O(S) extra space, where S is the number of distinct states (at most 2^6 + 1 here), because each state is visited once before a repeat.
+
+@@ dataframe
+what: Think of data as tables, not as loops over rows. Filter picks rows by a condition. Group collects rows by a key and summarizes each group. Join matches rows of two tables by a key. These operations run in optimized library code, so they are shorter and faster than hand loops.
+signals: a table with named columns ; "return a DataFrame" or "write a SQL query" ; filter rows then pick some columns ; count or sum per group ; combine two tables on a shared id
+code:
+```python
+import pandas as pd
+
+def create_dataframe(student_data: list[list[int]]) -> pd.DataFrame:
+    # each inner list becomes one row; names the two columns
+    return pd.DataFrame(student_data, columns=["student_id", "age"])
+
+def examples(df: pd.DataFrame, other: pd.DataFrame):
+    adults = df[df["age"] >= 18]                     # filter rows
+    ages = adults[["student_id", "age"]]             # choose columns
+    per_age = df.groupby("age").size()               # group and count
+    joined = df.merge(other, on="student_id")        # join on a key
+    return adults, ages, per_age, joined
+```
+walk: #2877 Create a DataFrame from List
+step: Input student_data = [[1, 15], [2, 11], [3, 11], [4, 20]].
+step: pd.DataFrame builds a table with one row per inner list and two columns.
+step: Column names are student_id and age, given by the columns argument.
+step: The rows are (1, 15), (2, 11), (3, 11), (4, 20). The shape is (4, 2).
+step: The answer is that table, and for example df[df["age"] >= 18] would keep only the row (4, 20).
+bugs: Looping over rows with a for loop, which is much slower than column operations ; Writing df["a"] > 1 and df["b"] < 2 instead of using & with parentheses ; Forgetting to name the columns, so they appear as 0 and 1 ; Changing a slice of a DataFrame and being surprised that the original is not changed
+cost: O(rows) time and O(rows) extra space for building, filtering or grouping, because each operation reads or writes each row a constant number of times.
+
+@@ js-throttle
+what: Debounce waits for a quiet period: every new call cancels the timer of the last one, so only the last call in a burst runs. Throttle limits the rate: a call runs only if enough time has passed since the last run, and other calls are dropped. Both use a timer or a clock and one saved variable.
+signals: "debounce" or "throttle" ; calls must be delayed or dropped ; "run only the last call after t milliseconds of quiet" ; limit how often a function runs ; typing, scrolling or resize events
+code:
+```python
+import threading
+import time
+
+def debounce(fn, t: float):                   # t is in seconds
+    timer = None
+    def debounced(*args):
+        nonlocal timer
+        if timer is not None:
+            timer.cancel()                    # drop the earlier pending call
+        timer = threading.Timer(t, fn, args)  # run only if no new call comes
+        timer.start()
+    return debounced
+
+def throttle(fn, t: float):
+    last = None
+    def throttled(*args):
+        nonlocal last
+        now = time.monotonic()
+        if last is None or now - last >= t:   # enough time has passed
+            last = now
+            return fn(*args)
+    return throttled
+```
+walk: #2627 Debounce
+step: Input t = 50 (milliseconds). Call debounced(1) at time 50. A timer is set to fire at 100.
+step: Call debounced(2) at time 75. The timer for the first call is still waiting, so cancel it.
+step: A new timer is set to fire at 75 + 50 = 125 with the input 2.
+step: No more calls come, so the timer fires at time 125 and runs fn(2).
+step: The result is a single run: time 125 with input 2. The first call never ran.
+bugs: Not cancelling the earlier timer, so every call runs, only later ; Mixing up debounce (last call wins) and throttle (first call wins) ; Losing the arguments of the last call ; Creating one timer shared by all debounced functions instead of one per function ; Mixing units, seconds in one place and milliseconds in another
+cost: O(1) time per call and O(1) extra space, because only one timer or one timestamp is kept for each wrapped function.
+
+@@ bucket
+what: Put the numbers into buckets of equal width. By the pigeonhole principle, if the width is chosen well, the largest gap cannot be inside one bucket; it must be between the max of one bucket and the min of the next. So keep only the min and max of each bucket. This gives a linear time answer without sorting.
+signals: "maximum gap" between sorted neighbours but the array is not sorted ; you need O(n) time and may not sort ; the values lie in a known range ; "closest pair" or "at least k values within a range" ; counting by value ranges rather than by exact values
+code:
+```python
+def maximum_gap(nums: list[int]) -> int:
+    n = len(nums)
+    if n < 2:
+        return 0
+    lo, hi = min(nums), max(nums)
+    if lo == hi:
+        return 0
+    size = max(1, (hi - lo) // (n - 1))        # width so the gap cannot hide inside
+    count = (hi - lo) // size + 1
+    mins: list = [None] * count
+    maxs: list = [None] * count
+    for x in nums:
+        b = (x - lo) // size
+        mins[b] = x if mins[b] is None else min(mins[b], x)
+        maxs[b] = x if maxs[b] is None else max(maxs[b], x)
+    best, prev_max = 0, lo
+    for b in range(count):
+        if mins[b] is None:                    # empty bucket
+            continue
+        best = max(best, mins[b] - prev_max)   # gap to the previous used bucket
+        prev_max = maxs[b]
+    return best
+```
+walk: #164 Maximum Gap
+step: Input nums = [3, 6, 9, 1]. n = 4, lo = 1, hi = 9. Width = max(1, 8 // 3) = 2, and the bucket count = 8 // 2 + 1 = 5.
+step: Bucket index = (x - 1) // 2. So 1 goes to bucket 0, 3 to bucket 1, 6 to bucket 2, and 9 to bucket 4. Bucket 3 stays empty.
+step: Sweep with prev_max = 1. Bucket 0: min 1, gap 1 - 1 = 0, prev_max = 1.
+step: Bucket 1: min 3, gap 3 - 1 = 2, prev_max = 3. Bucket 2: min 6, gap 6 - 3 = 3, prev_max = 6.
+step: Bucket 3 is empty, so skip. Bucket 4: min 9, gap 9 - 6 = 3.
+step: The answer is 3. Check by sorting: 1, 3, 6, 9 has gaps 2, 3, 3.
+bugs: Measuring the gap inside a bucket, which is always smaller than the best gap ; Not skipping empty buckets, so their None values break the compare ; Using a width of 0 when the values are close together ; Forgetting the case where all values are equal
+cost: O(n) time and O(n) extra space, because each number is placed in a bucket once and there are at most n buckets.
+
+@@ inversions
+what: During merge sort, both halves are already sorted when you merge them. For each item in the left half, count how many items in the right half form a pair with it, by moving a pointer forward in the right half. The pointer never goes back, so counting is linear per merge. This turns an O(n^2) pair count into O(n log n).
+signals: "count pairs i < j with nums[i] > nums[j]" ; "reverse pairs" or "inversions" ; count of smaller elements after self ; pair condition compares two values, and the order of indexes matters ; n up to 5 * 10^4 or more, so O(n^2) is too slow
+code:
+```python
+def reverse_pairs(nums: list[int]) -> int:
+    def sort(a: list[int]):
+        if len(a) <= 1:
+            return a, 0
+        mid = len(a) // 2
+        left, cl = sort(a[:mid])
+        right, cr = sort(a[mid:])
+        count = cl + cr
+        j = 0
+        for x in left:                       # left and right are both sorted
+            while j < len(right) and x > 2 * right[j]:
+                j += 1                       # right[0..j-1] all pair with x
+            count += j
+        merged, i, k = [], 0, 0              # standard merge of two sorted runs
+        while i < len(left) and k < len(right):
+            if left[i] <= right[k]: merged.append(left[i]); i += 1
+            else: merged.append(right[k]); k += 1
+        return merged + left[i:] + right[k:], count
+
+    return sort(nums)[1]
+```
+walk: #493 Reverse Pairs
+step: Input nums = [1, 3, 2, 3, 1]. We count i < j with nums[i] > 2 * nums[j]. Split into [1, 3, 2] and [3, 1].
+step: In [3, 2], split into [3] and [2]. 3 > 4 is false, so 0 pairs. Merged: [2, 3]. Then [1] with [2, 3]: 1 > 4 is false, so 0 pairs. Merged: [1, 2, 3].
+step: In [3, 1]: left [3], right [1]. 3 > 2 is true, so j = 1 and count 1. Merged: [1, 3].
+step: Merge step on [1, 2, 3] and [1, 3]: x = 1 gives j = 0 and x = 2 gives j = 0, since 2 > 2 is false.
+step: x = 3: 3 > 2 is true, j = 1, and 3 > 6 is false. So count 1 more.
+step: The total is 0 + 0 + 1 + 1 = 2. The answer is 2.
+bugs: Counting after merging instead of before, when the halves are no longer separate ; Using x > right[j] when the rule is x > 2 * right[j] ; Resetting j for each x, which makes it O(n^2) ; Forgetting that j must not move back, which only works because the left half is sorted
+cost: O(n log n) time and O(n) extra space, because there are log n levels, and each level does a linear count plus a linear merge.
+
+@@ prefixmod
+what: Take the running total of the array and keep only its remainder modulo k. If two prefix totals have the same remainder, the numbers between them add up to a multiple of k. So count pairs of equal remainders with a map, as in the prefix sum plus hash map idea.
+signals: "subarray sum divisible by k" ; multiple of k in a sum ; "continuous subarray sum" with a modulus ; count subarrays whose sum has a given remainder ; negative numbers may appear
+code:
+```python
+def subarrays_div_by_k(nums: list[int], k: int) -> int:
+    seen = {0: 1}               # remainder of the empty prefix
+    total = 0
+    answer = 0
+    for x in nums:
+        total = (total + x) % k          # Python % is never negative for k > 0
+        answer += seen.get(total, 0)     # each earlier equal remainder is a subarray
+        seen[total] = seen.get(total, 0) + 1
+    return answer
+```
+walk: #974 Subarray Sums Divisible by K
+step: Input nums = [4, 5, 0, -2, -3, 1], k = 5. Start with seen = {0: 1}, answer = 0.
+step: The prefix remainders are 4, 4, 4, 2, 4, 0. Process 4: remainder 4 is new, so add 0. seen[4] = 1.
+step: Process 5: remainder 4 was seen once, so answer = 1. Process 0: remainder 4 was seen twice, so answer = 3.
+step: Process -2: remainder 2 is new, so answer stays 3. Process -3: remainder 4 was seen three times, so answer = 6.
+step: Process 1: remainder 0 was seen once (the empty prefix), so answer = 7.
+step: The answer is 7.
+bugs: Forgetting to start with {0: 1}, so subarrays that start at index 0 are missed ; Using a negative remainder when the language keeps the sign of the dividend ; Counting only one earlier match instead of all of them ; Storing the totals instead of the remainders
+cost: O(n) time and O(k) extra space, because one pass does a map lookup per item and there are at most k different remainders.
+
+@@ sweep
+what: Turn each interval into a start event and an end event. Sort the events by position, then walk through them while keeping a running count of active intervals. Answer queries in sorted order too, so the count always matches the query position. This replaces a check of every interval for every query.
+signals: intervals and points or queries on a line ; "how many are active at time t" ; meeting rooms or maximum overlap ; skyline or covered length ; events that start and end at known times
+code:
+```python
+def full_bloom_flowers(flowers: list[list[int]], people: list[int]) -> list[int]:
+    starts = sorted(s for s, e in flowers)       # a flower opens at s
+    ends = sorted(e for s, e in flowers)         # a flower is gone after e
+    answer = [0] * len(people)
+    i = j = bloom = 0
+    for idx in sorted(range(len(people)), key=lambda k: people[k]):
+        t = people[idx]
+        while i < len(starts) and starts[i] <= t:    # flowers opened by time t
+            bloom += 1
+            i += 1
+        while j < len(ends) and ends[j] < t:         # flowers that closed before t
+            bloom -= 1
+            j += 1
+        answer[idx] = bloom
+    return answer
+```
+walk: #2251 Number of Flowers in Full Bloom
+step: Input flowers = [[1,6],[3,7],[9,12],[4,13]], people = [2,3,7,11]. starts = [1,3,4,9], ends = [6,7,12,13].
+step: t = 2: start 1 is at most 2, so bloom = 1. No end is below 2. Answer 1.
+step: t = 3: start 3 opens, so bloom = 2. Answer 2.
+step: t = 7: start 4 is at most 7, so bloom = 3. Start 9 is too late. End 6 is below 7, so bloom = 2. Answer 2.
+step: t = 11: start 9 opens, so bloom = 3. End 7 is below 11, so bloom = 2. Answer 2.
+step: The answer is [1, 2, 2, 2].
+bugs: Treating the end as exclusive when it is inclusive, which is an off-by-one at the end point ; Not sorting the queries, so the running count is wrong ; Writing answers in sorted order instead of the original order ; Processing end events before start events at the same time, when the order matters
+cost: O((n + q) log(n + q)) time and O(n + q) extra space, because of the sorting; the sweep itself is linear.
+
+@@ atmostk
+what: Counting windows with exactly k of something is hard for a sliding window, because shrinking can skip valid windows. Counting windows with at most k is easy: for each right end, every left end from the window start to right works. So the exact count is at_most(k) minus at_most(k - 1).
+signals: "exactly k" distinct values, odd numbers or ones ; count subarrays with a sum or count equal to a target ; the numbers are non-negative, so windows can slide ; "at most k" would be easy but the statement says "exactly" ; counting subarrays, not finding one
+code:
+```python
+def num_subarrays_with_sum(nums: list[int], goal: int) -> int:
+    def at_most(k: int) -> int:             # subarrays with sum <= k
+        if k < 0:
+            return 0
+        left = total = count = 0
+        for right, x in enumerate(nums):
+            total += x
+            while total > k:                # shrink until the sum fits
+                total -= nums[left]
+                left += 1
+            count += right - left + 1       # every start from left..right works
+        return count
+
+    return at_most(goal) - at_most(goal - 1)
+```
+walk: #930 Binary Subarrays With Sum
+step: Input nums = [1, 0, 1, 0, 1], goal = 2. We compute at_most(2) and at_most(1).
+step: at_most(2): the counts added per right end are 1, 2, 3, 4, then 4 (the window shrinks once at the last one). Total 14.
+step: at_most(1): the counts added per right end are 1, 2, 2, 3, 2. Total 10.
+step: Subarrays with sum at most 2 but not at most 1 have a sum of exactly 2.
+step: 14 - 10 = 4. The answer is 4.
+bugs: Calling at_most(goal - 1) when goal is 0, so k = -1 and the loop never ends, unless you return 0 ; Using this with negative numbers, where the window does not shrink correctly ; Counting count += 1 instead of right - left + 1 ; Subtracting in the wrong order
+cost: O(n) time and O(1) extra space, because each call is one pass where both pointers only move forward, and we call it twice.
+
+@@ ksum
+what: Sort the array. Fix the first item in a loop. Then find the other two with two pointers moving inward from both ends: if the sum is too small, move the left pointer up; if too big, move the right pointer down. Skipping repeated values avoids duplicate answers. This is O(n^2) instead of O(n^3).
+signals: "find all triplets that sum to zero" ; 3Sum, 4Sum or k-sum ; no duplicate answers allowed ; the order of the output does not matter ; "closest sum to target" with three numbers
+code:
+```python
+def three_sum(nums: list[int]) -> list[list[int]]:
+    nums.sort()
+    result = []
+    for i in range(len(nums) - 2):
+        if i > 0 and nums[i] == nums[i - 1]:
+            continue                          # same first item as before
+        lo, hi = i + 1, len(nums) - 1
+        while lo < hi:
+            s = nums[i] + nums[lo] + nums[hi]
+            if s < 0:
+                lo += 1
+            elif s > 0:
+                hi -= 1
+            else:
+                result.append([nums[i], nums[lo], nums[hi]])
+                lo += 1
+                hi -= 1
+                while lo < hi and nums[lo] == nums[lo - 1]:
+                    lo += 1                   # skip repeated second item
+    return result
+```
+walk: #15 3Sum
+step: Input nums = [-1, 0, 1, 2, -1, -4]. Sorted: [-4, -1, -1, 0, 1, 2].
+step: i = 0 (value -4): lo and hi scan inward. The best sum is -4 + 1 + 2 = -1, which is not 0, so no triplet.
+step: i = 1 (value -1): lo = 2, hi = 5: -1 + -1 + 2 = 0. Save [-1, -1, 2]. Move lo = 3, hi = 4.
+step: Now -1 + 0 + 1 = 0. Save [-1, 0, 1]. lo = 4, hi = 3, so stop.
+step: i = 2 has value -1, the same as before, so skip it. i = 3 (value 0): 0 + 1 + 2 = 3 is too big. hi moves down and lo meets hi.
+step: The answer is [[-1, -1, 2], [-1, 0, 1]].
+bugs: Not sorting first, so the pointer moves have no meaning ; Not skipping equal first items, which gives duplicate triplets ; Skipping equal second items before the first match, which loses a valid triplet like -1, -1, 2 ; Moving both pointers by one after a match but not skipping equal values ; Using a set of tuples to remove duplicates, which works but is slower and uses more space
+cost: O(n^2) time and O(1) extra space besides the output, because sorting costs O(n log n) and each fixed item runs one linear two-pointer pass.
+
+@@ minwin
+what: Grow the right end until the window holds everything needed. Then shrink from the left while the window still holds everything, and record the shortest one. Keep a count of what is still missing, so each step is O(1). Each pointer moves forward only, so it is linear.
+signals: "minimum window" or "shortest substring" that contains all of something ; cover all required characters ; smallest subarray with sum at least target ; window must satisfy a "contains all" condition ; need counts, not just presence
+code:
+```python
+from collections import Counter
+
+def min_window(s: str, t: str) -> str:
+    need = Counter(t)               # need[c] > 0: still needed; < 0: extra copies
+    missing = len(t)                # how many needed characters are not yet covered
+    left = 0
+    best_start, best_len = 0, float("inf")
+    for right, ch in enumerate(s):
+        if need[ch] > 0:
+            missing -= 1
+        need[ch] -= 1
+        if missing == 0:            # the window is valid
+            while need[s[left]] < 0:        # drop extra characters on the left
+                need[s[left]] += 1
+                left += 1
+            if right - left + 1 < best_len:
+                best_start, best_len = left, right - left + 1
+            need[s[left]] += 1      # drop one needed char to search further
+            missing += 1
+            left += 1
+    return "" if best_len == float("inf") else s[best_start:best_start + best_len]
+```
+walk: #76 Minimum Window Substring
+step: Input s = "ADOBECODEBANC", t = "ABC". need = {A:1, B:1, C:1}, missing = 3.
+step: Reading up to index 5 ("ADOBEC") covers A, B and C, so missing = 0. Left char A is needed, so the window is "ADOBEC" with length 6. Drop A: missing = 1, left = 1.
+step: Reading on, index 10 gives A again, so missing = 0. Shrinking drops D, O, B, E (all extra), then C is needed. Window "CODEBA" has length 6, which is not shorter. Drop C: left = 6.
+step: Index 12 gives C, so missing = 0. Shrinking drops O, D, E (extra), then B is needed.
+step: Window s[9:13] = "BANC" has length 4, which beats 6.
+step: No more letters, so the answer is "BANC".
+bugs: Using a set of characters, which ignores repeated needs like t = "AAB" ; Not shrinking after the window becomes valid, so the window is too long ; Forgetting to move left after recording, so the same window is found again ; Not handling the case where no window exists, which must return the empty string ; Comparing two Counters in each step, which is O(26) or worse per step
+cost: O(n + m) time and O(m) extra space, because each pointer moves at most n steps and the count map holds at most the distinct characters of t.
+
+@@ calc
+what: Read the expression left to right and remember the last operator seen. When a new operator arrives, apply the last one to the number just read. Plus and minus push the number (with sign) on a stack, but times and divide act at once on the top of the stack. At the end, sum the stack. For parentheses, save the state on a stack at '(' and restore it at ')'.
+signals: "evaluate the expression" given as a string ; operators + - * / with precedence ; parentheses may appear ; "implement a basic calculator" ; numbers have many digits and spaces may appear
+code:
+```python
+def calculate(s: str) -> int:
+    stack: list[int] = []
+    num = 0
+    op = "+"                       # the operator before the current number
+    for i, ch in enumerate(s):
+        if ch.isdigit():
+            num = num * 10 + int(ch)
+        if ch in "+-*/" or i == len(s) - 1:
+            if op == "+":
+                stack.append(num)
+            elif op == "-":
+                stack.append(-num)
+            elif op == "*":
+                stack.append(stack.pop() * num)      # binds tighter: act now
+            else:
+                stack.append(int(stack.pop() / num)) # truncate toward zero
+            op = ch
+            num = 0
+    return sum(stack)
+```
+walk: #227 Basic Calculator II
+step: Input s = "3+2*2". Start with op = "+", num = 0, stack = [].
+step: Read 3, so num = 3. Then "+" arrives: apply the old op "+", push 3. Now op = "+" and num = 0. stack = [3].
+step: Read 2, so num = 2. Then "*" arrives: apply the old op "+", push 2. Now op = "*". stack = [3, 2].
+step: Read the last 2, so num = 2. It is the last character, so apply the old op "*": pop 2, push 2 * 2 = 4. stack = [3, 4].
+step: The answer is sum([3, 4]) = 7. The multiplication happened before the addition.
+bugs: Using integer floor division with // on a negative result, when the rule is to truncate toward zero ; Forgetting to flush the last number at the end of the string ; Applying + and - at once, which breaks precedence ; Not resetting num after an operator ; Treating spaces as numbers or operators
+cost: O(n) time and O(n) extra space, because each character is read once and the stack holds at most one number for each + or - term.
+
+@@ greedy-stack
+what: To get the smallest sequence after removing k items, a larger earlier digit is worse than a smaller later one. Keep a stack. When a new digit is smaller than the top, pop the top while you still may remove items. If removals are left at the end, cut them from the back, where the stack is largest.
+signals: "remove k digits to make the smallest number" ; lexicographically smallest subsequence ; keep a result in order and delete items ; "remove duplicate letters" or "smallest subsequence of length k" ; a larger earlier item can be replaced by a smaller later one
+code:
+```python
+def remove_kdigits(num: str, k: int) -> str:
+    stack: list[str] = []
+    for d in num:
+        while k and stack and stack[-1] > d:   # a bigger digit earlier is worse
+            stack.pop()
+            k -= 1
+        stack.append(d)
+    if k:                                      # still to remove: cut from the end
+        stack = stack[:-k]
+    return "".join(stack).lstrip("0") or "0"
+```
+walk: #402 Remove K Digits
+step: Input num = "1432219", k = 3. Push 1, then push 4. stack = [1, 4].
+step: Digit 3: top 4 is bigger, so pop it (k = 2). Push 3. stack = [1, 3].
+step: Digit 2: top 3 is bigger, so pop it (k = 1). Push 2. stack = [1, 2]. Next digit 2: top 2 is not bigger, so push. stack = [1, 2, 2].
+step: Digit 1: top 2 is bigger, so pop it (k = 0). Push 1. stack = [1, 2, 1].
+step: Digit 9: k is 0, so just push. stack = [1, 2, 1, 9]. No leading zeros to strip.
+step: The answer is "1219".
+bugs: Forgetting to remove leftover digits from the end when the digits are already non-decreasing ; Not stripping leading zeros, or returning an empty string instead of "0" ; Popping on an equal digit, which removes digits that did not need to go ; Doing the stack[:-k] cut when k is 0, which empties the stack
+cost: O(n) time and O(n) extra space, because each digit is pushed once and popped at most once.
+
+@@ histogram
+what: Keep a stack of bars with rising heights. When a new bar is shorter than the top, the top bar cannot extend further right. The bar below it on the stack is its nearest shorter bar on the left. So its widest rectangle is known the moment it is popped. A sentinel bar of height 0 at the end pops all the rest.
+signals: "largest rectangle in a histogram" ; maximal rectangle in a binary matrix ; for each bar, find how far it can extend left and right ; nearest smaller value on both sides ; area equals height times a width found by neighbours
+code:
+```python
+def largest_rectangle_area(heights: list[int]) -> int:
+    hs = heights + [0]                 # sentinel: pops everything at the end
+    stack: list[int] = []              # indexes with increasing heights
+    best = 0
+    for i, h in enumerate(hs):
+        while stack and hs[stack[-1]] >= h:
+            height = hs[stack.pop()]
+            left = stack[-1] if stack else -1       # nearest shorter bar on the left
+            best = max(best, height * (i - left - 1))
+        stack.append(i)
+    return best
+```
+walk: #84 Largest Rectangle in Histogram
+step: Input heights = [2, 1, 5, 6, 2, 3] plus the sentinel 0. i = 0 pushes bar 2. i = 1 (height 1) pops bar 0: left = -1, width 1 - (-1) - 1 = 1, area 2. Push 1.
+step: Push bars at index 2 and 3 (heights 5 and 6). stack = [1, 2, 3].
+step: i = 4 (height 2) pops index 3 (height 6): left = 2, width 1, area 6. Then pops index 2 (height 5): left = 1, width 2, area 10. Push 4.
+step: Push index 5 (height 3). stack = [1, 4, 5]. Sentinel at i = 6 pops index 5: width 1, area 3.
+step: Pops index 4 (height 2): left = 1, width 4, area 8. Pops index 1 (height 1): left = -1, width 6, area 6.
+step: The best area seen is 10, so the answer is 10.
+bugs: Forgetting the sentinel, so bars left on the stack are never counted ; Using the wrong width, such as i - left instead of i - left - 1 ; Pushing the heights instead of the indexes, so the width cannot be found ; Not handling an empty stack when the popped bar is the lowest so far
+cost: O(n) time and O(n) extra space, because each bar is pushed once and popped once.
+
+@@ mono-deque
+what: To get the maximum of every window of size k, keep a deque of indexes whose values decrease from front to back. A new item removes all smaller items from the back, since they can never be the max while the new item is in the window. The front is the max of the window, and it is dropped when it leaves the window.
+signals: "sliding window maximum" or minimum ; max or min of every window of size k ; a window that moves one step at a time ; DP with a "best of the last k values" ; O(n log k) with a heap is too slow
+code:
+```python
+from collections import deque
+
+def max_sliding_window(nums: list[int], k: int) -> list[int]:
+    dq: deque[int] = deque()           # indexes; their values go down front to back
+    out: list[int] = []
+    for i, x in enumerate(nums):
+        while dq and nums[dq[-1]] <= x:
+            dq.pop()                   # smaller items can never win again
+        dq.append(i)
+        if dq[0] <= i - k:             # the front left the window
+            dq.popleft()
+        if i >= k - 1:                 # the first full window is complete
+            out.append(nums[dq[0]])
+    return out
+```
+walk: #239 Sliding Window Maximum
+step: Input nums = [1, 3, -1, -3, 5, 3, 6, 7], k = 3. i = 0: dq = [0]. i = 1 (value 3): pop index 0, since 1 <= 3. dq = [1].
+step: i = 2 (value -1): dq = [1, 2]. The first full window is done, and the max is nums[1] = 3.
+step: i = 3 (value -3): dq = [1, 2, 3]. Front 1 is still inside, so the max is 3.
+step: i = 4 (value 5): pop 3, 2, 1, then dq = [4]. The max is 5. i = 5 (value 3): dq = [4, 5], and the max is 5.
+step: i = 6 (value 6): pop all, then dq = [6]. The max is 6. i = 7 (value 7): dq = [7]. The max is 7.
+step: The answer is [3, 3, 5, 5, 6, 7].
+bugs: Storing values instead of indexes, so you cannot tell when the front leaves the window ; Popping only when the top is strictly smaller, so equal values pile up in the deque ; Checking the front only after adding the answer ; Forgetting to start recording answers only after i >= k - 1
+cost: O(n) time and O(k) extra space, because each index is added once and removed once, and the deque never holds more than k indexes.
