@@ -469,6 +469,7 @@ function ideaPanel(d){
   let h = `<div class="eyebrow"><span class="lpill" style="--c:${famVar(d.f)}"><span class="sw"></span>${esc(fam.name)}</span><span>Level ${d.l}</span><span class="mono">${d.probs.length} problem${d.probs.length===1?"":"s"}${solvedHere?` · ${solvedHere} solved`:""}</span></div>
     <h2>${esc(d.name)}</h2><p class="mech">${esc(d.s)}</p>`;
   h += `<div class="btnrow"><button type="button" class="btn" data-pmclose>Back to the overview</button></div>`;
+  h += lessonHTML(d);
   h += `<h3>Builds on</h3>` + (d.b.length ? `<div class="chips">${d.b.map(b=>ideaChip(I.byId[b])).join("")}</div>` : `<p class="empty">Nothing: this is a foundation.</p>`);
   if(d.c.length) h += `<h3>Pinned to these concepts</h3><div class="chips">${conceptChips(d.c)}</div>`;
   if(anchor) h += `<h3>The anchor problem</h3><p class="pm-anchor">The simplest problem that introduces this idea: ${pref(anchor.n)} ${diffPill(anchor.d)}</p>`;
@@ -482,6 +483,21 @@ function ideaPanel(d){
   if(d.used.length){ const ul = s.more.used || 8, uu = d.used.filter(q=>probOk(q,s));
     h += `<h3>Also needed in · ${uu.length} problems</h3><p class="pm-note">Problems about another idea that use this one along the way.</p>${uu.slice(0, ul).map(q=>probRow(q, done, {idea:true})).join("")}${uu.length>ul?`<button type="button" class="btn" data-pmmore="used">Show ${Math.min(30, uu.length-ul)} more</button>`:""}`; }
   return h;
+}
+// the idea's lesson (content/problemmap/lessons): read it, then climb the ladder
+function lessonHTML(d){
+  const L = (PM.raw.lessons || {})[d.id]; if(!L) return "";
+  const A = app(), R = window.DTSRich, RI = t => R ? R.inline(t, {blocks:false}) : esc(t);
+  const m = L.walk.match(/^#(\d+)\s+(.*)$/), wn = m && I.byN[+m[1]];
+  const walk = wn ? `<button type="button" class="linkish" data-pmprob="${wn.n}">#${wn.n} ${esc(wn.t)}</button> ${diffPill(wn.d)}` : esc(L.walk);
+  const code = R && R.para ? R.para("```python\n" + L.code + "\n```") : `<pre class="pm-code"><code>${esc(L.code)}</code></pre>`;
+  return `<details class="pm-lesson" open><summary><span class="pm-lk">Learn it first</span><span class="pm-lt">${esc(d.name)} in five minutes</span></summary>
+    <p class="pm-lw">${RI(L.what)}</p>
+    <h4>Signals in a problem</h4><ul class="pm-sig">${L.signals.map(x=>`<li>${RI(x)}</li>`).join("")}</ul>
+    <h4>The template in Python</h4>${code}
+    <h4>Walk-through: ${walk}</h4><ol class="pm-walk">${L.steps.map(x=>`<li>${RI(x)}</li>`).join("")}</ol>
+    <h4>Common bugs</h4><ul class="pm-bugs">${L.bugs.map(x=>`<li>${RI(x)}</li>`).join("")}</ul>
+    <p class="pm-cost"><b>Cost.</b> ${RI(L.cost)}</p></details>`;
 }
 function pathTo(q){
   const out = [q]; let cur = q; const seen = new Set([q.n]);
@@ -648,6 +664,6 @@ function route(kind, val){
 }
 
 window.DTSPM = { available, ensure, render, panel, hash, route, fillPins, fillNext, pinsCount, practiceLink, patternLink, vizLink, refresh,
-  count: () => { const s = sum(); return s ? s.problems : 0; }, done: () => doneSet(), _I: () => I };
+  count: () => { const s = sum(); return s ? s.problems : 0; }, done: () => doneSet(), _I: () => I, _raw: () => PM.raw };
 if(window.__dts && window.__dts.pmReady) window.__dts.pmReady();
 })();

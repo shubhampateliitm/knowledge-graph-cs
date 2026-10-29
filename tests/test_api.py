@@ -278,6 +278,15 @@ class API(unittest.TestCase):
         body = c.getresponse().read().decode(); self.assertNotIn("import argparse", body); self.assertIn("<!doctype html>", body)
 
     # ---------- problem map (tests/fixtures/problemmap_sample.json: 27 problems, closed under prerequisites) ----------
+    def test_lessons(self):
+        s, pm = self.get("/api/problemmap"); self.assertEqual(s, 200)
+        ids = {d["id"] for d in pm["ideas"]}
+        L = pm.get("lessons", {})
+        for k, v in L.items():
+            self.assertIn(k, ids)
+            for f in ("what", "signals", "code", "walk", "steps", "bugs", "cost"): self.assertTrue(v[f], (k, f))
+            compile(v["code"], k, "exec")
+
     def test_problemmap(self):
         s, g = self.get("/api/graph")
         pm = g["problemmap"]

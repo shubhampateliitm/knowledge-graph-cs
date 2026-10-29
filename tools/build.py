@@ -386,13 +386,23 @@ def main():
     if pm:
         data["problemmap_full"] = pm
         data["problemmap"], data["pm_summary"] = compact_problemmap(pm)
+        # a short lesson per idea (content/problemmap/lessons/*.txt, tools/lessons.py), served with the compact map
+        import lessons
+        # checked against the full map (content/problemmap/map.json), then cut to the map being built (tests use a sample)
+        full = json.load(open(PROBLEMMAP, encoding="utf-8")) if os.path.exists(PROBLEMMAP) else pm
+        les, lerrs = lessons.load({d["id"] for d in full["ideas"]})
+        if lerrs:
+            print("LESSON ERRORS (check one file with python3 tools/lessons.py <file>):\n  " + "\n  ".join(lerrs), file=sys.stderr); sys.exit(1)
+        here = {d["id"] for d in pm["ideas"]}
+        data["problemmap"]["lessons"] = {k: v for k, v in les.items() if k in here}
     data["stats"]["problemmap"] = len(pm["problems"]) if pm else 0
+    data["stats"]["lessons"] = len(data["problemmap"].get("lessons", {})) if pm else 0
     st = data["stats"]
     print(f"content ok: {st['nodes']} concepts {st['per_layer']}, {st['edges']} links, {st['side']} side links, "
           f"{st['tours']} tours, {st['courses']} courses, {st['words']:,} words, {st['refs']} sources ({st['urls']} with direct links), {st['deep']} deep reads, "
           f"{st['designs']} design questions, {st['practice']} practice problems, {st['templates']} pattern templates, {st['scenes']} animated scenes, "
           f"{st['patterns']} architecture patterns on {st['pattern_concepts']} concepts ({len(data['pcatalog'])} in the catalog), "
-          f"{st['handson']} hands-on practice links, "
+          f"{st['handson']} hands-on practice links, {st['lessons']} problem-map lessons, "
           f"{st['problemmap']} problems in the problem map" + ("" if pm else " (no content/problemmap/map.json yet)"))
     if "--check" in args: return
     os.makedirs(os.path.join(ROOT, "data"), exist_ok=True); os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)

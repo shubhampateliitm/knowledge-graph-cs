@@ -519,6 +519,13 @@ const shots = process.argv[3] || null;
     await page.click(`#pm-road .pm-ir[data-pmidea="${rid}"]`); await page.waitForSelector('#panel .pm-ladder .pm-row');
     ok(await page.locator(`#pm-road .pm-ir.sel[data-pmidea="${rid}"]`).count() === 1, 'roadmap: an idea opens its ladder and stays marked');
     await page.click('#panel [data-pmclose]'); await page.waitForTimeout(100);
+    // lesson: an idea's panel starts with "Learn it first" (what, signals, Python template, walk-through, bugs, cost)
+    const lesIdea = await page.evaluate(() => { const L = window.DTSPM._raw && window.DTSPM._raw().lessons; return L ? Object.keys(L)[0] : null; });
+    if (lesIdea) {
+      await page.evaluate(id => location.hash = '#problems/idea/' + id, lesIdea); await page.waitForSelector('#panel .pm-lesson');
+      ok(await page.locator('#panel .pm-lesson[open] .codeblock').count() === 1 && await page.locator('#panel .pm-lesson .pm-walk li').count() >= 3 && await page.locator('#panel .pm-lesson .pm-sig li').count() >= 3, 'idea panel: "Learn it first" lesson with signals, a Python template and a walk-through (' + lesIdea + ')');
+      await page.click('#panel [data-pmclose]'); await page.waitForTimeout(100);
+    }
     await page.click('[data-pmmode="map"]'); await page.waitForSelector('#pm-svg .pm-n');
     const pm = await page.evaluate(() => { const I = window.DTSPM._I(); return { ideas: I.ideas.length, probs: I.P.length, nodes: document.querySelectorAll('#pm-svg .pm-n').length, allG: document.querySelectorAll('#pm-svg g').length }; });
     ok(pm.nodes === pm.ideas && pm.allG < pm.ideas + 40, `problem map draws its ${pm.ideas} ideas as SVG nodes, not its ${pm.probs} problems (${pm.allG} groups)`);
