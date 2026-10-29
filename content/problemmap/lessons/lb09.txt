@@ -1,0 +1,962 @@
+@@ rollbs
+what: A rolling hash turns every substring of length L into a number, and the next number comes from the last one in O(1). If a repeated substring of length L exists, then one of length L-1 also exists, so "is there a repeat of length L?" is a yes-then-no pattern. That lets you binary search the length L instead of trying every length, and test each length in one pass with a set of hashes.
+signals: longest repeated or duplicate substring ; longest common substring of two strings ; "does a substring of length k exist?" is easy to test ; length up to 10^5, so O(n²) compare fails ; answer length can be searched because shorter lengths always work
+code:
+```python
+def longest_dup_substring(s: str) -> str:
+    n, MOD, B = len(s), (1 << 61) - 1, 131
+
+    def find(L: int) -> int:           # start of a repeat of length L, or -1
+        h = 0
+        for ch in s[:L]:
+            h = (h * B + ord(ch)) % MOD
+        pw = pow(B, L, MOD)            # weight of the char that leaves the window
+        seen = {h: 0}
+        for i in range(1, n - L + 1):
+            h = (h * B - ord(s[i - 1]) * pw + ord(s[i + L - 1])) % MOD
+            if h in seen and s[seen[h]:seen[h] + L] == s[i:i + L]:
+                return i               # compare text too, in case of a collision
+            seen.setdefault(h, i)
+        return -1
+
+    lo, hi, start, best = 1, n - 1, 0, 0
+    while lo <= hi:                    # repeats of length L exist for L <= answer
+        mid = (lo + hi) // 2
+        i = find(mid)
+        if i >= 0:
+            start, best, lo = i, mid, mid + 1
+        else:
+            hi = mid - 1
+    return s[start:start + best]
+```
+walk: #1044 Longest Duplicate Substring
+step: Input s = "banana", n = 6. Search lengths lo = 1 to hi = 5.
+step: mid = 3. The windows are "ban", "ana", "nan", "ana". The second "ana" matches the first, so find returns 3.
+step: A repeat of length 3 exists, so save start = 3, best = 3, and search longer: lo = 4.
+step: mid = 4. The windows "bana", "anan", "nana" are all different, so find returns -1. Set hi = 3.
+step: Now lo = 4 is greater than hi = 3, so the loop ends. Return s[3:6] = "ana".
+bugs: Trusting the hash alone and skipping the text compare, so a collision gives a wrong answer ; Using a small modulus such as 1000, which makes collisions common ; Forgetting to subtract the leaving character times B^L, so the window hash is wrong ; Searching hi = n instead of n - 1, because a repeat can never be the whole string
+cost: O(n log n) time on average and O(n) extra space, because each of the log n lengths costs one O(n) pass with a set of hashes.
+@@ suffixarr
+what: A suffix array lists the start positions of all suffixes of a string in sorted order. Suffixes next to each other in that order share the longest common prefixes, and the LCP array stores those prefix lengths. Every substring is a prefix of some suffix, so counting distinct substrings becomes simple arithmetic: all prefixes minus the repeated ones.
+signals: number of distinct substrings ; longest repeated substring ; compare or sort all suffixes ; k-th smallest substring ; longest common prefix between many pairs of suffixes
+code:
+```python
+def count_distinct(s: str) -> int:
+    n = len(s)
+    sa = sorted(range(n), key=lambda i: s[i:])   # simple build; O(n² log n) worst case
+    rank = [0] * n
+    for r, i in enumerate(sa):
+        rank[i] = r
+    total, lcp = n * (n + 1) // 2, 0             # every prefix of every suffix
+    for i in range(n):                           # Kasai: lcp drops by at most 1 per step
+        if rank[i] == 0:
+            lcp = 0
+            continue
+        j = sa[rank[i] - 1]                      # the suffix just before i in sorted order
+        while i + lcp < n and j + lcp < n and s[i + lcp] == s[j + lcp]:
+            lcp += 1
+        total -= lcp                             # these prefixes were already counted
+        lcp = max(lcp - 1, 0)
+    return total
+```
+walk: #1698 Number of Distinct Substrings in a String
+step: Input s = "abab". The suffixes are abab (0), bab (1), ab (2), b (3).
+step: Sorted order: ab (2), abab (0), b (3), bab (1). So sa = [2, 0, 3, 1].
+step: Total prefixes = 4 * 5 / 2 = 10. Now remove repeats using neighbour pairs.
+step: ab and abab share "ab", so LCP is 2. abab and b share nothing, so LCP is 0. b and bab share "b", so LCP is 1.
+step: The answer is 10 - (2 + 0 + 1) = 7. The substrings are a, b, ab, ba, aba, bab, abab.
+bugs: Counting n * (n + 1) / 2 and forgetting to subtract the LCP sum ; Taking the LCP of suffixes that are not neighbours in sorted order ; Building the array by sorting suffix slices on a long string, which is too slow and uses too much memory ; Resetting lcp to 0 at every step, which turns Kasai from O(n) into O(n²)
+cost: O(n) time for the LCP step and O(n) space; the simple sort build above is slower, and prefix doubling builds the array in O(n log² n).
+@@ triedfs
+what: A trie stores words so that words with the same start share the same path. A normal letter has only one child to follow. A wildcard such as "." may be any letter, so you try every child with DFS and succeed if any branch works. This is faster than scanning every word because each branch only continues where a real word still exists.
+signals: pattern with "." or "?" that matches any letter ; add words then search them many times ; prefix search with a wildcard ; "design a dictionary" ; letters only, so each node has at most 26 children
+code:
+```python
+class WordDictionary:
+    def __init__(self):
+        self.root: dict = {}
+
+    def addWord(self, word: str) -> None:
+        node = self.root
+        for c in word:
+            node = node.setdefault(c, {})
+        node["$"] = True               # marks the end of a word
+
+    def search(self, word: str) -> bool:
+        def dfs(i: int, node: dict) -> bool:
+            if i == len(word):
+                return "$" in node
+            c = word[i]
+            if c == ".":               # wildcard: try every child
+                return any(dfs(i + 1, child)
+                           for k, child in node.items() if k != "$")
+            return c in node and dfs(i + 1, node[c])
+        return dfs(0, self.root)
+```
+walk: #211 Design Add and Search Words Data Structure
+step: Add "bad", "dad", "mad". The root has three children b, d, m, and each leads down a one-word path.
+step: search("pad"): the root has no child "p", so the answer is False at once.
+step: search("bad"): follow b, then a, then d. The node for d has "$", so the answer is True.
+step: search(".ad"): the first letter is a wildcard, so try child b. From b follow a, then d, which ends a word, so return True.
+step: search("b.."): follow b, then the wildcard tries a, then the wildcard tries d. The node has "$", so True. The wildcard never visits d or m under b, because they do not exist.
+bugs: Forgetting the end marker, so "ba" is wrongly found after adding "bad" ; Treating the "$" marker key as a letter child when looping over children ; Checking the wildcard only against one child instead of trying all of them ; Returning True when the pattern ends without checking that a word really ends there
+cost: add is O(L) time. A search is O(L) without wildcards and O(26^w * L) in the worst case with w wildcards. Space is O(total letters).
+@@ grundy
+what: In a game where both players play perfectly, each position has a Grundy number: the mex (smallest missing whole number) of the Grundy numbers of the positions you can move to. A position is lost for the player to move exactly when its Grundy number is 0. For a sum of independent games, the Grundy number is the XOR of the parts, so you solve each part alone instead of searching the combined game. In plain Nim a pile of size p has Grundy number p, so the first player wins when the XOR of the piles is not 0.
+signals: two players take turns and both play perfectly ; several independent piles or groups ; the player who cannot move loses ; you can remove any number of items from one pile, or a fixed set of amounts ; asks who wins, not the score
+code:
+```python
+def mex(values: set[int]) -> int:      # smallest whole number not in the set
+    m = 0
+    while m in values:
+        m += 1
+    return m
+
+def grundy_subtraction(n: int, moves: list[int]) -> int:
+    g = [0] * (n + 1)                  # Grundy numbers when you may take any amount in moves
+    for i in range(1, n + 1):
+        g[i] = mex({g[i - m] for m in moves if m <= i})
+    return g[n]
+
+def nim_game(piles: list[int]) -> bool:
+    x = 0
+    for p in piles:
+        x ^= p                         # Grundy number of a pile of size p is p
+    return x != 0                      # non-zero XOR: the first player can win
+```
+walk: #1908 Game of Nim
+step: Input piles = [1, 2, 3]. Each pile's Grundy number is its size: 1, 2 and 3.
+step: XOR them: 1 ^ 2 = 3, then 3 ^ 3 = 0. The XOR is 0, so Alice, who moves first, loses: the answer is False.
+step: Why: whatever Alice takes, the XOR becomes non-zero, and Bob can always take stones to make it 0 again.
+step: For piles = [1], the XOR is 1. Alice takes the only stone, Bob cannot move, and the answer is True.
+step: For a subtraction game where you may take 1 or 3 stones, grundy_subtraction gives 0, 1, 0, 1, ... so even piles are lost.
+bugs: Adding the piles instead of XOR-ing them ; Mixing up normal play (the player who cannot move loses) with misere play (taking the last stone loses) ; Searching the whole combined game, which grows exponentially, instead of XOR-ing the parts ; Taking the mex over positions you came from instead of positions you can move to
+cost: O(n) time and O(1) space for the Nim sum of n piles; building Grundy numbers up to n with m moves costs O(n * m) time and O(n) space.
+
+@@ matexp
+what: If each step of a recurrence is a fixed linear combination of the last k values, write one step as a k by k matrix M. Then n steps equal M raised to the n-th power. Raise it by repeated squaring, so you do about log n matrix multiplications instead of n steps. The time is O(k^3 log n), which is fast when k is small and n is huge.
+signals: n is huge, such as 10^9 or 10^18 ; the next state is a fixed linear mix of the current state ; "after t transformations or steps" ; small number of states, such as 26 letters ; answer is asked modulo 10^9 + 7
+code:
+```python
+def length_after_transformations(s: str, t: int, nums: list[int]) -> int:
+    MOD, k = 10**9 + 7, 26
+    M = [[0] * k for _ in range(k)]
+    for i in range(k):
+        for d in range(1, nums[i] + 1):    # letter i becomes the next nums[i] letters
+            M[i][(i + d) % k] += 1
+
+    def mul(A: list[list[int]], B: list[list[int]]) -> list[list[int]]:
+        return [[sum(A[i][l] * B[l][j] for l in range(k)) % MOD
+                 for j in range(k)] for i in range(k)]
+
+    R = [[int(i == j) for j in range(k)] for i in range(k)]   # identity matrix
+    while t:                                # fast power: M ** t
+        if t & 1:
+            R = mul(R, M)
+        M = mul(M, M)
+        t >>= 1
+    cnt = [0] * k
+    for ch in s:
+        cnt[ord(ch) - 97] += 1
+    return sum(cnt[i] * sum(R[i]) for i in range(k)) % MOD
+```
+walk: #3337 Total Characters in String After Transformations II
+step: Take s = "az", t = 2, and nums[z] = 2 while every other nums value is 1. So a becomes b, b becomes c, and z becomes "ab".
+step: Row a of M has a single 1 at column b. Row z of M has 1s at columns a and b.
+step: t = 2 is binary 10. The lowest bit is 0, so skip R. Square: M becomes M², and t becomes 1.
+step: The lowest bit is 1, so R = identity times M² = M². In M², a leads to c, and z leads to b and c.
+step: Counts are a = 1 and z = 1. Row a of R sums to 1, and row z sums to 2.
+step: The answer is 1 * 1 + 1 * 2 = 3. Check by hand: "az" becomes "bab" and then "cbc", so the length after 2 steps is 3.
+bugs: Multiplying matrices without taking the modulus, so numbers grow without limit ; Starting R as the zero matrix instead of the identity matrix ; Forgetting to square M after each bit, even when the bit is 0 ; Using the wrong order for the vector and matrix, so rows and columns are swapped ; Looping t times when t is up to 10^9
+cost: O(k^3 log t) time and O(k^2) extra space, because each of about log t steps multiplies two k by k matrices. For k = 26 that is fast.
+@@ intervalmap
+what: Keep the non-overlapping intervals in a sorted structure keyed by their start. When a new number arrives, a binary search finds the interval just before it and the interval just after it. You then extend or merge at most two neighbours, instead of sorting or scanning all intervals again. Python has no built-in sorted map, so a sorted list with bisect plays that role here.
+signals: numbers arrive in a stream and you report disjoint ranges ; add a range and merge touching ranges ; "find the interval that contains x" ; insert or remove ranges and keep them sorted ; need the floor or ceiling neighbour of a value
+code:
+```python
+from bisect import bisect_left
+
+class SummaryRanges:
+    def __init__(self):
+        self.iv: list[list[int]] = []          # sorted, disjoint [start, end]
+
+    def addNum(self, value: int) -> None:
+        iv = self.iv
+        i = bisect_left(iv, [value])           # first interval with start >= value
+        if i > 0 and iv[i - 1][1] >= value:    # already inside the left neighbour
+            return
+        if i < len(iv) and iv[i][0] == value:  # already the start of the right one
+            return
+        left = i > 0 and iv[i - 1][1] == value - 1
+        right = i < len(iv) and iv[i][0] == value + 1
+        if left and right:                     # value glues two intervals together
+            iv[i - 1][1] = iv[i][1]
+            del iv[i]
+        elif left:
+            iv[i - 1][1] = value
+        elif right:
+            iv[i][0] = value
+        else:
+            iv.insert(i, [value, value])
+
+    def getIntervals(self) -> list[list[int]]:
+        return [x[:] for x in self.iv]
+```
+walk: #352 Data Stream as Disjoint Intervals
+step: addNum(1): the list is empty, so insert [1, 1]. Now iv = [[1,1]].
+step: addNum(3): it is not next to [1,1] because 2 is missing, so insert: iv = [[1,1],[3,3]].
+step: addNum(7): it touches nothing, so iv = [[1,1],[3,3],[7,7]].
+step: addNum(2): the left neighbour ends at 1 and the right neighbour starts at 3. Both touch, so merge: iv = [[1,3],[7,7]].
+step: addNum(6): the right neighbour starts at 7, which is 6 + 1, so extend it to the left: iv = [[1,3],[6,7]]. getIntervals returns that.
+bugs: Not handling a value that is already inside an interval, which makes bad duplicates ; Merging with the left neighbour only and forgetting that the right one may touch too ; Comparing with end + 1 on the wrong side ; Scanning every interval on each add, which makes the whole design O(n²) ; Returning the inner lists, so the caller can change them
+cost: Finding the place is O(log n). With a sorted list the insert or delete shifts items, so it is O(n) in the worst case; a balanced tree map gives O(log n) per add. Space is O(number of intervals).
+@@ lfu
+what: An LFU cache evicts the key used the fewest times, and the oldest one among ties. Keep a dictionary from each use count to an ordered list of keys with that count, plus the current minimum count. A use moves a key from bucket f to bucket f+1, and an eviction pops the oldest key of the minimum bucket, so every operation is O(1). A heap would cost O(log n) per update.
+signals: "least frequently used" ; evict the key with the lowest use count ; ties broken by least recently used ; get and put must both run in O(1) ; design a cache with a capacity
+code:
+```python
+from collections import OrderedDict, defaultdict
+
+class LFUCache:
+    def __init__(self, capacity: int):
+        self.cap = capacity
+        self.val: dict[int, int] = {}
+        self.cnt: dict[int, int] = {}                  # key -> use count
+        self.bucket = defaultdict(OrderedDict)         # count -> keys, oldest first
+        self.low = 0                                   # smallest count in the cache
+
+    def _touch(self, key: int) -> None:
+        f = self.cnt[key]
+        del self.bucket[f][key]
+        if not self.bucket[f] and self.low == f:
+            self.low += 1                              # that bucket is now empty
+        self.cnt[key] = f + 1
+        self.bucket[f + 1][key] = None                 # newest in its bucket
+
+    def get(self, key: int) -> int:
+        if key not in self.val:
+            return -1
+        self._touch(key)
+        return self.val[key]
+
+    def put(self, key: int, value: int) -> None:
+        if self.cap == 0:
+            return
+        if key in self.val:
+            self.val[key] = value
+            self._touch(key)
+            return
+        if len(self.val) == self.cap:                  # evict the oldest of the lowest count
+            old, _ = self.bucket[self.low].popitem(last=False)
+            del self.val[old], self.cnt[old]
+        self.val[key], self.cnt[key] = value, 1
+        self.bucket[1][key] = None
+        self.low = 1                                   # a new key always has count 1
+```
+walk: #460 LFU Cache
+step: Capacity is 2. put(1,1) and put(2,2): both keys have count 1, and bucket 1 holds [1, 2]. low = 1.
+step: get(1) returns 1. Key 1 moves to bucket 2, so bucket 1 = [2] and bucket 2 = [1]. low is still 1.
+step: put(3,3): the cache is full, so evict the oldest key of bucket 1, which is key 2. Then key 3 enters bucket 1.
+step: get(2) returns -1 because key 2 was evicted. get(3) returns 3, so key 3 moves to bucket 2 behind key 1: bucket 2 = [1, 3].
+step: put(4,4): the lowest count is 2 and the oldest key in bucket 2 is key 1, so key 1 is evicted. Then get(1) returns -1, get(3) returns 3, and get(4) returns 4.
+bugs: Forgetting to raise the minimum count when its bucket becomes empty ; Not resetting the minimum count to 1 when a new key is added ; Using one global recency order, which is LRU and ignores the use count ; Handling capacity 0 wrongly, because there is nothing to evict ; Counting a put on an existing key as a new key instead of an update
+cost: O(1) time per get and put, and O(capacity) extra space for the maps and buckets.
+@@ sqrtdecomp
+what: Split the work into two cases around a threshold B of about sqrt(n). When a step size y is small, there are few distinct sizes, so precompute a table for each one in O(n). When y is large, a direct loop only visits n / y items, which is fewer than sqrt(n). Each query then costs about sqrt(n), and you never need a heavy structure.
+signals: queries with a step or stride, such as every y-th element from x ; n and the number of queries both up to 5 * 10^4 or 10^5 ; both a table and brute force look too slow alone ; block updates or block sums on an array ; the time limit suggests about n * sqrt(n)
+code:
+```python
+from collections import defaultdict
+
+def solve(nums: list[int], queries: list[list[int]]) -> list[int]:
+    MOD = 10**9 + 7
+    n = len(nums)
+    B = int(n ** 0.5) + 1                      # threshold between small and large steps
+    ans = [0] * len(queries)
+    small = defaultdict(list)                  # step y -> [(x, query index)]
+    for qi, (x, y) in enumerate(queries):
+        if y >= B:                             # large step: at most n / B terms
+            ans[qi] = sum(nums[x::y]) % MOD
+        else:
+            small[y].append((x, qi))
+    for y, qs in small.items():                # one O(n) table per distinct small y
+        suf = [0] * (n + y)                    # suf[i] = nums[i] + suf[i + y]
+        for i in range(n - 1, -1, -1):
+            suf[i] = (nums[i] + suf[i + y]) % MOD
+        for x, qi in qs:
+            ans[qi] = suf[x]
+    return ans
+```
+walk: #1714 Sum Of Special Evenly-Spaced Elements In Array
+step: Input nums = [0,1,2,3,4,5,6,7] and queries [[0,3],[5,1],[4,2]]. n = 8, so B = int(2.83) + 1 = 3.
+step: Query [0,3] has y = 3, which is at least B, so loop directly: nums[0] + nums[3] + nums[6] = 0 + 3 + 6 = 9.
+step: Query [5,1] has y = 1, which is small. Build suf for y = 1 from the right: suf[7] = 7, suf[6] = 13, suf[5] = 18. The answer is 18.
+step: Query [4,2] has y = 2. Build suf for y = 2: suf[7] = 7, suf[6] = 6, suf[5] = 12, suf[4] = 10. The answer is 10.
+step: The result is [9, 18, 10].
+bugs: Building a new table for every query instead of once per distinct small y ; Making the table too short, so suf[i + y] goes out of range ; Choosing B = 1 or B = n, which leaves all work in one of the two cases ; Forgetting the modulus on the sums
+cost: O(n * sqrt(n) + q * sqrt(n)) time, because there are at most sqrt(n) tables of size n and each query loops at most sqrt(n) times. Extra space is O(n).
+@@ sweep-segtree
+what: Sweep a vertical line from left to right across rectangles. Each left edge adds a y-range to the "covered" set and each right edge removes it. A segment tree over the sorted y values keeps the total covered y-length, so the area grows by (covered length) times (distance moved) between events. Because you only count a segment as covered or not, overlaps are never counted twice.
+signals: area of the union of rectangles ; overlapping rectangles must be counted once ; coordinates up to 10^9, so no grid ; sweep a line and keep the covered length ; add and remove ranges as the sweep moves
+code:
+```python
+def rectangle_area(rectangles: list[list[int]]) -> int:
+    MOD = 10**9 + 7
+    ys = sorted({y for _, y1, _, y2 in rectangles for y in (y1, y2)})
+    idx = {y: i for i, y in enumerate(ys)}
+    events = []
+    for x1, y1, x2, y2 in rectangles:
+        events.append((x1, 1, y1, y2))          # the rectangle starts here
+        events.append((x2, -1, y1, y2))         # and ends here
+    events.sort()
+    m = len(ys) - 1                             # number of elementary y segments
+    cnt, cov = [0] * (4 * m), [0] * (4 * m)     # cover count and covered length
+
+    def update(node: int, l: int, r: int, a: int, b: int, v: int) -> None:
+        if b <= l or r <= a:
+            return
+        if a <= l and r <= b:
+            cnt[node] += v
+        else:
+            mid = (l + r) // 2
+            update(2 * node, l, mid, a, b, v)
+            update(2 * node + 1, mid, r, a, b, v)
+        if cnt[node] > 0:
+            cov[node] = ys[r] - ys[l]
+        elif r - l == 1:
+            cov[node] = 0
+        else:
+            cov[node] = cov[2 * node] + cov[2 * node + 1]
+
+    area, prev = 0, events[0][0]
+    for x, v, y1, y2 in events:
+        area += cov[1] * (x - prev)             # covered length times the gap
+        prev = x
+        update(1, 0, m, idx[y1], idx[y2], v)
+    return area % MOD
+```
+walk: #850 Rectangle Area II
+step: Rectangles [[0,0,2,2],[1,0,2,3],[1,0,3,1]]. The sorted y values are [0,1,2,3].
+step: Event x = 0 adds y-range [0,2]. The covered length before it is 0, so area stays 0. After it the covered length is 2.
+step: Events at x = 1 add [0,1] and [0,3]. Moving from x = 0 to 1 adds 2 * 1 = 2 to the area. After both events the covered length is 3.
+step: Events at x = 2 remove [0,2] and [0,3]. Moving from 1 to 2 adds 3 * 1, so the area is 5. The rectangle [0,1] is still active, so the covered length drops to 1.
+step: Event x = 3 removes [0,1]. Moving from 2 to 3 adds 1 * 1, so the area is 6. Answer: 6.
+bugs: Adding a covered length that is not updated before the next gap is measured ; Using cover count to store the length itself, so removals cannot be undone ; Forgetting to compress coordinates when they reach 10^9 ; Removing a range that was never added, or with different bounds than when it was added ; Forgetting the modulus at the end
+cost: O(n log n) time and O(n) extra space, because there are 2n events and each update touches O(log n) tree nodes.
+@@ functional
+what: In a graph where every node has exactly one out-edge, each walk either ends or falls into a cycle. So the graph is cycles with trees hanging into them. Walk from each unvisited node and write a timestamp on every node you pass. If the walk reaches a node stamped in this same walk, you found a new cycle, and its length is the difference of stamps. Each node is visited once.
+signals: each node has at most one outgoing edge ; array where edges[i] is the next node ; "follow the pointer" until something repeats ; find the longest or any cycle ; permutation or successor array
+code:
+```python
+def longest_cycle(edges: list[int]) -> int:
+    n = len(edges)
+    stamp = [0] * n                    # 0 means not visited yet
+    best, clock = -1, 1
+    for s in range(n):
+        if stamp[s]:
+            continue
+        start = clock                  # stamps from this walk are >= start
+        u = s
+        while u != -1 and not stamp[u]:
+            stamp[u] = clock
+            clock += 1
+            u = edges[u]
+        if u != -1 and stamp[u] >= start:   # we met a node from this very walk
+            best = max(best, clock - stamp[u])
+    return best
+```
+walk: #2360 Longest Cycle in a Graph
+step: Input edges = [3,3,4,2,3]. Start at node 0 with clock = 1.
+step: Stamp node 0 as 1, node 3 as 2, node 2 as 3, node 4 as 4. The next node is edges[4] = 3, and clock is now 5.
+step: Node 3 already has stamp 2, which is at least this walk's start of 1. So a new cycle exists, with length 5 - 2 = 3 (nodes 3, 2, 4).
+step: Next, node 1 starts a new walk with start = 5. It stamps node 1 as 5, then reaches node 3, whose stamp 2 is smaller than 5.
+step: That means the walk joined an old part of the graph, so there is no new cycle. The answer is 3.
+bugs: Counting a cycle when you meet a node stamped in an earlier walk ; Using a plain visited flag, so you cannot tell how long the cycle is ; Starting from every node with a fresh visited set, which is O(n²) ; Not stopping at -1, which means there is no out-edge ; Returning 0 instead of -1 when no cycle exists
+cost: O(n) time and O(n) extra space, because every node is stamped once and each edge is followed once.
+@@ leafpeel
+what: In a tree, the centre nodes are the last ones left after you repeatedly remove all leaves. Start with every node of degree 1 and remove them all together in one round. Each removal may turn a neighbour into a new leaf, which goes to the next round. Stop when at most two nodes remain. This is BFS from the outside, and it avoids trying every node as the root.
+signals: minimum height tree or best root ; centre of a tree ; remove leaves round by round ; the answer is one or two nodes ; node degrees matter, such as degree 1
+code:
+```python
+def find_min_height_trees(n: int, edges: list[list[int]]) -> list[int]:
+    if n == 1:
+        return [0]
+    adj = [set() for _ in range(n)]
+    for a, b in edges:
+        adj[a].add(b)
+        adj[b].add(a)
+    leaves = [i for i in range(n) if len(adj[i]) == 1]
+    remaining = n
+    while remaining > 2:               # a tree has at most 2 centres
+        remaining -= len(leaves)
+        nxt = []
+        for leaf in leaves:
+            nb = adj[leaf].pop()       # a leaf has exactly one neighbour
+            adj[nb].discard(leaf)
+            if len(adj[nb]) == 1:      # nb has become a leaf
+                nxt.append(nb)
+        leaves = nxt
+    return leaves
+```
+walk: #310 Minimum Height Trees
+step: Input n = 6 and edges [[3,0],[3,1],[3,2],[3,4],[5,4]]. Node 3 has four neighbours: 0, 1, 2, 4. Node 4 has 3 and 5.
+step: The leaves are [0,1,2,5]. remaining = 6, which is more than 2, so peel them: remaining becomes 2.
+step: Removing 0, 1, 2 leaves node 3 with only one neighbour, node 4. So node 3 joins the next round.
+step: Removing leaf 5 leaves node 4 with only neighbour 3, so node 4 joins too. The next leaves are [3, 4].
+step: remaining is 2, so the loop stops. The answer is [3, 4].
+bugs: Forgetting n == 1, where the node has degree 0 and is never a leaf ; Removing leaves one at a time instead of a whole round, which gives wrong centres ; Looping until the queue is empty, which removes the centres too ; Using the degree check before the edge is removed ; Trying every root with BFS, which is O(n²)
+cost: O(n) time and O(n) extra space, because every node and edge is removed once.
+@@ topo-build
+what: Some problems do not give you a graph, but they give ordering facts such as "a comes before b". Turn each fact into a directed edge a to b. Then run a topological sort: any order that respects all edges is valid. If the sort cannot use every node, there is a cycle, so no valid order exists. For a sorted dictionary, compare each neighbouring pair of words to find the first different letters.
+signals: "a must come before b" ; sorted dictionary in an unknown alphabet ; find an order that satisfies all rules ; return empty if the order is impossible ; prerequisites between items you build yourself
+code:
+```python
+from collections import deque
+
+def alien_order(words: list[str]) -> str:
+    adj = {c: set() for w in words for c in w}
+    indeg = {c: 0 for c in adj}
+    for a, b in zip(words, words[1:]):
+        for x, y in zip(a, b):
+            if x != y:                         # first difference gives one rule x < y
+                if y not in adj[x]:
+                    adj[x].add(y)
+                    indeg[y] += 1
+                break
+        else:
+            if len(a) > len(b):                # "abc" before "ab" is impossible
+                return ""
+    q = deque(c for c in indeg if indeg[c] == 0)
+    out = []
+    while q:
+        c = q.popleft()
+        out.append(c)
+        for d in adj[c]:
+            indeg[d] -= 1
+            if indeg[d] == 0:
+                q.append(d)
+    return "".join(out) if len(out) == len(adj) else ""   # shorter means a cycle
+```
+walk: #269 Alien Dictionary
+step: Input words = ["wrt","wrf","er","ett","rftt"]. Compare each neighbouring pair at the first different letter.
+step: wrt and wrf give t before f. wrf and er give w before e. er and ett give r before t. ett and rftt give e before r.
+step: Indegrees: w = 0, e = 1, r = 1, t = 1, f = 1. Only w has indegree 0, so the queue starts with w.
+step: Take w, which lowers e to 0. Take e, which frees r. Take r, which frees t. Take t, which frees f. Take f.
+step: All 5 letters were used, so there is no cycle. The answer is "wertf".
+bugs: Adding the same edge twice and so counting its indegree twice ; Comparing letters after the first difference, which creates false rules ; Missing the invalid case where a longer word comes before its own prefix ; Leaving out letters that never appear in a rule, so they are missing from the answer ; Not checking that every letter was output, so a cycle gives a partial answer
+cost: O(C) time and O(U) extra space, where C is the total number of characters in all words and U is the number of different letters. The graph has at most U² edges, but each pair of words adds only one.
+@@ matching
+what: In a bipartite graph, a matching pairs left nodes with right nodes so that nobody is used twice. Try each left node in turn. If its wanted partner is free, take it. If the partner is taken, ask the current owner to move to a different partner by a recursive search. That chain of moves is an augmenting path, and each one grows the matching by one. Max flow generalises this to edge capacities, and the biggest flow equals the smallest cut.
+signals: pair people with jobs, boys with girls, or tasks with workers ; each item can be used at most once ; maximum number of valid pairs ; two groups with edges only between the groups ; "assign" with compatibility rules
+code:
+```python
+def maximum_invitations(grid: list[list[int]]) -> int:
+    m, n = len(grid), len(grid[0])
+    owner = [-1] * n                    # owner[g] = boy currently matched to girl g
+
+    def try_boy(b: int, seen: list[bool]) -> bool:
+        for g in range(n):
+            if grid[b][g] and not seen[g]:
+                seen[g] = True
+                # girl is free, or her current boy can move to someone else
+                if owner[g] == -1 or try_boy(owner[g], seen):
+                    owner[g] = b
+                    return True
+        return False
+
+    return sum(try_boy(b, [False] * n) for b in range(m))
+```
+walk: #1820 Maximum Number of Accepted Invitations
+step: Input grid = [[1,1,1],[1,0,1],[0,0,1]]. Boy 0 likes all three girls, boy 1 likes girls 0 and 2, and boy 2 likes girl 2.
+step: Boy 0 tries girl 0. She is free, so owner[0] = 0. The matching has size 1.
+step: Boy 1 tries girl 0. She is taken by boy 0, so ask boy 0 to move. Boy 0 skips girl 0 (seen) and takes free girl 1. Now owner = [1, 0, -1].
+step: Boy 2 tries girl 2. She is free, so owner[2] = 2.
+step: Three boys were matched, so the answer is 3.
+bugs: Sharing one seen list for all boys, so a girl is wrongly blocked in later searches ; Not resetting seen for each new boy ; Giving a girl to a new boy without letting the old boy move ; Calling the search again on the owner without marking the girl as seen, which loops forever
+cost: O(V * E) time for this augmenting-path method, because each of the V left nodes runs one search over at most E edges. Extra space is O(V) for the owner and seen arrays and the recursion.
+@@ editdist
+what: Let dp[i][j] be the fewest edits that turn the first i letters of a into the first j letters of b. If the last letters match, the cost is the same as dp[i-1][j-1]. Otherwise take the cheapest of replace (diagonal), delete (up) or insert (left), and add 1. Only the previous row is needed, so you can keep two rows.
+signals: minimum number of edits to turn one string into another ; insert, delete or replace a character ; how similar are two strings ; two strings of length up to 500 ; transform with the fewest operations
+code:
+```python
+def min_distance(word1: str, word2: str) -> int:
+    m, n = len(word1), len(word2)
+    prev = list(range(n + 1))               # turning "" into word2[:j] needs j inserts
+    for i in range(1, m + 1):
+        cur = [i] + [0] * n                 # turning word1[:i] into "" needs i deletes
+        for j in range(1, n + 1):
+            if word1[i - 1] == word2[j - 1]:
+                cur[j] = prev[j - 1]        # letters match: no new edit
+            else:
+                cur[j] = 1 + min(prev[j - 1],   # replace
+                                 prev[j],       # delete from word1
+                                 cur[j - 1])    # insert into word1
+        prev = cur
+    return prev[n]
+```
+walk: #72 Edit Distance
+step: Input word1 = "ab", word2 = "bc". The first row is prev = [0, 1, 2], the cost of making "" into "", "b", "bc".
+step: Row i = 1 (letter "a"): it starts with 1. Against "b" the letters differ: 1 + min(0, 1, 1) = 1. Against "c" they differ: 1 + min(1, 2, 1) = 2. So cur = [1, 1, 2].
+step: Row i = 2 (letter "b"): it starts with 2. Against "b" the letters match, so take prev[0] = 1. Against "c" they differ: 1 + min(1, 2, 1) = 2.
+step: The last row is [2, 1, 2], so the answer is prev[2] = 2.
+step: One way to do it: replace "a" with "b", then replace "b" with "c".
+bugs: Using 0 as the first row and column instead of the number of inserts or deletes ; Adding 1 even when the letters match ; Mixing the indexes: dp uses i and j, but the strings use i - 1 and j - 1 ; Reading cur[j - 1] from the previous row after reusing one array in the wrong order
+cost: O(m * n) time because each cell takes O(1) work, and O(n) extra space with two rows (O(m * n) with a full table).
+@@ lisfast
+what: Keep an array tails, where tails[k] is the smallest possible last value of an increasing subsequence of length k+1. This array is always sorted. For each new value, binary search the first tail that is not smaller than it and overwrite that tail, or append when the value is larger than all of them. A smaller tail is never worse, so the array stays useful, and its length is the answer.
+signals: longest increasing subsequence with n up to 10^5 ; O(n²) DP is too slow ; nesting or stacking items in two dimensions ; sort one dimension, then find an increasing run in the other ; strictly increasing sequence
+code:
+```python
+from bisect import bisect_left
+
+def max_envelopes(envelopes: list[list[int]]) -> int:
+    # width ascending; for equal widths, height descending so they cannot chain
+    envelopes.sort(key=lambda e: (e[0], -e[1]))
+    tails: list[int] = []
+    for _, h in envelopes:
+        i = bisect_left(tails, h)      # first tail >= h (strict increase)
+        if i == len(tails):
+            tails.append(h)            # h extends the longest chain
+        else:
+            tails[i] = h               # h gives a smaller tail for length i + 1
+    return len(tails)
+```
+walk: #354 Russian Doll Envelopes
+step: Input [[5,4],[6,4],[6,7],[2,3]]. Sort by width up and height down for ties: [[2,3],[5,4],[6,7],[6,4]]. The heights are 3, 4, 7, 4.
+step: h = 3: tails is empty, so append. tails = [3].
+step: h = 4: no tail is at least 4, so append. tails = [3, 4]. Then h = 7 also appends: tails = [3, 4, 7].
+step: h = 4: bisect_left finds index 1, where the tail is 4. Replace it with 4, so tails stays [3, 4, 7].
+step: The length of tails is 3, so the answer is 3 (envelopes 2x3, 5x4, 6x7).
+bugs: Using bisect_right, which allows equal values and makes the sequence non-strict ; Sorting heights ascending for equal widths, so two envelopes of the same width can nest ; Thinking tails is itself the subsequence, when it only holds the best tails ; Sorting by only one key and then running LIS on that order ; Running the O(n²) DP when n is 10^5
+cost: O(n log n) time, because the sort and n binary searches each cost O(n log n). Extra space is O(n) for tails.
+@@ dagdp
+what: When the dependencies between states form a directed graph with no cycle, every state depends only on states that come earlier in some order. So you compute each state once, after all the states it needs. You can do this with a topological order, or with a DFS that stores each answer in a memo. This turns an exponential path search into one visit per node.
+signals: longest path in a graph with no cycles ; move to a neighbour only if the value is larger ; count the paths from a start to an end ; each state is built from states it points to ; grid moves that must go strictly up or down
+code:
+```python
+import sys
+from functools import cache
+
+sys.setrecursionlimit(1 << 16)         # a path can be as long as the grid
+
+def longest_increasing_path(matrix: list[list[int]]) -> int:
+    m, n = len(matrix), len(matrix[0])
+
+    @cache
+    def dfs(r: int, c: int) -> int:    # longest path that starts at (r, c)
+        best = 1
+        for nr, nc in ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)):
+            if 0 <= nr < m and 0 <= nc < n and matrix[nr][nc] > matrix[r][c]:
+                best = max(best, 1 + dfs(nr, nc))
+        return best
+
+    return max(dfs(r, c) for r in range(m) for c in range(n))
+```
+walk: #329 Longest Increasing Path in a Matrix
+step: Input matrix = [[9,9,4],[6,6,8],[2,1,1]]. Strictly larger moves cannot go in a circle, so the graph has no cycle.
+step: Cell 9 at (0,0) has no larger neighbour, so dfs = 1. The same holds for the other 9 at (0,1).
+step: Cell 6 at (1,0) can move up to 9, so dfs = 2. Cell 2 at (2,0) can move up to 6, so dfs = 1 + 2 = 3.
+step: Cell 1 at (2,1) can move to 2 (path length 3) or to 6 at (1,1) (path length 2). The best is 1 + 3 = 4.
+step: The memo makes every cell run its loop only once. The largest value over all cells is 4, the path 1, 2, 6, 9.
+bugs: Forgetting the memo, so the same cell is computed again and again and the time is exponential ; Using a visited set instead of a memo, which blocks valid paths from other starts ; Allowing equal values, which makes cycles ; Hitting the recursion limit on a long path ; Taking dfs of only one start cell instead of the maximum over all cells
+cost: O(m * n) time, because each cell is computed once and checks 4 neighbours, and O(m * n) extra space for the memo and recursion.
+@@ intervaldp
+what: Define dp[i][j] as the answer for the part of the input from index i to index j. A range depends on smaller ranges inside it, so fill the table from short ranges to long ones. Each cell reads a few cells for shorter ranges, and the answer for the full input is dp[0][n-1]. This works when the best answer for a range can be built from the best answers for sub-ranges.
+signals: answer for a substring or subarray range [i, j] ; palindromic subsequence ; the ends of the range decide the next step ; n up to 1000, so O(n²) states are fine ; remove or merge items at the ends
+code:
+```python
+def longest_palindrome_subseq(s: str) -> int:
+    n = len(s)
+    dp = [[0] * n for _ in range(n)]
+    for i in range(n):
+        dp[i][i] = 1                          # one letter is a palindrome
+    for length in range(2, n + 1):            # short ranges first
+        for i in range(n - length + 1):
+            j = i + length - 1
+            if s[i] == s[j]:
+                dp[i][j] = dp[i + 1][j - 1] + 2    # both ends join the palindrome
+            else:
+                dp[i][j] = max(dp[i + 1][j], dp[i][j - 1])  # drop one end
+    return dp[0][n - 1]
+```
+walk: #516 Longest Palindromic Subsequence
+step: Input s = "bbbab". Every single letter has dp[i][i] = 1.
+step: Length 2: "bb" at (0,1) and (1,2) matches, so dp = 0 + 2 = 2. "ba" at (2,3) and "ab" at (3,4) do not match, so dp = 1.
+step: Length 3: "bbb" at (0,2) has equal ends, so dp = dp[1][1] + 2 = 3. "bab" at (2,4) also matches, so dp = 3. "bba" at (1,3) is max(2, 1) = 2.
+step: Length 4: "bbba" at (0,3) is max(dp[1][3], dp[0][2]) = max(2, 3) = 3. "bbab" at (1,4) has equal ends, so dp[2][3] + 2 = 3.
+step: Length 5: "bbbab" at (0,4) has equal ends, so dp[1][3] + 2 = 4. The answer is 4 ("bbbb").
+bugs: Filling by row from the top, so a cell reads sub-ranges that are not computed yet ; Forgetting dp[i][i] = 1 for single letters ; Confusing a subsequence with a substring, so you drop both ends when they differ ; Reading dp[i + 1][j - 1] for a length-2 range, which needs the empty range to be 0 ; Returning dp[n - 1][0] instead of dp[0][n - 1]
+cost: O(n²) time and O(n²) extra space, because there are n² ranges and each takes O(1) work.
+@@ profiledp
+what: When each row of a grid is small, store the choices made in the previous row as a bitmask. The state is the row number plus that mask. For each new row, try every mask that is legal on its own, and keep only those that do not clash with the previous row's mask. The number of states per row is 2^width, so this works when width is up to about 8 to 10.
+signals: grid with a small width, such as at most 8 ; place items with no conflict between neighbouring cells ; rules involve only the row above ; bad pairs are side by side or diagonal ; count or maximise valid placements
+code:
+```python
+def max_students(seats: list[list[str]]) -> int:
+    m, n = len(seats), len(seats[0])
+    ok = [sum(1 << j for j in range(n) if seats[i][j] == "." ) for i in range(m)]
+    dp = {0: 0}                                   # mask of previous row -> best count
+    for i in range(m):
+        nd: dict[int, int] = {}
+        for mask in range(1 << n):
+            if mask & ~ok[i] or mask & (mask << 1):   # broken seat, or two side by side
+                continue
+            c = bin(mask).count("1")
+            for pm, v in dp.items():
+                if mask & (pm << 1) or mask & (pm >> 1):  # sees the upper left or right
+                    continue
+                nd[mask] = max(nd.get(mask, 0), v + c)
+        dp = nd
+    return max(dp.values())
+```
+walk: #1349 Maximum Students Taking Exam
+step: Input seats = [[".", "#"], [".", "."]]. Bit j is seat j. Usable masks: row 0 has ok = 0b01, and row 1 has ok = 0b11.
+step: Row 0: mask 0 gives 0 students and mask 1 (seat 0) gives 1. So dp = {0: 0, 1: 1}.
+step: Row 1: mask 3 is rejected because two seats are side by side. Mask 2 (seat 1) clashes with previous mask 1, as seat 0 above is its upper left. So mask 2 only works with previous mask 0, for a total of 1.
+step: Mask 1 (seat 0) works with previous mask 1, since the student is directly below, not diagonal. Total is 1 + 1 = 2.
+step: The best value in dp is 2, so the answer is 2.
+bugs: Checking only side by side seats and forgetting the upper left and upper right ; Forgetting to remove masks that use broken seats ; Treating the seat directly above as a clash ; Using a mask for the whole grid instead of one row ; Not shifting the previous mask in both directions
+cost: O(m * 4^n) time, because each row tries 2^n masks against 2^n previous masks, and O(2^n) extra space for the dp table.
+@@ treedp
+what: Each node returns a small tuple, with the best value for each state of that node, such as "taken" and "skipped". The parent builds its own tuple from its children's tuples, so every node is visited once. This avoids recursing twice on the same subtree, which is what the simple recursion does. The answer is the best of the root's states.
+signals: choose nodes in a tree with a rule about parent and child ; cannot pick two nodes that are directly linked ; each node is either used or not used ; best value over a binary tree ; the result for a node depends on its children's choices
+code:
+```python
+def rob(root: "TreeNode | None") -> int:
+    def dfs(node):
+        if not node:
+            return (0, 0)                      # (best if taken, best if skipped)
+        lt, ls = dfs(node.left)
+        rt, rs = dfs(node.right)
+        take = node.val + ls + rs              # a taken node forces its children to be skipped
+        skip = max(lt, ls) + max(rt, rs)       # a skipped node lets each child choose
+        return (take, skip)
+    return max(dfs(root))
+```
+walk: #337 House Robber III
+step: Tree [3,2,3,null,3,null,1]: root 3 has left child 2 and right child 3; 2 has right child 3; the right 3 has right child 1.
+step: The leaf 3 under node 2 returns (3, 0). The leaf 1 returns (1, 0).
+step: Node 2 has no left child, so take = 2 + 0 + 0 = 2. Skip = 0 + max(3, 0) = 3. It returns (2, 3).
+step: The right node 3: take = 3 + 0 + 0 = 3. Skip = 0 + max(1, 0) = 1. It returns (3, 1).
+step: Root: take = 3 + 3 + 1 = 7. Skip = max(2, 3) + max(3, 1) = 6. The answer is max(7, 6) = 7.
+bugs: Recursing twice per node (once with and once without the parent), which makes the time exponential ; Using only the child's best value, which hides whether the child was taken ; Adding the child's take value when the node is taken ; Returning only a single number from the recursion ; Forgetting that a skipped node may still skip its children too
+cost: O(n) time, because each node is visited once with O(1) work, and O(h) extra space for the recursion stack, where h is the tree height.
+@@ aho
+what: Aho-Corasick is a trie of all patterns with a failure link on each node. The failure link points to the longest proper suffix of the node's string that is also in the trie. When the next letter has no edge, follow failure links, like KMP does. Each node also remembers whether it, or any node along its failure links, ends a word. So one pass over the text finds all patterns, with no restart.
+signals: many patterns searched in one text or stream ; letters arrive one by one and you ask "does a suffix match a word?" ; the sum of pattern lengths is bounded ; count or find all occurrences of a set of words ; one pattern at a time is too slow
+code:
+```python
+from collections import deque
+
+class StreamChecker:
+    def __init__(self, words: list[str]):
+        self.nxt: list[dict] = [{}]
+        self.fail, self.end = [0], [False]
+        for w in words:
+            node = 0
+            for c in w:
+                if c not in self.nxt[node]:
+                    self.nxt[node][c] = len(self.nxt)
+                    self.nxt.append({})
+                    self.fail.append(0)
+                    self.end.append(False)
+                node = self.nxt[node][c]
+            self.end[node] = True
+        q = deque(self.nxt[0].values())        # depth-1 nodes keep fail = 0
+        while q:
+            u = q.popleft()
+            for c, v in self.nxt[u].items():
+                f = self.fail[u]
+                while f and c not in self.nxt[f]:
+                    f = self.fail[f]
+                self.fail[v] = self.nxt[f].get(c, 0)
+                self.end[v] = self.end[v] or self.end[self.fail[v]]
+                q.append(v)
+        self.cur = 0
+
+    def query(self, letter: str) -> bool:
+        while self.cur and letter not in self.nxt[self.cur]:
+            self.cur = self.fail[self.cur]     # fall back, like KMP
+        self.cur = self.nxt[self.cur].get(letter, 0)
+        return self.end[self.cur]
+```
+walk: #1032 Stream of Characters
+step: Use words ["abc","bd"]. The trie has a path a, b, c and a path b, d. The failure link of node "ab" is node "b", because "b" is a suffix of "ab".
+step: Query "a": the root has an edge a, so cur is node "a". It is not a word end, so False.
+step: Query "b": cur moves to node "ab". Not a word end, so False.
+step: Query "d": node "ab" has no child d. Follow the failure link to node "b", which has a child d. Now cur is node "bd", which ends a word, so True.
+step: Query "c": node "bd" has no child c, and its failure link is the root, which also has no c. So cur stays at the root and the answer is False.
+bugs: Not copying the end flag along failure links, so a word that is a suffix of the current path is missed ; Computing failure links in the wrong order instead of breadth first ; Not following failure links more than once when the next letter is missing ; Going back to the root on a mismatch, which loses partial matches ; Setting a depth-1 node's failure link to itself
+cost: Build is O(total pattern length). Each query is O(1) amortised, because the falls back cannot exceed the steps forward. Space is O(total pattern length).
+@@ trieboard
+what: Put all words in a trie, then walk the grid with DFS and move down the trie at the same time. At each cell, continue only if the current trie node has a child for the cell's letter. A path that is not the start of any word stops at once, so you do not run one search per word. Removing finished words and empty branches from the trie speeds the search further.
+signals: find all words from a list in a letter grid ; path must use neighbouring cells and no cell twice ; many words, so a search for each is slow ; stop when the path is not a prefix of any word ; word search with a dictionary
+code:
+```python
+def find_words(board: list[list[str]], words: list[str]) -> list[str]:
+    root: dict = {}
+    for w in words:
+        node = root
+        for c in w:
+            node = node.setdefault(c, {})
+        node["$"] = w                          # store the whole word at its end
+    m, n = len(board), len(board[0])
+    res: list[str] = []
+
+    def dfs(r: int, c: int, parent: dict) -> None:
+        ch = board[r][c]
+        node = parent[ch]
+        if "$" in node:
+            res.append(node.pop("$"))          # take each word only once
+        board[r][c] = "#"                      # mark this cell as used
+        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < m and 0 <= nc < n and board[nr][nc] in node:
+                dfs(nr, nc, node)
+        board[r][c] = ch                       # undo
+        if not node:
+            parent.pop(ch)                     # prune a branch with no words left
+
+    for r in range(m):
+        for c in range(n):
+            if board[r][c] in root:
+                dfs(r, c, root)
+    return res
+```
+walk: #212 Word Search II
+step: Board [["o","a"],["e","t"]] and words ["oat","ate","xyz"]. The trie has paths o-a-t, a-t-e and x-y-z.
+step: Cell (0,0) is "o", and the root has "o". Go to the trie child "o". The neighbour "a" at (0,1) is a child, so go on. Then "t" at (1,1) is a child. This node has "$", so "oat" is found.
+step: The search backs up and prunes the o-a-t branch, because no word is left there. From "o" the other neighbour "e" is not a child of "o", so it is skipped.
+step: Cell (0,1) is "a" and the root has "a". Move to "t" at (1,1), then to "e" at (1,0). That node has "$", so "ate" is found.
+step: No cell is "x", so "xyz" is never searched. The result is ["oat", "ate"].
+bugs: Searching each word separately with its own DFS, which is too slow ; Not marking the cell as used, so a path reuses a cell ; Forgetting to undo the mark when backing up ; Adding the same word twice because the end marker was not removed ; Not pruning dead branches, so the search repeats useless work
+cost: O(m * n * 4 * 3^(L-1)) time in the worst case, where L is the longest word, but the trie stops dead paths early. Space is O(total letters in words).
+@@ patterndp
+what: Let dp[i][j] say whether the first i letters of the text match the first j letters of the pattern. A normal letter or "?" needs the previous diagonal cell to match. A star can match nothing, which copies the cell on its left, or it can match one more letter, which copies the cell above. So every cell looks at at most three earlier cells, and no branching search is needed.
+signals: match a string against a pattern ; wildcard characters such as ? and * ; regular expression matching ; star means any run of letters ; decide yes or no for the whole string
+code:
+```python
+def is_match(s: str, p: str) -> bool:
+    m, n = len(s), len(p)
+    dp = [[False] * (n + 1) for _ in range(m + 1)]
+    dp[0][0] = True                           # empty text matches empty pattern
+    for j in range(1, n + 1):
+        if p[j - 1] == "*":
+            dp[0][j] = dp[0][j - 1]           # a star can match the empty text
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if p[j - 1] == "*":
+                # star matches nothing (left) or one more letter (up)
+                dp[i][j] = dp[i][j - 1] or dp[i - 1][j]
+            elif p[j - 1] == "?" or p[j - 1] == s[i - 1]:
+                dp[i][j] = dp[i - 1][j - 1]
+    return dp[m][n]
+```
+walk: #44 Wildcard Matching
+step: Input s = "ab" and p = "*b". Row 0 (empty text) is [True, True, False]: the star matches nothing, but "b" cannot match nothing.
+step: Row i = 1 (text "a"): at the star, dp[1][1] = dp[1][0] or dp[0][1] = False or True = True. At "b" the letters differ from "a", so dp[1][2] = False.
+step: Row i = 2 (text "ab"): at the star, dp[2][1] = dp[2][0] or dp[1][1] = False or True = True, so the star matched "ab" so far.
+step: At "b": the letters match "b", so dp[2][2] = dp[1][1] = True.
+step: The answer is dp[2][2] = True.
+bugs: Forgetting to set the first row for patterns that start with stars ; Making a star match exactly one letter instead of any run ; Using dp[i - 1][j - 1] for a star, which is the wrong cell ; Mixing up i and j between the text and the pattern ; Writing a recursion without memo, which is exponential
+cost: O(m * n) time and O(m * n) extra space, because each cell is filled in O(1) from its neighbours.
+@@ reroot
+what: First compute the answer for node 0 with one DFS and count each subtree's size. Then move the root across each edge. When you move from a parent p to a child c, the size[c] nodes in c's subtree get one step closer, and the other n - size[c] nodes get one step farther. So ans[c] = ans[p] - size[c] + (n - size[c]), which is O(1). You never run a new DFS per root.
+signals: answer for every node as the root ; sum of distances from each node to all others ; tree with n up to 3 * 10^4 or more ; naive per-root DFS would be O(n²) ; the answer changes in a simple way when the root moves by one edge
+code:
+```python
+def sum_of_distances_in_tree(n: int, edges: list[list[int]]) -> list[int]:
+    adj = [[] for _ in range(n)]
+    for a, b in edges:
+        adj[a].append(b)
+        adj[b].append(a)
+    parent, order = [-1] * n, [0]
+    for u in order:                          # BFS order from root 0
+        for v in adj[u]:
+            if v != parent[u]:
+                parent[v] = u
+                order.append(v)
+    size, down = [1] * n, [0] * n
+    for u in reversed(order):                # children before parents
+        p = parent[u]
+        if p >= 0:
+            size[p] += size[u]
+            down[p] += down[u] + size[u]     # all of u's subtree is 1 farther from p
+    ans = [0] * n
+    ans[0] = down[0]
+    for u in order[1:]:                      # parents before children
+        ans[u] = ans[parent[u]] - size[u] + (n - size[u])
+    return ans
+```
+walk: #834 Sum of Distances in Tree
+step: Input n = 6 and edges [[0,1],[0,2],[2,3],[2,4],[2,5]]. Node 2 has three leaf children, 3, 4, 5. Node 0 has children 1 and 2.
+step: Subtree sizes: size[3] = size[4] = size[5] = 1, size[2] = 4, size[1] = 1, size[0] = 6.
+step: Sum of distances down from each node: down[2] = 3, since each of its 3 leaves is 1 away. down[0] = (0 + 1) + (3 + 4) = 8. So ans[0] = 8.
+step: Move the root to node 1: ans[1] = 8 - 1 + (6 - 1) = 12. Move it to node 2: ans[2] = 8 - 4 + (6 - 4) = 6.
+step: Move from node 2 to node 3: ans[3] = 6 - 1 + 5 = 10. Nodes 4 and 5 also give 10. The result is [8, 12, 6, 10, 10, 10].
+bugs: Running a fresh DFS from every root, which is O(n²) ; Using n - size[c] for both sides of the change, or the wrong sign ; Going top-down before the subtree sizes are known ; Deep recursion on a path-shaped tree, which can overflow the stack ; Forgetting that the size of a node includes itself
+cost: O(n) time and O(n) extra space, because there are two passes over the tree and each node does O(1) work.
+@@ splitpoint
+what: For a range [i, j], the last piece to be formed or the last cut to be made splits the range at some point k. Try every k and combine the answers of [i, k] and [k, j], plus the cost of the split itself. Fill ranges from short to long so both halves are ready. The idea gives O(n³) time for an O(n²) table, which is fine for n up to 200 to 500.
+signals: cut or split a range in the best order ; triangulate a polygon ; multiply a chain of matrices ; burst balloons or remove items in the best order ; the cost of a step depends on both ends of the range
+code:
+```python
+def min_score_triangulation(values: list[int]) -> int:
+    n = len(values)
+    dp = [[0] * n for _ in range(n)]          # dp[i][j]: best for polygon i..j
+    for length in range(2, n):                # j - i = length; 2 is a triangle
+        for i in range(n - length):
+            j = i + length
+            dp[i][j] = min(
+                dp[i][k] + dp[k][j] + values[i] * values[k] * values[j]
+                for k in range(i + 1, j)      # k is the third corner of the edge i-j
+            )
+    return dp[0][n - 1]
+```
+walk: #1039 Minimum Score Triangulation of Polygon
+step: Input values = [3, 7, 4, 5]. The polygon has 4 corners, so dp for a range with only two corners is 0.
+step: Length 2: dp[0][2] = 3 * 7 * 4 = 84 and dp[1][3] = 7 * 4 * 5 = 140. Each is a single triangle.
+step: Length 3, range [0,3]. Try k = 1: dp[0][1] + dp[1][3] + 3 * 7 * 5 = 0 + 140 + 105 = 245.
+step: Try k = 2: dp[0][2] + dp[2][3] + 3 * 4 * 5 = 84 + 0 + 60 = 144.
+step: The smaller is 144, so dp[0][3] = 144, and that is the answer.
+bugs: Starting k at i or ending it at j, which makes a split with an empty side ; Looping i first and length last, so the shorter ranges are not ready ; Taking max instead of min, or the other way around ; Forgetting that the base cases dp[i][i + 1] are 0 ; Adding the split cost with the wrong corners
+cost: O(n³) time, because there are O(n²) ranges and each tries O(n) splits, and O(n²) extra space for the table.
+@@ nextperm
+what: To get the next larger arrangement, find the last place where the numbers rise, at index i with nums[i] < nums[i+1]. Everything right of i is in falling order, which is the largest arrangement of that tail. Swap nums[i] with the smallest larger number in the tail, then reverse the tail so it becomes the smallest. If no rise exists, the whole array is the largest, so just reverse it.
+signals: next larger permutation ; rearrange numbers into the next greater order ; lexicographic order of arrangements ; in place with O(1) extra memory ; wrap around to the smallest order
+code:
+```python
+def next_permutation(nums: list[int]) -> None:
+    i = len(nums) - 2
+    while i >= 0 and nums[i] >= nums[i + 1]:   # find the last rise
+        i -= 1
+    if i >= 0:
+        j = len(nums) - 1
+        while nums[j] <= nums[i]:              # smallest value larger than nums[i]
+            j -= 1
+        nums[i], nums[j] = nums[j], nums[i]
+    l, r = i + 1, len(nums) - 1                # the tail is in falling order
+    while l < r:
+        nums[l], nums[r] = nums[r], nums[l]
+        l, r = l + 1, r - 1
+```
+walk: #31 Next Permutation
+step: Input nums = [1,3,5,4,2]. Scan from the right for the last rise: 4 >= 2, 5 >= 4, then 3 < 5. So i = 1.
+step: The tail after i is [5,4,2]. Scan from the right for a value larger than nums[1] = 3. 2 is not larger, 4 is. So j = 3.
+step: Swap nums[1] and nums[3]: the array is [1,4,5,3,2].
+step: The tail [5,3,2] is in falling order. Reverse it to get [2,3,5]. The array is [1,4,2,3,5].
+step: If the input is [3,2,1], there is no rise, so i = -1. Reverse everything to get [1,2,3].
+bugs: Using > instead of >= when scanning for the rise, which breaks on repeated numbers ; Swapping with the first larger number from the left instead of the smallest larger number in the tail ; Forgetting to reverse the tail after the swap ; Not handling the case with no rise, where the whole array must be reversed ; Returning a new list when the problem asks for an in-place change
+cost: O(n) time because there are at most three passes, and O(1) extra space because everything is done in place.
+@@ duel-ptr
+what: Keep two candidate start positions i and j, and a length k of how far they match. Compare letters at i+k and j+k. If one is bigger, the other candidate loses. The loser start, and every start inside the part it already matched, cannot be best, so skip them all by moving the pointer past k. Both pointers only move forward, so the whole scan is linear.
+signals: last or largest substring in dictionary order ; smallest rotation of a string ; compare two candidate starts letter by letter ; O(n²) string comparison is too slow ; the answer is always a suffix
+code:
+```python
+def last_substring(s: str) -> str:
+    n = len(s)
+    i, j, k = 0, 1, 0                      # candidates i and j, matched length k
+    while j + k < n:
+        if s[i + k] == s[j + k]:
+            k += 1
+        elif s[i + k] < s[j + k]:          # j is better, so i and its matched part lose
+            i = max(i + k + 1, j)
+            j = i + 1
+            k = 0
+        else:                              # i is better, so j and its matched part lose
+            j += k + 1
+            k = 0
+    return s[i:]
+```
+walk: #1163 Last Substring in Lexicographical Order
+step: Input s = "abab". Start with i = 0, j = 1, k = 0.
+step: Compare s[0] = "a" with s[1] = "b". "a" is smaller, so candidate j wins. Set i = max(0 + 0 + 1, 1) = 1, j = 2, k = 0.
+step: Compare s[1] = "b" with s[2] = "a". "b" is bigger, so candidate i wins. Move j to 2 + 0 + 1 = 3.
+step: Compare s[1] = "b" with s[3] = "b". They are equal, so k = 1. Now j + k = 4, which is not below n = 4, so the loop stops.
+step: Return s[1:] = "bab".
+bugs: Setting i = j + 1 and not using max, so j may fall behind i ; Resetting k to 0 but not skipping the already matched part, which brings back O(n²) ; Comparing whole substrings in the loop ; Returning only the best start index instead of the suffix ; Forgetting that the answer is a suffix, since a longer string with the same start is larger
+cost: O(n) time and O(1) extra space, because i, j and k only move forward and together they take at most about 2n steps.
+@@ pointer-switch
+what: Two linked lists may join and share a tail. Start one pointer at each head. When a pointer reaches the end, send it to the head of the other list. Each pointer then walks lenA + lenB nodes in total, so both reach the shared start at the same time. If the lists never join, both reach None together. This needs no length counting and no extra memory.
+signals: where two linked lists intersect ; two lists with different lengths ; find the common tail without a hash set ; O(1) extra space ; the two pointers must meet at the same distance
+code:
+```python
+def get_intersection_node(headA, headB):
+    a, b = headA, headB
+    while a is not b:
+        a = a.next if a else headB     # after the end, jump to the other list
+        b = b.next if b else headA
+    return a                           # the meeting node, or None if no overlap
+```
+walk: #160 Intersection of Two Linked Lists
+step: List A is a1, a2, c1, c2 and list B is b1, c1, c2. They share the tail c1, c2. So A has 4 nodes and B has 3.
+step: Both pointers start at their heads. Walk: a goes a1, a2, c1, c2 while b goes b1, c1, c2, then None.
+step: a reaches the end after 4 steps and moves to headB. b reaches the end after 3 steps and moves to headA.
+step: Now a walks b1, c1 and b walks a1, a2, then c1. Both have taken 4 + 3 = 7 steps in total.
+step: At that point a and b are both at c1, so the loop ends and returns c1.
+bugs: Stopping when a pointer is on the last node instead of after it, so the lists with no overlap never end together ; Comparing the values and not the node objects ; Counting the lengths first and so using extra code and passes ; Moving a pointer to the other head and then skipping the head
+cost: O(m + n) time and O(1) extra space, because each pointer walks at most m + n nodes and no extra structure is used.
+@@ lastseen
+what: Keep one variable that stores the last index where an event happened. When you see the next event, the distance or the count is a simple subtraction with that stored value. You never look back over the array, so a nested loop becomes one scan. When you need two kinds of events, keep one last index for each.
+signals: distance to the nearest earlier occurrence ; closest pair of two given words ; gap since the last time something happened ; count items between two events ; one pass, O(1) memory
+code:
+```python
+def shortest_distance(words: list[str], word1: str, word2: str) -> int:
+    i1 = i2 = -1                       # last index of word1 and of word2
+    best = len(words)
+    for i, w in enumerate(words):
+        if w == word1:
+            i1 = i
+        elif w == word2:
+            i2 = i
+        if i1 >= 0 and i2 >= 0:        # both have been seen at least once
+            best = min(best, abs(i1 - i2))
+    return best
+```
+walk: #243 Shortest Word Distance
+step: Input words = ["practice","makes","perfect","coding","makes"], word1 = "makes", word2 = "coding". Start i1 = i2 = -1.
+step: Index 0 "practice" and index 2 "perfect" match neither word, so nothing changes.
+step: Index 1 is "makes", so i1 = 1. Only one word has been seen, so no distance yet.
+step: Index 3 is "coding", so i2 = 3. The distance is |1 - 3| = 2, so best = 2.
+step: Index 4 is "makes", so i1 = 4. The distance is |4 - 3| = 1, so best = 1. Return 1.
+bugs: Not resetting or checking the -1 start value, so you measure against a fake index ; Storing only the first index, not the latest ; Updating the answer only when the second word appears, and missing the reverse order ; Starting best at 0 instead of a large value
+cost: O(n) time and O(1) extra space, because one pass keeps only two stored indexes.
+@@ median-minimizes
+what: The sum of |x - m| over all items is smallest when m is the median. Moving m one step to the right helps the items on the right and hurts the items on the left. The best place is where those two sides are equal, which is the middle. So sort the numbers, take the middle one, and add up the distances to it. You do not need to try every possible target.
+signals: make all numbers equal with the fewest moves ; each move changes one number by 1 ; minimise the sum of absolute differences ; best meeting point on a line ; choose a point close to all others
+code:
+```python
+def min_moves2(nums: list[int]) -> int:
+    nums.sort()
+    med = nums[len(nums) // 2]         # any value between the two middles also works
+    return sum(abs(x - med) for x in nums)
+```
+walk: #462 Minimum Moves to Equal Array Elements II
+step: Input nums = [1, 10, 2, 9]. Sort it: [1, 2, 9, 10].
+step: The length is 4, so the middle index is 2 and the median choice is nums[2] = 9.
+step: Distances to 9 are 8, 7, 0, 1.
+step: The sum is 8 + 7 + 0 + 1 = 16. Using 2 as the target gives 1 + 0 + 7 + 8 = 16 too, so the answer is 16.
+bugs: Using the mean as the target, which minimises squared distance and not absolute distance ; Forgetting to sort before taking the middle item ; Trying every target value from min to max, which is too slow ; Thinking the answer must be a median of an odd-length list only
+cost: O(n log n) time for the sort and O(1) extra space with in-place sorting. Quickselect finds the median in O(n) on average.
+@@ sort-take
+what: When you want to fit as many items as you can into a budget, the smallest items are always the best to take first. So sort the items by the key that matters, then take them one by one while they still fit. Stop when the next item would break the limit. The sort is the only costly step. The reason it works is that swapping any chosen item for a smaller one never makes things worse.
+signals: take as many items as possible within a limit ; maximum count under a total weight or cost ; "how many can you buy or carry?" ; each item has a size and all items are worth the same ; budget, capacity or time is given
+code:
+```python
+def max_number_of_apples(weight: list[int]) -> int:
+    weight.sort()                      # lightest apples first
+    total = 0
+    for i, w in enumerate(weight):
+        total += w
+        if total > 5000:               # the basket holds at most 5000 units
+            return i                   # the first i apples fit
+    return len(weight)
+```
+walk: #1196 How Many Apples Can You Put into the Basket
+step: Input weight = [900, 950, 800, 1000, 700, 800]. Sort it: [700, 800, 800, 900, 950, 1000].
+step: Running totals: 700, 1500, 2300, 3200, 4150. All are at most 5000, so five apples fit so far.
+step: The sixth apple makes the total 5150, which is more than 5000. The loop is at i = 5, so return 5.
+step: If every apple fits, the loop ends and the answer is len(weight).
+bugs: Taking the heaviest items first, which fits fewer items ; Using total >= limit instead of total > limit, so an exact fit is lost ; Forgetting to sort ; Returning i + 1 and not i when the item breaks the limit
+cost: O(n log n) time because of the sort, and O(1) extra space after sorting in place.
