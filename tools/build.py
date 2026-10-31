@@ -38,9 +38,11 @@ CREATE INDEX edges_dst ON edges(dst);
 CREATE TABLE side_links (a TEXT NOT NULL REFERENCES nodes(id), b TEXT NOT NULL REFERENCES nodes(id), type TEXT NOT NULL, reason TEXT NOT NULL);
 CREATE TABLE tours (id INTEGER PRIMARY KEY, title TEXT NOT NULL, subtitle TEXT NOT NULL);
 CREATE TABLE tour_steps (tour_id INTEGER NOT NULL REFERENCES tours(id), ord INTEGER NOT NULL, node_id TEXT NOT NULL REFERENCES nodes(id), note TEXT NOT NULL, PRIMARY KEY (tour_id, ord));
-CREATE TABLE programs (id TEXT PRIMARY KEY, name TEXT NOT NULL, year TEXT NOT NULL, url TEXT NOT NULL, summary TEXT NOT NULL);
+-- schools (content/curriculum/*.txt "@school" lines); programs and courses name theirs
+CREATE TABLE schools (id TEXT PRIMARY KEY, short TEXT NOT NULL, name TEXT NOT NULL, url TEXT NOT NULL, ord INTEGER NOT NULL);
+CREATE TABLE programs (id TEXT PRIMARY KEY, name TEXT NOT NULL, year TEXT NOT NULL, url TEXT NOT NULL, summary TEXT NOT NULL, short TEXT NOT NULL, school TEXT NOT NULL REFERENCES schools(id));
 CREATE TABLE program_groups (program_id TEXT NOT NULL REFERENCES programs(id), ord INTEGER NOT NULL, name TEXT NOT NULL, note TEXT NOT NULL, courses TEXT NOT NULL, PRIMARY KEY (program_id, ord));
-CREATE TABLE courses (code TEXT PRIMARY KEY, title TEXT NOT NULL, url TEXT NOT NULL, term TEXT NOT NULL, material TEXT NOT NULL, ord INTEGER NOT NULL);
+CREATE TABLE courses (code TEXT PRIMARY KEY, title TEXT NOT NULL, url TEXT NOT NULL, term TEXT NOT NULL, material TEXT NOT NULL, ord INTEGER NOT NULL, school TEXT NOT NULL REFERENCES schools(id));
 CREATE TABLE course_concepts (code TEXT NOT NULL REFERENCES courses(code), ord INTEGER NOT NULL, node_id TEXT NOT NULL REFERENCES nodes(id), PRIMARY KEY (code, ord));
 CREATE INDEX course_concepts_node ON course_concepts(node_id);
 CREATE TABLE designs (id TEXT PRIMARY KEY, title TEXT NOT NULL, category TEXT NOT NULL, level TEXT NOT NULL, concepts TEXT NOT NULL,
@@ -54,6 +56,11 @@ CREATE TABLE templates (pattern TEXT PRIMARY KEY, ord INTEGER NOT NULL, body TEX
 -- animated scenes (content/anim/*.json, format in content/anim/README.md): one JSON object per row, in file order
 CREATE TABLE scenes (id TEXT PRIMARY KEY, concept TEXT NOT NULL REFERENCES nodes(id), ord INTEGER NOT NULL, title TEXT NOT NULL, steps INTEGER NOT NULL, body TEXT NOT NULL);
 CREATE INDEX scenes_concept ON scenes(concept, ord);
+-- architecture patterns (content/patterns/*.txt, spec in content/patterns/README.md): one JSON object per pattern, with its
+-- compiled scene; the canonical pattern catalog (content/patterns/catalog.txt) is in meta ('pcatalog')
+-- hands-on practice links (content/handson/*.txt): playgrounds, puzzles, labs, CTFs per concept, one JSON object per link
+CREATE TABLE handson (concept TEXT NOT NULL REFERENCES nodes(id), ord INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY (concept, ord));
+CREATE TABLE patterns (concept TEXT NOT NULL REFERENCES nodes(id), ord INTEGER NOT NULL, title TEXT NOT NULL, kinds TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (concept, ord));
 -- problem map (content/problemmap/map.json, built by tools/merge_problemmap.py): one full JSON entry per problem;
 -- the compact form the app loads (/api/problemmap, the standalone page) and its per-concept summary are in meta
 -- ('problemmap', 'problemmap_summary'). Absent when there is no map.json.
@@ -84,23 +91,27 @@ def write_db(data, path):
     for i, n in enumerate(data["nodes"]):
         db.execute("INSERT INTO nodes VALUES (?,?,?,?,?,?,?,?,?,?,?)", (n["id"], n["l"], n["label"], n["cat"], n["y"], n["st"], n["m"], int(n["deep"]), n["w"], n["rm"], i))
     owners = [(n["id"], n) for n in data["nodes"]] + [(r["id"], r) for r in data["layers"]]
+    pats = {}
+    for x in data.get("patterns", []): pats.setdefault(x["concept"], []).append(x)
     for owner, r in owners:
         db.executemany("INSERT INTO paragraphs VALUES (?,?,?,?)", owner_rows(owner, r))
         db.executemany("INSERT INTO sources (owner, ord, kind, title, who, url, work_key) VALUES (?,?,?,?,?,?,?)",
                        [(owner, j, x["k"], x["t"], x["w"], x["u"], work_key(x)) for j, x in enumerate(r["refs"])])
         label = r.get("label") or r.get("n"); mech = r.get("m") or r.get("d")
-        db.execute("INSERT INTO search VALUES (?,?,?,?)", (owner, label, mech, "\n".join(p for ps in r["rd"].values() for p in ps)))
+        ptext = [" ".join([x["title"], x["when"]] + x["how"] + [x["used"]]) for x in pats.get(owner, [])]
+        db.execute("INSERT INTO search VALUES (?,?,?,?)", (owner, label, mech, "\n".join([p for ps in r["rd"].values() for p in ps] + ptext)))
     db.executemany("INSERT INTO edges VALUES (?,?,?,?)", [(e["s"], e["t"], e["k"], e["r"]) for e in data["edges"]])
     db.executemany("INSERT INTO side_links VALUES (?,?,?,?)", [(s["a"], s["b"], s["t"], s["r"]) for s in data["side"]])
     for i, t in enumerate(data["tours"]):
         db.execute("INSERT INTO tours VALUES (?,?,?)", (i, t["title"], t["sub"]))
         db.executemany("INSERT INTO tour_steps VALUES (?,?,?,?)", [(i, j, s[0], s[1]) for j, s in enumerate(t["steps"])])
     cur = data["curriculum"]
+    db.executemany("INSERT INTO schools VALUES (?,?,?,?,?)", [(x["id"], x["short"], x["name"], x["url"], i) for i, x in enumerate(cur.get("schools", []))])
     for p in cur["programs"]:
-        db.execute("INSERT INTO programs VALUES (?,?,?,?,?)", (p["id"], p["name"], p["year"], p["url"], p["summary"]))
+        db.execute("INSERT INTO programs VALUES (?,?,?,?,?,?,?)", (p["id"], p["name"], p["year"], p["url"], p["summary"], p["short"], p["school"]))
         db.executemany("INSERT INTO program_groups VALUES (?,?,?,?,?)", [(p["id"], i, g["name"], g["note"], ",".join(g["courses"])) for i, g in enumerate(p["groups"])])
     for i, c in enumerate(cur["courses"]):
-        db.execute("INSERT INTO courses VALUES (?,?,?,?,?,?)", (c["code"], c["title"], c["url"], c["term"], c["text"], i))
+        db.execute("INSERT INTO courses VALUES (?,?,?,?,?,?,?)", (c["code"], c["title"], c["url"], c["term"], c["text"], i, c["school"]))
         db.executemany("INSERT INTO course_concepts VALUES (?,?,?)", [(c["code"], j, n) for j, n in enumerate(c["concepts"])])
     for i, d in enumerate(data["designs"]):
         db.execute("INSERT INTO designs VALUES (?,?,?,?,?,?,?,?)", (d["id"], d["title"], d["category"], d["level"], ",".join(d["concepts"]), d["w"], d["rm"], i))
@@ -114,6 +125,13 @@ def write_db(data, path):
         db.execute("INSERT INTO templates VALUES (?,?,?)", (name, i, json.dumps(t, ensure_ascii=False)))
     for i, s in enumerate(data.get("scenes", [])):
         db.execute("INSERT INTO scenes VALUES (?,?,?,?,?,?)", (s["id"], s["concept"], i, s.get("title", ""), len(s["steps"]), json.dumps(s, ensure_ascii=False)))
+    ho = {}
+    for x in data.get("handson", []): ho.setdefault(x["concept"], []).append(x)
+    for c, xs in ho.items():
+        db.executemany("INSERT INTO handson VALUES (?,?,?)", [(c, i, json.dumps(x, ensure_ascii=False)) for i, x in enumerate(xs)])
+    for c, ps in pats.items():
+        db.executemany("INSERT INTO patterns VALUES (?,?,?,?,?)", [(c, i, x["title"], ",".join(x["kinds"]), json.dumps(x, ensure_ascii=False)) for i, x in enumerate(ps)])
+    db.execute("INSERT INTO meta VALUES (?,?)", ("pcatalog", json.dumps(data.get("pcatalog", []), ensure_ascii=False)))
     pm = data.get("problemmap_full")
     if pm:
         db.executemany("INSERT INTO pm_problems VALUES (?,?,?,?,?,?)", [(q["n"], q["idea"], q["family"], q["depth"], q["slug"], json.dumps(q, ensure_ascii=False)) for q in pm["problems"]])
@@ -301,6 +319,41 @@ def load_scenes(node_ids):
             seen[s["id"]] = where; out.append(s)
     return out, errs
 
+def load_patterns(node_ids):
+    """Architecture patterns (content/patterns/*.txt): (flat list in concept order, catalog list, errors)."""
+    import patterns
+    pats, cat, errs = patterns.load(node_ids)
+    errs += patterns.check_scenes(pats, node_ids)
+    catalog = [dict(c, n=sum(1 for ps in pats.values() for x in ps if c["id"] in x["kinds"])) for c in cat.values()]
+    return [x for c in pats for x in pats[c]], catalog, errs
+
+HO_KINDS = ("playground", "simulator", "puzzles", "exercises", "lab", "ctf", "game", "dataset", "kata")
+HO_ACCESS = ("open-source", "free", "free-tier")
+def load_handson(node_ids):
+    """content/handson/*.txt: one line per link, "concept | kind | title | who | url | access | what you do there".
+    Returns (links in file order, errors). A concept keeps at most 4 links; duplicates (same concept and url) are errors."""
+    out, errs, seen = [], [], set()
+    for f in sorted(glob.glob(os.path.join(ROOT, "content", "handson", "*.txt"))):
+        where = os.path.relpath(f, ROOT)
+        for ln, line in enumerate(open(f, encoding="utf-8"), 1):
+            line = line.strip()
+            if not line or line.startswith("#"): continue
+            p = [x.strip() for x in line.split(" | ")]
+            w = f"{where}:{ln}"
+            if len(p) != 7: errs.append(f"{w}: needs 7 fields separated by ' | ', got {len(p)}"); continue
+            c, kind, title, who, url, access, what = p
+            if c not in node_ids: errs.append(f"{w}: unknown concept {c!r}"); continue
+            if kind not in HO_KINDS: errs.append(f"{w}: kind must be one of {', '.join(HO_KINDS)}"); continue
+            if access not in HO_ACCESS: errs.append(f"{w}: access must be one of {', '.join(HO_ACCESS)}"); continue
+            if not re.match(r"https?://\S+$", url): errs.append(f"{w}: bad url {url!r}"); continue
+            if not title or not what: errs.append(f"{w}: title and description are required"); continue
+            if (c, url) in seen: errs.append(f"{w}: duplicate link for {c}"); continue
+            seen.add((c, url)); out.append(dict(concept=c, kind=kind, t=title, w=who, u=url, access=access, d=what))
+    n = {}
+    for x in out: n[x["concept"]] = n.get(x["concept"], 0) + 1
+    errs += [f"content/handson: {c} has {k} links (at most 4)" for c, k in n.items() if k > 4]
+    return out, errs
+
 def main():
     args = sys.argv[1:]
     t0 = time.time()
@@ -319,16 +372,37 @@ def main():
     if aerrs:
         print("ANIMATION ERRORS (fix them, or check one file with python3 tools/checkanim.py <file>):\n  " + "\n  ".join(aerrs), file=sys.stderr); sys.exit(1)
     data["stats"]["scenes"] = len(data["scenes"])
+    data["patterns"], data["pcatalog"], perrs2 = load_patterns({n["id"] for n in data["nodes"]})
+    if perrs2:
+        print("PATTERN ERRORS (check one file with python3 tools/checkpatterns.py <file>):\n  " + "\n  ".join(perrs2), file=sys.stderr); sys.exit(1)
+    data["handson"], herrs = load_handson({n["id"] for n in data["nodes"]})
+    if herrs:
+        print("HANDS-ON ERRORS:\n  " + "\n  ".join(herrs), file=sys.stderr); sys.exit(1)
+    data["stats"]["handson"] = len(data["handson"])
+    data["stats"]["patterns"] = len(data["patterns"])
+    data["stats"]["pattern_concepts"] = len({x["concept"] for x in data["patterns"]})
     pm, pmerrs = load_problemmap()
     for e in pmerrs: print("problem map: skipped " + e, file=sys.stderr)
     if pm:
         data["problemmap_full"] = pm
         data["problemmap"], data["pm_summary"] = compact_problemmap(pm)
+        # a short lesson per idea (content/problemmap/lessons/*.txt, tools/lessons.py), served with the compact map
+        import lessons
+        # checked against the full map (content/problemmap/map.json), then cut to the map being built (tests use a sample)
+        full = json.load(open(PROBLEMMAP, encoding="utf-8")) if os.path.exists(PROBLEMMAP) else pm
+        les, lerrs = lessons.load({d["id"] for d in full["ideas"]})
+        if lerrs:
+            print("LESSON ERRORS (check one file with python3 tools/lessons.py <file>):\n  " + "\n  ".join(lerrs), file=sys.stderr); sys.exit(1)
+        here = {d["id"] for d in pm["ideas"]}
+        data["problemmap"]["lessons"] = {k: v for k, v in les.items() if k in here}
     data["stats"]["problemmap"] = len(pm["problems"]) if pm else 0
+    data["stats"]["lessons"] = len(data["problemmap"].get("lessons", {})) if pm else 0
     st = data["stats"]
     print(f"content ok: {st['nodes']} concepts {st['per_layer']}, {st['edges']} links, {st['side']} side links, "
           f"{st['tours']} tours, {st['courses']} courses, {st['words']:,} words, {st['refs']} sources ({st['urls']} with direct links), {st['deep']} deep reads, "
           f"{st['designs']} design questions, {st['practice']} practice problems, {st['templates']} pattern templates, {st['scenes']} animated scenes, "
+          f"{st['patterns']} architecture patterns on {st['pattern_concepts']} concepts ({len(data['pcatalog'])} in the catalog), "
+          f"{st['handson']} hands-on practice links, {st['lessons']} problem-map lessons, "
           f"{st['problemmap']} problems in the problem map" + ("" if pm else " (no content/problemmap/map.json yet)"))
     if "--check" in args: return
     os.makedirs(os.path.join(ROOT, "data"), exist_ok=True); os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)

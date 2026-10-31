@@ -1,0 +1,838 @@
+@@ cachelayer
+== Cache-aside with stampede protection
+kind: cache-aside
+when: A read-heavy service has a slow database, and the same keys are read again and again.
+how: The application owns the cache logic. On a read it asks the cache first. On a hit it returns at once, often in under 1 ms. On a miss it reads the database, writes the value into the cache with a time to live (TTL), and returns it.
+On a write the application updates the database and then deletes the cache key. Delete is safer than update, because two racing writers cannot leave an old value behind. The TTL is the safety net for any missed delete.
+When a hot key expires, thousands of requests can miss together and hit the database at once. This is a cache stampede. Fix it with a short lock or single-flight per key, so one request refills the key while the others wait. Add random jitter to TTLs so many keys do not expire together.
+used: Redis, Valkey and Memcached in front of MySQL or Postgres at most large web sites; Facebook's Memcache deployment is the well-known paper.
+avoid: When data must always be fresh after a write, or the working set is as large as the database; read replicas may be simpler.
+flow:
+  App [svc] -> Cache [cache: Redis + TTL 60 s] : GET user:7 | The app asks the cache first, using a key built from the entity id.
+  Cache -x> App : miss | The key is not there, or its TTL has expired.
+  App -> Database [db: MySQL] : SELECT user 7 | Only on a miss does the app pay the cost of the slow read, about 5 to 20 ms.
+  App -> Cache : SET user:7 + TTL | The app stores the value with a TTL that has random jitter added.
+  * Cache: user:7 cached | Later reads of this key are served from memory.
+  App -> Database : UPDATE user 7 | On a write, the app changes the source of truth first.
+  App -> Cache : DEL user:7 | The app then deletes the key, so the next read loads fresh data.
+ref: paper | Scaling Memcache at Facebook | Nishtala et al., NSDI 2013 |
+
+== Sharded cache tier with consistent hashing
+kind: consistent-hashing, sharding
+when: One cache node is too small for the working set or the request rate, and you want to add nodes without emptying the cache.
+how: The client library, or a proxy, hashes each key onto a ring that holds many virtual points for each cache node. The key is sent to the node that owns the next point on the ring. Each node holds only a slice of the data, so memory and request rate both scale out.
+When a node is added or fails, only the keys next to its points move, about 1/N of all keys. With simple modulo hashing, nearly all keys would move and the database would be flooded with misses.
+A skewed key is the weak point. One very popular key lives on one node and can overload it. Mitigate with a small local in-process cache for the hottest keys, or with replicas of that key under several names.
+used: Memcached clients with ketama hashing; Redis Cluster uses 16,384 hash slots, a close relative; proxies such as Twemproxy and Envoy do the routing.
+avoid: When the data fits in one node and the extra network hop adds more cost than it saves.
+flow:
+  Web app [client] -> Cache proxy [svc: ring lookup] : GET key | The app sends a normal GET; it does not know how many nodes exist.
+  Cache proxy -> Cache node A [cache: 1/3 of keys], Cache node B [cache: 1/3 of keys], Cache node C [cache: 1/3 of keys] : hash(key) picks one | The proxy hashes the key and sends it to the node that owns that part of the ring.
+  Cache node C -x> Cache proxy : node down | Node C stops answering and the health check marks it dead.
+  * Cache node C: removed from ring | Only the keys that lived on C are remapped to A and B.
+  Cache proxy -> Database [db] : miss for C's keys | Those keys miss once and are then reloaded into A and B; the other keys stay hot.
+ref: paper | Consistent Hashing and Random Trees | Karger et al., STOC 1997 |
+
+== Multi-level cache: local, shared, then origin
+kind: memory-tiering, cdn-edge
+when: Some keys are so hot that even a network call to the shared cache is too slow or too loaded.
+how: Put a tiny in-process cache (L1) inside each app instance, for example 10,000 keys with a TTL of a few seconds. Behind it sits the shared network cache (L2), such as Redis. Behind that is the database or origin.
+A read checks L1, then L2, then the origin, and fills each level on the way back. L1 costs about 100 ns, L2 about 0.5 ms and the database several milliseconds. The hottest keys never leave the process, so the shared tier sees far fewer requests.
+The price is staleness and extra copies. Each instance may hold an old value for up to its L1 TTL. Keep the L1 TTL short, or send invalidation messages through pub/sub, so all instances drop a key together. Never use L1 for data that needs strict freshness.
+used: Caffeine in front of Redis in JVM services; Redis client-side caching with server invalidation; CDN plus app cache plus database for web pages.
+avoid: When correctness needs the newest value on every read, such as account balances.
+flow:
+  App instance [svc: L1 in-process] -> Redis [cache: L2 shared] : L1 miss, GET | The local cache missed, so the instance asks the shared cache.
+  Redis -> App instance : value | The shared cache hit is returned and copied into L1 for a few seconds.
+  Redis -x> App instance : L2 miss | For a cold key the shared cache also misses.
+  App instance -> Database [db: origin] : SELECT | Only the rare cold read reaches the database.
+  Writer [svc] -> Redis : DEL key + publish | A writer deletes the key and publishes an invalidation message.
+  Redis ~> App instance : invalidate key | Every app instance drops its local copy, so staleness stays short.
+ref: paper | Scaling Memcache at Facebook | Nishtala et al., NSDI 2013 |
+
+@@ robotics
+== Sense, estimate, plan, act loop with layered rates
+kind: control-loop, pipeline-stages
+when: A robot must move safely in a changing world using noisy sensors and slow planning.
+how: The software is split into layers that run at different rates. Sensors feed a state estimator (a Kalman or particle filter) at 100 to 1000 Hz for the inertial unit and 10 to 30 Hz for cameras and lidar. The estimator outputs a pose and a map with uncertainty.
+A planner uses that state and a goal to choose a path, usually at 1 to 10 Hz. A low-level controller (PID or model predictive control) turns the path into motor commands at 100 to 1000 Hz. Fast loops sit inside slow loops, so a late plan never stops the motors from holding balance or speed.
+Every layer assumes the one below it is reliable, so the lowest layer also has a safety check: if commands stop arriving, the motors stop. Timing, not average speed, is what breaks robots, so these loops run with real-time priority.
+used: ROS 2 navigation stacks (Nav2); autonomous vehicle software; warehouse mobile robots; drone flight controllers such as PX4 and ArduPilot.
+avoid: When the task is a fixed, repeated motion in a cage; a plain programmable controller with a fixed program is simpler and safer.
+flow:
+  Sensors [svc: IMU + lidar + camera] -> State estimator [svc: Kalman filter] : readings at 10 to 1000 Hz | Raw sensor data is noisy, so the estimator fuses many readings into one best pose.
+  State estimator -> Planner [svc: 5 Hz] : pose + obstacle map | The planner gets the state with its uncertainty.
+  Planner -> Controller [svc: PID + 500 Hz] : target path | The planner chooses a collision-free path and sends the next target point.
+  Controller -> Motors [svc: wheels + joints] : torque commands | The controller turns path error into motor commands many times per second.
+  Motors ~> Sensors : motion changes the world | Moving changes what the sensors see, which closes the loop.
+  Planner -x> Controller : plan late | A late plan is dropped; the controller keeps the last safe command or stops.
+ref: docs | ROS 2 documentation | Open Robotics | https://docs.ros.org/
+
+== Publish-subscribe nodes over a robot middleware
+kind: pubsub, plugin-arch
+when: Many independent robot programs (drivers, perception, planning) must exchange data without direct links, and be swapped or replayed.
+how: Each program is a node that publishes or subscribes to named topics with typed messages. A lidar driver publishes scans, and a mapper and an obstacle detector both subscribe. In ROS 2 this runs over DDS, with quality-of-service settings such as best effort for camera frames and reliable for commands.
+Nodes can run on one computer or many, and none knows who reads its output. A recorder node can save all topics to a bag file, and the same file can later be played back to test new code on real data.
+The cost is latency and copy overhead, so large images may use shared memory inside one process. Clock handling also matters: nodes must use the same time source, simulated or real, or sensor data cannot be aligned.
+used: ROS 2 in research and industry robots; Autoware for self-driving research; Isaac ROS; Gazebo and Isaac Sim connect through the same topics.
+avoid: For a hard real-time inner loop of a few microseconds; use one process or the controller firmware directly.
+flow:
+  Lidar driver [svc] -> /scan topic [topic: best effort] : LaserScan | The driver publishes each scan without knowing who listens.
+  /scan topic -> Mapper [svc: SLAM], Obstacle detector [svc] : LaserScan | Both subscribers receive a copy of the same scan.
+  Mapper -> Planner [svc: Nav2] : map + pose | The map and pose go to the planner.
+  Planner -> cmd_vel topic [topic: reliable] : Twist | The planner publishes velocity commands with reliable delivery.
+  cmd_vel topic -> Base controller [svc] : Twist | The base controller drives the wheels from the command.
+  /scan topic ~> Bag recorder [store: bag file] : all topics | A recorder saves every message, so the run can be replayed later.
+ref: docs | ROS 2 concepts: nodes and topics | Open Robotics | https://docs.ros.org/
+
+== Sim-to-real training and testing loop
+kind: shadow-ab, feedback-loop
+when: Trying a new robot policy or planner on hardware is slow, risky or costly, so most testing must happen first in simulation.
+how: A physics simulator (MuJoCo, Isaac Sim, Gazebo) runs the same software stack as the real robot, with simulated sensors. Thousands of simulated robots can run in parallel on GPUs. A policy is trained or a planner is tuned there, with randomized friction, mass and lighting so it does not depend on exact values.
+The result is first tested in simulation against a fixed set of scenarios, then on a real robot in a safe area. Logs from the real robot, such as failures and odd sensor values, are replayed or turned into new simulation scenarios.
+The gap between simulation and the real world (the sim-to-real gap) never closes fully. Contact, deformable objects and sensor noise are hard to model, so real tests stay required.
+used: Isaac Lab and Isaac Sim for robot learning; MuJoCo and its GPU variants in research; self-driving companies that replay logged drives in simulation.
+avoid: When the task depends on physics that simulators model badly; collect real data instead.
+flow:
+  Scenario set [store: tests + randomization] -> Simulator [svc: MuJoCo / Isaac Sim] : randomized worlds | Each run draws random friction, mass and lighting values.
+  Simulator -> Policy trainer [svc: GPU envs] : states + rewards | Thousands of parallel robots send experience to the trainer.
+  Policy trainer -> Policy [model: new version] : updated weights | The trainer produces a new policy.
+  Policy -> Real robot [client: test area] : deploy after sim gate | The policy runs on hardware only after it passes all simulated tests.
+  Real robot -> Log store [store: sensor logs] : failures + sensor data | Real runs record what went wrong.
+  Log store ~> Scenario set : new test cases | Failures become new scenarios, so the same bug is caught in simulation next time.
+ref: docs | MuJoCo documentation | Google DeepMind | https://mujoco.readthedocs.io/
+
+@@ security
+== Zero-trust request path with a policy decision point
+kind: zero-trust, api-gateway
+when: A service must not trust a request just because it comes from inside the network.
+how: Every request carries proof of identity: a short-lived token for the user and a certificate for the calling service. A gateway or sidecar checks the token signature and expiry, then asks a policy engine whether this identity may do this action on this resource. The engine answers allow or deny from rules, roles or relationship data.
+The decision is enforced at each hop, not only at the edge. The next service checks again, so one stolen foothold inside the network gives little. Each decision is logged with identity, action and result for audit.
+Policy sits outside the code, so it can change without a deploy. The cost is latency (a local policy check takes under 1 ms, a remote one a few ms) and the need to keep policy data fresh.
+used: Google BeyondCorp; Envoy with Open Policy Agent; Istio authorization policies; Google Zanzibar-style systems such as SpiceDB for fine-grained access.
+avoid: For a tiny single-service app; plain role checks in the app are enough.
+flow:
+  User [user] -> Gateway [svc: verify token] : request + OIDC token | The user sends a request with a signed, short-lived token.
+  Gateway -> Policy engine [svc: OPA / Zanzibar] : may alice read doc 9? | The gateway asks a policy engine; it does not decide by itself.
+  Policy engine -> Gateway : allow | The engine checks roles and relations and returns allow.
+  Gateway -> Orders service [svc: mTLS] : request + identity | The call is over mutual TLS, and the identity travels with it.
+  Orders service -> Audit log [log] : who, what, result | Every decision is written to an append-only log.
+  Gateway -x> User : 403 denied | If the engine says deny, the request stops at the first hop.
+ref: docs | BeyondCorp: A New Approach to Enterprise Security | Ward & Beyer, Google, 2014 |
+ref: spec | NIST SP 800-207 Zero Trust Architecture | NIST, 2020 | https://csrc.nist.gov/pubs/sp/800/207/final
+
+== Envelope encryption with a key management service
+kind: envelope-encryption
+when: Data at rest must be encrypted, keys must be rotated and every use of a key must be audited.
+how: A key management service (KMS) holds a master key (key-encryption key) that never leaves it, usually in a hardware security module. For each object or file the app asks the KMS for a fresh data key. It gets the key in plain form and in a wrapped form.
+The app encrypts the data locally with the plain data key (AES-256-GCM), stores the wrapped key next to the ciphertext, and discards the plain key from memory. To read, the app sends the wrapped key to the KMS, which unwraps it only if policy allows.
+Because the master key only wraps small data keys, large data never travels to the KMS and rotation is cheap: re-wrap the data keys, not the data. Every unwrap is logged, so access is traceable. Deleting the master key makes all its data unreadable, which is a way to erase data.
+used: AWS KMS with S3, EBS and RDS; Google Cloud KMS; Azure Key Vault; HashiCorp Vault transit engine.
+avoid: When the data is public, or you cannot accept the KMS as a runtime dependency; a KMS outage blocks reads.
+flow:
+  App [svc] -> KMS [svc: master key in HSM] : GenerateDataKey | The app asks for a new data key, naming the master key to use.
+  KMS -> App : plain key + wrapped key | The KMS returns both forms; the master key never leaves.
+  App -> Object store [store: ciphertext + wrapped key] : AES-GCM ciphertext | The app encrypts locally and stores the wrapped key beside the data.
+  App -> KMS : Decrypt wrapped key | On a later read, the app sends only the small wrapped key.
+  KMS -> Audit log [log] : who unwrapped what | The KMS records each use of the master key.
+  KMS -x> App : access denied | If policy does not allow this caller, the key is not unwrapped and the data stays unreadable.
+ref: docs | AWS KMS concepts: envelope encryption | AWS | https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html
+
+== Defence in depth with layered controls and detection
+kind: layered-arch, observability-pipeline
+when: One control will fail sooner or later, so an attack must have to pass several independent ones.
+how: Controls are placed in layers. At the edge, a CDN or web application firewall (WAF) filters floods and known attacks. The app validates input and checks authorization. The network segments services, and the host or container runs with minimal rights and with exploit mitigations such as ASLR.
+Data is encrypted, and secrets are kept in a vault, not in code. All layers send logs and alerts to a central pipeline. Detection rules and anomaly models look for unusual logins, large downloads or odd process starts, and alert a response team.
+The layers must fail independently. A shared password for all layers breaks the idea. Test the layers with red-team work, fuzzing and incident drills, and keep a plan to revoke credentials fast.
+used: Cloudflare or AWS WAF in front of web apps; Kubernetes network policies; Falco and cloud audit logs feeding a SIEM; most compliance frameworks (SOC 2, ISO 27001) ask for layered controls.
+avoid: Do not use layers as a reason to skip basic fixes; patching and least privilege come first.
+flow:
+  Attacker [user] -> WAF [svc: edge filter] : malicious request | The attacker first meets an edge filter that drops known bad patterns.
+  WAF -x> Attacker : blocked | Known attacks stop here and never reach the app.
+  Attacker -> App [svc: validates input] : novel payload | A new attack gets past the filter, but the app validates input and checks authorization.
+  App -x> Attacker : 403 rejected | The app refuses the action because the identity lacks the right.
+  App -> Log pipeline [log: central] : denied + anomalies | Every layer reports what it saw.
+  Log pipeline -> SIEM [svc: detection rules] : events | Rules and models look for patterns across layers.
+  SIEM ~> Responder [user: on call] : alert | A person is paged and can revoke tokens or isolate the host.
+ref: spec | NIST SP 800-53 Security and Privacy Controls | NIST | https://csrc.nist.gov/pubs/sp/800/53/r5/upd1/final
+
+@@ langruntime
+== Tiered execution: interpreter, then JIT
+kind: pipeline-stages, offload-accelerator
+when: A language must start fast and still run hot code at near native speed.
+how: Source is parsed and compiled once to bytecode. A virtual machine starts by interpreting the bytecode, which is slow to run but needs no compile wait. The runtime counts how often each method or loop runs and records the types it sees.
+When a method is hot, a fast compiler turns it into machine code. If it stays hot, an optimizing compiler recompiles it using the recorded profile, for example inlining calls and assuming a type. Each assumption has a guard. If a guard fails, the runtime deoptimizes and goes back to the interpreter.
+The price is warm-up: the first seconds run slower, and the compiler uses extra CPU and memory. Short scripts and serverless functions feel this most.
+used: HotSpot JVM (interpreter, C1, C2); V8 (Ignition, Sparkplug, Maglev, TurboFan); .NET tiered compilation; PyPy.
+avoid: When start time and memory matter more than peak speed; use ahead-of-time compilation (GraalVM Native Image, Go, Rust).
+flow:
+  Source code [store: .java / .js] -> Bytecode compiler [svc] : AST then bytecode | The front end checks syntax and emits compact bytecode.
+  Bytecode compiler -> Interpreter [svc: runs bytecode] : bytecode | The VM starts running at once, with no compile wait.
+  Interpreter -> Profiler [svc: counters] : call counts | The runtime counts calls and records types seen.
+  Profiler -> JIT compiler [svc: C1 then C2] : hot method | A method passes the threshold and is compiled to machine code.
+  JIT compiler -> Code cache [cache: machine code] : optimized code | Later calls jump straight to the compiled code.
+  Code cache -x> Interpreter : guard fails, deopt | A broken type assumption throws the code away and returns to the interpreter.
+ref: docs | HotSpot Virtual Machine Garbage Collection Tuning Guide | Oracle | https://docs.oracle.com/en/java/javase/21/gctuning/
+
+== Compiler pipeline with a shared intermediate representation
+kind: interpreter-compiler, pipes-filters
+when: Many source languages must target many CPUs without writing a compiler for each pair.
+how: Each language front end parses its source, checks types and lowers it to one shared intermediate representation (IR), often in static single assignment (SSA) form. A middle end then runs the same optimization passes on the IR: inlining, dead code removal, loop transforms and more.
+A back end for each CPU picks instructions, allocates registers and emits machine code. A linker joins the object files with libraries into one executable. With N languages and M targets, the work drops from N times M compilers to N plus M parts.
+The costs are an IR that must fit all languages, and long compile times for big programs. Link-time optimization and profile-guided optimization give more speed but make builds slower.
+used: LLVM with Clang, rustc and Swift; GCC with GIMPLE; Go's own SSA compiler; MLIR for machine learning compilers.
+avoid: For a small domain language; a simple interpreter or a source-to-source translator is enough.
+flow:
+  Rust source [store] -> Front end [svc: rustc] : tokens, AST, types | The front end rejects bad programs early, using the type checker.
+  Front end -> Optimizer [svc: passes] : LLVM IR in SSA form | The program is lowered to an SSA form shared by all languages. Passes inline calls, remove dead code and transform loops.
+  Optimizer -> Back end [svc: x86-64 / ARM64] : optimized IR | A target back end selects instructions and allocates registers.
+  Back end -> Linker [svc: ld / lld] : object files | The linker joins objects and libraries and resolves symbols.
+  Linker -> Executable [store: ELF binary] : machine code | The result is one file that the OS loader can start.
+ref: book | The Architecture of Open Source Applications: LLVM | Chris Lattner, 2011 | https://aosabook.org/en/v1/llvm.html
+
+== Managed heap with generational concurrent GC
+kind: memory-tiering, producer-consumer
+when: A long-running service allocates many objects, and pauses must stay short while memory is safe.
+how: The heap is split by age. New objects go to a small young generation. Most die young, so a minor collection copies the few survivors and frees the rest cheaply. Objects that survive several rounds are promoted to the old generation.
+The old generation is collected mostly while the application runs. Concurrent collectors such as G1 and ZGC mark live objects in background threads and use barriers so the program can keep changing references. Only short pauses remain, often under 1 ms with ZGC.
+You trade CPU and memory for short pauses. Concurrent collectors need spare heap, often 20 to 50 percent. If allocation outruns collection, the runtime stalls the program.
+used: JVM with G1 (default) and ZGC; Go's concurrent mark-sweep collector; .NET generational GC; V8 young and old spaces.
+avoid: For hard real-time or very small devices; use manual memory or ownership and borrowing, as in Rust.
+flow:
+  App threads [svc: mutators] -> Young gen [store: eden + survivor] : allocate objects | New objects are created by bumping a pointer, which is very cheap.
+  Young gen -> GC threads [svc: minor GC] : eden full | When eden fills, a short minor collection starts.
+  GC threads -> Old gen [store: promoted objects] : survivors, age 3 | Objects that survive several rounds are moved to the old generation.
+  GC threads -> Old gen : concurrent mark | A background mark finds live objects while the program runs.
+  App threads -x> GC threads : allocation stall | If allocation is faster than collection, the program waits for the GC.
+  * Old gen: regions reclaimed | Garbage regions are freed and the heap shrinks or is reused.
+ref: docs | The Z Garbage Collector | OpenJDK | https://wiki.openjdk.org/display/zgc/Main
+
+@@ durableexec
+== Workflow replay from an event history
+kind: event-sourcing, checkpoint-restart
+when: A business process runs for minutes to months, calls many services and must survive crashes and deploys.
+how: The workflow is ordinary code that must be deterministic. A server keeps an event history for each workflow run: every started activity, its result, every timer and every signal. Workers poll task queues and run the code.
+When a worker crashes, another worker loads the history and runs the code again from the start. Each call that already has a recorded result returns that result at once and does not run again. The code then continues from the first step that has no result. So local variables and the call stack are rebuilt, not stored.
+Because code is replayed, it must not read the clock, use random numbers or call the network directly. Those go through the SDK or into activities. History also has a size limit, so very long runs use continue-as-new to start a fresh history.
+used: Temporal (and the Cadence system it came from); AWS Step Functions and Azure Durable Functions use the same idea in other forms; Restate and DBOS are newer engines.
+avoid: For short request-reply calls under a second; a plain function with retries is simpler.
+flow:
+  Client [client] -> Workflow service [svc: history + queues] : start OrderWorkflow | The client starts a run; the service creates a history with a first event.
+  Workflow service -> Worker A [svc: runs workflow code] : workflow task | A worker takes the task and runs the code up to the first activity.
+  Worker A -> Workflow service : schedule ChargeCard | The worker asks the service to run an activity; this is recorded in history.
+  Worker A -x> Workflow service : crash | Worker A dies after the charge, before the next step.
+  Workflow service -> Worker B [svc: replay] : history of 7 events | Worker B replays the code against the history.
+  * Worker B: skips ChargeCard | The recorded result is returned, so the card is not charged twice.
+  Worker B -> Workflow service : schedule ShipOrder | The code moves on to the first step with no result.
+ref: docs | Temporal workflows | Temporal Technologies | https://docs.temporal.io/workflows
+
+== Saga with compensating activities
+kind: saga, choreography
+when: One business action spans several services, and there is no distributed transaction to roll it back.
+how: The workflow runs the steps in order: reserve stock, charge payment, book shipping. After each step succeeds, the workflow registers an undo action, such as release stock or refund payment.
+If a later step fails for good, the workflow runs the registered undo actions in reverse order. The workflow state is durable, so even if the worker dies in the middle of undoing, another worker continues from the history. Compare this with an event-based saga, where the failure path is spread over many services.
+Every activity and every undo must be idempotent, because the engine retries them. An idempotency key, such as the workflow id plus the step name, lets the payment service ignore a repeated call. Undo is not true rollback: other parties may already have seen the earlier result.
+used: Payment, booking and order flows built on Temporal, Cadence or AWS Step Functions; Uber's Cadence for ride and payment flows.
+avoid: When one database transaction can cover all the data; use it instead of a saga.
+flow:
+  Workflow [svc: durable code] -> Inventory [svc] : reserve stock | The first step reserves the items; the workflow stores an undo action.
+  Workflow -> Payment [svc: idempotency key] : charge card | The second step charges the card, with a key that makes retries safe.
+  Workflow -x> Shipping [svc] : booking failed | The shipping call fails after all retries.
+  Workflow -> Payment : refund (compensation) | The workflow runs the undo actions in reverse order, so the refund comes first.
+  Workflow -> Inventory : release stock | Then the stock reservation is released.
+  * Workflow: failed and compensated | The run ends in a clear final state that other systems can read.
+ref: paper | Sagas | Garcia-Molina & Salem, SIGMOD 1987 |
+
+== Durable timers and human-in-the-loop waits
+kind: scheduler-agent, webhook-callback
+when: A process must wait for a long time or for a person, such as a 30-day trial, an approval or a payment callback.
+how: The workflow calls a durable timer or waits for a signal. The engine writes the timer to its history and frees the worker. Nothing runs and no thread is held while the workflow waits, so a million sleeping workflows cost only storage.
+When the timer fires, or an outside event arrives as a signal (for example an approval webhook), the engine schedules a new task. A worker replays the history and continues. A wait with a timeout covers both cases: continue on approval or after 7 days, whichever comes first.
+This replaces cron tables, status columns and polling jobs with straight-line code. The cost is operating the engine, and care when changing workflow code: running histories must still replay, so changes are versioned.
+used: Subscription trials and reminders in Temporal; approval flows in Step Functions task tokens; Azure Durable Functions human interaction pattern.
+avoid: For exact real-time deadlines in milliseconds; timers are accurate to about seconds, not microseconds.
+flow:
+  Workflow [svc: durable code] -> Engine [svc: timers + history] : sleep 7 days or signal | The workflow asks to wait; the worker is freed at once.
+  Engine -> History [db: event log] : TimerStarted | The wait is stored, so it survives restarts of every component.
+  Approver [user] -> Webhook API [svc] : approve | A person approves after 2 days.
+  Webhook API -> Engine : signal Approved | The API sends a signal to the waiting workflow.
+  Engine -> Worker [svc: replay] : new workflow task | The engine schedules a worker, which replays history and sees the signal.
+  Engine ~> Worker : timer fired (if no signal) | If nobody answers, the timer fires after 7 days and the workflow takes the timeout path.
+ref: docs | Temporal workflows | Temporal Technologies | https://docs.temporal.io/workflows
+
+@@ microservices
+== API gateway with independently deployed services
+kind: microservices, api-gateway
+when: A product has grown too big for one team and one release cycle, and parts need to scale and deploy on their own.
+how: The system is split along business boundaries (bounded contexts): orders, catalog, payments. Each service owns its code, its database and its deploy pipeline. Services talk through APIs or events, never through a shared database.
+Clients call a gateway, which authenticates, rate limits and routes each request to the right service. Services find each other through DNS or a service registry. Each service is scaled by its own load, and a release of one service does not need the others.
+The cost is the network. Calls now fail, time out and add latency, so every call needs timeouts and retries. Debugging needs distributed tracing, and a transaction over two services needs a saga. Start with a modular monolith unless several teams really need independent deploys.
+used: Netflix, Amazon and Uber describe such systems; Kubernetes plus an ingress or API gateway such as Envoy or Kong is the common platform.
+avoid: For small teams or unclear domain boundaries; a modular monolith is cheaper and easier to change.
+flow:
+  Mobile app [client] -> API gateway [svc: auth + routing] : GET /orders/42 | Clients know one address, not the internal services.
+  API gateway -> Orders service [svc: own DB] : route by path | The gateway checks the token and forwards the call.
+  Orders service -> Catalog service [svc: own DB] : GET /items/9 | The orders service calls another service through its API.
+  Orders service -> Orders DB [db] : read order 42 | Only the orders service reads its own database.
+  Orders service -x> Payments service [svc: slow] : timeout at 300 ms | A slow call times out, so the thread is not tied up.
+  * Orders service: returns partial result | The service shows the order without payment detail instead of failing fully.
+ref: blog | Microservices | Martin Fowler & James Lewis, 2014 | https://martinfowler.com/articles/microservices.html
+
+== Resilient service calls: timeout, retry, circuit breaker
+kind: circuit-breaker, retry-backoff, bulkhead
+when: One slow or failing service must not drag down every service that calls it.
+how: Each outgoing call has a timeout, set from the caller's own deadline. A failed call is retried a few times with exponential backoff and random jitter, and only if it is safe to repeat (idempotent). Retries are capped by a budget, such as 10 percent of normal traffic, so they do not multiply load.
+A circuit breaker counts failures. After, for example, 50 percent errors in 10 seconds it opens: calls fail at once with no network use. After a pause it lets a few trial calls through, and closes again if they succeed. A bulkhead gives each dependency its own small thread or connection pool, so one bad dependency cannot use them all.
+Without these limits, a retry storm turns a small slowdown into an outage. The caller also needs a fallback: a cached value, a default, or a clear error.
+used: Resilience4j and Envoy outlier detection; Istio traffic policies; Hystrix started this style at Netflix and is now in maintenance mode.
+avoid: Do not retry non-idempotent calls without idempotency keys; and do not retry at every layer of a deep call chain.
+flow:
+  Checkout [svc: bulkhead pool 20] -> Breaker [svc: closed] : call pricing | Every call goes through a breaker with its own small pool.
+  Breaker -> Pricing service [svc: degraded] : request + 200 ms deadline | The call has a timeout.
+  Pricing service -x> Breaker : timeout | Pricing is slow and many calls time out.
+  * Breaker: open | The error rate passes the limit, so the breaker opens and rejects new calls at once.
+  Breaker -> Checkout : fallback: cached price | Checkout uses a cached price instead of waiting.
+  Breaker ~> Pricing service : trial call after 30 s | A half-open probe checks whether pricing has recovered.
+ref: docs | Circuit Breaker pattern | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker
+
+== Database per service with events and an outbox
+kind: outbox, event-driven, saga
+when: Services own their data, but other services must react to changes and keep their own read copies.
+how: Each service keeps its own database. When it changes data, it writes the change and an event row in one local transaction (the outbox). A relay publishes the row to a broker such as Kafka, so the event exists only if the change committed.
+Other services subscribe and update their own copy of the data they need, for example a customer name in the shipping service. They stay available even when the owner is down, but their copy can be a few seconds old. This is eventual consistency.
+Because delivery is at least once, consumers must be idempotent. A change that spans services becomes a saga: each service does its local step and publishes the result, and a failure triggers compensating events.
+used: Debezium outbox with Kafka; Axon and Eventuate Tram; order and payment flows at many online retailers.
+avoid: When users need an instant, strongly consistent view across services; keep that data in one service.
+flow:
+  Orders service [svc] -> Orders DB [db: order + outbox] : one local transaction | The service writes the order and the event in one transaction.
+  Orders DB -> Relay [svc: CDC or poller] : new outbox row | The relay reads committed outbox rows.
+  Relay -> Event bus [log: Kafka] : OrderPlaced | The event is published at least once.
+  Event bus -> Shipping service [svc: own DB], Billing service [svc: own DB] : OrderPlaced | Each subscriber gets its own copy of the event.
+  Shipping service -> Shipping DB [db: order copy] : upsert by event id | The consumer saves what it needs and ignores repeats.
+  Billing service -x> Event bus : PaymentFailed | A failure is published as an event, and orders can cancel the order.
+ref: docs | Transactional outbox pattern | microservices.io | https://microservices.io/patterns/data/transactional-outbox.html
+
+@@ multitenancy
+== Pooled tenants with a tenant id and per-tenant quotas
+kind: rate-limit, load-shedding, sharding
+when: Thousands of small customers share one app and one database, and the cost per customer must stay low.
+how: All tenants share the same app servers and tables. Every row has a tenant_id, every query is filtered by it, and the tenant comes from the verified login token, never from a request field. In Postgres, row-level security can enforce the filter in the database itself.
+A gateway applies per-tenant quotas, such as a token bucket for requests per second and a cap on concurrent jobs. When one tenant goes over, only that tenant gets 429 errors. Queues use per-tenant fairness, for example round robin, so a big import does not delay small tenants.
+This is the cheapest model, but the weakest isolation. One missing filter leaks data across tenants, and a heavy tenant can still hurt others (the noisy neighbour problem). Tests for cross-tenant access, and per-tenant metrics, are required.
+used: Most SaaS products, such as CRM and ticketing tools; Postgres row-level security; Citus (distributed Postgres) shards by tenant id.
+avoid: When tenants need strong isolation, their own encryption keys or data residency; use separate schemas, databases or stacks.
+flow:
+  Tenant A [user] -> Gateway [svc: quota per tenant] : request + token | The gateway reads the tenant id from the verified token.
+  Tenant B [user] -> Gateway : burst of 5,000 req/s | Tenant B sends a burst far over its quota.
+  Gateway -x> Tenant B : 429 too many requests | Only tenant B is throttled; tenant A is not affected.
+  Gateway -> App [svc: stateless] : request + tenant_id | The app gets the tenant id as part of the request context.
+  App -> Shared DB [db: tenant_id on rows] : WHERE tenant_id = A | Every query is filtered by tenant, and row-level security enforces it.
+  Shared DB -> App : tenant A rows only | A bug that forgets the filter still cannot see other tenants' rows.
+ref: docs | Multitenant SaaS patterns | AWS Well-Architected SaaS Lens | https://docs.aws.amazon.com/wellarchitected/latest/saas-lens/saas-lens.html
+
+== Silo, pool and bridge: tiered tenant isolation
+kind: deployment-stamp, sharding
+when: Tenants differ a lot in size and needs: a few large customers need isolation, and many small ones need low cost.
+how: Offer tiers. Small tenants share a pooled stack. Larger or regulated tenants get a silo: their own database or even their own deployment, possibly in a chosen region. A bridge model mixes these, for example a shared app tier with a database per tenant.
+A tenant directory (a control-plane table) maps each tenant to its stack and database. A router looks up the tenant and sends the request there. Onboarding creates the tenant in the directory and provisions resources by code. A tenant can be moved from pool to silo by copying data and then updating the directory entry.
+The cost is operations. Each silo is one more thing to upgrade, monitor and back up. Keep one code version for all tenants and automate deployment, or you end up supporting many products.
+used: Salesforce-style pooled model for most customers; dedicated tenants and cells in B2B SaaS; AWS describes silo, pool and bridge in its SaaS guidance.
+avoid: When all tenants are similar and small; a single pooled model is simpler.
+flow:
+  Request [client] -> Tenant router [svc: lookup] : host acme.app.com | The router uses the host name or token to find the tenant.
+  Tenant router -> Tenant directory [db: tenant to stack] : which stack for acme? | The directory says acme is on a silo in the EU.
+  Tenant router -> Acme silo [svc: own stack + DB] : request | Large tenant acme runs on its own app and database.
+  Tenant router -> Pooled stack [svc: shared] : request for small tenants | Small tenants are sent to the shared stack.
+  Pooled stack -> Shared DB [db: many tenants] : filtered by tenant_id | The pooled stack keeps all small tenants in one database.
+  Ops pipeline [svc: IaC] ~> Tenant directory : provision + register | A pipeline creates stacks and records them, so onboarding takes minutes.
+ref: docs | SaaS Lens: silo, pool and bridge | AWS Well-Architected | https://docs.aws.amazon.com/wellarchitected/latest/saas-lens/saas-lens.html
+
+== Shared cluster with namespaces, quotas and network policy
+kind: bulkhead, control-loop
+when: Several teams or customers share one Kubernetes cluster, and each must be limited and kept apart.
+how: Each tenant gets a namespace. A ResourceQuota caps total CPU, memory and object counts there, and a LimitRange sets defaults for each pod. RBAC rules let tenant users act only inside their namespace.
+NetworkPolicy blocks traffic between namespaces unless allowed. Admission policy (Pod Security, Kyverno or Gatekeeper) rejects privileged pods and checks images. Cgroups enforce the CPU and memory limits on the node, so one tenant cannot take all the resources.
+Namespaces share one kernel and one control plane. For hostile tenants, add sandboxed runtimes (gVisor, Kata Containers), dedicated node pools or one cluster per tenant.
+used: Platform teams on Kubernetes; Capsule and vcluster add tenant abstractions on top; managed services such as GKE and EKS document the pattern.
+avoid: For untrusted code from unknown customers; use separate clusters or strong sandboxes.
+flow:
+  Team A [user] -> API server [svc: RBAC + admission] : apply Deployment in ns-a | The API server checks that team A may act in its own namespace.
+  API server -> Quota controller [svc: ResourceQuota] : check usage in ns-a | Quota is checked on creation; it allows 8 of 10 CPUs.
+  API server -x> Team A : denied: privileged pod | Admission policy rejects a pod that asks for host rights.
+  API server -> Node [svc: kubelet + cgroups] : pod with limits | The pod runs with CPU and memory limits enforced by the kernel.
+  Node -> Pod B [svc: ns-b] : traffic from ns-a | A pod in ns-a tries to reach ns-b.
+  Node -x> Pod B : NetworkPolicy drop | Default-deny policy drops the packet.
+ref: docs | Multi-tenancy | Kubernetes documentation | https://kubernetes.io/docs/concepts/security/multi-tenancy/
+
+@@ cicd
+== Pipeline with a test pyramid and artifact promotion
+kind: pipes-filters, immutable-infra
+when: Many developers merge often, and every change must be checked and releasable within minutes.
+how: Each push or pull request starts a pipeline. Stages run in order from cheap to costly: lint and unit tests in seconds, integration tests in minutes, and a few end-to-end tests last. A failing stage stops the pipeline, so cost is spent only on changes that pass the cheap checks.
+The build runs once and produces an immutable artifact, such as a container image tagged by commit hash. The same artifact is promoted through test, staging and production. It is never rebuilt, so what was tested is what ships.
+Speed is a feature: a pipeline above about 10 to 15 minutes makes people batch changes and skip checks. Cache dependencies, run tests in parallel and fix flaky tests, because ignored failures destroy trust.
+used: GitHub Actions, GitLab CI, Jenkins, Buildkite; Google's monorepo uses presubmit tests on every change.
+avoid: When the build needs hardware that is not available in automation; keep a manual gate and shrink the manual part.
+flow:
+  Developer [user] -> Git repo [store: pull request] : push commit | A push to a pull request starts the pipeline.
+  Git repo -> CI runner [svc: build + unit tests] : webhook | The runner builds the code and runs unit tests in seconds.
+  CI runner -> Integration stage [svc: DB + services] : if unit tests pass | Slower tests run only after the fast ones pass.
+  CI runner -x> Developer : red build | A failing test stops the pipeline and the developer is told within minutes.
+  CI runner -> Artifact registry [store: image by commit] : push image abc123 | A green build produces one immutable image.
+  Artifact registry -> Staging [svc: deploy abc123] : promote same image | The same bytes move on to staging and later production.
+ref: book | Continuous Delivery | Humble & Farley, 2010 |
+
+== Progressive delivery with canary and automatic rollback
+kind: blue-green, feature-flags, health-check
+when: A release can break production in ways tests do not show, and the damage should reach few users and be undone fast.
+how: The pipeline deploys the new version next to the old one. A router sends a small share of traffic, say 1 percent, to the canary. An analysis step compares the canary's error rate and latency with the old version for 10 minutes.
+If the numbers stay within limits, traffic rises in steps: 5, 25, 50, then 100 percent. If they fail, the router sends all traffic back to the old version in seconds, and the pipeline stops. Feature flags separate deploying code from turning on a feature, so a risky feature can be switched off without a new deploy.
+This needs good metrics and enough traffic to detect a problem. Database changes must be backward compatible (expand, then contract) so both versions work at once.
+used: Argo Rollouts and Flagger on Kubernetes; Spinnaker canary analysis; AWS CodeDeploy blue/green; LaunchDarkly and OpenFeature for flags.
+avoid: For tiny services with almost no traffic; a quick blue-green switch with smoke tests is enough.
+flow:
+  Pipeline [svc: deploy] -> Canary v2 [svc: 1% of traffic] : deploy v2 beside v1 | v2 starts next to v1 and gets a small share of traffic.
+  Router [svc: weighted] -> Canary v2 : 1% of requests | Real users hit v2, but only a few of them.
+  Canary v2 -> Metrics [store: error + latency] : error rate 0.4% | The new version reports its error rate and latency.
+  Metrics -> Analysis [svc: compare to v1] : canary vs baseline | The analysis compares canary and baseline over 10 minutes.
+  Analysis -x> Router : error rate too high | The error rate is above the limit.
+  Analysis -> Pipeline : abort and roll back | The router returns all traffic to v1 in seconds.
+ref: docs | Canary release | Martin Fowler | https://martinfowler.com/bliki/CanaryRelease.html
+
+== Trunk-based development with a merge queue
+kind: producer-consumer, feature-flags
+when: Many engineers merge to one main branch, and a broken main would block everybody.
+how: Developers work in short branches, a day or less, and merge to main often. Unfinished work is hidden behind feature flags, so main stays releasable. The pull request runs checks before review ends.
+A merge queue handles the race between two green pull requests that break main together. The queue takes the next change, builds it on top of the current main plus the changes ahead of it, and runs the tests. Only a green result is merged, and the queue moves on. A red one is removed and the developer is told.
+The queue serializes merges, so its test time limits throughput. Large teams batch several changes per run, and bisect the batch when it fails. Keep tests fast and not flaky, or the queue becomes a bottleneck.
+used: GitHub merge queue; GitLab merge trains; Bors and Mergify; Google, Meta and others describe trunk-based development.
+avoid: For small teams with few merges per day; plain pull requests with required checks are enough.
+flow:
+  Dev A [user] -> Merge queue [queue: serialized] : PR 101 ready | A reviewed and green pull request enters the queue.
+  Dev B [user] -> Merge queue : PR 102 ready | A second pull request joins; it may conflict in meaning with 101.
+  Merge queue -> CI [svc: tests on main + 101] : build temp branch | The queue tests 101 on top of the latest main.
+  CI -> Main branch [store: always green] : merge 101 | A green result is merged, and the queue moves to 102.
+  Merge queue -> CI : test main + 101 + 102 | 102 is tested on top of the new main, not on the old one.
+  CI -x> Dev B : failed; removed from queue | The failure appears only in this combined test, so main stays green.
+ref: docs | Merging a pull request with a merge queue | GitHub Docs | https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue
+
+@@ formalverif
+== Model-check a protocol design before building it
+kind: consensus-log
+when: A distributed protocol or concurrency design has rare bugs that tests and reviews do not find, and a flaw would be costly.
+how: The engineer writes a small formal model of the protocol, for example in TLA+, with its states, steps and failures such as crashes and lost messages. Then the engineer writes the properties: safety ("two nodes never both lead") and liveness ("a request is eventually answered").
+A model checker (TLC or Apalache) explores every reachable state of a small version, for example 3 nodes and 2 messages. When a property fails, it prints the shortest sequence of steps that breaks it. The engineer fixes the design and checks again.
+The check covers only the small model, and only the properties written. It does not prove the real code is correct. Teams keep the model with the design document and often add tests that link the code to the model.
+used: Amazon Web Services used TLA+ for DynamoDB, S3 and others; MongoDB and CockroachDB have written TLA+ specs; Azure Cosmos DB has a TLA+ spec.
+avoid: For simple CRUD code with no concurrency; ordinary tests are cheaper.
+flow:
+  Engineer [user] -> TLA+ spec [store: states + steps] : write model + invariants | The engineer writes the protocol and the rules it must keep.
+  TLA+ spec -> Model checker [svc: TLC] : explore all states | The checker visits every reachable state of a small model, often millions.
+  Model checker -x> Engineer : counterexample in 23 steps | A violated rule comes with the exact steps that cause it.
+  Engineer -> TLA+ spec : fix design | The engineer changes the protocol, not the checker.
+  Model checker -> Design doc [store: verified spec] : all invariants hold | After a clean run, the spec is kept with the design.
+  Design doc ~> Implementation [svc: real code] : guides code + tests | Developers build the system from the verified design.
+ref: paper | How Amazon Web Services Uses Formal Methods | Newcombe et al., CACM 2015 |
+ref: book | Specifying Systems | Leslie Lamport, 2002 |
+
+== Proof checked in CI with a verified-code toolchain
+kind: pipes-filters
+when: A small, critical piece of code (a kernel, a parser or an authorization rule) must be proven correct for all inputs.
+how: The developer writes code together with a specification in a verification-aware language such as Dafny, or a proof assistant such as Lean or Coq. The spec states preconditions, postconditions and loop invariants.
+A verifier turns the code and spec into logical conditions and sends them to an SMT solver, such as Z3. The solver proves each one or reports a failure. In a proof assistant, the developer writes proof steps and a small trusted kernel checks them. The proof is a build step in CI, so a code change that breaks it fails the build.
+Proofs are costly: verified systems can take several lines of proof for each line of code. So teams verify the small core and test the rest. The proof is only as good as the spec, so a wrong spec proves the wrong thing.
+used: seL4 microkernel (proved against its spec); CompCert C compiler (proved with Coq); AWS uses Dafny for its Cedar authorization language.
+avoid: For fast-changing business code with unclear requirements; use tests and review.
+flow:
+  Developer [user] -> Source + spec [store: Dafny / Lean] : code + contracts | Code and its contract are written together.
+  Source + spec -> Verifier [svc: Dafny] : generate conditions | The verifier turns each contract into logic formulas.
+  Verifier -> SMT solver [svc: Z3] : prove or refute | The solver checks every formula for all inputs.
+  SMT solver -x> Developer : postcondition may fail | A failed proof points to the line where the rule can break.
+  SMT solver -> CI [svc: proof check] : all proofs pass | A clean run means the contract holds.
+  CI -> Compiler [svc: emits code] : compile verified code | Only verified code is compiled into the release.
+ref: docs | Dafny documentation | Dafny project | https://dafny.org/
+ref: paper | seL4: Formal Verification of an OS Kernel | Klein et al., SOSP 2009 |
+
+== Automated reasoning on configuration and policies
+kind: control-loop
+when: A large set of rules, such as cloud access policies or network configuration, is too complex to check by reading it.
+how: The rules are translated into logic formulas. A solver (SAT or SMT) then answers questions about all possible requests, not about samples. For example: "can any request from the internet read this bucket?"
+The check runs automatically when a policy changes, before it is deployed, and can also run on a schedule. Because a solver reasons about all cases, a "no" answer is a proof within the model. A "yes" answer comes with an example request that shows the problem.
+The model must match the real system. Gaps in the translation, for example a feature the model does not know, make answers wrong. Run it as a guard in the change pipeline, and treat findings as bugs.
+used: AWS Zelkova behind IAM Access Analyzer and S3 Block Public Access checks; network reachability analysis tools; Cedar policy analysis.
+avoid: When the rules are few and simple; a code review is enough.
+flow:
+  Policy author [user] -> Policy repo [store: IAM policy] : change policy | A policy change is proposed as a pull request.
+  Policy repo -> Translator [svc: policy to logic] : formula | The policy is converted to a logic formula.
+  Translator -> SMT solver [svc: all requests] : can anyone read? | The solver reasons about every possible request at once.
+  SMT solver -x> Policy author : public via rule 3 | An example request shows how the policy can be abused.
+  Policy author -> Policy repo : fix rule 3 | The author narrows the rule.
+  SMT solver -> Deploy [svc: pipeline] : proved no public access | Only a proved policy is deployed.
+ref: paper | Semantic-based Automated Reasoning for AWS Access Policies using SMT | Backes et al., FMCAD 2018 |
+
+@@ vcs
+== Content-addressed commit graph with branches
+kind: copy-on-write
+when: Many people change the same files at once, and you need cheap branches, full history and a way to detect damage.
+how: Each snapshot of the project is stored as a commit. A commit names its file tree and its parent commits, and is itself named by the hash of that content (SHA-1 or SHA-256 in Git). Unchanged files are shared between commits by hash, so a new commit stores only what changed.
+A branch is only a movable pointer to a commit. Creating one costs a few bytes. Merging joins two lines of history in a new commit with two parents. Because every hash covers its parents, changing old history changes all later hashes, so tampering is easy to detect.
+Packfiles store similar objects as deltas, which keeps big repositories small. Very large binary files are poor fits, so teams use Git LFS or a monorepo tool.
+used: Git; Mercurial; Jujutsu uses a Git-compatible store; Linux kernel development is the classic large Git user.
+avoid: For huge binary assets with locking needs, such as game art; use Perforce or Git LFS.
+flow:
+  Developer [user] -> Working tree [store: files] : edit files | The developer changes files in the working tree.
+  Working tree -> Object store [store: .git objects] : git commit | Changed files become hashed blobs, and a tree and commit object are written.
+  Object store -> Branch pointer [note: main at c3f1] : move pointer | The branch name moves to the new commit hash.
+  Developer -> Branch pointer : git switch -c fix | A new branch is a new pointer; no files are copied.
+  Branch pointer -> Object store : merge commit: 2 parents | A merge writes one commit that records both histories.
+  Object store -x> Developer : hash mismatch | If any object was changed or damaged, its hash no longer matches and Git reports it.
+ref: book | Pro Git | Chacon & Straub | https://git-scm.com/book
+
+== Distributed repositories with a central hosting service
+kind: pubsub, leader-follower
+when: A team needs offline work and full local history, but also one shared place for review and release.
+how: Every developer has a full clone, with all history. Work and commits are local and fast. A hosting service (GitHub, GitLab, or a self-run server) holds the shared main repository. Developers push branches to it and open pull requests.
+The service runs checks and review, then merges to main. Others fetch the new commits and merge or rebase their work. Only changed objects travel, since the client and server compare hashes and send what is missing. Branch protection rules decide who may push to main.
+There is no technical need for the central copy, but teams use one by agreement. Many clones also give free backups. The cost is merge conflicts: they appear at merge time, not while editing.
+used: GitHub, GitLab and Bitbucket; Gerrit at Android and Chromium; self-hosted Gitea and Forgejo.
+avoid: For one person on one machine; a local repository without a remote is enough.
+flow:
+  Dev clone [client: full history] -> Hosting service [svc: GitHub / GitLab] : git push feature | The developer pushes a branch; only missing objects are sent.
+  Hosting service -> CI [svc: checks] : webhook on push | The push starts tests on the branch.
+  Reviewer [user] -> Hosting service : approve pull request | A reviewer approves the change.
+  Hosting service -> Main repo [store: protected main] : merge | After checks pass, the service merges to main.
+  Main repo -> Other clone [client] : git fetch | Other developers fetch the new commits and update their own branches.
+  Hosting service -x> Dev clone : push rejected | If main moved, the push is refused until the developer rebases or merges.
+ref: book | Pro Git: Distributed Git | Chacon & Straub | https://git-scm.com/book/en/v2/Distributed-Git-Distributed-Workflows
+
+== Commits as the trigger for build, test and deploy
+kind: event-driven, gitops
+when: You want every change to be built and tested, and the repository to be the single source of truth for what runs.
+how: A push or merge in the repository sends a webhook. The CI system checks out the exact commit, builds it and runs tests. The result is shown as a status on the commit, and branch rules can require a green status before merge.
+For deployment, a GitOps tool such as Argo CD or Flux watches a repository that holds the desired configuration. When a commit changes it, the tool applies the change to the cluster and keeps the cluster equal to the commit. A rollback is a revert commit.
+The commit hash gives traceability: every running version links to one commit, one author and one review. Secrets must not be stored in the repository, only references to a secret store.
+used: GitHub Actions and GitLab CI on push events; Argo CD and Flux for Kubernetes; Terraform workflows in pull requests.
+avoid: When changes are made by hand in the cluster; drift defeats the idea, so stop manual edits.
+flow:
+  Developer [user] -> Git repo [store: main] : merge to main | A reviewed change is merged to the main branch.
+  Git repo -> CI [svc: build + test] : webhook with commit sha | The webhook carries the exact commit hash.
+  CI -> Config repo [store: desired state] : bump image to abc123 | A green build updates the version in the deploy config.
+  Argo CD [svc: GitOps agent] -> Config repo : poll for changes | The agent notices the new commit.
+  Argo CD -> Kubernetes [svc: cluster] : apply manifests | The agent applies the change so the cluster matches Git.
+  Git repo ~> Argo CD : revert commit = rollback | Reverting the commit returns the cluster to the older state.
+ref: docs | Argo CD documentation | Argo Project | https://argo-cd.readthedocs.io/
+
+@@ datalake
+== Medallion layers in a lake
+kind: medallion, etl-elt
+when: Raw data from many sources must be kept, cleaned and then served to analysts and machine learning in steps.
+how: Data lands unchanged in a bronze layer: files in object storage, for example JSON, CSV or Parquet, one folder per source and date. A job cleans and joins it into a silver layer: fixed types, removed duplicates, standard keys.
+Another job builds a gold layer with business tables, such as daily revenue by region. Each layer is stored as columnar files and partitioned by date, so queries read only the folders they need. Engines such as Spark, Trino or DuckDB read the files directly.
+Keeping bronze allows replay: if a cleaning rule was wrong, rebuild silver from raw. Without table formats and a catalog, a lake can become a swamp with no schema, no ownership and no way to tell which copy is correct.
+used: Databricks popularised the name; common on S3, ADLS and GCS with Spark, Trino and dbt; log and event data platforms.
+avoid: For small data under a few hundred GB with one SQL user; a single warehouse or Postgres is simpler.
+flow:
+  Sources [svc: apps + logs + CDC] -> Bronze [lake: raw files] : land as is | Raw files are written without changes, so history is kept.
+  Bronze -> Spark job [svc: clean + dedupe] : read raw files | A job reads raw files by date partition.
+  Spark job -> Silver [lake: typed Parquet] : cleaned tables | The job writes typed, deduplicated Parquet files.
+  Silver -> dbt models [svc: SQL] : join + aggregate | Business logic builds tables for reporting.
+  dbt models -> Gold [lake: business tables] : daily revenue | Gold tables are small, tested and ready for BI.
+  Gold ~> Bronze : replay on rule change | When a rule changes, silver and gold are rebuilt from bronze.
+ref: docs | What is the medallion lakehouse architecture? | Databricks documentation | https://docs.databricks.com/aws/en/lakehouse/medallion
+
+== Decoupled storage and many query engines
+kind: data-locality, polyglot-persistence
+when: Several teams need different tools on the same data, and storage must scale without buying compute.
+how: Files live in object storage, which stores petabytes cheaply with erasure coding. Compute is not part of the storage: Spark runs ETL, Trino or Athena answer SQL, and Python or ML jobs read the same Parquet files. Each engine starts only when needed and stops after.
+A metastore or catalog (Hive Metastore, AWS Glue) maps table names to folders and schemas. The engines read only needed columns and skip files with partition pruning and min/max statistics. Reads are large and parallel, and throughput scales with the number of workers.
+Object storage has high latency per request, usually tens of milliseconds, and listing many files is slow. So files should be big, often 128 MB to 1 GB, and few.
+used: Trino, Spark and Athena on S3; Hive-style lakes on HDFS in older systems; ML training reading Parquet from object storage.
+avoid: For low-latency point lookups and frequent small updates; use a database.
+flow:
+  Spark ETL [svc: batch] -> Object storage [lake: Parquet files] : write partitioned files | ETL writes large files in date folders.
+  Trino [svc: SQL engine] -> Catalog [db: Hive Metastore] : where is table sales? | The engine asks the catalog for the table folder and schema.
+  Trino -> Object storage : read 3 columns | Trino reads only the needed columns and skips folders outside the date range.
+  Training job [svc: Python + ML] -> Object storage : read Parquet | The training job reads the same files with its own tool.
+  Object storage -x> Trino : slow LIST on 1M files | Too many small files make listing and opening slow.
+  Compaction job [svc: Spark] ~> Object storage : merge small files | A background job merges small files into large ones.
+ref: paper | Lakehouse: A New Generation of Open Platforms that Unify Data Warehousing and Advanced Analytics | Armbrust et al., CIDR 2021 |
+
+== Streaming ingestion into the lake
+kind: kappa-arch, tiered-storage, backfill-replay
+when: Events arrive continuously, and the lake needs fresh data that is also kept for years at low cost.
+how: Producers write events to a log such as Kafka. A sink job (Kafka Connect, Flink or Spark Structured Streaming) reads in micro-batches and writes Parquet files to object storage, partitioned by event date. The job commits its offset only after the files are written, so a crash causes repeats, not loss.
+Streaming creates many small files. A compaction job merges them. Late events go to the partition of their event time, so old partitions can change. Raw events are also kept in the log for several days, so the sink can be replayed after a bug.
+Fresh data is minutes old, not seconds. For real-time queries, keep a separate serving store. The lake is for history and large scans.
+used: Kafka Connect S3 sink; Flink and Spark streaming sinks; ad-tech and clickstream pipelines that keep billions of events per day for years.
+avoid: When users need results within a second; query the stream or a real-time OLAP store instead.
+flow:
+  Apps [svc: producers] -> Events topic [log: Kafka] : click events | Producers append events to the log.
+  Events topic -> Sink job [svc: Flink or Spark] : read from offset | The sink reads events in micro-batches.
+  Sink job -> Lake raw zone [lake: Parquet by date] : 128 MB files | The sink writes large files in date folders.
+  Sink job -> Events topic : commit offset after write | The offset is saved only after the files are safe.
+  Sink job -x> Events topic : crash before commit | After a crash the sink re-reads and may write duplicates.
+  Compaction job [svc: nightly] ~> Lake raw zone : merge + dedupe | A job removes duplicates and merges small files.
+ref: docs | Kafka Connect | Apache Kafka documentation | https://kafka.apache.org/documentation/#connect
+
+@@ dfs
+== Metadata server with chunk servers
+kind: leader-follower, data-locality
+when: Huge files must be stored on many cheap machines, read in parallel and survive disk and machine failures.
+how: Files are split into large blocks, for example 64 or 128 MB. One metadata server (the master or NameNode) keeps the namespace and the map from file to block to servers, in memory. Many data servers store the blocks as local files.
+To read, the client asks the metadata server where the blocks are, then reads the data directly from data servers. The metadata server is not in the data path, so it does not limit throughput. For writes, the client sends data along a pipeline of replicas, usually three copies in different racks.
+Data servers send heartbeats and block reports. When one dies, the metadata server orders new copies of its blocks. The single metadata server is the weak point, so it has a log, checkpoints and standby copies.
+used: Google File System and Colossus; HDFS in Hadoop and Spark clusters; the same split of metadata and data appears in Lustre and CephFS.
+avoid: For many small files, since metadata sits in memory; or for random small writes and strict POSIX behaviour.
+flow:
+  Client [client] -> Metadata server [svc: namespace in RAM] : open /logs/a.dat | The client asks only for block locations.
+  Metadata server -> Client : block 7 on S1, S4, S9 | The reply lists the servers that hold each block.
+  Client -> Chunk server S1 [svc: local disk] : read block 7 | The client reads data directly; the metadata server is not involved.
+  Chunk server S1 -> Metadata server : heartbeat + block report | Every few seconds each data server reports that it is alive and what it holds.
+  Chunk server S4 -x> Metadata server : heartbeat lost | After a timeout, S4 is declared dead.
+  Metadata server -> Chunk server S9 : copy block 7 to S2 | The master restores the third replica.
+ref: paper | The Google File System | Ghemawat, Gobioff & Leung, SOSP 2003 |
+ref: docs | HDFS Architecture | Apache Hadoop | https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html
+
+== Compute scheduled near the data blocks
+kind: data-locality, map-reduce
+when: A job must scan terabytes, and moving the data over the network would cost more than moving the code.
+how: A job is split into tasks, one for each input block. The scheduler asks the file system where each block lives. It then tries to run each task on a machine that holds a replica, or at least in the same rack. The task reads from local disk at disk speed, with no network use.
+With three replicas, the scheduler has three machines to choose from for each block. If those are busy, it accepts a rack-local or remote read rather than waiting too long. A cluster with hundreds of disks reads in parallel, so total throughput can reach many GB per second.
+This idea weakens when storage and compute are separated, as with object storage and fast networks. Then locality gives way to caching and fast shared storage.
+used: MapReduce on GFS; Hadoop and Spark on HDFS with YARN; HPC systems with Lustre use striping instead.
+avoid: When storage is in the cloud and compute is elastic; use object storage with caching.
+flow:
+  Job scheduler [svc: YARN] -> NameNode [svc: block map] : where are blocks of input? | The scheduler asks for the block locations of the input file.
+  NameNode -> Job scheduler : block 1 on N1 N2 N3 | It replies with three replica hosts for each block.
+  Job scheduler -> Worker N2 [svc: task for block 1] : run task here | The task goes to a machine that holds a replica.
+  Worker N2 -> Local disk [store: block 1] : sequential read | The read is local, at disk speed.
+  Job scheduler -> Worker N7 [svc: other rack] : block 9 (no free slot) | When replica hosts are busy, it uses another rack.
+  Worker N7 -x> Job scheduler : remote read is slower | The remote read crosses the network, so it is slower.
+ref: paper | MapReduce: Simplified Data Processing on Large Clusters | Dean & Ghemawat, OSDI 2004 |
+
+== Leases and write pipeline for consistent writes
+kind: lease, fencing-token, quorum
+when: Many clients may write to the same file, and the system must avoid two writers, or a stale one, corrupting it.
+how: Before writing, a client gets a lease from the metadata server: the right to write that file for a limited time, for example 60 seconds. The client renews it while it works. If the client dies, the lease expires and another client can take over.
+Data goes through a pipeline: client to replica 1 to replica 2 to replica 3, and each replica acknowledges. The write is successful when all replicas confirm. On failure, the pipeline is rebuilt with the good replicas, and the missing copy is repaired later.
+The lease makes one writer at a time safe only if clocks do not drift too far. Systems that need more safety add a generation number or fencing token, so a replica rejects writes from an old writer.
+used: HDFS single-writer file leases; GFS chunk leases with a primary replica; NFSv4 delegations and locks use leases too.
+avoid: When many writers need to append to the same file at the same time; use a log service or message queue.
+flow:
+  Client [client] -> Metadata server [svc: lease manager] : create /out/part-1 | The client asks to write the file.
+  Metadata server -> Client : lease for 60 s + pipeline | The client receives a time-limited right to write and a list of replicas.
+  Client -> Replica 1 [svc: data server] : write packet | The client sends data to the first replica.
+  Replica 1 -> Replica 2 [svc: data server] : forward packet | Each replica forwards to the next, which saves client bandwidth.
+  Replica 2 -> Replica 3 [svc: data server] : forward packet | The third copy is written in another rack.
+  Replica 3 -x> Client : ack lost: rebuild pipeline | If a replica fails, the client rebuilds the pipeline with the healthy ones.
+ref: paper | The Google File System | Ghemawat, Gobioff & Leung, SOSP 2003 |
+
+@@ lakehouse
+== Transaction log over Parquet files
+kind: open-table-format, wal
+when: You need ACID commits, consistent reads and updates on files in object storage, which has no transactions of its own.
+how: A table is a set of immutable Parquet files plus a metadata log. In Delta Lake the log is a folder of numbered JSON files, with checkpoints. In Iceberg, snapshots point to manifest lists and manifest files. Both name exactly which data files belong to each table version.
+A writer writes new data files first. It then commits by adding the next log entry with an atomic put-if-absent (or a catalog compare-and-swap). If two writers race, one fails and retries after checking for conflicts. Readers pick one version, so they never see half a commit.
+Old versions stay until cleaned up, which gives time travel and rollback. The log needs maintenance: checkpoints, compaction of small files and vacuum of unused files. Commit rate is limited, often to a few per second per table.
+used: Delta Lake on Databricks and open-source Spark; Apache Iceberg in Snowflake, Trino, Spark and Flink; Apache Hudi.
+avoid: For very high-rate single-row updates; use an OLTP database and load the changes.
+flow:
+  Writer [svc: Spark job] -> Object storage [lake: Parquet data files] : write new files | The writer first adds new data files that no reader can see yet.
+  Writer -> Table log [log: _delta_log] : commit 00042.json | The commit adds the next log entry, atomically.
+  Table log -> Reader [svc: Trino or Spark] : snapshot 42 | A reader loads the log and learns the exact file list of version 42.
+  Reader -> Object storage : read listed files | The reader opens only the files in that snapshot.
+  Writer 2 [svc: other job] -x> Table log : commit 00042 conflicts | A second writer loses the race for entry 42 and must retry.
+  Writer 2 -> Table log : retry as 00043 | After a conflict check, it commits as version 43.
+ref: paper | Delta Lake: High-Performance ACID Table Storage over Cloud Object Stores | Armbrust et al., VLDB 2020 |
+ref: spec | Apache Iceberg table spec | Apache Iceberg | https://iceberg.apache.org/spec/
+
+== Lakehouse with medallion tables and one catalog
+kind: medallion, cdc, materialized-view
+when: You want one copy of data for BI, streaming and machine learning, with updates, deletes and access control.
+how: Source databases and event streams feed bronze tables. Change data capture (CDC) rows are applied to silver tables with MERGE, which updates, inserts or deletes rows. Gold tables hold business results, and a job or streaming query keeps them current.
+All tables are in open formats in object storage, and one catalog holds names, schemas and permissions. SQL engines, Spark and Python read the same tables. Updates use copy-on-write (rewrite files) or merge-on-read with deletion vectors (mark rows, merge later), based on how often tables change.
+Compared with a lake of plain files, tables have transactions and schema checks. Compared with a warehouse, storage is open and cheap, but query speed depends on file size, clustering and statistics, so tables need compaction and layout jobs.
+used: Databricks with Delta Lake and Unity Catalog; Iceberg tables with Polaris or other REST catalogs; Hudi for CDC-heavy tables.
+avoid: When one warehouse already serves all users well and no one needs open files; stay with it.
+flow:
+  Postgres [db: source] -> CDC stream [log: Debezium + Kafka] : row changes | Changes are captured from the database log.
+  CDC stream -> Bronze table [lake: raw changes] : append | Changes are appended, as received.
+  Bronze table -> Silver table [lake: MERGE by key] : upsert + delete | A job merges the changes, so silver holds the current rows.
+  Silver table -> Gold table [lake: aggregates] : refresh | Gold is rebuilt or refreshed on a schedule.
+  Catalog [svc: names + ACLs] ~> Silver table : permissions | One catalog checks who may read each table.
+  BI tool [client] -> Gold table : SQL query | BI users query gold with a SQL engine and see consistent snapshots.
+ref: paper | Lakehouse: A New Generation of Open Platforms that Unify Data Warehousing and Advanced Analytics | Armbrust et al., CIDR 2021 |
+
+== Time travel, branching and incremental reads
+kind: copy-on-write, event-sourcing
+when: You must reproduce an old report, test a change safely or process only new data, without copying the table.
+how: Each commit creates an immutable table version. A query can name a version or a timestamp, such as VERSION AS OF 42, and read the table exactly as it was. Since data files are shared between versions, a new version costs only the changed files plus a log entry.
+Iceberg and some catalogs add branches and tags on snapshots. A pipeline writes to a branch, runs data checks, and only then publishes by moving main to the branch. This is write, audit, publish. Readers see either the old or the new table, never the middle.
+Downstream jobs read changes between two versions with a change data feed or incremental read, and so process only new rows. Old versions must be cleaned eventually, and time travel only reaches back as far as retention allows. Time travel also keeps deleted personal data until it is vacuumed.
+used: Delta Lake time travel and change data feed; Iceberg snapshots, branches and tags; Nessie and lakeFS add Git-like branches over lake data.
+avoid: When history must not be kept for privacy reasons; set short retention and vacuum.
+flow:
+  ETL job [svc: writer] -> Branch audit [lake: branch of sales] : write new snapshot | The job writes to a branch, not to main.
+  Branch audit -> Quality checks [svc: row counts + nulls] : snapshot 51 | Checks run on the new data before anyone sees it.
+  Quality checks -x> ETL job : failed: duplicates | A failed check keeps bad data away from readers.
+  Quality checks -> Main table [lake: sales] : publish: move main | A passing branch is published by moving the main pointer.
+  Analyst [user] -> Main table : VERSION AS OF 50 | An analyst reproduces last week's report from an older version.
+  Main table -> Incremental job [svc: reads changes] : changes 50 to 51 | A downstream job reads only the rows that changed.
+ref: docs | Delta Lake time travel | Delta Lake documentation | https://docs.delta.io/latest/delta-batch.html
+
+@@ objectstore
+== Flat namespace, key index and erasure-coded chunks
+kind: sharding, tiered-storage
+when: You must store billions of immutable objects cheaply, with very high durability, behind a simple HTTP API.
+how: A client sends PUT bucket/key over HTTP. The front end splits the object into chunks and applies erasure coding, for example 8 data pieces plus 4 parity pieces. It spreads the pieces over disks in different servers, racks or zones. Any 8 of the 12 pieces rebuild the object, which gives high durability for about 1.5 times the raw size, instead of 3 times for replicas.
+A distributed index, partitioned by key, maps each key to its chunk locations and metadata. A listing is a range scan on this index. Objects are immutable: an update writes a whole new object. Storage classes move cold objects to cheaper tiers.
+Per-request latency is tens of milliseconds, and small objects are inefficient. It is not a file system: no cheap rename, no append to existing objects, and directories are only key prefixes.
+used: Amazon S3, Google Cloud Storage and Azure Blob Storage; MinIO, Ceph RGW and Garage as open-source stores.
+avoid: For low-latency random writes or POSIX file semantics; use block storage or a file system.
+flow:
+  Client [client] -> Front end [svc: HTTP API] : PUT photos/a.jpg | The client uploads one object by bucket and key.
+  Front end -> Chunk servers [svc: 12 disks in 3 zones] : 8 data + 4 parity pieces | The object is cut up and spread out with erasure coding.
+  Chunk servers -> Front end : pieces stored + checksums | Each piece is stored with a checksum.
+  Front end -> Key index [db: partitioned by key] : key to chunk map | Only after the pieces are safe is the key made visible.
+  Client -> Front end : GET photos/a.jpg | A read looks up the index and fetches the pieces.
+  Chunk servers -x> Front end : 2 disks failed | Reads still work, because any 8 of the 12 pieces are enough.
+ref: paper | Windows Azure Storage: A Highly Available Cloud Storage Service with Strong Consistency | Calder et al., SOSP 2011 |
+
+== Pre-signed URLs and direct upload
+kind: valet-key, claim-check
+when: Users or apps upload and download large files, and your servers should not carry the bytes.
+how: The client asks your API for permission. The API checks the user and creates a pre-signed URL: a link for one bucket, key and action, signed with the server's key and valid for a short time such as 5 minutes. The client then sends or gets the file directly from the object store.
+For large files the client uses multipart upload: parts of 5 MB to 5 GB are sent in parallel and then joined by one complete call. Failed parts are retried alone. After the upload, the store sends an event (a notification) so a worker can scan, resize or index the file.
+Your servers handle only small control requests, so they stay cheap and fast. Put limits in the signature, such as size and content type, and a short expiry. A link works for anyone who has it until it expires.
+used: S3 pre-signed URLs and multipart uploads; Google Cloud Storage signed URLs; Azure shared access signatures; photo and video upload paths in most web apps.
+avoid: When every byte must be inspected before it reaches storage; upload through a proxy or use a quarantine bucket.
+flow:
+  Browser [client] -> API [svc: auth] : may I upload cat.mp4? | The browser asks the app, not the store.
+  API -> Browser : pre-signed URL (5 min) | The API signs a short-lived link for one key and action.
+  Browser -> Object store [store: bucket] : multipart PUT parts | The browser uploads parts in parallel, straight to the store.
+  Browser -> Object store : complete upload | One call joins the parts into one object.
+  Object store ~> Worker [svc: scan + transcode] : ObjectCreated event | An event starts a background job.
+  Browser -x> Object store : link expired (403) | After the expiry time, the link no longer works.
+ref: docs | Sharing objects with presigned URLs | Amazon S3 User Guide | https://docs.aws.amazon.com/AmazonS3/latest/userguide/ShareObjectPreSignedURL.html
+
+== Lifecycle tiering and cross-region replication
+kind: tiered-storage, multi-region
+when: Data volume grows for years, access drops with age, and a region loss must not lose data.
+how: Rules on a bucket move objects by age or prefix: after 30 days from the standard class to an infrequent-access class, after 90 days to archive, and delete after 7 years. Cheaper classes cost less per GB but more per request, and archive classes can take minutes or hours to read.
+A replication rule copies new objects to a bucket in another region, asynchronously, often within minutes. Versioning keeps old copies, so a delete or overwrite by mistake can be undone. Object lock can make objects write-once for a set time, for rules about records.
+Replication is eventual: a read from the second region right after a write may not find the object yet. Replicated delete and version rules need care. Test restores, not only backups.
+used: S3 lifecycle rules and cross-region replication; GCS Autoclass and dual-region buckets; Azure Blob lifecycle management.
+avoid: When data is read often at random; archive tiers will cost more in retrieval fees than they save.
+flow:
+  App [svc] -> Standard bucket [store: region A] : PUT log-2026-01.gz | New objects start in the fast standard class.
+  Standard bucket ~> Replica bucket [store: region B] : async replication | A rule copies each new object to region B.
+  Standard bucket -> Infrequent tier [store: cheaper] : age 30 days | A lifecycle rule moves the older objects.
+  Infrequent tier -> Archive tier [store: cold] : age 90 days | After 90 days they go to archive, which costs very little.
+  Auditor [user] -> Archive tier : restore request | Reading archived data starts a restore that takes hours.
+  Standard bucket -x> Replica bucket : region A outage | During an outage, readers use region B.
+ref: docs | Managing your storage lifecycle | Amazon S3 User Guide | https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html
+
+@@ warehouse
+== Star schema with ELT inside the warehouse
+kind: star-schema, etl-elt
+when: Analysts need fast, consistent SQL answers on clean business data from many source systems.
+how: Raw data from sources is loaded first, then changed inside the warehouse with SQL (ELT). A tool such as dbt builds layers: staging tables, then clean dimension tables (customer, product, date) and fact tables (orders, clicks), joined by keys. This is the star schema.
+Data is stored by column and compressed, so a query on three of fifty columns reads about 6 percent of the data. A cost-based optimizer picks join orders. Dimension tables are small, so joins are cheap and queries stay simple for BI tools.
+The model fixes business definitions, such as what counts as revenue, in one place. The cost is design effort up front and a delay for new sources until they are modeled. Slowly changing dimensions need rules for history.
+used: Snowflake, BigQuery and Redshift with dbt; Kimball-style marts in most BI programs.
+avoid: For raw, unstructured data such as images or logs with no clear schema; keep it in a lake and model later.
+flow:
+  Source apps [svc: CRM + billing] -> Staging [db: raw copies] : load as is | Extract and load tools copy the source tables with no changes.
+  Staging -> dbt [svc: SQL models] : SELECT ... JOIN | dbt runs SQL inside the warehouse to build clean tables.
+  dbt -> Fact + dimensions [db: star schema] : fact_orders + dim_customer | The result is one fact table joined to small dimension tables.
+  BI tool [client] -> Fact + dimensions : SUM(revenue) BY region | A dashboard query scans only the needed columns.
+  Fact + dimensions -> BI tool : result in 1 s | A columnar scan and compression keep the answer fast.
+  dbt -x> Staging : test failed: null keys | A data test fails the run before bad data is published.
+ref: book | The Data Warehouse Toolkit | Kimball & Ross, 3rd ed., 2013 |
+
+== Separated storage and compute with virtual warehouses
+kind: horizontal-scale, autoscaling
+when: Teams run heavy and light queries on the same data, and one group's load must not slow another's.
+how: Data is stored once in columnar files in object storage. Compute is a set of clusters, called virtual warehouses in Snowflake, that read from it. Each team gets its own cluster, sized from small to very large. A cluster can start in seconds, pause when idle, and add clusters when many users query at the same time.
+Hot files are cached on local disks of the compute nodes. Metadata and statistics let a query skip files. Because storage is shared, a new cluster can query the data at once, with no copy.
+Billing is by compute time and storage, so a forgotten large cluster is costly. Set auto-suspend and spending limits. BigQuery uses a similar split, but it has no cluster to size: it allocates slots for each query.
+used: Snowflake virtual warehouses; BigQuery slots and reservations; Redshift Serverless and RA3 nodes; Databricks SQL warehouses.
+avoid: For steady, predictable load all day; a fixed-size or reserved cluster may cost less.
+flow:
+  Finance [user] -> Finance cluster [svc: size M] : month-end report | Finance runs a heavy report on its own cluster.
+  Marketing [user] -> Marketing cluster [svc: size S] : dashboard query | Marketing uses another cluster at the same time.
+  Finance cluster -> Shared storage [lake: columnar files] : read needed columns | Both clusters read the same single copy of the data.
+  Marketing cluster -> Shared storage : read needed columns | One team's load does not slow the other.
+  Marketing cluster -> Local cache [cache: SSD] : repeat reads | Hot files are kept on local disks.
+  * Finance cluster: auto-suspended | After 5 idle minutes the cluster stops, and billing stops with it.
+ref: paper | The Snowflake Elastic Data Warehouse | Dageville et al., SIGMOD 2016 |
+
+== Materialized views and result caching for dashboards
+kind: materialized-view, precompute, pre-aggregation
+when: Many users run the same expensive aggregate queries, and each should return in about a second.
+how: A materialized view stores the result of a heavy query, for example revenue by day and region. The warehouse refreshes it when base tables change, either fully or only for new data. The optimizer can rewrite a query on the base table to read the view instead.
+A result cache stores the answer of an exact repeated query, and returns it with no compute while the data has not changed. Together they turn a scan of billions of rows into a read of thousands of rows.
+The cost is storage and refresh compute, and data that can be a little stale. Choose views for queries that are asked often, not for all. Watch for views that refresh more often than they are read.
+used: Snowflake materialized views and result cache; BigQuery materialized views and cached results; Redshift materialized views.
+avoid: For ad-hoc queries that are rarely repeated; the refresh cost will be higher than the saving.
+flow:
+  Pipeline [svc: ELT] -> Fact table [db: 5 billion rows] : daily load | New data is loaded into the base table.
+  Fact table -> Materialized view [db: revenue by day] : incremental refresh | The warehouse updates only the changed part of the view.
+  Dashboard [client] -> Optimizer [svc: query rewrite] : SUM(revenue) BY day | Many users send the same kind of query.
+  Optimizer -> Materialized view : read 365 rows | The optimizer reads the small view, not the large table.
+  Optimizer -> Result cache [cache: exact queries] : store result | The exact answer is stored for the next identical query.
+  Dashboard -> Result cache : same query again | The repeat is served with no compute until the data changes.
+ref: docs | Working with materialized views | Snowflake documentation | https://docs.snowflake.com/en/user-guide/views-materialized
+
+@@ htap
+== Row store with a columnar replica in one system
+kind: read-replicas, cdc
+when: You need live analytics on fresh transactional data, and you do not want a separate warehouse and an ETL pipeline.
+how: Transactions run on a row store, which is good for point reads and small writes. The system keeps a second copy of the same tables in columnar form, which is good for scans and aggregates. Changes flow from the row store to the column copy through the replication log, within about a second.
+In TiDB, TiFlash nodes join each Raft group as a learner replica, so they never vote and do not slow commits. In MySQL HeatWave, an in-memory column engine is loaded from InnoDB and stays in sync. The optimizer decides for each query whether to use rows, columns or both.
+Resources for analytics must be kept apart from transactions, with separate nodes or limits, or a large query hurts checkout latency. The columnar copy also uses extra memory and storage.
+used: TiDB with TiKV and TiFlash; MySQL HeatWave; SingleStore; Oracle Database In-Memory; SAP HANA.
+avoid: For heavy petabyte-scale analytics or many data sources; a warehouse or lakehouse fits better.
+flow:
+  App [client] -> Row store [db: TiKV or InnoDB] : INSERT order | Transactions are committed in the row store.
+  Row store -> Column replica [db: TiFlash or HeatWave] : replicate log | Changes are sent to a column copy, as a learner that does not vote.
+  Dashboard [client] -> Optimizer [svc: picks engine] : SUM(amount) GROUP BY day | An analytic query arrives at the same SQL endpoint.
+  Optimizer -> Column replica : scan 2 columns | The optimizer sends the scan to the columnar copy.
+  Optimizer -> Row store : point lookup by id | A lookup by key goes to the row store.
+  Column replica -x> Dashboard : lag over 1 s | If replication is behind, results are slightly old, or the query reads the row store.
+ref: paper | TiDB: A Raft-based HTAP Database | Huang et al., VLDB 2020 |
+
+== Snapshot-consistent analytics with MVCC
+kind: copy-on-write, materialized-view
+when: Long analytic queries must see one consistent state of the data while transactions keep writing.
+how: Every row version carries a commit timestamp (MVCC). An analytic query takes a read timestamp when it starts and sees only versions committed before it. Writers create new versions and never block it, and it never sees a half-done transaction.
+The column engine stores the same timestamps, or a delta of recent changes next to a large read-optimized base. A query reads the base plus the delta up to its timestamp. Background jobs merge the delta into the base, so the delta stays small.
+Old versions must be kept while a long query reads them, so a very long query can grow storage and slow cleanup. Set time limits for analytic queries and watch the age of the oldest snapshot.
+used: TiDB (timestamp oracle and snapshot reads on TiFlash); SAP HANA delta merge; SingleStore; Postgres-based systems use MVCC for the same reason.
+avoid: When queries need the very latest row and cannot use snapshot reads; read the row store.
+flow:
+  Analytic query [client] -> Timestamp service [svc: oracle] : get read ts 1000 | The query takes a read timestamp when it begins.
+  Analytic query -> Column engine [db: base + delta] : scan as of ts 1000 | The scan reads base plus delta, up to that timestamp only.
+  Writer [client] -> Row store [db: versions] : commit at ts 1005 | A new transaction commits later, and the scan does not see it.
+  Row store -> Column engine : delta rows at 1005 | The change arrives in the delta for later queries.
+  Merge job [svc: background] ~> Column engine : merge delta into base | A background merge keeps the delta small.
+  * Column engine: delta merged | The delta is empty again, so later scans read less.
+  Analytic query -x> Column engine : snapshot too old | A query that runs too long is stopped, so old versions can be cleaned.
+ref: paper | TiDB: A Raft-based HTAP Database | Huang et al., VLDB 2020 |
+
+== Workload isolation and query routing
+kind: bulkhead, load-shedding
+when: Analytics and transactions share data, but analytic queries must never raise transaction latency.
+how: The cluster has separate node groups: one for transactions and one for analytics. A router or optimizer sends short key lookups to the transaction nodes, and large scans and aggregates to the analytic nodes. The tenant or user class can also force the choice by a session setting or a hint.
+Resource groups cap CPU and memory for each class. A large query that goes over its limit is slowed or stopped, while checkout traffic keeps its share. Admission control can queue analytic queries when the cluster is busy.
+This costs more hardware than one shared pool, but it removes the noisy neighbour. Monitor the replication lag between the two groups, since analytics are only as fresh as the copy.
+used: TiDB resource control and TiFlash nodes; HeatWave cluster separate from the MySQL primary; Aurora and other systems with analytic read replicas.
+avoid: For small data where one node serves both well; do not add isolation you do not need.
+flow:
+  App [client] -> SQL router [svc: classify query] : mixed SQL | All queries enter at one SQL endpoint.
+  SQL router -> OLTP nodes [svc: row store] : INSERT + lookups | Short transactions go to the row-store nodes.
+  SQL router -> Analytic nodes [svc: column store] : large scans | Big aggregates go to the columnar nodes.
+  Analytic nodes -x> SQL router : over CPU limit: throttled | A heavy query that uses too much CPU is slowed by its resource group.
+  OLTP nodes -> Analytic nodes : replicate changes | Changes keep the column copy fresh.
+  * OLTP nodes: p99 stays at 12 ms | The latency of transactions does not change when analytics run.
+ref: docs | TiDB HTAP architecture | PingCAP documentation | https://docs.pingcap.com/tidb/stable/tiflash-overview

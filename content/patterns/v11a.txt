@@ -1,0 +1,114 @@
+@@ pruning
+== Compression pipeline: prune, recover, quantize, gate
+kind: model-compression
+when: A trained model is too large or too slow for its target, and you want a smaller version without losing accuracy on your real tasks.
+how: The pipeline treats pruning as one stage of a release job. A scoring rule (magnitude, or Wanda for large language models) ranks the weights and a mask removes the lowest, for example 50%. Removing weights hurts the loss, so the next stage recovers it: fine-tuning with the mask fixed, often with the dense model as a teacher in distillation, so the pruned model copies the teacher's output probabilities.
+Quantization comes next, for example from 16-bit to 8-bit or 4-bit weights. Pruning removes entries and quantization shrinks the rest, so the two savings multiply. An evaluation gate then runs the real task suite and a latency test on the target device. If accuracy falls below the limit, the job lowers the sparsity and tries again. Only a model that passes goes to the registry.
+Prune in small rounds with fine-tuning between them. Han and colleagues showed that this iterative process reached 9 times fewer parameters on AlexNet, where one aggressive step reached about 5 times.
+used: Deep Compression (pruning, trained quantization, Huffman coding) set the pattern; SparseGPT and Wanda are one-shot variants for large language models; PyTorch ships a pruning module (torch.nn.utils.prune) for masks.
+avoid: When a smaller dense model, trained or distilled from scratch, meets the target; it runs on any hardware with no sparse kernel risk.
+flow:
+  Dense model [model: FP16 trained] -> Prune job [svc: Wanda or magnitude] : rank weights | The job scores every weight and masks the lowest 50%.
+  Dense model ~> Fine-tune job [svc: distillation] : teacher outputs | The dense model acts as teacher and gives soft targets.
+  Prune job -> Fine-tune job : masked model | The mask zeroes the weights and accuracy drops a little; fine-tuning with the mask fixed lets the rest make up for it.
+  Fine-tune job -> Quantizer [svc: INT8 or INT4] : recovered weights | Fewer bits per weight shrink the model again.
+  Quantizer -> Eval gate [svc: task suite + latency] : compressed model | The gate runs real tasks and a latency test on the target device.
+  Eval gate -x> Prune job : accuracy below limit | The job tries a lower sparsity or fewer pruned layers.
+  Eval gate -> Model registry [store: versioned] : approved model | Only a model that passes is stored for deployment.
+ref: paper | Deep Compression: Pruning, Trained Quantization and Huffman Coding | Han, Mao & Dally, ICLR 2016 | https://arxiv.org/abs/1510.00149
+ref: paper | Learning both Weights and Connections for Efficient Neural Networks | Han, Pool, Tran & Dally, 2015 | https://arxiv.org/abs/1506.02626
+
+== 2:4 sparse weights on GPU tensor cores
+kind: offload-accelerator
+when: You serve a large model on NVIDIA Ampere or later GPUs and want less weight memory and higher math throughput for big matrix multiplications.
+how: A one-time offline step prunes each large linear layer to the 2:4 pattern: in every group of four consecutive weights, the two with the smallest magnitude become zero. The step then fine-tunes the model with the pattern fixed, or uses a one-shot method such as SparseGPT, which also supports 2:4.
+The weights are stored in a compressed form: two kept values plus a 2-bit position for each. For 16-bit weights, a group of four goes from 64 bits to 36 bits, about 44% less. At run time, the inference server calls a sparse matrix multiplication kernel. The sparse tensor core reads the position bits, selects the matching activations and multiplies only the non-zeros, at up to twice the dense math rate.
+Measure on the real shapes. Large matrices come close to the 2 times gain, while small matrices and small batches often gain little. Attention and the key-value cache do not shrink, so the end-to-end gain is lower than the layer gain.
+used: NVIDIA Ampere sparse tensor cores and the cuSPARSELt library; PyTorch supports semi-structured 2:4 sparse tensors; SparseGPT can produce 2:4 models from large language models.
+avoid: When the target has no 2:4 hardware (CPUs, older GPUs) or the workload is dominated by small matrices; use structured pruning of channels or heads, or quantization alone.
+flow:
+  Dense checkpoint [store: FP16 weights] -> Sparsify job [svc: keep 2 of 4] : prune and fine-tune | The job keeps the two largest weights of each group of four and retrains briefly.
+  Sparsify job -> Packed weights [store: values + 2-bit index] : compress 2:4 | Two values and four index bits replace four values: 36 bits instead of 64.
+  Packed weights -> GPU memory [store: HBM, about 44% smaller] : load at start | The server loads the smaller weights, so more model fits per GPU.
+  Inference server [svc] -> Sparse GEMM kernel [svc: sparse tensor core] : matmul request | The server calls the sparse kernel for each large linear layer.
+  GPU memory -> Sparse GEMM kernel : read compressed weights | The kernel reads half the values plus the index bits.
+  Sparse GEMM kernel -> Inference server : output activations | The tensor core multiplies only the non-zeros, up to twice the dense rate.
+  * Inference server: batch 1, small matrix | At a small batch the layer is limited by memory and launch cost, so the gain is small.
+ref: paper | Accelerating Sparse Deep Neural Networks | Mishra et al., NVIDIA, 2021 | https://arxiv.org/abs/2104.08378
+ref: paper | SparseGPT: Massive Language Models Can Be Accurately Pruned in One-Shot | Frantar & Alistarh, 2023 | https://arxiv.org/abs/2301.00774
+
+@@ graphemb
+== Offline walk embeddings, online nearest-neighbour retrieval
+kind: two-tower-retrieval, online-offline
+when: A recommender needs candidate items for a seed item or user from a large interaction graph, within a few milliseconds.
+how: A batch job builds a graph from logs: items are nodes, and an edge joins two items that users viewed or bought together. A trainer runs random walks (DeepWalk or node2vec) and trains skip-gram vectors, usually 64 to 256 dimensions. The vectors are published to an approximate nearest-neighbour (ANN) index, with a version number.
+At request time, the recommender looks up the vector of the seed item, such as the item the user is viewing. It asks the ANN index for the nearest 200 or so items. These candidates go to a heavier ranking model that uses user features, price and freshness. The graph stage is cheap and covers many items; the ranker is costly and runs on few.
+Walk-based vectors are transductive: a new item has no vector until the next training run. A common fix is a fallback by category or by content features until the item has enough edges. Retrain on a schedule and keep the old index for rollback.
+used: Common in item-to-item recommendation; PyTorch-BigGraph trains such embeddings for very large graphs; Pinterest's PinSage uses random walks inside a graph neural network for the same retrieval job.
+avoid: When items change every few minutes or most have no history; use content-based or inductive (graph neural network) embeddings.
+flow:
+  Interaction logs [lake: views and buys] -> Graph builder [svc: Spark job] : item-item edges | A batch job turns co-views into weighted edges between items.
+  Graph builder -> Walk trainer [svc: node2vec] : edge list | The trainer runs random walks and trains skip-gram vectors of 128 numbers.
+  Walk trainer -> Vector index [store: ANN v12] : item vectors | The vectors are published as a new versioned index.
+  Recommender API [svc] -> Vector index : seed item vector | At request time the API looks up the seed item's vector and asks for neighbours.
+  Vector index -> Recommender API : top 200 items | The index returns the nearest items in a few milliseconds.
+  Recommender API -> Ranking model [model: features + candidates] : 200 candidates | The ranker scores the candidates with richer user and item features.
+  Recommender API -x> Vector index : new item, no vector | A new item has no vector until the next run, so the API uses a fallback.
+ref: paper | node2vec: Scalable Feature Learning for Networks | Grover & Leskovec, KDD 2016 | https://arxiv.org/abs/1607.00653
+ref: paper | PyTorch-BigGraph: A Large-scale Graph Embedding System | Lerer et al., 2019 | https://arxiv.org/abs/1903.12287
+
+== Identity-graph link scoring with embeddings
+kind: identity-graph, precompute
+when: Device, account and household identifiers must be linked into people or homes, and a rule-based match leaves too many true links unfound.
+how: Link evidence, such as a shared login, a shared home network or a matching purchase, becomes weighted edges in an identity graph. A scheduled job trains node embeddings on this graph. Devices that sit in the same dense neighbourhood, even without a direct edge, end up with close vectors.
+A match service proposes candidate pairs from the nearest neighbours of each device. A scoring model, trained on known true and false links, takes the vector similarity and graph features, such as the number of shared neighbours, and returns a match probability. Only links above a threshold are written back to the graph, and low-confidence links stay as weak edges.
+Keep the embedding as one feature, not the decision. Hold out known links to measure precision at the threshold. Wrong merges cost more than missed ones in advertising and privacy terms, so choose the threshold for high precision. Treat vectors and graph as personal data under your privacy policy.
+used: Common in identity resolution and fraud-ring detection; graph embeddings and graph neural networks both score likely matches; open-source options are PyTorch Geometric, DGL and PyTorch-BigGraph.
+avoid: When deterministic keys exist (a logged-in user id): use them directly. Do not merge identities on similarity alone where a wrong merge is costly.
+flow:
+  Device events [topic: logins and IPs] -> Edge builder [svc: link rules] : link evidence | Rules turn shared logins and networks into weighted edges.
+  Edge builder -> Identity graph [db: devices and accounts] : upsert edges | The graph keeps one node per identifier and one edge per link.
+  Identity graph -> Embedding job [svc: node2vec daily] : edge list | A scheduled job trains vectors of 128 numbers on the graph.
+  Embedding job -> Vector store [store: device vectors] : publish vectors | Vectors are stored for fast nearest-neighbour lookups.
+  Match service [svc] -> Vector store : nearest devices | For one device, the service fetches the closest devices as candidates.
+  Match service -> Scoring model [model: gradient boosting] : similarity and graph stats | The model combines vector similarity with shared-neighbour counts.
+  Scoring model -> Identity graph : link, score 0.93 | A link above the threshold is written back with its score.
+  Scoring model -x> Match service : score 0.41, no link | A low score is kept as a weak edge, not merged.
+ref: paper | DeepWalk: Online Learning of Social Representations | Perozzi, Al-Rfou & Skiena, KDD 2014 | https://arxiv.org/abs/1403.6652
+ref: paper | Network Embedding as Matrix Factorization | Qiu, Dong, Ma & Li, WSDM 2018 | https://arxiv.org/abs/1710.02971
+
+@@ itp
+== Proved model plus differential testing
+kind: machine-checked-proof
+when: A security-critical component must ship as fast, idiomatic code in a mainstream language, but you still want machine-checked guarantees about its behaviour.
+how: The team writes an executable model of the component in a proof assistant, here Lean. They state the key properties, for example "a forbid rule always wins", and prove them. The Lean kernel checks every proof. The production code is written separately, for example in Rust, for speed and ease of maintenance.
+A differential test then links the two. A fuzzer generates random inputs, runs them through both the model and the production code, and compares the outputs. Any difference is a bug in one of them. Properties of parts that are not modelled are covered by property-based tests.
+The Cedar authorization language was built this way. The Cedar team reports that proofs found 4 bugs in the validator, and differential random testing and property-based testing found 21 more. The guarantee has a limit: the proof covers the model, and the testing, not a proof, connects the model to the code.
+used: Cedar, the policy language of Amazon Verified Permissions, as described in the Cedar paper (Lean model and proofs, Rust implementation).
+avoid: When the component is large or changes weekly, or the specification is unclear; use property-based testing and model checking.
+flow:
+  Property list [note: forbid wins] -> Lean model [svc: executable model] : formalize | Engineers turn the English requirements into an executable model and formal statements.
+  Lean model -> Lean kernel [svc: proof checker] : proof terms | The kernel checks every proof; only checked theorems count.
+  Lean kernel -x> Lean model : proof fails, bug found | A failed proof shows a flaw in the model; Cedar found 4 validator bugs this way.
+  Fuzzer [svc: random inputs] -> Lean model, Rust code [svc: production] : same input | The fuzzer sends the same random request to both implementations.
+  Lean model, Rust code -> Comparator [svc: diff outputs] : two decisions | The comparator checks that both decide the same way.
+  Comparator -x> Rust code : mismatch | A mismatch is a bug in the code or the model; Cedar found 21 more bugs with testing.
+ref: paper | How We Built Cedar: A Verification-Guided Approach | Disselkoen et al., AWS, 2024 | https://arxiv.org/abs/2407.01688
+
+== Refinement proof from spec to code, gated in CI
+kind: machine-checked-proof
+when: A small core, such as a kernel or a compiler, must be correct for all inputs, and the proof must cover the shipped code.
+how: The proof is built in layers. An abstract specification says what the system must do, in a few pages of logic. An executable model refines it, and the real source code, here C, is translated into the logic by a parser written in the prover. Each layer is proved to behave as the layer above. The seL4 team did this in Isabelle/HOL for a kernel of about 10,000 lines of code, with about 200,000 lines of proof script.
+Proofs break when code changes, so the proof build runs as a gate in continuous integration. A change is merged only if all affected theories still check. Build systems cache results, so only changed sessions and those above them are re-checked.
+The assumptions stay outside the proof: hardware, the compiler (or a separate translation validation step) and unverified boot code. Write them down and review them with the specification.
+used: seL4 (Isabelle/HOL); CompCert, a C compiler proved in Rocq (formerly Coq); CompCert 3.18 (August 2026) works with Rocq 9.2.
+avoid: When the code is large, changes often or has no clear specification; verify a small trusted core and test the rest.
+flow:
+  Abstract spec [note: Isabelle theory] -> Executable model [svc: refines spec] : refinement proof | A proof shows the model behaves as the abstract specification says.
+  Executable model -> C code [store: kernel source] : refinement proof | A second proof shows the C code behaves as the model does.
+  Developer [user] -> C code : pull request | A developer changes the source code.
+  C code -> CI proof build [svc: Isabelle build] : re-check theories | CI re-checks the proofs that depend on the change.
+  CI proof build -x> Developer : proof broken | A failed proof blocks the merge; the developer fixes the code or the proof.
+  CI proof build -> Release [store: proved kernel] : all theories pass | Only a fully checked version is released.
+ref: docs | seL4 white paper | seL4 Foundation | https://sel4.systems/About/seL4-whitepaper.pdf
+ref: docs | CompCert, compilers you can formally trust | INRIA and AbsInt | https://compcert.org/

@@ -1,0 +1,823 @@
+@@ unity
+== Credential vending for direct storage access
+kind: valet-key, zero-trust
+when: Many engines must read governed tables in cloud storage, but nobody should hold permanent cloud keys.
+how: Users and engines never get a bucket key. An engine (Spark, Trino, DuckDB) asks Unity Catalog for a table by its three-part name, for example main.sales.orders. Unity Catalog checks the caller's grants on the catalog, schema and table.
+If the check passes, Unity Catalog calls the cloud token service (AWS STS, Azure or Google equivalents) and gets a temporary credential. The credential is limited to the table's storage path and expires in about an hour. The engine then reads the Parquet files directly from object storage, so the data never passes through the catalog.
+The result is one place for permissions, with enforcement at the storage layer. Revoking a grant stops new credentials at once. Credentials already issued stay valid until they expire.
+used: Databricks Unity Catalog on all three clouds; the open-source Unity Catalog server exposes a temporary-credential API for external engines.
+avoid: When data is small and one team owns it; plain bucket policies are simpler. Also avoid it for engines that cannot use temporary credentials.
+flow:
+  Spark job [client: engine] -> Unity Catalog [svc: grants + metadata] : get main.sales.orders | The engine asks for a table by its three-part name.
+  * Unity Catalog: SELECT grant ok | The catalog checks grants on the catalog, schema and table, and finds the grant.
+  Unity Catalog -> Cloud STS [svc: token service] : mint scoped token | After the check passes, the catalog asks the cloud for a temporary token for one path.
+  Cloud STS -> Spark job : short-lived credential | The engine receives a credential that expires in about an hour.
+  Spark job -> S3 bucket [lake: Parquet files] : read files | The engine reads the data files directly with the temporary credential.
+  Spark job -x> S3 bucket : expired token | After expiry the read is rejected, so the engine must ask the catalog again.
+ref: docs | Unity Catalog open source documentation | Unity Catalog project | https://docs.unitycatalog.io/
+
+== Three-level namespace with inherited grants
+kind: control-data-plane, zero-trust
+when: Many workspaces and teams share one lakehouse and need one central rule book for who can see what.
+how: One metastore per region holds the whole tree: catalog, then schema, then table, view, volume, model or function. A grant on a parent flows down to every child. Giving a group USE CATALOG on prod and SELECT on prod.sales lets it read all current and future tables in that schema.
+Row filters and column masks are functions attached to a table. The engine applies them when it plans the query, so two users running the same SQL see different rows. Workspaces are only compute; they attach to the metastore, so one set of rules holds in every workspace.
+Group membership comes from the identity provider (SCIM sync), so a leaver loses access in one place. Typical layout: one catalog per environment or business domain, one schema per data product.
+used: Databricks workspaces attached to one Unity Catalog metastore; teams that map one catalog per domain in a data mesh.
+avoid: When you must also govern data that never goes through a Unity Catalog-aware engine; direct file access then bypasses the rules.
+flow:
+  Analyst [user] -> SQL warehouse [svc: compute] : SELECT from prod.sales | An analyst runs a query in any workspace.
+  SQL warehouse -> Unity Catalog [svc: metastore] : resolve + check grants | The warehouse asks the central metastore, not a local one.
+  Unity Catalog -> SQL warehouse : allowed, mask email column | Grants are inherited from the schema, and a column mask is returned with the plan.
+  SQL warehouse -> Delta table [lake: files] : read masked data | The warehouse reads the files and applies the mask while it runs.
+  SQL warehouse -> Analyst : result | The analyst sees masked values; an admin running the same SQL sees real ones.
+  SCIM sync [svc: identity sync] ~> Unity Catalog : group changes | Group membership is synced from the identity provider.
+ref: docs | Unity Catalog documentation | Databricks | https://docs.databricks.com/en/data-governance/unity-catalog/index.html
+
+== Query-time lineage and audit capture
+kind: observability-pipeline
+when: You must answer who used which column, and what breaks downstream if a source table changes.
+how: Because every engine goes through the catalog, the catalog can see each read and write. When a query runs, the engine reports the tables and columns it read and the ones it wrote. Unity Catalog stores these edges as lineage, down to column level.
+An audit event is written for each access: user, action, object and time. Both streams land in system tables that you can query with SQL. A table owner can ask which dashboards read this column before dropping it.
+Lineage is only as complete as the engines that report it. Jobs that read raw files by path, outside the catalog, leave gaps. The edges also cost storage, so they are kept for a limited time, about a year on Databricks.
+used: Databricks lineage and audit system tables; compliance reviews and impact analysis before schema changes.
+avoid: When the main engines do not report lineage; use a separate OpenLineage collector instead.
+flow:
+  Pipeline job [svc: Spark] -> Unity Catalog [svc: governance] : read raw, write silver | The job reports its inputs and outputs while it runs.
+  Unity Catalog -> Lineage store [db: column edges] : add edges | Column-level edges are recorded.
+  Unity Catalog -> Audit log [log: access events] : who, what, when | Every access becomes an audit event.
+  BI dashboard [client] -> Unity Catalog : read gold.revenue | A dashboard read is recorded as a downstream edge.
+  Data owner [user] -> Lineage store : who reads silver.price? | Before a change, the owner queries the edges for impact.
+ref: docs | Data lineage in Unity Catalog | Databricks | https://docs.databricks.com/en/data-governance/unity-catalog/data-lineage.html
+
+@@ browser
+== Rendering pipeline as staged filters
+kind: pipes-filters, offload-accelerator
+when: A page must turn HTML, CSS and JavaScript into 60 frames per second without redoing all the work each time.
+how: The browser runs a fixed chain of stages. It parses HTML into the DOM and CSS into style rules. It then computes each element's style, runs layout (box sizes and positions), and paints the elements into draw commands.
+The main thread does the early stages. A compositor thread and the GPU process do the late stages: raster turns commands into pixels in tiles, and the compositor stacks layers into the final frame. A change that touches only transform or opacity can skip layout and paint and run on the compositor alone.
+So the cost of a change depends on how early it enters the chain. Changing width forces layout, paint and composite. Changing transform forces only composite. At 60 fps the whole frame has a budget of about 16 ms.
+used: Blink in Chrome and Edge, WebKit in Safari and Gecko in Firefox all use this staged design with GPU compositing.
+avoid: Do not animate layout properties such as width or top; animate transform and opacity instead.
+flow:
+  HTML + CSS [note: bytes from network] -> Main thread [svc: parse + style + layout] : DOM and style rules | The main thread builds the DOM, then computes style and layout.
+  Main thread -> Paint step [svc: draw commands] : layout tree | Each element becomes a list of draw commands.
+  Paint step -> GPU raster [svc: GPU process: tiles] : display list | The GPU process turns commands into pixel tiles.
+  GPU raster -> Compositor [svc: layers] : tiles | The compositor stacks the layers into one frame.
+  Compositor -> Screen [client] : frame at 60 fps | The frame is shown; a transform change would start here and skip the earlier stages.
+ref: blog | Inside look at modern web browser | Mariko Kosaka, Google Chrome Developers, 2018 | https://developer.chrome.com/blog/inside-browser-part3
+
+== Process-per-site isolation
+kind: bulkhead, zero-trust
+when: Untrusted pages run on the same machine as the user's other tabs, accounts and files.
+how: A modern browser splits itself into processes with different power. A browser process runs the UI and holds permissions. A network process makes requests. A GPU process draws. Each site gets its own renderer process in a sandbox that cannot read files or open sockets.
+The renderer asks the browser process for anything outside its box, such as camera access or a file. The browser process checks the permission first. Cross-site iframes run in separate renderer processes, so a page cannot read another site's memory even through a CPU side-channel attack such as Spectre.
+The cost is memory: each process adds tens of megabytes. A crash or exploit in one renderer is contained to that site, and the other tabs keep working.
+used: Chrome site isolation; Firefox Fission; Safari uses separate web content processes.
+avoid: Not a choice for the page author, but on low-memory devices browsers reduce isolation to save RAM.
+flow:
+  Browser process [svc: UI + permissions] -> Renderer bank.com [svc: sandbox] : navigate | The browser starts a sandboxed renderer for each site.
+  Browser process -> Renderer ads.example [svc: sandbox] : cross-site iframe | An iframe from another site goes to a different renderer process.
+  Renderer ads.example -x> Renderer bank.com : read memory | The ad renderer cannot read the bank's memory, even with a timing attack.
+  Renderer ads.example -> Browser process : request camera | A renderer must ask for anything outside its sandbox.
+  Browser process -> Network process [svc: network] : fetch URL | Network access is done by a separate process, with checks applied.
+ref: docs | Site Isolation | Chromium project | https://www.chromium.org/Home/chromium-security/site-isolation/
+
+== HTTP cache with a service worker
+kind: cache-aside, cdn-edge
+when: A web app should load fast on repeat visits and still work with a poor or no network.
+how: The browser cache stores responses by URL. A response with Cache-Control: max-age=31536000, immutable is reused for a year with no request. Files get a hash in their name (app.3f2a.js), so a new release uses a new URL.
+For HTML, the server sends an ETag. The browser asks If-None-Match and gets a tiny 304 reply when nothing changed. A service worker adds a programmable layer in front of the network. It can answer from its own Cache Storage first and update in the background, or answer from the network first and fall back to cache when offline.
+This gives three layers: the service worker, the HTTP cache, and a CDN. The risk is stale content, so versioned file names and a clear update rule matter.
+used: Progressive web apps; Workbox strategies such as stale-while-revalidate; sites that put hashed assets behind a CDN.
+avoid: Do not cache personalised or private HTML in a shared cache; use Cache-Control: private or no-store.
+flow:
+  Page [client] -> Service worker [svc: fetch handler] : fetch /app.3f2a.js | Every request from the page passes through the service worker.
+  Service worker -> Cache Storage [cache: precached assets] : lookup | The worker looks in its own cache first.
+  Cache Storage -> Page : hit, no network | A hit returns at once and works offline.
+  Service worker -> CDN [cache: edge] : GET /index.html + ETag | For HTML the worker revalidates with the server.
+  CDN -> Service worker : 304 Not Modified | The server confirms the copy is current, with almost no bytes sent.
+  Service worker ~> Cache Storage : refresh in background | On a change the new copy is stored for the next visit.
+ref: docs | HTTP caching | MDN Web Docs | https://developer.mozilla.org/en-US/docs/Web/HTTP/Caching
+
+@@ git
+== Content-addressed object store
+kind: copy-on-write
+when: You need cheap branches, safe history and a way to detect any corruption or tampering.
+how: Git stores four kinds of object, each named by the hash of its content: blob (file bytes), tree (a folder listing of names and hashes), commit (a tree hash, parent hashes, author, message) and tag. Hashes are SHA-1 today; SHA-256 repositories exist and are planned to become the default.
+A commit holds the hash of its parents, so the history is a chain of hashes: changing one old byte changes every later commit id. An unchanged file in a new commit points to the same blob, so a snapshot costs only what changed. A branch is just a 41-byte file that holds one commit id.
+Objects are never edited. Periodic garbage collection packs them into pack files and stores similar objects as deltas, which makes a repository of years of history only a little bigger than the latest checkout.
+used: Every Git hosting service; the same idea appears in Docker image layers, IPFS and Nix stores.
+avoid: Large binary files that change often; they bloat history. Use Git LFS or an artifact store.
+flow:
+  Developer [user] -> Working tree [store: files] : edit app.py | The developer changes one file.
+  Working tree -> Object store [store: .git/objects] : git add: blob a1b2 | The new content is stored as a blob named by its hash.
+  * Object store: tree c3d4 built | A new tree reuses the hashes of unchanged files and points to the new blob.
+  Object store -> Branch ref [note: main] : commit e5f6, parent 9a8b | The commit records the tree and its parent hash.
+  Branch ref -> Object store : move pointer | The branch moves to the new commit; nothing old is changed.
+ref: book | Pro Git, chapter 10: Git Internals | Scott Chacon and Ben Straub | https://git-scm.com/book/en/v2/Git-Internals-Plumbing-and-Porcelain
+
+== GitOps: Git as desired state
+kind: gitops, control-loop
+when: You want every infrastructure or deployment change reviewed, versioned and easy to roll back.
+how: The desired state of the system (Kubernetes manifests, Helm values, Terraform files) lives in a Git repository. Engineers change it only through pull requests. CI checks the change and a human reviews it. Merging to main is the deployment decision.
+An agent inside the cluster (Argo CD or Flux) polls the repository or receives a webhook. It compares Git with the live cluster and applies the difference. If someone edits the cluster by hand, the agent notices the drift and puts the state back.
+Rollback is git revert. The audit trail is the commit log. Credentials stay inside the cluster, because CI never needs to push to it. The cost is a second repository and slower emergency fixes.
+used: Argo CD and Flux, both CNCF projects; platform teams that run many clusters from one config repository.
+avoid: For tiny setups with one server, or for secrets, which should not be stored in plain text in Git.
+flow:
+  Engineer [user] -> Config repo [store: Git main] : pull request | A change to the manifests is proposed as a pull request.
+  CI [svc: checks] -> Config repo : lint + dry run | Automatic checks must pass before merge.
+  Config repo -> Argo CD [svc: in-cluster agent] : new commit | The agent sees the new commit on main.
+  Argo CD -> Kubernetes [svc: cluster: 3 nodes] : apply diff | The agent applies only what differs from the live state.
+  Kubernetes -> Argo CD : live state | The agent reads back the live state and reports sync status.
+  Operator [user] -x> Kubernetes : kubectl edit by hand | A manual edit creates drift.
+  Argo CD ~> Kubernetes : revert drift | The agent restores the state that Git declares.
+ref: docs | OpenGitOps principles | OpenGitOps, CNCF | https://opengitops.dev/
+
+== Bisection to find a bad commit
+kind: bisection
+when: A bug appeared somewhere in hundreds of commits and you do not know which one caused it.
+how: Mark one commit as good and one as bad. git bisect checks out the commit in the middle and asks for a verdict. Each answer halves the range, so 1,000 commits need about 10 tests, not 1,000.
+With git bisect run <script>, a script returns exit code 0 for good and non-zero for bad, and Git finds the first bad commit with no human. Because history is a graph, Git picks the middle in terms of commits that are still possible suspects, even after merges.
+The method needs a fast and reliable test, and history in which most commits build. Squashed or broken-build commits make the answer unclear. Large projects run it in CI against a failing test.
+used: Linux kernel regression hunts; Chromium and Firefox have automated bisect tools built on the same idea.
+avoid: When the test is flaky; the search then goes the wrong way. Fix or repeat the test first.
+flow:
+  Developer [user] -> git bisect [svc: bisect driver] : start: v1.0 good, HEAD bad | The developer names one good and one bad commit, 1,000 apart.
+  git bisect -> Test script [svc: build + test] : checkout commit 500 | Git checks out the middle commit.
+  Test script -> git bisect : exit code 1, bad | The test fails, so the bug is in the first half.
+  git bisect -> Test script : checkout commit 250 | The range is halved again.
+  Test script -> git bisect : exit code 0, good | The test passes, so the bug entered between 250 and 500.
+  git bisect -> Developer : first bad commit 3c9e | After about 10 steps one commit is left.
+ref: docs | git-bisect | Git documentation | https://git-scm.com/docs/git-bisect
+
+@@ jupyter
+== Client and kernel over a message protocol
+kind: async-request-reply, pubsub
+when: A user wants to run code step by step in a live process, from a browser, without blocking the page.
+how: The notebook page or editor is only a client. It sends an execute_request message to a kernel, a separate process that holds the Python interpreter and all variables. Messages are JSON, sent over ZeroMQ sockets (or WebSockets between browser and server).
+The kernel has several channels. The shell channel carries the request and the final execute_reply. The IOPub channel is a broadcast: the kernel publishes status, stdout text, plots and errors, and every connected client sees them. Two browser tabs on the same notebook, or a notebook and a console, can watch one kernel.
+Because the state lives in the kernel, variables survive between cells. The price is hidden state: running cells out of order gives results that a fresh top-to-bottom run will not give. Restart the kernel and run all before you share a notebook.
+used: Jupyter Server with IPython, R, Julia and many other kernels; JupyterLab, VS Code and Google Colab use the same kernel protocol.
+avoid: For production jobs that must be repeatable; turn the notebook into a script or a parameterised run instead.
+flow:
+  Notebook UI [client: browser] -> Jupyter server [svc: WebSocket proxy] : run cell | The page sends the cell text over a WebSocket.
+  Jupyter server -> IPython kernel [svc: Python process: x=5] : execute_request | The server forwards it on the shell channel.
+  IPython kernel -> Notebook UI : status: busy | On the IOPub channel the kernel says it is busy.
+  IPython kernel -> Notebook UI, VS Code console [client] : stream, display_data | Output is broadcast to every client that is attached.
+  IPython kernel -> Jupyter server : execute_reply | The kernel sends the final reply with status ok or error.
+  * IPython kernel: x=5, y=10 | The new variable y stays in memory for the next cell.
+ref: docs | Messaging in Jupyter | Jupyter Client documentation | https://jupyter-client.readthedocs.io/en/stable/messaging.html
+
+== Hub that spawns one server per user
+kind: federated-identity, horizontal-scale
+when: A class or data team needs hundreds of notebook users on shared hardware, each with an isolated environment.
+how: JupyterHub is a front door. A proxy (configurable-http-proxy) receives all traffic. The Hub signs the user in through an authenticator, for example OAuth with the company identity provider. It then asks a spawner to start a single-user notebook server for that person.
+On Kubernetes, the KubeSpawner starts one pod per user with a CPU and memory limit and a persistent volume for their files. The proxy adds a route /user/alice that points to that pod. Idle servers are culled after, say, 1 hour, which frees the node. The cluster autoscaler adds nodes when many pods are pending, for example when a class starts.
+Isolation is by container, so kernels from different users do not share memory. The weak point is cost: idle GPUs held by notebooks are a common waste, so culling rules matter.
+used: The Zero to JupyterHub with Kubernetes project; university courses; research clusters and data science platforms built on JupyterHub.
+avoid: For a single user or a small team; run JupyterLab locally or use a managed notebook service.
+flow:
+  Alice [user] -> Proxy [svc: routes /user/*] : open /hub/login | Alice opens the Hub address in her browser.
+  Proxy -> JupyterHub [svc: auth + spawner] : login | The Hub checks her identity with the OAuth provider.
+  JupyterHub -> Kubernetes [svc: KubeSpawner] : start pod for alice | The spawner asks the cluster for one pod with 2 CPUs and 8 GB of memory.
+  Kubernetes -> Alice's server [svc: pod + volume] : pod running | The pod starts and mounts her home volume.
+  JupyterHub -> Proxy : add route /user/alice | The Hub registers the route to her pod.
+  Proxy -> Alice's server : notebook traffic | Later requests go straight to her pod, not through the Hub.
+  JupyterHub ~> Alice's server : cull after 1 h idle | An idle server is stopped to free the node.
+ref: docs | Zero to JupyterHub with Kubernetes | JupyterHub project | https://z2jh.jupyter.org/
+
+== Parameterised notebook as a scheduled job
+kind: scheduler-agent, etl-elt
+when: An analysis written in a notebook must run every day on new data, and its output must be saved.
+how: A notebook gets a cell tagged parameters with default values, such as run_date. A runner (Papermill is a common one) injects new values, starts a kernel and executes all cells top to bottom. It saves the executed notebook, with outputs and any errors, as a new file.
+A scheduler such as Airflow calls the runner once per day, for each date, and retries on failure. The executed notebook goes to object storage, and nbconvert can turn it into HTML for a report. If a cell fails, the saved file shows which one, which makes debugging easy.
+This turns exploration into production with little rewriting. The limits: notebooks are hard to unit test and review as diffs, so move shared logic into a normal Python package that the notebook imports.
+used: Papermill with Airflow or Kubernetes jobs; Netflix described scheduling notebooks this way in a 2018 engineering post; Databricks Jobs can also run notebooks.
+avoid: For heavy and critical pipelines; write them as tested modules and use the notebook only for the report.
+flow:
+  Airflow [svc: scheduler] -> Papermill [svc: runner: run_date param] : daily run 2026-10-27 | The scheduler starts one run per day with the date as a parameter.
+  Papermill -> Kernel [svc: IPython] : execute all cells | The runner injects the parameters and runs every cell in order.
+  Kernel -> Warehouse [db: SQL] : query for that date | The notebook reads one day of data.
+  Kernel -> Papermill : outputs, charts | Results come back and are written into the notebook.
+  Papermill -> Object store [store: executed .ipynb] : save run notebook | The executed copy is stored as a record of the run.
+  Kernel -x> Papermill : cell 7 raised error | On error the runner marks the task failed and the scheduler retries.
+ref: docs | Papermill documentation | nteract project | https://papermill.readthedocs.io/
+
+@@ react
+== Render, diff and commit loop
+kind: control-loop
+when: A UI has much changing state, and you want to describe the screen as a function of state, not edit the DOM by hand.
+how: A component is a function from state and props to a description of the UI (a tree of elements). When state changes, React calls the function again and gets a new tree. It compares this tree with the previous one (reconciliation), and finds the smallest set of changes.
+Only then does it touch the real DOM, in one batch called the commit. Several setState calls in one event are batched into one render. React 18 and later can split rendering into small slices and pause for urgent input, such as typing, so the page stays responsive.
+Keys on list items tell React which item is which, so a reorder moves nodes and does not rebuild them. The loop is simple to reason about, but extra renders cost time when a parent re-renders many children; memoization and a smaller state scope fix this.
+used: Facebook and Instagram web, and a very large share of single-page apps; React Native uses the same loop with native views as the target.
+avoid: For mostly static pages; plain HTML or server templates are lighter.
+flow:
+  User [user] -> Button [client: onClick] : click | The user clicks and the event handler calls setCount.
+  Button -> Component [svc: function count=0] : state update | React schedules a render; two updates in one event are batched.
+  Component -> Reconciler [svc: diff old vs new tree] : new element tree | The component runs again and returns a new tree.
+  * Component: count=1, tree v2 | The reconciler finds that only one text node differs.
+  Reconciler -> DOM [store: browser DOM] : set text "1" | The commit changes only that node, in one batch.
+  DOM -> Screen [client] : layout + paint | The browser lays out and paints the change.
+ref: docs | Preserving and resetting state | React documentation | https://react.dev/learn/preserving-and-resetting-state
+
+== Server rendering with hydration
+kind: precompute, cdn-edge
+when: A page must show content fast and be indexed by search engines, but still be interactive afterwards.
+how: The server runs the same components and produces HTML. The browser shows this HTML at once, before any JavaScript has loaded, which helps first paint and search crawlers. For pages that rarely change, the HTML can be built ahead of time and cached on a CDN.
+Then the JavaScript bundle loads, and React hydrates: it walks the existing DOM, attaches event handlers and adopts the markup, without drawing it again. Until hydration finishes, clicks do nothing, so bundle size matters. Streaming SSR sends the shell first and fills slower parts later, each inside a Suspense boundary.
+React Server Components go further: some components run only on the server and send no code to the browser, so database access and big libraries stay off the client. Frameworks such as Next.js wire these parts together.
+used: Next.js, Remix and React Router framework mode; e-commerce and news sites that need fast first paint and good search ranking.
+avoid: For internal dashboards behind a login where search ranking does not matter; a client-only app is simpler.
+flow:
+  Browser [client] -> CDN [cache: edge HTML] : GET /product/42 | The browser requests the page; the CDN may already hold the HTML.
+  CDN -> Node server [svc: React SSR] : cache miss | On a miss the origin renders the components to HTML.
+  Node server -> Product API [svc: data] : fetch product 42 | The server loads data before it renders.
+  Node server -> Browser : HTML + script tags | The browser shows content at once.
+  Browser -> CDN : GET main.js | The bundle is loaded from the CDN, with a hashed name.
+  * Browser: hydrated | React attaches handlers to the existing HTML; the page is now interactive.
+ref: docs | hydrateRoot | React documentation | https://react.dev/reference/react-dom/client/hydrateRoot
+
+== Server-state cache with optimistic update
+kind: cache-aside
+when: Many components show the same data from an API, and you want fewer requests and instant-feeling updates.
+how: A data library (TanStack Query, SWR, or Relay) keeps a client-side cache keyed by request, for example ["todos"]. A component asks for the key. A fresh cache entry is returned at once. A stale entry is returned and refetched in the background (stale-while-revalidate). Two components asking for the same key share one request.
+For a write, the library can update the cache first (an optimistic update) and send the request after. If the server rejects it, the cache rolls back to the saved copy and the UI shows an error. On success, the key is marked stale and refetched, so the cache converges with the server.
+This keeps remote data out of component state and removes much hand-written loading code. The risk is showing a value that the server later rejects, so use optimistic updates only for actions that rarely fail.
+used: TanStack Query, SWR and Apollo Client in React apps; Relay at Meta.
+avoid: When data must be exactly current on every view, such as a bank balance before a transfer; fetch and confirm first.
+flow:
+  TodoList [client: component] -> Query cache [cache: key todos] : useQuery(todos) | The component asks the cache for the key.
+  Query cache -> TodoList : stale data now | A stale copy is shown at once.
+  Query cache -> API [svc: REST] : refetch todos | The cache refreshes the data in the background.
+  TodoList -> Query cache : add todo (optimistic) | The user adds an item; the cache shows it before the server replies.
+  Query cache -> API : POST /todos | The write is sent to the server.
+  API -x> Query cache : 422 rejected | The server rejects the change.
+  * Query cache: rolled back | The cache restores the saved copy and the UI shows an error.
+ref: docs | Optimistic Updates | TanStack Query documentation | https://tanstack.com/query/latest/docs/framework/react/guides/optimistic-updates
+
+@@ webrtc
+== NAT traversal with STUN and TURN fallback
+kind: nat-traversal
+when: Two peers behind home routers or company firewalls must send media directly, and still connect when direct paths fail.
+how: Each peer asks a STUN server what its public IP and port look like from outside. This gives a server-reflexive candidate. It also lists its local addresses and, if configured, a relay address allocated on a TURN server. ICE gathers all these candidates.
+The peers swap candidates through the signalling channel and test pairs with STUN checks. The best working pair is chosen, usually a direct path. If both sides are behind strict NATs, or UDP is blocked, the pair that works is the TURN relay, which forwards the encrypted media for both.
+A relay costs real bandwidth: a 2 Mbit/s video call relayed through TURN uses about 4 Mbit/s on your server. Many deployments see a minority of calls, often around 10 to 20 percent, that need a relay, so size TURN for that.
+used: coturn, the common open-source TURN server; Google Meet, Zoom's browser client and many other products rely on ICE for connectivity.
+avoid: For server-to-client streaming with a public server address; a plain server with a public IP does not need peer NAT traversal.
+flow:
+  Peer A [client: behind NAT] -> STUN server [svc: public] : what is my address? | Peer A learns its public address and port.
+  STUN server -> Peer A : 203.0.113.7:50000 | The reply gives a reflexive candidate.
+  Peer A -> Peer B [client: behind NAT] : candidates via signalling | The peers exchange their candidate lists.
+  Peer A -> Peer B : ICE connectivity checks | Each candidate pair is tested with a STUN check.
+  Peer A -x> Peer B : direct path blocked | A strict firewall drops the direct packets.
+  Peer A -> TURN relay [svc: coturn] : allocate relay | The peer falls back to a relay address.
+  TURN relay -> Peer B : forwarded media | The relay forwards the encrypted media in both directions.
+ref: spec | RFC 8445: Interactive Connectivity Establishment (ICE) | IETF, 2018 | https://www.rfc-editor.org/rfc/rfc8445
+
+== Selective forwarding unit for group calls
+kind: pubsub, fan-out-write
+when: A call has more than three or four people, and a full mesh of direct connections would overload each client.
+how: In a mesh with N people, each client sends N-1 copies of its video. With 8 people, that is 7 uploads, which most laptops and phones cannot do. Instead, each client sends one stream to a Selective Forwarding Unit (SFU), a server that does not decode the video.
+The SFU copies packets to every subscriber. A client often sends simulcast: the same video at three sizes, such as 1080p, 360p and 180p. The SFU picks the layer that fits each receiver's bandwidth, so one weak phone does not slow everyone. Media stays encrypted hop by hop (DTLS-SRTP); end-to-end encryption needs extra insertable streams work.
+An SFU is cheaper than an MCU, which decodes and mixes video, but each viewer still downloads one stream per speaker shown.
+used: Open-source SFUs such as mediasoup, Janus, Pion-based servers and LiveKit; Google Meet and Jitsi use SFU designs.
+avoid: For one-to-one calls, where direct peer-to-peer is cheaper; or for very large live audiences, where a CDN is better.
+flow:
+  Presenter [client: simulcast] -> SFU [svc: forwards RTP] : 3 layers, 1080p to 180p | The presenter uploads three quality layers once.
+  SFU -> Laptop viewer [client: good link] : 1080p layer | A viewer with a fast link gets the high layer.
+  SFU -> Phone viewer [client: weak link] : 360p layer | A viewer on a weak link gets a smaller layer.
+  Phone viewer -> SFU : bandwidth estimate | The viewer reports packet loss and bandwidth through RTCP.
+  * SFU: phone moved to 180p | The SFU switches only that viewer to the lowest layer.
+  SFU ~> Presenter : keyframe request | When a layer switches, the SFU may ask for a new keyframe.
+ref: docs | LiveKit documentation: how it works | LiveKit | https://docs.livekit.io/
+
+== Signalling as control plane, media as data plane
+kind: control-data-plane
+when: You build a live video product and must decide what goes over your servers' HTTP APIs and what goes peer to peer or to a media server.
+how: WebRTC does not define signalling. Your app picks the way peers swap offers and answers (SDP): a WebSocket server, a REST call, a chat message. This path is low volume, needs login, and is where you check who may join which room.
+After the offer and answer, media goes on a separate path over UDP, encrypted with DTLS-SRTP. This path is high volume and time sensitive. It goes peer to peer or to a media server. The two paths can scale separately: signalling in a stateless web tier, media on servers with fast networking.
+WHIP (RFC 9725) standardises the simplest signalling: the encoder makes one HTTP POST with its SDP offer and gets the answer back. This lets tools such as OBS publish to a WebRTC server without custom code.
+used: OBS Studio publishing over WHIP; LiveKit, Janus, mediasoup and cloud video platforms that separate their signalling API from the media servers.
+avoid: Do not push media through the signalling server; it cannot carry the load and adds delay.
+flow:
+  Encoder [client: OBS] -> Signalling API [svc: HTTP + auth] : POST SDP offer | The encoder sends its offer and a token with one HTTP request.
+  Signalling API -> Media server [svc: WebRTC SFU] : create session | The API picks a media server and asks it to accept the stream.
+  Media server -> Signalling API : SDP answer | The media server returns its answer and ICE details.
+  Signalling API -> Encoder : 201 + answer | The encoder gets the answer and starts ICE.
+  Encoder -> Media server : SRTP over UDP | Media now flows on the data path, not through the API.
+  Media server -> Viewers [client: many] : forward streams | Viewers subscribe to the stream from the media server.
+ref: spec | RFC 9725: WebRTC-HTTP Ingestion Protocol (WHIP) | IETF, 2025 | https://www.rfc-editor.org/rfc/rfc9725
+
+@@ agents
+== Tool-use loop with stop condition
+kind: agent-loop
+when: A task needs several steps whose order depends on what each tool returns, such as fixing a failing test or researching a question.
+how: The program sends the model the goal, the history and a list of tool definitions (name, description, JSON schema for arguments). The model replies with text or with a tool call. The program runs the tool in its own code, appends the result to the history and calls the model again.
+The loop ends when the model answers with no tool call, or when a limit is reached: for example 30 steps, a token budget or a time limit. The limits matter, because an agent can loop forever or spend a lot of money on one task.
+Each turn re-sends the whole history, so cost grows with length. Prompt caching makes the repeated prefix cheaper, and context management (summaries, clearing old tool output) keeps the window from filling up. Tool errors go back to the model as text, so it can retry with a fix.
+used: Coding agents such as Claude Code; research and customer-support agents built on the tool-calling APIs of major model providers.
+avoid: When the steps are fixed and known; write a plain workflow in code, which is cheaper and more predictable.
+flow:
+  Harness [svc: loop + limits] -> LLM [model: tools + history] : goal + tool list | The harness sends the goal, the history and the tool definitions.
+  LLM -> Harness : tool_call run_tests | The model asks to run the tests instead of answering.
+  Harness -> Shell tool [svc: sandbox] : pytest | The harness runs the tool; the model never runs code itself.
+  Shell tool -> Harness : 2 failed, trace | The tool output is captured as text.
+  Harness -> LLM : append result | The result is added to the history and the model is called again.
+  LLM -> Harness : final answer | With no tool call, the loop ends and the harness returns the answer.
+  Harness -x> LLM : step limit 30 reached | A hard limit stops a loop that does not converge.
+ref: blog | Building effective agents | Anthropic, 2024 | https://www.anthropic.com/engineering/building-effective-agents
+ref: paper | ReAct: Synergizing Reasoning and Acting in Language Models | Yao et al., ICLR 2023 | https://arxiv.org/abs/2210.03629
+
+== Orchestrator with sub-agents
+kind: llm-workflow, scheduler-agent
+when: A task is too big for one context window, or has parts that can be researched in parallel.
+how: A lead agent breaks the task into sub-tasks, for example "check each of five vendors". It starts one sub-agent per sub-task. Each sub-agent has a fresh context, its own tools and a short brief, and works alone.
+Sub-agents return a short summary, not their whole transcript. This keeps the lead's context small and lets the parts run in parallel, which cuts wall-clock time. The lead merges the summaries, checks gaps and writes the answer.
+The cost is tokens: multi-agent runs can use several times the tokens of one agent, so use them for high-value tasks. Failures spread, too: a wrong sub-result can mislead the lead, so ask for sources and verify key claims. Give each sub-agent clear limits on its task and tools.
+used: Anthropic described a multi-agent research system built this way in 2025; Claude Code sub-agents; LangGraph supervisor graphs.
+avoid: For tightly coupled tasks, such as editing one file, where agents must share every detail; one agent is better.
+flow:
+  Lead agent [svc: plans + merges] -> Search agent A [svc: fresh context], Search agent B [svc: fresh context], Search agent C [svc: fresh context] : sub-task + brief | The lead splits the task and gives each agent a short brief.
+  Search agent A -> Web search [svc: tool] : queries | Each sub-agent runs its own tool loop.
+  Search agent A, Search agent B, Search agent C -> Lead agent : 200-word summary | Each returns a short summary, not its full transcript.
+  * Lead agent: 3 summaries merged | The lead's context holds only the summaries, so it stays small.
+  Lead agent -> Citation checker [svc: verifier agent] : draft + sources | A last agent checks the claims against the sources.
+  Citation checker -> Lead agent : 2 claims unsupported | The lead fixes those claims before it answers.
+ref: blog | How we built our multi-agent research system | Anthropic, 2025 | https://www.anthropic.com/engineering/multi-agent-research-system
+
+== Sandboxed tools with approval gates
+kind: zero-trust, checkpoint-restart
+when: An agent can change files, send money or email, and a wrong or manipulated step must not cause damage.
+how: The agent runs its tools inside a sandbox: a container or VM with no secrets, limited disk and a network allow-list. Read-only actions run freely. Risky actions, such as deleting data, pushing to production or paying, pause and ask a person to approve.
+Text the agent reads from web pages or email is untrusted, because it may hold instructions (prompt injection). So tools get least privilege and the tool that reads untrusted text should not hold the power to send data out. Policy is enforced in code outside the model, not in the prompt.
+The harness writes a checkpoint after each step. After a crash, a rejected approval or a human edit, the run continues from the last checkpoint and not from the start. Logs of every tool call give an audit trail.
+used: Claude Code permission modes; LangGraph interrupts with checkpointers; cloud coding agents that run in isolated VMs.
+avoid: For read-only, low-risk assistants where approval prompts only train users to click yes.
+flow:
+  Agent [model: plans] -> Policy gate [svc: rules in code] : tool_call delete_rows | The agent asks to run a risky tool.
+  Policy gate -> Approver [user] : approve delete 4,000 rows? | The gate pauses the run and asks a person.
+  Approver -> Policy gate : approved | The person approves after reading the exact action.
+  Policy gate -> Sandbox [svc: no secrets] : run tool | The tool runs in a sandbox with least privilege.
+  Sandbox -> Checkpoint store [db: run state] : save step 12 | The harness saves state after the step.
+  Sandbox -x> Internet : POST to unknown host | The network allow-list blocks data leaving the sandbox.
+ref: docs | LangGraph interrupts and persistence | LangChain | https://langchain-ai.github.io/langgraph/concepts/persistence/
+
+@@ cv
+== Detect, track and count video analytics pipeline
+kind: pipes-filters, offload-accelerator
+when: Cameras produce video that must become events, such as people counts or lane violations, within about a second.
+how: Frames are decoded on the camera box or a server. Every frame, or every few frames, goes to an object detector (YOLO, or a similar CNN or transformer) on a GPU. Detections are boxes with a class and a score.
+A tracker (a Kalman filter plus matching by overlap, as in SORT or ByteTrack) links boxes between frames, so a person keeps the same id. Rules read the tracks: a line crossing becomes one event, and only that small event, not the video, is sent to the cloud.
+Engineers pick the frame rate and the model size by cost. Detection at 5 frames per second is often enough for counting and uses a sixth of the GPU of 30 fps. One GPU can serve many streams if frames are batched.
+used: NVIDIA DeepStream pipelines; retail people counting; traffic monitoring; open-source Ultralytics YOLO with ByteTrack.
+avoid: When a simple motion sensor or a single frame check is enough; a deep model adds cost and upkeep.
+flow:
+  Camera [client: RTSP, 30 fps] -> Decoder [svc: GPU decode] : H.264 stream | The stream is decoded into frames on the GPU.
+  Decoder -> Detector [model: YOLO on GPU] : every 6th frame | The detector sees 5 frames per second, which is enough for counting.
+  Detector -> Tracker [svc: Kalman + matching] : boxes + scores | Boxes from each frame are linked into tracks.
+  Tracker -> Rule engine [svc: line crossing] : track 17 moved | Rules turn tracks into events.
+  Rule engine -> Event bus [queue: Kafka] : person entered | Only small events leave the site, not the video.
+ref: docs | DeepStream SDK documentation | NVIDIA | https://docs.nvidia.com/metropolis/deepstream/dev-guide/
+
+== Active learning and labeling loop
+kind: feedback-loop, online-offline
+when: A vision model works in the lab but fails on new lighting, cameras or products in the field, and labels are expensive.
+how: The deployed model logs the frames it is unsure about (low confidence, or two models disagree) and a sample of random frames to measure true quality. These go to a labeling tool where people fix boxes or classes.
+New labels join the training set. The team retrains from the last checkpoint, runs the new model on a fixed test set and on a slice of hard cases, and only then ships it, often first as a shadow model. A hard example set, kept forever, protects against old mistakes returning.
+Labelling uncertain frames is often several times more efficient than labelling random ones. The risk is bias: the uncertain frames are not representative, so keep the random sample for honest metrics.
+used: Tesla described a data engine of this kind for Autopilot; Roboflow, Labelbox and CVAT support the labelling step; common in industrial inspection.
+avoid: When the input is stable and a fixed dataset already gives good accuracy.
+flow:
+  Edge model [model: v7 on camera] -> Frame store [store: low-confidence frames] : uncertain + random frames | The device uploads uncertain frames and a random sample.
+  Frame store -> Labeling tool [svc: annotators] : 2,000 frames | A person fixes the boxes and classes.
+  Labeling tool -> Training set [lake: versioned data] : new labels | Labeled frames join the versioned dataset.
+  Training set -> Trainer [svc: GPU job] : fine-tune from v7 | The trainer starts from the last checkpoint.
+  Trainer -> Evaluator [svc: fixed test set] : model v8 | The new model is scored on the fixed test set and the hard-case slice.
+  Evaluator -> Edge model : ship v8 if better | Only a better model is rolled out.
+
+== Image embeddings for visual search
+kind: two-tower-retrieval, precompute
+when: Users search by image or by text over millions of pictures, and keyword tags are missing or poor.
+how: An image encoder (a CNN or vision transformer, or CLIP) turns every catalog image into a vector of, say, 512 numbers. Vectors are computed offline in a batch job and stored in an approximate nearest-neighbour index such as HNSW.
+At query time the query image, or a text query through CLIP's text encoder, becomes a vector too. The index returns the nearest 100 vectors in a few milliseconds. A second stage can re-rank with a heavier model or with filters such as price and stock.
+New images are embedded as they arrive. If you change the encoder, all vectors must be recomputed and the index rebuilt, so version the embeddings.
+used: Pinterest visual search; Google Lens and shopping image search use similar ideas; open-source stacks with CLIP and FAISS or a vector database.
+avoid: For exact duplicate detection, where a perceptual hash is cheaper; or for small catalogs, where brute force is enough.
+flow:
+  Catalog images [lake: 5M images] -> Encoder [model: CLIP image tower] : batch job | An offline job embeds every image.
+  Encoder -> ANN index [db: HNSW, 512-d] : vectors + ids | The vectors are stored with product ids.
+  Shopper [user] -> Search API [svc: query] : photo or text | The shopper uploads a photo or types a phrase.
+  Search API -> Encoder : embed query | The query becomes a vector with the matching tower.
+  Search API -> ANN index : top 100 neighbours | The index returns similar items in a few milliseconds.
+  Search API -> Reranker [svc: filters + model] : 100 candidates | A second stage applies stock, price and a heavier score.
+  Reranker -> Shopper : 20 results | The shopper sees the best twenty.
+ref: paper | Learning Transferable Visual Models From Natural Language Supervision (CLIP) | Radford et al., ICML 2021 | https://arxiv.org/abs/2103.00020
+
+@@ diffusion
+== Latent diffusion text-to-image pipeline
+kind: pipes-filters, offload-accelerator
+when: You need to turn a text prompt into a high-resolution image at a cost one GPU can afford.
+how: Working on a 1024 by 1024 image in pixels is costly. Latent diffusion first compresses images with a VAE into a latent about 8 times smaller on each side, so the denoiser handles 128 by 128 numbers, not a million pixels.
+The text prompt goes through a text encoder (CLIP or T5 in Stable Diffusion models). Its output reaches the denoising network, a U-Net or a diffusion transformer, through cross-attention or joint attention. The sampler starts from pure noise and runs 20 to 50 steps. Each step predicts the noise and removes a part of it. Classifier-free guidance runs the network twice per step, with and without the prompt, and mixes the results to follow the prompt more closely.
+At the end, the VAE decoder turns the clean latent into pixels. Most of the compute is in the repeated denoising steps, so step count is the main cost control.
+used: Stable Diffusion family, which this concept's product page covers; many open-source image models and hosted image APIs use latent diffusion or similar designs.
+avoid: When you need exact text or layout control without extra tools; add ControlNet-style conditioning or an editing model.
+flow:
+  Prompt [user: a red fox in snow] -> Text encoder [model: CLIP or T5] : tokens | The prompt is turned into embedding vectors.
+  Text encoder -> Denoiser [model: U-Net or DiT on GPU] : text embeddings | The embeddings guide every denoising step through attention.
+  Noise latent [note: 128x128x4 random] -> Denoiser : step 1 of 30 | Sampling starts from random noise in the latent space.
+  * Denoiser: step 30, clean latent | After 30 steps the latent holds a clear image.
+  Denoiser -> VAE decoder [model: latent to pixels] : final latent | The decoder expands the latent to a 1024 by 1024 image.
+  VAE decoder -> User : PNG image | The user receives the picture.
+ref: paper | High-Resolution Image Synthesis with Latent Diffusion Models | Rombach et al., CVPR 2022 | https://arxiv.org/abs/2112.10752
+
+== GPU job queue for image generation
+kind: async-request-reply, load-leveling
+when: Image generation takes seconds on a costly GPU, and requests come in bursts from many users.
+how: A request does not run on the web server. The API checks the user's quota, saves the job in a queue and returns a job id at once. Workers on GPUs pull jobs, run the pipeline and write the image to object storage.
+The client polls the job id, or gets a webhook or a WebSocket message when it is done. The queue absorbs bursts: during a spike users wait a little longer, but the GPUs run at full use and nothing crashes. Queue depth drives autoscaling: add GPU nodes when the wait time passes, say, 20 seconds.
+Workers can batch several jobs of the same size to use the GPU better, and they keep the model loaded, because loading weights takes tens of seconds. Priority queues let paying users go first.
+used: Hosted image generation services, and open-source UIs that run a job queue; the pattern is common for any slow GPU task.
+avoid: For tiny, fast models that answer in milliseconds; a direct call is simpler.
+flow:
+  Client [client: app] -> API [svc: quota check] : POST /generate | The client submits a prompt.
+  API -> Job queue [queue: Redis or SQS] : job 881 | The API stores the job and returns the id 881 at once.
+  Job queue -> GPU worker [svc: model loaded] : pull job 881 | A free worker takes the job.
+  GPU worker -> Image store [store: S3] : PNG | The worker saves the image.
+  GPU worker ~> Client : done: url | A webhook or socket message says the image is ready.
+  Job queue ~> Autoscaler [svc: scale by wait] : queue depth 400 | A long queue triggers more GPU nodes.
+ref: docs | Asynchronous Request-Reply pattern | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/patterns/async-request-reply
+
+== Training with precomputed latents
+kind: precompute, data-parallel
+when: You train or fine-tune a diffusion model on millions of images and want to avoid redoing the same work every epoch.
+how: The VAE and the text encoder stay frozen during training. So their outputs for each image and caption never change. A prep job runs them once and stores the latents and text embeddings in shards on object storage.
+Training then reads only the small latents. Each step takes a batch, picks a random noise level t, adds noise to the latent and asks the denoiser to predict the noise. The loss is a simple mean squared error between the predicted and true noise. Many GPUs each hold a full copy of the denoiser and average gradients with all-reduce (data parallelism).
+This saves a large share of compute and I/O per epoch. The cost is storage for the latents and a fixed crop and resolution. Changing the VAE or the captions means redoing the prep job.
+used: Large open image-model training runs and fine-tuning tools (LoRA, DreamBooth) that cache latents; the idea is standard in latent diffusion training.
+avoid: When you use heavy random augmentation on pixels each epoch; cached latents cannot follow it.
+flow:
+  Image shards [lake: 100M images + captions] -> Prep job [svc: VAE + text encoder] : read batch | A one-time job reads images and captions.
+  Prep job -> Latent shards [lake: latents + embeddings] : write once | Latents and embeddings are saved to disk.
+  Latent shards -> GPU worker 1 [svc: denoiser copy], GPU worker 2 [svc: denoiser copy] : batch of latents | Each worker reads its own part of the data.
+  GPU worker 1, GPU worker 2 -> All-reduce [svc: NCCL] : gradients | Workers add noise at random levels and compute the loss gradients.
+  All-reduce -> GPU worker 1, GPU worker 2 : averaged gradients | Every worker gets the same average and takes the same step.
+ref: paper | Denoising Diffusion Probabilistic Models | Ho, Jain & Abbeel, NeurIPS 2020 | https://arxiv.org/abs/2006.11239
+
+@@ dl
+== Data-parallel training with all-reduce
+kind: data-parallel
+when: A model fits on one GPU, but the dataset is large and you want to train faster with many GPUs.
+how: Each GPU holds a full copy of the model. A global batch of, say, 1,024 samples is split into 8 parts of 128, one per GPU. Each GPU runs forward and backward on its part and gets its own gradients.
+Then an all-reduce adds the gradients across GPUs and divides by 8. Every GPU now holds the same average gradient, so the same optimizer step keeps all copies identical. Libraries overlap the all-reduce for early layers with the backward pass of later layers to hide the network time.
+Throughput grows almost linearly while communication stays small compared to compute. Gradients cost the same bytes as the model, so a 1 billion parameter model in 16-bit sends about 2 GB per step. Slow links limit the speed-up. Sharded variants (FSDP, ZeRO) also split optimizer state and weights when memory is the limit.
+used: PyTorch DistributedDataParallel with NCCL on NVLink and InfiniBand; Horovod; nearly all multi-GPU vision training.
+avoid: When the model does not fit in one GPU's memory; use sharding or model parallelism.
+flow:
+  Data loader [svc: shards batch] -> GPU 0 [model: samples 0-127], GPU 1 [model: samples 128-255] : 128 samples each | Each GPU gets its own part of the global batch.
+  GPU 0, GPU 1 -> NCCL all-reduce [svc: ring over NVLink] : local gradients | Each GPU computes gradients on its own data.
+  NCCL all-reduce -> GPU 0, GPU 1 : average gradient | Every GPU receives the same averaged gradient.
+  * GPU 1: step 1 done, same weights | Both GPUs apply the same update, so their weights stay identical.
+  GPU 0 ~> Checkpoint store [store: object storage] : save every 1,000 steps | Only one GPU writes the checkpoint.
+ref: docs | PyTorch DistributedDataParallel notes | PyTorch documentation | https://pytorch.org/docs/stable/notes/ddp.html
+
+== Pipeline and tensor parallelism for large models
+kind: model-parallel
+when: The model is too large for one GPU, for example 70 billion parameters at about 140 GB in 16-bit.
+how: Tensor parallelism splits each large matrix across GPUs in one machine. Each GPU computes part of every layer, and an all-reduce joins the parts. It needs very fast links (NVLink), so it is used inside one node of 8 GPUs.
+Pipeline parallelism puts groups of layers on different nodes: layers 1 to 20 on node A, 21 to 40 on node B. A batch is cut into micro-batches that flow through the stages, so all stages work at once. Idle time at the start and end is called the pipeline bubble; more micro-batches shrink it.
+Real runs combine three kinds: data parallel across replicas, pipeline across nodes and tensor inside a node. The mapping follows the network: slow links carry the least traffic. Mixed precision and activation recomputation cut memory further.
+used: Megatron-LM and DeepSpeed for large language model training; the same ideas split models during inference.
+avoid: When one GPU or plain data parallel with sharding is enough; each extra split adds complexity and lost time.
+flow:
+  Batch [note: 512 samples] -> Stage 1 [svc: layers 1-20 on A] : micro-batch 1 | The batch is cut into micro-batches that enter stage 1.
+  Stage 1 -> Stage 2 [svc: layers 21-40 on B] : activations | Stage 1 sends activations to stage 2 over the network.
+  Stage 2 -> Stage 3 [svc: layers 41-60 on C] : activations | Each stage passes activations forward while it starts the next micro-batch.
+  Stage 3 -> Stage 2 : gradients | The backward pass sends gradients in the reverse direction.
+  * Stage 1: bubble 12% idle | Early and late in the batch some stages wait; more micro-batches shrink this idle time.
+ref: paper | Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism | Shoeybi et al., 2019 | https://arxiv.org/abs/1909.08053
+
+== Checkpoint and resume for long runs
+kind: checkpoint-restart
+when: A training run uses hundreds of GPUs for weeks, and some part will fail during that time.
+how: At large scale, failures are normal: a GPU, a network link or a node fails every few hours or days. Without a plan, one failure would waste the whole run.
+Every N steps, each worker writes its shard of the model weights, optimizer state and data loader position to object storage. Writes are asynchronous: weights are copied to host memory first, so GPUs resume training while the upload continues. A job manager notices the failure, replaces the node and restarts all workers from the latest complete checkpoint.
+The interval is a trade-off. A checkpoint every 30 minutes means at most 30 minutes of work are lost, but frequent saves of hundreds of GB cost bandwidth. Teams also keep several older checkpoints, because a loss spike may need a rollback to an earlier step.
+used: PyTorch Distributed Checkpoint; the Llama 3 paper reports hundreds of interruptions during a 54-day run and automated recovery.
+avoid: For short jobs of minutes, where a restart from zero costs less than the saving code.
+flow:
+  Trainer ranks [svc: 512 GPUs] -> Host memory [cache: snapshot copy] : snapshot at step 9,000 | Each rank copies its shard to host memory in seconds.
+  Host memory ~> Object store [store: checkpoint 9000] : async upload | The upload runs in the background while training goes on.
+  Trainer ranks -x> Job manager [svc: watchdog] : node 77 stopped | A node fails at step 9,400 and stops the job.
+  Job manager -> Trainer ranks : restart with spare node | The manager swaps in a spare node and restarts all ranks.
+  Object store -> Trainer ranks : load checkpoint 9000 | Every rank loads its shard of the last complete checkpoint.
+  * Trainer ranks: resumed at step 9,000 | Training resumes; only 400 steps of work are lost.
+ref: paper | The Llama 3 Herd of Models | Llama Team, Meta, 2024 | https://arxiv.org/abs/2407.21783
+
+@@ llm
+== Prefill then decode with a KV cache
+kind: memory-tiering, offload-accelerator
+when: You serve a transformer that writes text one token at a time, and recomputing the whole prompt for each token would be far too slow.
+how: Generation has two phases. In prefill, the model reads the whole prompt in one parallel pass. For every token and every layer it stores a key and a value vector. These are the KV cache. Prefill is compute bound and uses the GPU well.
+In decode, the model makes one new token per step. It computes the query for the new token and attends to the cached keys and values, so earlier tokens are not recomputed. Each step reads the full cache and all weights from GPU memory, so decode is memory bound.
+The cache grows with every token. For a 70B model with grouped-query attention, a 4,000-token chat can need about 1.3 GB of cache. Grouped-query attention, quantized caches and paging cut this. Long contexts and many users make cache memory, not compute, the limit.
+used: Every production LLM server, including vLLM, TensorRT-LLM and llama.cpp; API providers sell cached prompt tokens at a lower price.
+avoid: Not optional for text generation; for short classification with one output token, the cache matters little.
+flow:
+  Prompt [user: 2,000 tokens] -> GPU prefill [model: parallel pass] : all prompt tokens | The model reads the whole prompt in one pass.
+  GPU prefill -> KV cache [cache: GPU memory] : keys + values per layer | Keys and values are stored for each token and layer.
+  KV cache -> GPU decode [model: 1 token per step] : read cache | Each decode step reads the stored keys and values.
+  GPU decode -> KV cache : append token 2,001 | The new token's key and value are added to the cache.
+  GPU decode -> User : streamed token | Each token is sent to the user as soon as it is made.
+  * KV cache: 2,500 tokens, 0.8 GB | The cache grows by one entry per layer on every step.
+ref: paper | Attention Is All You Need | Vaswani et al., NeurIPS 2017 | https://arxiv.org/abs/1706.03762
+
+== Mixture of experts with expert parallelism
+kind: model-parallel
+when: You want a model with a very large number of parameters but a compute cost per token like a much smaller model.
+how: In a mixture-of-experts layer, the single feed-forward block is replaced by many (for example 64 or 256) smaller expert blocks. A small router looks at each token and picks the top few experts, often 2 to 8. Only those experts run for that token.
+So a model with several hundred billion total parameters may use only tens of billions per token. This keeps training and serving compute low while capacity stays high. All experts must still sit in memory.
+At scale the experts are spread across GPUs (expert parallelism). Tokens are sent to the GPU that holds their chosen experts with an all-to-all message and sent back after. Load balance is a problem: if one expert gets most tokens, its GPU is the bottleneck, so training adds a balancing loss or bias. All-to-all traffic needs fast networks.
+used: Mixtral, DeepSeek-V3 and other open-weight MoE models; many frontier models are widely reported to use MoE.
+avoid: For small deployments with one GPU, where all the experts' memory is waste; a dense model of the same quality can be simpler.
+flow:
+  Token batch [note: 4,096 tokens] -> Router [model: top-2 of 8] : hidden states | The router scores the experts for every token.
+  Router -> Expert 1 [model: on GPU 0], Expert 2 [model: on GPU 1] : tokens by expert | Tokens go to their chosen experts across GPUs with an all-to-all message.
+  Expert 1, Expert 2 -> Combine [svc: weighted sum] : expert outputs | Each expert returns its output for its tokens.
+  Combine -> Next layer [model: attention block] : mixed output | Outputs are mixed with the router weights and sent on.
+  Router -x> Expert 2 : overloaded, tokens dropped | If one expert gets too many tokens, extra tokens may be dropped or delayed.
+ref: paper | Mixtral of Experts | Jiang et al., 2024 | https://arxiv.org/abs/2401.04088
+
+== Pretrain, post-train and deploy pipeline
+kind: feedback-loop, online-offline
+when: You need a general text predictor turned into a safe and useful assistant, and kept improving after launch.
+how: Pretraining teaches next-token prediction on trillions of tokens from the web, books and code. It takes weeks on thousands of GPUs and gives a base model that continues text but does not follow instructions well.
+Post-training makes it helpful. Supervised fine-tuning uses thousands of good instruction and answer pairs. Then preference training (RLHF, DPO or RL with checked rewards) pushes the model toward answers that people or verifiers prefer, and away from harmful ones. Evaluations and red-team tests gate each release.
+After deployment, usage data, thumbs ratings and failure reports feed the next round of data, within privacy rules. Each loop is one model version, released as a new snapshot. Teams keep an eval set that never enters training, to catch regressions.
+used: Described in the InstructGPT paper, the Llama 3 report and similar technical reports; the same stages are used by most labs.
+avoid: For narrow tasks, where fine-tuning a small open model or prompting an existing one is much cheaper than full pretraining.
+flow:
+  Web + code corpus [lake: trillions of tokens] -> Pretraining [svc: 10k GPUs] : next-token loss | The model learns to continue text.
+  Pretraining -> SFT [svc: instruction pairs] : base model | Supervised fine-tuning teaches the answer format.
+  SFT -> Preference tuning [svc: RLHF or DPO] : chat model | Preference data pushes toward better answers.
+  Preference tuning -> Eval gate [svc: held-out evals + red team] : candidate | A release must pass held-out tests and safety checks.
+  Eval gate -> Production API [svc: serving] : model v2 | A passing model is released.
+  Production API ~> Preference tuning : ratings + failures | Usage signals feed the next round of training data.
+ref: paper | Training language models to follow instructions with human feedback | Ouyang et al., NeurIPS 2022 | https://arxiv.org/abs/2203.02155
+
+@@ llmserving
+== Continuous batching over a paged KV cache
+kind: continuous-batching
+when: Many users send requests of different lengths to one GPU, and you want high throughput without long waits.
+how: Static batching waits for a full batch and keeps the whole batch until its longest answer is done, so the GPU idles. Continuous batching decides at every decode step: finished requests leave, and waiting requests join at once. The GPU stays busy.
+Memory is the second limit. The KV cache of each request grows token by token, and its final size is unknown. PagedAttention cuts the cache into fixed blocks, for example 16 tokens each, and keeps a block table per request, like virtual memory pages. Blocks are allocated on demand, so waste falls to a few percent and more requests fit on the GPU.
+When memory is full, the scheduler pauses or swaps out the newest request instead of crashing. Throughput can rise several times against naive serving. The trade-off is latency: a big batch makes each token a little slower.
+used: vLLM introduced PagedAttention; TensorRT-LLM, SGLang and Hugging Face TGI use continuous batching.
+avoid: For a single user on a laptop, where batching has nothing to batch; use a simple local runner.
+flow:
+  Request queue [queue: waiting: 40] -> Scheduler [svc: runs every step] : new requests | The scheduler checks the queue at every decode step.
+  Scheduler -> GPU engine [model: batch of 32] : step: 32 sequences | One forward pass makes one token for each of 32 sequences.
+  GPU engine -> Block table [cache: 16-token blocks] : allocate block | Each sequence gets a new cache block only when it needs one.
+  GPU engine -> Client [client: streaming] : token per sequence | Each user receives a token.
+  * GPU engine: request 7 finished | Request 7 ends and frees its blocks at once.
+  Scheduler -> GPU engine : add request 41 | A waiting request joins on the next step; no one waits for the whole batch.
+ref: paper | Efficient Memory Management for Large Language Model Serving with PagedAttention | Kwon et al., SOSP 2023 | https://arxiv.org/abs/2309.06180
+
+== Disaggregated prefill and decode
+kind: pipeline-stages, offload-accelerator
+when: Long prompts slow down the token streams of other users, and you must meet both a first-token time and a per-token time.
+how: Prefill is compute heavy and decode is memory heavy. On the same GPU, a long prefill delays the decode steps of all other requests, which makes the output stutter. Chunked prefill splits a long prompt into pieces mixed into normal steps. Disaggregation goes further.
+Prefill workers and decode workers run on separate GPU pools. A prefill worker reads the prompt, builds the KV cache and sends it over a fast link (NVLink or RDMA) to a decode worker. The decode worker then streams the tokens. Each pool can use its own GPU count, batch size and parallelism.
+This helps when both time to first token and time per token have strict targets. The costs are the KV transfer, which can be hundreds of MB for a long prompt, and a more complex scheduler and failure handling.
+used: DistServe and Mooncake research systems; vLLM, SGLang and NVIDIA Dynamo support disaggregated serving modes.
+avoid: For short prompts and small deployments, where the transfer costs more than the gain; chunked prefill is enough.
+flow:
+  Router [svc: picks workers] -> Prefill pool [svc: compute bound] : prompt of 8,000 tokens | The router sends the prompt to a prefill worker.
+  Prefill pool -> Decode pool [svc: memory bound] : KV cache over RDMA | The finished cache moves to a decode worker.
+  Decode pool -> Client [client] : streamed tokens | The decode worker streams tokens at a steady rate.
+  Prefill pool -x> Decode pool : link slow or worker down | If the transfer fails, the router must rerun the prefill on another worker.
+  * Decode pool: steady | Decode GPUs are not interrupted by long prompts, so the stream stays smooth.
+ref: paper | DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving | Zhong et al., OSDI 2024 | https://arxiv.org/abs/2401.09670
+
+== Prefix-aware routing across replicas
+kind: consistent-hashing, cache-aside
+when: Many requests share a long prefix, such as a system prompt, a document or an agent history, and you run several replicas.
+how: Each replica keeps the KV cache of recent prompts. If a new prompt starts with a prefix already in a replica's cache, that part is not computed again. This cuts time to first token and cost for long shared prefixes.
+A load balancer that picks replicas at random wastes this. A prefix-aware router instead hashes the prompt prefix, or keeps a table of which replica holds which prefix, and sends the request to the replica with the longest match. It still checks load, so one hot prefix does not overload one replica.
+Cache memory is limited, so old blocks are evicted by least recent use. Providers pass the saving on: cached input tokens are billed lower. Keep the stable text (instructions, documents) at the front of the prompt and the changing text at the end.
+used: vLLM automatic prefix caching, SGLang RadixAttention, and the prompt caching features of hosted model APIs; llm-d and similar gateways add cache-aware routing.
+avoid: When prompts rarely share a prefix; plain load balancing by queue length is simpler.
+flow:
+  Client [client: agent session] -> Router [svc: prefix table] : 6k shared, 100 new | The request carries a long shared prefix.
+  Router -> Replica B [svc: GPU: holds prefix] : longest prefix match | The router finds the replica that holds the prefix cache.
+  Replica B -> Prefix cache [cache: radix tree of blocks] : reuse 6k tokens | Only the last 100 tokens need prefill.
+  Replica B -> Client : first token in 80 ms | The first token is fast, as little work was left.
+  Router -x> Replica A [svc: GPU: cold] : not chosen | A cold replica would recompute all 6,000 tokens.
+ref: paper | SGLang: Efficient Execution of Structured Language Model Programs | Zheng et al., NeurIPS 2024 | https://arxiv.org/abs/2312.07104
+
+@@ ml
+== Batch training with online serving
+kind: online-offline
+when: A model learns from large historical data but must answer single requests in milliseconds.
+how: Training is offline. A batch job reads months of logged examples from the data lake, builds features and labels, and fits the model, for example a gradient-boosted tree. The job evaluates it on held-out data and writes the model file, with its metrics, to a model registry.
+Serving is online. A service loads the model and answers each request with a prediction in a few milliseconds. It reads the freshest features from a low-latency store. The model runs on a schedule: retrained daily or weekly, or when drift is detected.
+The main risk is training-serving skew: features computed in two different ways in the two places give different values, and quality falls without any error. Use the same feature code, or a feature store, in both paths. Check that a new model beats the old one before it takes traffic.
+used: Fraud scoring, ad click prediction and recommendation systems in most large companies; MLflow, SageMaker and Vertex AI offer registries.
+avoid: When labels arrive in seconds and the world changes by the minute; consider online learning or frequent incremental updates.
+flow:
+  Event logs [lake: months of events] -> Training job [svc: nightly batch] : features + labels | The nightly job builds a training set from history.
+  Training job -> Evaluator [svc: holdout test] : candidate model | The new model is scored on held-out data.
+  Evaluator -> Model registry [store: versions] : model v14 + metrics | A passing model is stored with its metrics.
+  Model registry -> Scoring service [svc: online] : load v14 | The service loads the approved model.
+  App [client] -> Scoring service : score request | A live request arrives.
+  Scoring service -> Feature store [cache: fresh features] : lookup user 42 | The service reads fresh feature values.
+  Scoring service -> App : score 0.93 in 5 ms | The answer returns in a few milliseconds.
+ref: docs | MLOps: Continuous delivery and automation pipelines in machine learning | Google Cloud Architecture Center | https://cloud.google.com/architecture/mlops-continuous-delivery-and-automation-pipelines-in-machine-learning
+
+== Delayed-label feedback loop
+kind: feedback-loop
+when: The true outcome of a prediction arrives hours or days later, such as a purchase after a click or a chargeback after a payment.
+how: The serving system logs every prediction with its id, its features at that moment, the model version and the time. Later events, such as a conversion or a fraud report, arrive on a separate stream. A join job matches them by prediction id, after a wait window that fits the delay, for example 7 days.
+Joined rows are labelled examples and go to the training store. Late labels are still arriving, so recent data looks too negative; the training job either waits or corrects for it. Logging the features at serve time, and not re-computing them later, removes skew.
+The loop can hurt: the model only sees outcomes for what it showed. A model that stops showing something never learns whether it was good. Keep a small random exploration share, so that the data stays honest.
+used: Ad click and conversion prediction; fraud detection; recommendation feeds; common in all large ad and e-commerce platforms.
+avoid: When labels cannot be trusted or never arrive; then monitor proxy metrics and use human review.
+flow:
+  Model service [svc: model v14] -> Prediction log [log: id and features] : log prediction 8812 | Every prediction is logged with its inputs.
+  Outcome stream [queue: purchases] -> Join job [svc: wait window 7 d] : purchase for 8812 | A later outcome arrives with the same id.
+  Prediction log -> Join job : features at serve time | The join uses the logged features, not new ones.
+  Join job -> Training store [lake: labelled rows] : example, label=1 | The labelled example is stored.
+  Training store -> Trainer [svc: weekly retrain] : new data | The trainer includes the new examples.
+  Trainer -> Model service : model v15 | The new model replaces the old after checks.
+ref: paper | Hidden Technical Debt in Machine Learning Systems | Sculley et al., NeurIPS 2015 | https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html
+
+== Shadow and canary rollout of a model
+kind: shadow-ab
+when: A new model looks better offline, but you must prove it is safe on real traffic before it affects users.
+how: First, the new model runs in shadow: the live request goes to both models, but only the old model's answer is returned. Both predictions are logged. The team compares them offline: score distributions, latency, errors, and agreement. No user is affected.
+Next is a canary: 1 percent of traffic gets the new model's answer, then 5 and 25 percent. Guard metrics (latency, error rate, a business metric such as conversion) are watched. If one crosses its limit, traffic returns to the old model by a config switch.
+For the final decision, run an A/B test with enough users to see the expected gain, which can take weeks for small effects. Offline gains often do not appear online, so this step is not optional for important models.
+used: Common in recommendation, ranking and fraud teams; supported by serving tools such as Seldon, KServe and cloud ML endpoints with traffic splits.
+avoid: When there is not enough traffic to measure the difference, or the model's actions cannot be undone; use offline replay and careful review.
+flow:
+  Request [client: live traffic] -> Router [svc: traffic split] : score request | Every request reaches the router.
+  Router -> Model v14 [model: live], Model v15 [model: shadow] : same features | Both models receive the same input.
+  Model v14 -> Client : answer returned | Only the old model's answer is used.
+  Model v15 ~> Comparison log [log: both scores] : shadow answer | The shadow answer is logged, never returned.
+  * Router: canary 5% to v15 | After shadow checks pass, 5 percent of users get v15's answers.
+  Router -x> Model v15 : error rate above limit | A guard metric fails and traffic goes back to v14.
+
+@@ multimodal
+== Vision encoder, projector and language model
+kind: pipes-filters
+when: You want a language model to read images, charts or screenshots along with text.
+how: A pretrained vision encoder (a ViT, often from CLIP or SigLIP) cuts the image into patches, for example 14 by 14 pixels, and turns them into vectors. A small projector, a linear layer or a short MLP, maps these vectors into the language model's embedding space. Now each patch looks like a word vector.
+These image tokens are placed in the prompt beside the text tokens. The language model then uses ordinary self-attention across both. A 336 by 336 image gives 576 tokens at 14-pixel patches, so images use real context space and cost real money. High-resolution inputs are tiled or merged to control the count.
+Training usually has two stages: align the projector on image and caption pairs, then fine-tune on instruction data with images. Sometimes the language model is frozen at first, to keep its text skills.
+used: LLaVA-style open models; Claude, GPT and Gemini accept image input; the exact internals of closed models are not public.
+avoid: For narrow tasks such as reading barcodes or plain OCR, where a small dedicated vision model is cheaper and exact.
+flow:
+  Image [user: 336x336 photo] -> Vision encoder [model: ViT] : 576 patches | The image is cut into patches and encoded as vectors.
+  Vision encoder -> Projector [model: small MLP] : patch vectors | The projector maps them into the language model's space.
+  Projector -> Language model [model: LLM] : 576 image tokens | The image tokens are placed in the prompt.
+  Question [user: what is in the chart?] -> Language model : text tokens | The text tokens sit beside the image tokens.
+  Language model -> User : answer text | Attention reads across both and the model writes the answer.
+ref: paper | Visual Instruction Tuning (LLaVA) | Liu et al., NeurIPS 2023 | https://arxiv.org/abs/2304.08485
+
+== Shared embedding space for cross-modal search
+kind: two-tower-retrieval, precompute
+when: Users search images, video or audio with text, or with another example, and no tags exist.
+how: Two encoders are trained together with a contrastive loss (as in CLIP): an image encoder and a text encoder. Matching image and caption pairs are pulled close, and mismatched pairs are pushed apart. After training, both land in one vector space, so a text query vector is close to the vectors of fitting images.
+Items are embedded offline and stored in a vector index. At query time only the query is embedded, which takes milliseconds, and the index returns the nearest items. The same index can serve text to image, image to image and image to text.
+The limit is fine detail: one vector per image misses small objects and exact text, so systems add a re-ranker or captions and keyword search. Changing the model needs a re-embed of the whole library.
+used: Open-source CLIP and SigLIP models with FAISS or a vector database; stock photo and e-commerce search; multimodal RAG uses the same step.
+avoid: When exact filters or text on the image matter most; use OCR, metadata and keyword search too.
+flow:
+  Media library [lake: 2M images] -> Image encoder [model: image tower] : batch embed | An offline job embeds the library.
+  Image encoder -> Vector index [db: nearest neighbour] : vectors | The vectors are stored in the index.
+  User [user: red running shoes] -> Text encoder [model: text tower] : query text | The query is embedded into the same space.
+  Text encoder -> Vector index : query vector | The index is searched with this vector.
+  Vector index -> Reranker [svc: heavier model] : top 50 images | The best 50 are re-scored with a stronger model.
+  Reranker -> User : top 10 | The user sees the best ten.
+ref: paper | Learning Transferable Visual Models From Natural Language Supervision | Radford et al., ICML 2021 | https://arxiv.org/abs/2103.00020
+
+== Streaming voice assistant pipeline
+kind: pipeline-stages, event-driven
+when: A user talks to an assistant and expects a spoken answer within about a second.
+how: The classic design is a cascade. Speech recognition turns audio into text as the user speaks. A voice activity detector decides when the user has stopped. The language model reads the text and starts streaming its answer. A speech synthesizer turns the first sentence into audio while the model still writes the rest.
+Because every stage streams, the delay adds up: perhaps 200 ms for turn detection, 300 ms for the first model token and 150 ms for first audio. Barge-in matters: if the user speaks over the assistant, output stops and the audio buffer is flushed.
+Newer speech-to-speech models take audio in and give audio out in one model. This keeps tone and cuts delay, but it is harder to inspect, to add tools to and to log as text. Many products keep the cascade for control.
+used: Voice agents built on WebRTC and a media server; real-time voice APIs of major model providers; call-center assistants.
+avoid: For long dictation or batch transcription, where a plain offline speech recognizer is cheaper.
+flow:
+  Microphone [client: browser] -> Speech to text [model: streaming ASR] : audio frames | Audio is sent in small frames and decoded as it arrives.
+  Speech to text -> Turn detector [svc: voice activity] : partial text | The detector decides when the user has finished.
+  Turn detector -> Language model [model: LLM] : final text | The text is sent to the model.
+  Language model -> Text to speech [model: TTS] : first sentence | Speech starts when the first sentence is ready.
+  Text to speech -> Microphone : audio stream | Audio reaches the user while the model still writes.
+  Microphone -x> Text to speech : user speaks over it | Barge-in: the assistant stops and clears queued audio.
+
+@@ nlp
+== Pretrained encoder with a task head
+kind: online-offline
+when: You need a classifier or tagger for text, such as support ticket routing, and you have only thousands of labelled examples.
+how: A large encoder model (BERT-style) is pretrained once on huge text. It already knows grammar and word meaning. For your task you add a small head, such as a linear layer that outputs a class, and fine-tune on your labelled data. This often needs hours on one GPU.
+At serving time, text is tokenized, padded to a batch and sent through the model. A distilled or quantized version, with a quarter of the size, often keeps most of the accuracy and answers in a few milliseconds on CPU or a small GPU. Results below a confidence threshold go to a person.
+Compared with calling a large language model for each text, this costs far less per call and gives stable outputs. The price is the work to label data and retrain when categories change.
+used: BERT and RoBERTa family fine-tuning with Hugging Face Transformers; spam, intent and sentiment classifiers in production systems.
+avoid: When you have few labels and categories change weekly; prompting a large language model may be faster to start.
+flow:
+  Labeled tickets [lake: 5k examples] -> Fine-tune job [svc: 1 GPU job] : text + label | The job trains the head and tunes the encoder.
+  Fine-tune job -> Model registry [store: model v3] : weights | The tuned model is saved with its metrics.
+  Model registry -> Classifier API [svc: distilled model] : load v3 | The API serves a small distilled version.
+  Ticket [client: new text] -> Classifier API : classify | A new ticket arrives.
+  Classifier API -> Ticket : billing, 0.97 | The class and confidence return in a few milliseconds.
+  Classifier API ~> Review queue [queue: low confidence] : 0.55 cases | Uncertain texts go to a person for labels.
+ref: paper | BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding | Devlin et al., NAACL 2019 | https://arxiv.org/abs/1810.04805
+
+== Model cascade for text moderation
+kind: model-cascade
+when: A large volume of text needs checking, but most of it is clearly safe and a large model for every item is too costly.
+how: The first stage is cheap: keyword rules and a small classifier that runs in under 10 ms. It lets the clearly safe and clearly bad items pass at once. This stage handles perhaps 90 to 95 percent of the traffic.
+Items with a middle score go to a second stage, a larger model or a large language model with a policy prompt, which is slower and costs more per call. Items that are still unclear, or that carry high stakes, go to human reviewers. Their decisions are logged and become training data for the first stage.
+Thresholds set the balance between cost, missed harm and wrongly blocked content. Measure precision and recall of each stage on a labelled sample. The cascade saves money only if the first stage is good, so retrain it as new slang and attacks appear.
+used: Content moderation at social platforms and forums; spam filters; the same cascade is common in search ranking and fraud screening.
+avoid: When every item is high risk, such as legal review; then use the strongest model or a person for all items.
+flow:
+  Posts [queue: 10,000 per minute] -> Fast classifier [model: small] : text | Every post gets a cheap first score.
+  Fast classifier -> Publish [svc: allow] : score below 0.1 | Clearly safe posts are published at once.
+  Fast classifier -> Large model [model: LLM with policy] : score 0.1 to 0.9 | Unclear posts go to the stronger and slower model.
+  Large model -> Human review [user: moderators] : still unsure | Hard cases go to people.
+  Human review ~> Fast classifier : new labels | Decisions become training data for the first stage.
+
+== Classic NLP pipeline of text stages
+kind: pipes-filters
+when: Raw text such as contracts, news or clinical notes must become structured fields that other systems can query.
+how: Text passes through stages, each doing one job. Language detection and sentence splitting come first. Tokenization cuts sentences into tokens. Part-of-speech tagging, dependency parsing and named entity recognition then mark names, dates, amounts and relations.
+A final stage links entities to a knowledge base (entity linking) and writes rows or a graph. Each stage can be a rule, a statistical model or a neural model. Because the interfaces are simple, you can replace one stage without touching the others, and measure each stage on its own.
+Errors add up: a wrong sentence split hurts the entities that follow. Today a fine-tuned transformer or a large language model with a schema can do several stages in one call, but the staged design is still used when you need low cost, audit and exact spans.
+used: spaCy pipelines; Stanford CoreNLP; clinical and legal text extraction systems.
+avoid: When a single large language model call with a JSON schema is accurate enough and volume is small.
+flow:
+  Raw documents [lake: contracts] -> Tokenizer [svc: sentences + tokens] : text | The text is cut into sentences and tokens.
+  Tokenizer -> Tagger [model: POS + parser] : tokens | The tagger labels word types and sentence structure.
+  Tagger -> NER [model: entity finder] : tagged tokens | The recognizer finds names, dates and amounts.
+  NER -> Entity linker [svc: knowledge base] : Acme Corp, 2026-03-01 | Entities are matched to known records.
+  Entity linker -> Contract DB [db: fields] : structured rows | The fields are stored for queries.
+ref: docs | spaCy: Linguistic features and pipelines | Explosion | https://spacy.io/usage/processing-pipelines
+
+@@ rag
+== Index offline, retrieve and generate online
+kind: rag, precompute
+when: A model must answer from your private or fresh documents, and you want sources it can quote.
+how: Offline, an ingestion job loads the documents and cuts them into chunks, for example 300 to 800 tokens with some overlap. An embedding model turns each chunk into a vector. Chunks, vectors and metadata (source, date, owner) go into a vector index.
+Online, the question is embedded with the same model. The index returns the top k chunks, say 5 to 10. The prompt then holds the instructions, the chunks and the question, and the model is told to answer only from the chunks and to cite them. The answer shows the source ids.
+Quality depends mostly on retrieval. If the right chunk is not found, the model cannot answer well. Test recall at k on real questions. Re-embed when you change the embedding model, and update chunks when documents change.
+used: Enterprise search assistants, support bots and documentation helpers; LangChain and LlamaIndex provide building blocks; managed knowledge-base features of major cloud AI services.
+avoid: When the knowledge is small enough to fit in the prompt, or when the task needs reasoning over all documents together; consider long context or fine-tuning.
+flow:
+  Documents [lake: PDFs + wiki] -> Ingestion job [svc: chunk + embed] : 500-token chunks | An offline job cuts documents into chunks and embeds them.
+  Ingestion job -> Vector index [db: vectors + metadata] : chunk vectors | Chunks and vectors are stored with their sources.
+  User [user: question] -> RAG service [svc: orchestrator] : question | A question arrives.
+  RAG service -> Vector index : embed + top 8 | The service embeds the question and searches.
+  Vector index -> RAG service : 8 chunks | The best chunks come back with source ids.
+  RAG service -> LLM [model: answer from context] : prompt: chunks + question | The model answers from the chunks.
+  LLM -> User : answer with sources | The user gets an answer with citations.
+ref: paper | Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks | Lewis et al., NeurIPS 2020 | https://arxiv.org/abs/2005.11401
+
+== Hybrid retrieval with reranking
+kind: two-tower-retrieval, scatter-gather
+when: Pure vector search misses exact names, codes and rare terms, or returns near matches that do not answer the question.
+how: The query goes to two retrievers in parallel. A vector search finds chunks with similar meaning. A keyword search (BM25) finds exact words, such as an error code or a product name. Each returns, say, 50 candidates.
+The lists are merged, often with reciprocal rank fusion, which scores each item by its rank in each list and does not need comparable scores. The top 50 to 100 candidates go to a reranker, a cross-encoder model that reads the query and each chunk together and gives a precise score. The best 5 to 8 go into the prompt.
+The first stage is cheap and finds many candidates. The second stage is slower and accurate. Reranking adds perhaps 100 to 300 ms but raises answer quality a lot in many tests. Measure it with recall at k and NDCG on your own questions.
+used: Elasticsearch, OpenSearch and other databases with hybrid search; Cohere Rerank and open-source cross-encoders; most enterprise RAG systems.
+avoid: For small and clean collections, where plain vector search may be good enough; test before adding stages.
+flow:
+  Query [user: ERR-4071 timeout] -> Search service [svc: orchestrator] : question | The question reaches the search service.
+  Search service -> Vector index [db: embeddings], Keyword index [db: BM25] : same query | The query is sent to both indexes in parallel.
+  Vector index, Keyword index -> Search service : 50 + 50 candidates | Each index returns its own ranked list.
+  * Search service: fused to 80 unique | Reciprocal rank fusion merges the lists and removes duplicates.
+  Search service -> Reranker [model: cross-encoder] : query + 80 chunks | The reranker reads each pair and scores it.
+  Reranker -> Search service : top 6 | The six best chunks go to the prompt.
+ref: paper | Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods | Cormack, Clarke & Buettcher, SIGIR 2009 | 
+
+== Permission-aware and injection-safe retrieval
+kind: rag, zero-trust
+when: Documents have different owners and access rights, and some of them may contain hostile text.
+how: Each chunk is stored with its access list or group ids from the source system. At query time the service takes the user's identity from the login, and applies the filter inside the vector search, for example group in user.groups. Filtering after retrieval can leave too few results and may leak existence of documents, so it is done in the index.
+Retrieved text is data, not instructions. The prompt marks it clearly as untrusted, the model has no powerful tools in the same call, and the answer service checks output for secrets and for links to unknown hosts. A document that says "ignore previous instructions" must not change behaviour.
+Access changes must reach the index quickly: a sync job updates the access lists when a person leaves a group. Log which chunks were shown to whom, for audit.
+used: Enterprise assistants over SharePoint, Google Drive and Confluence; vector databases with metadata filters.
+avoid: For public documents with no access rules, where the filter adds cost without benefit.
+flow:
+  Employee [user: in group finance] -> RAG service [svc: has user identity] : question + token | The service knows who is asking.
+  RAG service -> Vector index [db: chunks + ACL] : query + filter groups | The filter is applied inside the search.
+  Vector index -> RAG service : 6 permitted chunks | Only chunks the user may read come back.
+  RAG service -> LLM [model: no tools here] : chunks marked untrusted | The prompt marks the chunk text as data only.
+  LLM -> Output check [svc: secrets + link filter] : draft answer | The answer is scanned before it is shown.
+  Output check -x> Employee : external link blocked | A link to an unknown host is removed.
+  ACL sync [svc: from source systems] ~> Vector index : group changes | Access lists are refreshed when people change groups.
+ref: docs | OWASP Top 10 for LLM Applications | OWASP | https://genai.owasp.org/llm-top-10/

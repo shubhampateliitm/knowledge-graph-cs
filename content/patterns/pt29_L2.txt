@@ -1,0 +1,780 @@
+@@ kr
+== GraphRAG: retrieve over an extracted knowledge graph
+kind: rag
+when: Questions need facts that are spread over many documents, and plain vector search returns pieces that miss the links between them.
+how: At indexing time an LLM reads each text chunk and extracts entities and relations as triples, such as (AcmeCo, acquired, BetaCorp). The triples are merged into one graph, and duplicate names are resolved to one node each. The graph can then be split into communities, and a summary is written for each community.
+At query time the system finds the entities named in the question, walks 1 to 3 hops along the edges, and collects the linked chunks and summaries. These are put into the LLM prompt as context. A question like "which suppliers of our suppliers are in one country" follows edges instead of hoping that one chunk contains the answer.
+The cost is indexing: every chunk needs at least one LLM call, and extraction errors become wrong edges. Keep the source chunk id on every edge, so answers can cite text.
+used: Microsoft GraphRAG (open source); Neo4j and other graph databases as the store in RAG stacks; enterprise question answering over contracts and reports.
+avoid: When questions are answered by one passage; plain vector RAG is cheaper and simpler.
+flow:
+  Documents [lake: text chunks] -> Extractor [svc: LLM calls] : chunk text | The extractor asks an LLM to list entities and relations found in each chunk.
+  Extractor -> Graph store [db: triples + chunk ids] : triples | Triples are merged into one graph, and the same entity under two names becomes one node.
+  User [user] -> RAG service [svc] : question | A user asks a question that links several facts.
+  RAG service -> Graph store : find entity, walk 2 hops | The service matches entities in the question and follows edges to nearby nodes.
+  Graph store -> RAG service : facts + source chunks | The service gets connected facts and the text chunks they came from.
+  RAG service -> LLM [model] : question + graph context | The LLM answers from linked facts and can cite the chunk ids.
+ref: paper | From Local to Global: A Graph RAG Approach to Query-Focused Summarization | Edge et al., Microsoft Research, 2024 | https://arxiv.org/abs/2404.16130
+
+== Ontology-driven integration of many sources
+kind: etl-elt, polyglot-persistence
+when: Several systems describe the same things with different schemas, and one shared, queryable view with meaning is needed.
+how: Each source system keeps its own schema. A mapping layer turns rows from each source into triples that use shared terms from an ontology, for example Person, Company and worksFor. A shared id (or a sameAs link) joins the same entity across sources.
+The triples are loaded into a triple store. A reasoner then adds facts that follow from the rules: if every Manager is an Employee, a query for employees also returns managers. Users and tools query with SPARQL over one model, not over five schemas.
+Adding a new source means writing a new mapping, not changing the other sources or the query layer. The cost is the work of designing the ontology and keeping the mappings correct as sources change.
+used: Wikidata and its public SPARQL endpoint; Google Knowledge Graph for search results; pharma and life-science data integration with RDF and OWL.
+avoid: When one relational database already holds all the data; SQL joins are simpler and faster.
+flow:
+  CRM [db] -> Mapper [svc: ontology mapping] : customer rows | The mapper turns CRM rows into triples with shared terms.
+  ERP [db] -> Mapper : supplier rows | The same mapper handles ERP rows with a second mapping file.
+  Mapper -> Triple store [db: RDF + OWL] : triples | Triples from both sources are loaded into one graph.
+  Triple store -> Reasoner [svc] : rules + facts | The reasoner applies the ontology rules, for example Manager is an Employee.
+  Reasoner -> Triple store : inferred triples | Derived facts are stored, so queries do not repeat the reasoning.
+  Analyst [user] -> Triple store : SPARQL query | One query spans both sources, because both use the same terms.
+ref: docs | Wikidata:Introduction | Wikimedia Foundation | https://www.wikidata.org/wiki/Wikidata:Introduction
+ref: spec | RDF 1.1 Concepts and Abstract Syntax | W3C, 2014 | https://www.w3.org/TR/rdf11-concepts/
+
+@@ planning
+== Plan, execute, monitor, replan
+kind: control-loop, agent-loop
+when: A robot or agent must reach a goal through many steps, while the world can change or an action can fail.
+how: A planner takes the current state, the goal and an action model written in PDDL. It runs heuristic search (often a relaxed-plan heuristic such as FF) and returns an ordered list of actions. An executor sends the first action to the actuators or tools.
+After each action a monitor compares the new observed state with the state the plan expected. If they match, the next action runs. If they differ, for example a door is closed or a tool call failed, the executor stops and asks the planner for a new plan from the real state.
+Replanning from the observed state is simple and robust. Plans are short, so the planner must answer in well under a second to keep the loop live. Long missions split the work: a task planner makes the order, and a motion planner or tool layer handles the detail.
+used: ROS 2 task planning with PlanSys2 and PDDL planners; NASA flight software that schedules spacecraft activities; LLM agents that write a step list and revise it after each tool result.
+avoid: When the actions and outcomes are fixed in advance; a plain script or workflow engine is simpler.
+flow:
+  Goal [note: deliver 5 items] -> Planner [svc: PDDL + A*] : state + goal | The planner searches for an action sequence with a heuristic.
+  Planner -> Executor [svc] : plan: pick, move, drop | The executor receives an ordered plan of actions.
+  Executor -> Robot [client: actuators] : action 1: pick | Only one action is sent at a time.
+  Robot -> Monitor [svc: state check] : observed state | The monitor reads sensors after the action.
+  Monitor -x> Executor : state differs: door closed | The world no longer matches the plan, so the rest of the plan is invalid.
+  Monitor -> Planner : replan from observed state | The planner makes a new plan from the real state, and the loop continues.
+ref: book | Automated Planning: Theory and Practice | Ghallab, Nau & Traverso, 2004 |
+
+== Planning as constraint or SAT solving for scheduling
+kind: solver-service
+when: Many actions must fit inside time, resource and ordering limits, and the plan has to be valid, not only good.
+how: The scheduling problem is written as variables and constraints. For example, each observation has a start time, two observations may not use the same antenna at once, and a battery level must stay above a minimum. A CP-SAT or SAT solver searches for an assignment that satisfies all of them.
+The solver uses learned conflicts to cut the search. If a step limit k is set, a classical plan of length k can be compiled to SAT. The planner raises k until a solution appears, which gives a plan with the fewest steps.
+An objective, such as the finish time, is then lowered step by step until the solver proves that no better plan exists or time runs out. The answer is either a valid plan or a proof that none exists within the limits.
+used: Spacecraft and satellite observation scheduling; factory and airline crew scheduling with OR-Tools CP-SAT; SAT-based planners such as SATPlan.
+avoid: When the problem has no hard limits and a greedy rule is good enough.
+flow:
+  Mission request [note: 40 tasks] -> Modeler [svc: variables + limits] : tasks, windows, resources | A modeler turns the request into variables and constraints.
+  Modeler -> CP-SAT solver [svc] : constraint model | The model is sent to a general solver.
+  * CP-SAT solver: learned 120 conflicts | The solver prunes values and learns conflicts, so it does not repeat a dead end.
+  CP-SAT solver -> Modeler : schedule, makespan 91 | The first valid schedule comes back with its finish time.
+  Modeler -> CP-SAT solver : require makespan < 91 | The model is tightened to ask for a better schedule.
+  CP-SAT solver -x> Modeler : infeasible | The solver proves nothing better exists, so 91 is optimal.
+ref: docs | OR-Tools CP-SAT solver | Google | https://developers.google.com/optimization/cp/cp_solver
+
+@@ apidesign
+== Cursor pagination over an indexed sort key
+kind: index-table, request-reply
+when: Clients read long lists that change while they page, and offset paging gets slow or skips rows.
+how: The server sorts by a stable, unique key, such as (created_at, id), backed by an index. A response returns one page, for example 50 items, and an opaque cursor. The cursor encodes the last key seen. The next request sends it back.
+The server runs "where (created_at, id) < cursor order by created_at desc, id desc limit 50". The database seeks into the index and reads 50 entries, so page 10,000 costs the same as page 1. With offset paging, the database must read and drop all earlier rows, and inserted rows shift the pages.
+The cursor is opaque so the server can change its content later without breaking clients. Keep an upper limit on page size, and sign the cursor if clients must not edit it.
+used: Stripe list endpoints (starting_after); GitHub GraphQL connections; Relay cursor connections specification.
+avoid: When users must jump to page N, or need a total count; offset paging with a count query is simpler there.
+flow:
+  Mobile app [client] -> API [svc] : GET /orders?limit=50 | The client asks for the first page.
+  API -> Orders DB [db: index on created_at] : order by key desc limit 50 | The query uses an index range scan, not a full sort.
+  Orders DB -> API : 50 rows | The database returns only the page.
+  API -> Mobile app : items + next_cursor | The cursor holds the last key and is opaque to the client.
+  Mobile app -> API : GET ?cursor=abc | The client sends the cursor for the next page.
+  API -> Orders DB : key < last key limit 50 | The database seeks straight to the position, so the cost stays flat.
+ref: docs | Pagination | Stripe API reference | https://docs.stripe.com/api/pagination
+ref: spec | GraphQL Cursor Connections Specification | Relay | https://relay.dev/graphql/connections.htm
+
+== Idempotency keys for safe retries
+kind: idempotent-consumer, retry-backoff
+when: A client may retry a write after a timeout, and the server must not charge or create twice.
+how: The client creates a unique key, such as a UUID, for each logical action and sends it in a header on a POST. The server first looks up the key in a store. If it is new, the server runs the action and saves the status and body of the response under the key, in the same transaction as the action.
+If the same key comes again, the server returns the saved response and does not run the action. A retry after a timeout is then harmless. If the same key arrives with a different request body, the server rejects it as a client error.
+Keys are kept for a limited time, for example 24 hours. The client retries with exponential backoff and jitter, and always reuses the same key for the same action.
+used: Stripe API (Idempotency-Key header); payment APIs in general; an IETF draft defines an Idempotency-Key header for HTTP.
+avoid: For reads and for PUT or DELETE that are already idempotent by design.
+flow:
+  Client [client] -> API [svc] : POST /charges key=K1 | The client sends a payment with a new idempotency key.
+  API -> Key store [db: key, response] : lookup K1 | The API checks if K1 was seen before.
+  API -> Payments DB [db] : charge + save K1 result | The charge and the saved result commit in one transaction.
+  API -x> Client : timeout | The response is lost on the network, so the client does not know the outcome.
+  Client -> API : retry key=K1 | The client retries with the same key after a backoff delay.
+  Key store -> API : saved response | The API finds K1 and returns the saved result, so the card is charged once.
+ref: docs | Idempotent requests | Stripe API reference | https://docs.stripe.com/api/idempotent_requests
+
+== GraphQL gateway as a backend for the front end
+kind: bff, api-gateway
+when: Mobile and web screens need data from many services, and one REST call per service is too slow.
+how: A GraphQL server sits between clients and the services. The schema describes types and fields. Each field has a resolver that calls a service or database. A client sends one query that names the exact fields a screen needs.
+The server runs the resolvers, in parallel where fields are independent, and returns one JSON document. A batching helper such as DataLoader groups many loads of the same kind into one call. Without it, a list of 50 orders would cause 50 user lookups (the N+1 problem).
+Add limits on query depth and cost, and persisted queries, so one client cannot send a query that overloads the services. Change the schema with additive fields and deprecate old ones, so old app versions keep working.
+used: GitHub GraphQL API; Shopify Storefront API; Apollo Federation setups over many services.
+avoid: When clients are simple and the data is a few cacheable resources; REST with HTTP caching is simpler.
+flow:
+  App [client] -> GraphQL server [svc: gateway] : one query, 2 types | One request names exactly the fields the screen shows.
+  GraphQL server -> Orders service [svc] : list orders | The orders resolver loads 50 orders.
+  GraphQL server -> User service [svc] : getUsers([ids]) | DataLoader sends one batched call for 50 users, not 50 calls.
+  Orders service -> GraphQL server : orders | The orders return.
+  User service -> GraphQL server : users | The users return.
+  GraphQL server -> App : one JSON document | The server merges results and returns only the asked fields.
+ref: spec | GraphQL specification | GraphQL Foundation | https://spec.graphql.org/
+
+@@ renderpipe
+== Critical rendering path with streamed server HTML
+kind: cdn-edge, pipeline-stages
+when: First paint must be fast on slow phones and networks, and the page needs data from the server.
+how: The server (or an edge node) sends the HTML head early, with links to CSS and scripts, and then streams the body as data arrives. The parser builds the DOM while bytes are still coming. CSS blocks rendering, so keep it small and inline the critical part. Scripts use defer or async, so they do not stop the parser.
+When the DOM and CSSOM are ready, the browser computes style and layout, paints, and composites. The first paint can happen before the full page arrives. Metrics to watch are First Contentful Paint and Largest Contentful Paint.
+A CDN caches the static shell near the user, which cuts the network round trips. Each avoided blocking resource removes one trip, often 50 to 200 ms on mobile.
+used: Streaming server rendering in React (renderToPipeableStream) and Next.js; Google Chrome's Core Web Vitals guidance; Chrome DevTools Performance panel.
+avoid: When the page is a pure client-side app behind a login and has no first-visit speed need; the shell approach is enough.
+flow:
+  Browser [client] -> Edge cache [cache: CDN] : GET /product/42 | The browser asks the nearest edge node for the page.
+  Edge cache -> Origin [svc: SSR] : cache miss | On a miss the edge asks the origin server.
+  Origin -> Edge cache : head + inline CSS | The origin sends the head and critical CSS first.
+  Edge cache -> Browser : streamed HTML | The browser starts parsing the DOM while more HTML arrives.
+  Origin ~> Browser : late body chunks | Slow data parts are streamed later, after the first paint.
+  * Browser: first paint at 0.9 s | The browser has DOM and CSSOM, so it runs style, layout and paint.
+ref: docs | Critical rendering path | web.dev | https://web.dev/learn/performance/understanding-the-critical-path
+
+== Keep the main thread free with workers and the compositor
+kind: event-loop, offload-accelerator
+when: The page janks or ignores clicks because scripts and layout use the single main thread for too long.
+how: Scripts, style, layout and paint share one main thread, and a task of 200 ms blocks input and the next frame. At 60 frames per second each frame has about 16 ms. So heavy work moves away from the main thread.
+Computation, such as parsing a large JSON or filtering a big list, goes to a Web Worker, which posts the result back as a message. Animations use only transform and opacity, because the compositor thread and the GPU can run them without layout or paint. Long tasks are split into chunks of under 50 ms, and yield to the event loop between chunks.
+Changing width or top forces layout again on every frame. Changing transform does not. Reading layout values such as offsetHeight right after a write forces a sync layout, so batch reads before writes.
+used: Chrome's compositor thread and Web Workers; Google's Long Tasks and INP guidance; web apps such as Google Docs and Figma that move heavy work to workers.
+avoid: For small tasks where message passing between threads costs more than the work.
+flow:
+  User [user] -> Main thread [svc: JS, style, layout] : click | Input arrives on the main thread.
+  Main thread -> Worker [svc: Web Worker] : postMessage(big list) | The heavy filter runs off the main thread.
+  Worker -> Main thread : result | The worker returns the answer as a message.
+  Main thread -> Compositor [svc: GPU thread] : layer + transform | The main thread only updates a transform value.
+  Compositor -> Display [client: screen] : frame at 60 fps | The compositor draws each frame without layout or paint.
+  Main thread -x> Display : 200 ms task, frame missed | A long script on the main thread would miss several frames.
+ref: docs | Rendering performance | web.dev | https://web.dev/articles/rendering-performance
+
+@@ virtualdom
+== Declarative render, diff and commit loop
+kind: control-loop
+when: A screen has many states, and hand-written DOM updates keep getting out of sync.
+how: The programmer writes a function from state to a tree of lightweight element objects. When state changes, the library calls the function again and gets a new tree. It compares the new tree with the previous one, top down, and collects a list of changes.
+The compare step uses two rules to stay linear in the tree size: elements of different types are replaced whole, and list children are matched by key. This replaces the O(n cubed) exact tree edit distance. A commit step then applies the list to the real DOM in one pass: create, update, move or remove nodes.
+The loop is the same idea as a control loop: desired state is data, and the library moves the real state toward it. Because the tree is plain data, it can also be built on a server, or tested without a browser.
+used: React reconciliation; Preact; Vue (a compiler-assisted virtual DOM); Inferno.
+avoid: When a few known nodes change very often; fine-grained signals (Solid, Svelte) skip the tree compare.
+flow:
+  User [user] -> Component [svc: render function] : click: add item | An event changes the state.
+  Component -> Reconciler [svc: diff] : new element tree | The render function returns a new tree from the new state.
+  * Reconciler: diff done, 2 changes | Same type is updated in place, keys match list items, other cases are replaced.
+  Reconciler -> DOM [store: browser tree] : 1 insert, 1 text update | Only the two real changes are applied, in one commit.
+  DOM -> Browser [client: layout + paint] : style recalculation | The browser lays out and paints just the changed part.
+ref: docs | Preserving and Resetting State (reconciliation) | React documentation | https://react.dev/learn/preserving-and-resetting-state
+
+== Batched state updates with one commit per frame
+kind: batching
+when: One event triggers many state changes, and rendering after each one would repeat work and flicker.
+how: In React 18 and later, updates made inside one event handler, timer or promise are queued and processed together (automatic batching). Five calls to setState in one click lead to one render and one commit, not five.
+The reconciler works on a work-in-progress tree. Render work can be split into small units, and urgent updates such as typing can go before low-priority ones such as a big filtered list. The commit step stays synchronous, so the user never sees a half-updated page.
+This also helps the browser: one commit means one pass of style, layout and paint, not several. The programmer should still keep render functions pure and cheap, because they can run more than once.
+used: React 18 automatic batching and transitions; Vue's asynchronous update queue (nextTick); Preact's batched render queue.
+avoid: When code must read the updated DOM right after a state change; use the framework's flush option for that rare case.
+flow:
+  Click handler [svc] -> Update queue [queue: pending state] : setCount, setName, setOpen | Three state updates are queued during one click, with no render yet.
+  Update queue -> Scheduler [svc: priority] : flush at end of event | The scheduler runs one render for all three updates.
+  Scheduler -> Reconciler [svc] : render once | The reconciler builds one new tree that has all three changes.
+  Reconciler -> DOM [store] : one commit | The commit applies all changes together, so there is no half state.
+  DOM -> Browser [client] : one layout + paint | The browser does one layout and one paint for the frame.
+ref: docs | Queueing a Series of State Updates | React documentation | https://react.dev/learn/queueing-a-series-of-state-updates
+
+@@ amortized
+== LSM write path with amortized compaction
+kind: lsm-compaction, batching
+when: A store takes many small random writes, and each write must be cheap even though disk likes large sorted files.
+how: A write goes to the write-ahead log and to an in-memory memtable. This costs O(log n) in memory and one sequential disk append. When the memtable is full, for example 64 MB, it is flushed as one sorted file (an SSTable).
+Files pile up, so background compaction merges them into fewer, larger sorted files. One compaction can rewrite gigabytes, which is a huge cost for that single moment. But each byte is rewritten only a bounded number of times, about once per level (with 10x level ratio, 4 to 6 levels). So the cost per written byte, averaged over the sequence, is small and fixed.
+The averaged cost is the point: the writer sees flat latency, and the system pays the rewrite cost in the background. The cost is write amplification, and compaction must keep up with the write rate, or the engine slows writers on purpose.
+used: RocksDB and LevelDB; Cassandra, HBase and ScyllaDB; Apache Kafka is similar in spirit for log segment cleanup.
+avoid: When reads dominate and write amplification hurts SSD life; a B-tree has lower write amplification for read-heavy loads.
+flow:
+  Writer [client] -> Memtable [store: RAM, 64 MB] : put(k, v) | Each write also appends to the log, then lands in memory.
+  Memtable -> L0 files [lake: sorted SSTables] : flush when full | A full memtable becomes one sorted file with a sequential write.
+  L0 files -> Compactor [svc: background] : 4 files | Compaction starts when too many files pile up in L0.
+  Compactor -> L1 files [lake: merged, sorted] : merged output | The compactor rewrites 4 files as fewer large ones and drops old versions.
+  Compactor -x> Writer : stall if it falls behind | If compaction lags, the engine slows writers to protect reads.
+ref: paper | The Log-Structured Merge-Tree (LSM-Tree) | O'Neil, Cheng, Gawlick & O'Neil, Acta Informatica, 1996 |
+ref: docs | RocksDB Compaction | RocksDB wiki | https://github.com/facebook/rocksdb/wiki/Compaction
+
+== Incremental rehash: spreading the resize cost
+kind: none
+when: A hash table must grow without one huge pause, because a single resize of millions of keys would stall all requests.
+how: A normal resize allocates a table twice as big and moves every key. The total cost of resizes over n inserts is O(n), so insert is O(1) on average. But one insert, the unlucky one, can take milliseconds or more, and that breaks a latency target.
+Redis keeps two hash tables during growth. New keys go to the new table. Each later command moves a few buckets from the old table to the new one, and lookups check both tables. When the old table is empty, it is dropped.
+Now the worst single operation is also small, because the work is split in tiny parts. This is called de-amortizing: the same total work, but paid in small steps. The cost is a short period of extra memory (two tables) and a slightly more complex lookup.
+used: Redis dictionary (incremental rehashing); Go maps grow incrementally; Java ConcurrentHashMap helps with transfers during resize.
+avoid: When a pause of a few milliseconds is fine, such as in a batch job; a plain doubling table is simpler.
+flow:
+  Client [client] -> Redis [svc: single thread] : SET key v | A write arrives while the table is resizing.
+  Redis -> New table [store: 2x buckets] : insert key | New keys go only to the new, larger table.
+  Redis -> Old table [store: draining] : move 1 bucket | Each command also moves one or a few old buckets over.
+  Client -> Redis : GET key | A read checks the new table, and then the old table.
+  * Old table: empty | When the old table has no keys left it is freed, and the resize ends.
+ref: docs | Redis dictionary implementation (dict.c) | Redis source code | https://github.com/redis/redis/blob/unstable/src/dict.c
+
+@@ approxalgo
+== List scheduling on a pool of identical workers
+kind: competing-consumers, thread-pool
+when: Many independent jobs of known or estimated size must finish as early as possible on a fixed set of machines.
+how: Finding the best split of jobs over m machines is NP-hard. A simple greedy rule is enough to get a proven bound. Keep each job in a queue. Whenever a machine is free, give it the next job. This is Graham's list scheduling.
+The finish time (makespan) is at most (2 - 1/m) times the optimum. The proof uses two facts: the optimum is at least the average load, and at least the longest job. If jobs are sorted from longest to shortest first (LPT), the bound becomes 4/3 - 1/(3m).
+So a capacity planner can promise "at most 33 percent over the best possible", without solving the hard problem. The same idea runs inside many work queues and batch schedulers, where an idle worker pulls the next job.
+used: Common in batch job runners and build farms that sort long tasks first; the 2-approximation for makespan in DAG schedulers; worker pools that pull from one queue.
+avoid: When jobs depend on each other in a graph with communication costs, or have placement limits; use a DAG or constraint scheduler.
+flow:
+  Job queue [queue: longest first] -> Scheduler [svc: greedy] : next job | The scheduler takes the longest waiting job.
+  Scheduler -> Worker A [svc: load 7 h] : job 9 h | A worker that becomes free gets the next job.
+  Scheduler -> Worker B [svc: load 8 h] : job 5 h | The other worker gets the following job when it is free.
+  Worker A -> Scheduler : done | Finished workers ask for more work, so none stays idle while jobs wait.
+  * Scheduler: makespan <= 4/3 OPT | With longest-first order the result is at most 4/3 of the best possible time.
+ref: paper | Bounds on Multiprocessing Timing Anomalies | R. L. Graham, SIAM Journal on Applied Mathematics, 1969 |
+
+== Greedy answer plus an LP lower bound
+kind: none
+when: An NP-hard planning problem must be solved fast, and the business wants to know how far the answer is from the best one.
+how: The solver first runs a fast greedy or rounding algorithm. For set cover, greedy picks the set that covers the most uncovered items each time. Its answer is at most ln(n) times the optimum.
+At the same time, the solver solves the linear programming (LP) relaxation, where yes or no choices become fractions between 0 and 1. The LP can be solved in polynomial time, and its value is a lower bound for every possible solution, in a minimisation problem.
+The gap between the greedy cost and the LP bound is a certificate. If greedy costs 105 and the LP bound is 100, the answer is within 5 percent of the best possible, whatever the best is. The team can stop, or spend more time on local search or branch and bound only when the gap is large.
+used: Common in capacity planning, delivery routing and server-placement tools; MIP solvers such as OR-Tools, Gurobi and HiGHS report the gap between best answer and bound.
+avoid: When the problem is small enough for an exact solver to finish in time; use the exact answer.
+flow:
+  Planner [client] -> Greedy solver [svc: fast] : problem instance | The planner asks for a quick answer first.
+  Greedy solver -> Planner : cost 105 | The greedy answer comes back in milliseconds.
+  Planner -> LP solver [svc: relaxation] : same instance | The same problem is solved with fractions allowed.
+  LP solver -> Planner : lower bound 100 | No real solution can cost less than 100.
+  * Planner: gap 5 percent | The gap is the proof that the greedy answer is close to the best.
+  Planner ~> Exact search [svc: branch and bound] : only if gap is large | Slow exact search runs only when the gap is too big for the business.
+ref: book | The Design of Approximation Algorithms | Williamson & Shmoys, Cambridge University Press, 2011 | https://www.designofapproxalgs.com/
+
+@@ bigo
+== Remove an N+1 query with a batched lookup
+kind: batching
+when: A page or job runs one query per item of a list, and latency grows with the list size.
+how: Code loads 100 orders, then loops and asks the database for each customer: 1 query for the list and 100 for the customers. This is O(n) round trips. At 1 ms per round trip, that is 100 ms for the list, and 10 seconds when the list has 10,000 items.
+The fix is to collect the ids first and send one query: "select * from customers where id in (...)", or a join. Now the number of round trips is O(1) and the database does the work in one pass. A batching helper such as DataLoader or an ORM eager-load option does this for you.
+Big-O is the tool that finds this: count the number of calls to the slow resource, not only CPU steps. A query count per request in the tracing tool shows the problem early.
+used: Rails includes and Django select_related and prefetch_related; GraphQL DataLoader; SQLAlchemy selectinload.
+avoid: When the list is always very small (under 5 items) and the extra code makes the code harder to read.
+flow:
+  API [svc] -> Orders DB [db] : select orders limit 100 | One query returns 100 orders.
+  API -x> Customers DB [db] : 100 queries by id | The naive loop makes 100 round trips, one per order.
+  * API: collected 100 ids | The fix is to gather all ids in memory first.
+  API -> Customers DB : where id in (100 ids) | One batched query replaces 100 calls.
+  Customers DB -> API : 100 rows | All customers come back at once and are joined in memory.
+ref: docs | Preventing N+1 Queries: select_related and prefetch_related | Django documentation | https://docs.djangoproject.com/en/stable/ref/models/querysets/#prefetch-related
+
+== Scan becomes index lookup: choosing by growth rate
+kind: index-table
+when: A query is fast in a test with 10,000 rows but gets slower in proportion to the table as data grows to millions.
+how: Without an index, a lookup by email reads every row: O(n). At 100 million rows and 1 microsecond per row, that is 100 seconds of CPU time. With a B-tree index on email, the lookup reads about 4 to 5 pages, which is O(log n) with a large base, and takes under a millisecond.
+The cost moves to writes: every insert also updates the index, so each insert costs O(log n) extra, and the index uses disk space. So the choice is a trade: pay on writes to save on reads.
+The query planner makes this choice with its cost estimates. In Postgres, EXPLAIN ANALYZE shows a sequential scan or an index scan. Test with 10 times and 100 times more data, and check that the time grows as predicted.
+used: Postgres and MySQL B-tree indexes; the same idea in a key-value store with a secondary index table.
+avoid: For small tables or queries that read most rows anyway; a sequential scan is faster there.
+flow:
+  App [client] -> Postgres [db: users 100M rows] : where email = x | A query asks for one user by email.
+  Postgres -x> App : seq scan: 100 s CPU | Without an index the planner must read all rows.
+  Postgres -> Email index [store: B-tree] : seek email | With an index the planner descends 4 to 5 pages.
+  Email index -> Postgres : row pointer | The index returns the location of the row.
+  Postgres -> App : 1 row in 0.5 ms | The heap fetch returns one row, so cost does not grow with the table.
+ref: docs | Using EXPLAIN | PostgreSQL documentation | https://www.postgresql.org/docs/current/using-explain.html
+
+@@ binpacking
+== Filter, score and bind in a pod scheduler
+kind: control-loop, pipes-filters
+when: A cluster must place thousands of pods with different CPU and memory needs on nodes, within milliseconds per pod.
+how: The scheduler watches the API server for pods with no node. For each pod it runs two phases. Filter removes nodes that cannot host the pod: not enough free CPU or memory, wrong labels, taints, or affinity rules. Score ranks the remaining nodes, and the best one wins.
+The NodeResourcesFit plugin scores by resource use. LeastAllocated prefers empty nodes, which spreads load. MostAllocated prefers full nodes, which packs pods tightly so the autoscaler can remove idle nodes. This is a greedy heuristic for multi-dimension bin packing, which is NP-hard, so no exact solver is used on the hot path.
+The scheduler then writes a binding to the API server, and the kubelet on that node starts the pod. Large pods are placed first when possible, because first-fit decreasing has a proven bound of about 11/9 of optimal.
+used: Kubernetes kube-scheduler (NodeResourcesFit); Hadoop YARN schedulers; Google Borg (scoring to reduce stranded resources, as described in the Borg paper).
+avoid: When placement needs a global optimum with many rules, such as a big batch of gang-scheduled jobs; use a batch scheduler such as Volcano or Kueue, or a solver.
+flow:
+  API server [svc: pod queue] -> Scheduler [svc: kube-scheduler] : pod web-7 needs 2 CPU | The scheduler sees a new pod with no node set.
+  * Scheduler: filtered 100 to 12 nodes | Nodes with too little room or wrong taints are removed.
+  Scheduler -> Node B [svc: 88 percent full] : score MostAllocated | The fullest node that still fits gets the highest score.
+  Scheduler -> API server : bind web-7 to Node B | The scheduler writes the binding to the API server.
+  API server -> Kubelet [svc: node agent] : start pod | The kubelet on Node B pulls the image and starts the pod.
+  Node A [svc: 5 percent full] -x> Scheduler : not chosen | Packed placement leaves Node A empty, so the autoscaler can remove it.
+ref: docs | Scheduling Framework | Kubernetes documentation | https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/
+ref: docs | Resource Bin Packing | Kubernetes documentation | https://kubernetes.io/docs/concepts/scheduling-eviction/resource-bin-packing/
+
+== Provision and consolidate nodes by packing pending pods
+kind: autoscaling, control-loop
+when: Nodes are rented by the hour, and unused capacity on them costs money.
+how: Karpenter watches for pods that cannot be scheduled. It waits a short batching window, then packs the pending pods onto the cheapest set of instance types that fits their CPU, memory and rules. This is bin packing where the bin size can also be chosen.
+In the other direction, a consolidation loop looks at running nodes. It removes an empty node, and it can drain a node if its pods fit on other nodes, or replace several nodes by one cheaper node. Pod disruption budgets limit how many pods are evicted at once.
+The two loops together keep the cluster close to the packed minimum as demand goes up and down. The cost is churn: pods move, so they must tolerate restarts. Choose the consolidation policy and a delay time to avoid constant moves.
+used: Karpenter on AWS EKS and other clouds; Kubernetes Cluster Autoscaler (scale-down of underused nodes).
+avoid: For stateful pods that cannot be moved easily, or when instance types are fixed by contract; keep a static node pool.
+flow:
+  Pending pods [queue: 40 pods] -> Karpenter [svc: provisioner] : unschedulable | The provisioner collects pods that no node can host.
+  Karpenter -> Cloud API [svc: EC2 fleet] : launch 3 x 16-CPU nodes | It packs the pods and asks for the cheapest nodes that fit.
+  Cloud API -> Nodes [svc: new nodes] : nodes ready | Nodes join the cluster, and the scheduler places the pods.
+  Karpenter -> Nodes : find nodes with free room | Later, the consolidation loop checks for underused nodes.
+  Nodes -> Karpenter : pods fit on 2 nodes | The pods of the third node can move to the other two.
+  Karpenter -> Cloud API : drain and terminate node 3 | The node is drained, and then removed, so billing stops.
+ref: docs | Karpenter disruption and consolidation | Karpenter documentation | https://karpenter.sh/docs/concepts/disruption/
+
+@@ binsearch
+== Sparse index lookup in a sorted log segment
+kind: lsm-compaction, index-table
+when: Data lives in large sorted files on disk, and a lookup by key or offset must read only a few blocks.
+how: The file is sorted, but an index entry is kept only for every few KB, not for every record. This is a sparse index. It is small enough to stay in memory. A lookup binary-searches the index for the largest entry that is not above the target. That gives a file position.
+The reader then seeks to that position and reads one block, or scans forward a few records. For a million index entries, binary search needs about 20 comparisons in memory and costs no disk reads. Only the final block read touches the disk.
+Kafka keeps a sparse offset index per log segment (by default one entry per 4 KB of log). It picks the segment by base offset, binary-searches the index, and scans the log from there. RocksDB and LevelDB use an index block in each SSTable in the same way.
+used: Kafka log segment .index and .timeindex files; RocksDB and LevelDB SSTable index blocks; Cassandra partition index.
+avoid: When the data is unsorted or changes in place; use a hash index or a B-tree.
+flow:
+  Consumer [client] -> Broker [svc: Kafka] : fetch offset 7,300,512 | A consumer asks for messages from one offset.
+  Broker -> Segment list [store: base offsets] : find segment | The broker finds the segment file whose base offset is not above the target.
+  Broker -> Offset index [cache: sparse and in memory] : binary search | About 20 comparisons find the nearest earlier entry.
+  Offset index -> Broker : file position 83,968 | The index returns where to start reading in the log file.
+  Broker -> Log file [log: segment] : read from 83,968 | One sequential read, and a short scan, reaches the exact offset.
+  Broker -> Consumer : records | The broker returns messages from that offset on.
+ref: docs | Kafka design: log | Apache Kafka documentation | https://kafka.apache.org/documentation/#log
+
+== Bisect the commit history to find the first bad build
+kind: bisection
+when: A test passed last week and fails now, and hundreds of commits are in between.
+how: The condition "this commit is bad" is false for old commits and true for later ones, and never flips back. That is exactly what binary search needs. Mark one good commit and one bad commit. Check out the middle commit, build it, and test it. If it is bad, the first bad commit is in the older half. If it is good, it is in the newer half.
+With 1,000 commits this takes about 10 builds, not 1,000. In git, "git bisect run ./test.sh" automates it: the script exits with code 0 for good and a non-zero code for bad.
+The method needs a test that is stable. A flaky test breaks the monotone rule and gives a wrong answer, so repeat the test or fix the flakiness first. Some CI systems run the same search automatically.
+used: git bisect; Chromium and Firefox regression range finders; culprit finding in CI services for large monorepos (common in build systems).
+avoid: When the failure comes from the combination of two commits, or the test is flaky; look at logs and traces first.
+flow:
+  Engineer [user] -> Git [svc: bisect] : good v1.2, bad HEAD | The engineer names one good and one bad commit, with 1,000 commits between.
+  Git -> Test runner [svc: build + test] : check out commit 500 | Git checks out the middle commit.
+  Test runner -> Git : bad | The test fails, so the bug is in the first 500 commits.
+  Git -> Test runner : check out commit 250 | The range is halved again.
+  Test runner -> Git : good | The first bad commit is between 250 and 500.
+  Git -> Engineer : first bad commit found | After about 10 tests the search ends with one commit.
+ref: docs | git-bisect | Git documentation | https://git-scm.com/docs/git-bisect
+
+@@ compgeom
+== Filter then refine: bounding boxes before exact geometry
+kind: index-table, pipes-filters
+when: A query asks which of millions of shapes touch a region or contain a point, and exact tests are too slow to run on all of them.
+how: Exact geometry tests, such as point in polygon, cost O(k) for a polygon with k vertices. So the database first stores each shape's bounding box (four numbers) in a spatial index, such as an R-tree built on the GiST index in PostGIS.
+A query first asks the index for boxes that overlap the query box. This filter step is cheap and returns a small set of candidates, for example 200 of 5 million. The refine step runs the exact test, with orientation tests, only on these candidates.
+The filter step never loses a true match, because a shape cannot touch the region unless its box does. It can return false matches, which the exact step removes. Use ST_DWithin or ST_Intersects: they run both steps for you.
+used: PostGIS with GiST spatial indexes; GEOS (the geometry library under PostGIS, Shapely and QGIS); MongoDB 2dsphere indexes.
+avoid: When shapes are huge and nearly all boxes overlap the query; consider simplifying shapes or tiling first.
+flow:
+  App [client] -> PostGIS [db: 5M polygons] : zones containing point P | The app asks which delivery zones contain a customer location.
+  PostGIS -> GiST index [store: R-tree of boxes] : boxes overlapping P | The index checks boxes only, with simple comparisons.
+  GiST index -> PostGIS : 200 candidate ids | Only 200 of 5 million shapes survive the filter.
+  PostGIS -> GEOS [svc: exact tests] : point in polygon x 200 | GEOS runs the exact test on the 200 candidates.
+  GEOS -> PostGIS : 2 matches | The exact test removes false matches from the box filter.
+  PostGIS -> App : zone ids | The app receives the true answer.
+ref: docs | PostGIS: Using spatial indexes | PostGIS documentation | https://postgis.net/docs/using_postgis_dbmanagement.html#spatial_index_intro
+
+== Simplify and clip geometry into map tiles
+kind: precompute, pipes-filters
+when: A map must draw millions of roads and borders quickly at many zoom levels, in a browser or on a phone.
+how: A tile pipeline cuts each layer into square tiles per zoom level. For each tile, geometry is clipped to the tile edge, with a polygon or line clipping algorithm. The tile only keeps the part that is visible in it.
+At low zoom levels, shapes are simplified. The Douglas-Peucker algorithm removes points that lie within a small distance of a straight line, so a coastline of 1 million points can become 5,000 at zoom 5, with an error below one pixel.
+The tiles are stored as Mapbox Vector Tiles, in a tile archive or on object storage with a CDN in front. The client only fetches the tiles on screen and draws them on the GPU. The cost is a build step each time the data changes, so rebuild only the affected tiles.
+used: PostGIS ST_AsMVT and ST_Simplify; Tippecanoe; Mapbox GL, MapLibre and OpenStreetMap vector tile servers.
+avoid: When the data is small, or changes every second; send raw GeoJSON or use a live spatial query.
+flow:
+  OSM data [lake: planet file] -> Tile builder [svc: Tippecanoe] : features | The builder reads all shapes of the layer.
+  * Tile builder: simplified per zoom | The Douglas-Peucker rule drops points that do not change the look at that zoom.
+  Tile builder -> Tile store [store: PMTiles or S3] : tile z/x/y | Each tile has clipped, simplified geometry.
+  Map client [client: MapLibre] -> CDN [cache: edge] : GET tile 5/17/11 | The client asks only for tiles inside its view.
+  CDN -> Tile store : miss | Only a cache miss goes to the store.
+  CDN -> Map client : vector tile | The client draws the tile on the GPU.
+ref: spec | Mapbox Vector Tile specification | Mapbox | https://github.com/mapbox/vector-tile-spec
+
+@@ compressalgo
+== Compress record batches between producer and storage
+kind: batching, data-locality
+when: Network and disk cost more than CPU, and records are similar to each other, such as JSON events or logs.
+how: A Kafka producer collects records into a batch (set by batch.size and linger.ms), then compresses the whole batch with lz4, zstd, snappy or gzip. Larger batches contain more repeated strings, so they compress better, often 3 to 5 times for JSON.
+The broker stores the compressed batch as it is, and replicates it as it is, so disk and network traffic both fall. It does not need to decompress. A consumer decompresses each batch after the fetch.
+LZ4 is very fast and gives a moderate ratio. Zstd gives a better ratio at more CPU cost and is a common default choice for new topics. Test on your own data, because the ratio depends on the content.
+used: Apache Kafka producers (compression.type); Parquet and ORC pages with Snappy or Zstd; Elasticsearch stored fields use LZ4 by default.
+avoid: When data is already compressed (JPEG, video, encrypted payloads); extra CPU buys nothing.
+flow:
+  Producer [client: batch 64 KB] -> Codec [svc: zstd] : 64 KB of JSON | The producer collects a batch and hands it to the compressor.
+  Codec -> Broker [svc: Kafka] : 14 KB batch | Only the small batch crosses the network.
+  Broker -> Disk log [log: stored compressed] : append as is | The broker does not decompress, so it uses little CPU.
+  Broker -> Follower [svc: replica] : 14 KB batch | Replication also moves the small batch.
+  Broker -> Consumer [client] : 14 KB batch | The fetch response is small too.
+  * Consumer: batch expanded to 64 KB | The consumer decompresses each batch after fetching.
+ref: docs | Kafka producer configs: compression.type | Apache Kafka documentation | https://kafka.apache.org/documentation/#producerconfigs_compression.type
+ref: docs | Zstandard | Meta (Facebook) | https://github.com/facebook/zstd
+
+== Precompress static assets and serve by Accept-Encoding
+kind: precompute, cdn-edge
+when: Many users download the same JavaScript, CSS and font files, and bytes over the network are the main cost.
+how: At build time, the pipeline compresses each file once, with Brotli at its slowest and best level and also with gzip. It saves foo.js.br and foo.js.gz next to foo.js. Slow compression at build time is free for users.
+The server or CDN reads the Accept-Encoding header. It sends the .br file to browsers that accept br, and the gzip file to others. It sets Content-Encoding and Vary: Accept-Encoding, so a cache keeps one copy per encoding.
+Brotli is usually about 15 to 20 percent smaller than gzip on text. Dynamic responses use a faster level, such as Brotli 4 or gzip 6, because compression runs per request.
+used: Nginx with static precompressed files (gzip_static); CDNs such as Cloudflare and Fastly that serve Brotli; web build tools that write .br and .gz files.
+avoid: For images, video and fonts such as WOFF2 that are already compressed; skip them.
+flow:
+  Build [svc: CI] -> Asset store [store: .js .br .gz] : app.js 900 KB | The build compresses each file once at the highest level.
+  Browser [client] -> CDN [cache: edge] : GET app.js, accepts br | The browser says it understands Brotli.
+  CDN -> Asset store : miss | On a miss the CDN fetches the precompressed file.
+  Asset store -> CDN : app.js.br | The store returns the .br file with Content-Encoding br.
+  CDN -> Browser : 210 KB, Vary header | The browser downloads 210 KB instead of 900 KB.
+  * Browser: decompressed and running | Decompression is fast, so the saved time is larger than the cost.
+ref: spec | Brotli Compressed Data Format | RFC 7932, Alakuijala & Szabadka, 2016 | https://www.rfc-editor.org/rfc/rfc7932
+
+@@ csp
+== Dependency resolution as a constraint search
+kind: solver-service
+when: A tool must pick one version of each package so that every dependency range holds, and a clear error is needed when none exists.
+how: Each package is a variable, and its domain is its list of released versions. Each dependency, such as "app needs lib 2.x" and "lib 2.4 needs core at least 1.3", is a constraint. The resolver picks a package, tries its newest version, and adds the constraints that follow from it.
+When a choice makes some package have no legal version left, the resolver backtracks. Modern resolvers also learn from the conflict: PubGrub records a short reason, such as "lib 2.4 and core below 1.3 cannot both hold", and never tries that combination again. This prunes huge parts of the search.
+If no solution exists, the learned reasons are chained into a message a person can read. The result is written to a lock file, so installs are repeatable.
+used: Dart pub (the origin of PubGrub); uv and other tools that use the PubGrub algorithm; Fedora dnf and openSUSE zypper use libsolv, a SAT solver.
+avoid: When packages have no version ranges and every dependency is pinned; a plain graph walk is enough.
+flow:
+  Manifest [note: app needs lib 2.x] -> Resolver [svc: PubGrub] : root constraints | The resolver starts from the root requirements.
+  Resolver -> Registry [store: package index] : versions of lib | It asks for the versions and dependencies of one package.
+  Registry -> Resolver : 2.4 needs core >= 1.3 | New constraints come back for each candidate version.
+  Resolver -x> Registry : no legal version of core | A choice led to an empty domain, so the resolver backtracks and learns why.
+  Resolver -> Lock file [store: exact versions] : lib 2.3, core 1.4 | After backtracking and learning, a full valid set is found and pinned.
+ref: blog | PubGrub: Next-Generation Version Solving | Natalie Weizenbaum, 2018 | https://nex3.medium.com/pubgrub-2fb6470504f
+
+== Staff rostering with hard rules and a soft goal
+kind: solver-service
+when: A schedule must obey many rules (rest time, skills, leave) and still be as fair or cheap as possible.
+how: The planner creates a yes or no variable for each person, shift and day. Hard constraints say: each shift has enough people, nobody works two shifts at once, there are 11 hours of rest between shifts, and approved leave is respected.
+A CP-SAT solver propagates these rules. When a person is assigned, other values are removed at once, which cuts the search early. If it hits a dead end it backtracks and learns a clause. Soft goals, such as fair weekend work or preferred days, become a penalty sum that the solver lowers.
+The solver runs with a time limit, for example 60 seconds, and returns the best schedule so far, with a proof of how far it is from the best possible. Re-run it when someone is sick, and fix all other shifts to avoid big changes.
+used: Google OR-Tools CP-SAT for nurse and employee rostering; MiniZinc models; commercial workforce schedulers.
+avoid: When rules are few and a greedy rule gives a good schedule; or when the problem is too big for a solver and needs local search.
+flow:
+  Manager [user] -> Planner [svc: model builder] : rules, leave, demand | The manager gives demand per shift and the rules.
+  Planner -> CP-SAT [svc: solver] : 1,200 yes/no variables | The planner builds a model of hard and soft constraints.
+  * CP-SAT: propagating and learning | Every assignment removes impossible values from other variables.
+  CP-SAT -> Planner : roster, penalty 340 | After 60 seconds the best roster so far is returned, with its penalty.
+  Planner -> Manager : roster + gap to bound | The manager sees the roster and how close it is to the best possible.
+  Manager -> Planner : nurse 4 is sick | A change comes in, and the planner solves again with most shifts fixed.
+ref: docs | Employee scheduling | Google OR-Tools | https://developers.google.com/optimization/scheduling/employee_scheduling
+
+@@ cuckoo
+== Cuckoo filter in front of a slow store
+kind: none
+when: Most lookups are for keys that do not exist, the store is slow or remote, and items must also be deleted.
+how: The service keeps a cuckoo filter in memory. It holds a short fingerprint of each key, for example 12 bits, in one of two buckets, as in cuckoo hashing. Before each read the service asks the filter. If the answer is "not present", it is always right, and the service skips the slow store.
+If the answer is "maybe present", the service reads the store. A small share of these answers are false positives, about 0.1 to 3 percent depending on the fingerprint size. They only cost one extra read.
+A Bloom filter cannot delete an item. A cuckoo filter can, by removing one matching fingerprint, so it fits sets that change, such as deleted accounts. At the same false positive rate below about 3 percent, it can use less space than a Bloom filter. Inserts can fail when the filter is very full, so size it at 90 to 95 percent load at most and rebuild when it fills.
+used: Common in cache and database layers that skip lookups for absent keys; Redis Stack (RedisBloom) offers a cuckoo filter; the structure comes from Fan et al., CoNEXT 2014.
+avoid: When the set never changes and is built once; a Bloom filter or a perfect hash is simpler.
+flow:
+  Client [client] -> API [svc] : GET user 9917 | A request for one key arrives.
+  API -> Cuckoo filter [cache: 12-bit fingerprints] : contains 9917? | The API checks the filter, which lives in RAM.
+  Cuckoo filter -> API : no | A "no" is always correct, so the API skips the database.
+  API -> Client : 404 in 0.1 ms | The miss is answered without any remote call.
+  API -> Cuckoo filter : contains 4410? | For another key, the filter says "maybe".
+  API -> Users DB [db] : read 4410 | The API reads the database to be sure.
+ref: paper | Cuckoo Filter: Practically Better Than Bloom | Fan, Andersen, Kaminsky & Mitzenmacher, CoNEXT 2014 |
+
+== Two-bucket hash table with bounded lookups
+kind: memory-tiering
+when: A cache or a packet-processing table needs very fast lookups with a worst case of two memory reads.
+how: Every key can live in only two buckets, picked by two hash functions. Each bucket holds 4 slots in one cache line. A lookup reads at most these two buckets, so the worst-case cost is two cache misses. Linear probing or chaining can need many more.
+On insert, if both buckets are full, the table evicts one key to its other bucket, and repeats if that bucket is also full. This is the "kick" chain. It is short in practice up to about 95 percent load with 4 slots per bucket. If the chain is too long, the table grows and rehashes.
+Memory use is high, because the table can be filled to 90 percent or more without losing the lookup bound. Readers can run without locks if writers use a version counter, as in MemC3.
+used: MemC3 (a memcached design from Fan et al., NSDI 2013); DPDK rte_hash flow tables; libcuckoo concurrent hash map.
+avoid: When the key set is tiny, or inserts dominate and kick chains hurt write latency; use a plain open-addressing table.
+flow:
+  Packet [client: 5-tuple key] -> Hash unit [svc: 2 hashes] : key | A packet arrives with a flow key.
+  Hash unit -> Bucket 1 [store: 4 slots] : h1(key) | The first hash picks a bucket in one cache line.
+  Hash unit -> Bucket 2 [store: 4 slots] : h2(key) | The second hash picks the other bucket.
+  Bucket 1 -> Hash unit : miss | The key is not in the first bucket.
+  Bucket 2 -> Hash unit : hit: flow entry | The key is found in the second bucket, so at most two reads were needed.
+  Hash unit -> Packet : forward to port 7 | The packet is sent on the route stored in the entry.
+ref: paper | MemC3: Compact and Concurrent MemCache with Dumber Caching and Smarter Hashing | Fan, Andersen & Kaminsky, NSDI 2013 |
+
+@@ dp
+== Join ordering by dynamic programming over table subsets
+kind: cost-based-optimizer
+when: A SQL query joins many tables, and the order of joins changes the cost by orders of magnitude.
+how: For a query with n tables, the number of join orders grows faster than exponentially. The optimizer does not try them one by one. It finds the cheapest plan for each subset of tables, from size 1 up to size n. A plan for a set S is built from the best plans of two smaller sets that join into S.
+Each best plan is stored in a memo table, so a sub-plan is costed once, even if many bigger plans use it. This is dynamic programming, and it needs about 3 to the power n steps for all subset pairs, instead of n factorial. The cost model uses row counts and selectivity from statistics.
+It stops being cheap at around 12 to 15 tables. PostgreSQL uses dynamic programming up to geqo_threshold (default 12 relations) and then switches to a genetic search. Bad statistics still give bad plans.
+used: System R (Selinger, 1979); PostgreSQL's planner; MySQL, SQL Server and Oracle optimizers use the same idea; Cascades-style optimizers add a memo of groups.
+avoid: When the query has two or three tables; any order is fine. For 20 or more tables, use heuristics or search with limits.
+flow:
+  SQL query [client: 5-table join] -> Optimizer [svc: planner] : parse tree | The optimizer receives a query with 5 joined tables.
+  Statistics [store: row counts] -> Optimizer : table sizes, selectivity | Statistics give the cost model its numbers.
+  Optimizer -> Memo table [cache: best plan per subset] : best plan for {A,B} | It stores the cheapest plan for each pair of tables.
+  Memo table -> Optimizer : reuse {A,B} in {A,B,C} | A larger subset reuses a stored sub-plan, instead of costing it again.
+  * Optimizer: best plan for {A..E} found | After all subsets are done, the cheapest full plan is known.
+  Optimizer -> Executor [svc] : hash join A,B then C | The executor runs the chosen join order.
+ref: paper | Access Path Selection in a Relational Database Management System | Selinger et al., SIGMOD 1979 |
+ref: docs | Genetic Query Optimizer | PostgreSQL documentation | https://www.postgresql.org/docs/current/geqo.html
+
+== Viterbi decoding of the best sequence
+kind: pipeline-stages
+when: A noisy signal must be turned into the most likely sequence of hidden states, such as words, tags or road segments.
+how: A model gives the chance of each state for each observation and the chance of moving from one state to another. Listing all state sequences needs S to the power T steps, for S states and T time steps. Viterbi keeps only the best path to each state at each time step.
+At each step, for each state, it picks the best previous state and stores its score and a back-pointer. The cost is T times S squared. At the end, the best final state is chosen, and the back-pointers are followed backwards to read the full sequence.
+Real decoders also prune: a beam keeps only states within a score margin of the best, so speech decoding with huge graphs runs in real time. Scores are kept as log values to avoid underflow.
+used: Kaldi and other speech recognition decoders; part-of-speech taggers with HMMs and CRFs; map matching of GPS traces to roads; error-correcting codes in modems.
+avoid: When the best path must depend on the whole past without limit; use beam search over a neural model.
+flow:
+  Audio frames [log: 100 frames per s] -> Acoustic model [model] : features | The model scores each frame against each state.
+  Acoustic model -> Viterbi decoder [svc: dynamic program] : scores per state | The decoder gets one score per state, per frame.
+  * Viterbi decoder: best path per state kept | At each frame it keeps one best path per state, with a back-pointer.
+  Language model [model: word chances] -> Viterbi decoder : transition scores | Word-to-word chances are added to the path scores.
+  Viterbi decoder -> Transcript [store] : trace back the pointers | At the end it follows the pointers backwards to get the words.
+ref: paper | A Tutorial on Hidden Markov Models and Selected Applications in Speech Recognition | Lawrence Rabiner, Proceedings of the IEEE, 1989 |
+
+@@ externalmem
+== External merge sort for data larger than memory
+kind: map-reduce, memory-tiering
+when: A sort, group-by or join must handle more data than fits in memory, for example 100 GB with 1 GB of RAM.
+how: In the I/O model, cost is the number of block transfers, not CPU steps. External merge sort has two phases. First it reads memory-sized chunks, sorts each in RAM, and writes it to disk as a sorted run. 100 GB with 1 GB of memory gives 100 runs.
+Then it merges all runs in one pass. It keeps one input buffer per run, for example 10 MB each, and an output buffer. A heap picks the smallest head element. Each byte is read twice and written once, with sequential I/O only, which disks and SSDs do well.
+If there are more runs than buffers, extra merge passes are needed. The number of passes is about log base (M/B) of (N/M), which is 1 or 2 in practice. This is why databases and Spark spill to disk instead of failing.
+used: PostgreSQL sort spills (work_mem) and its external sort; Spark shuffle spills; Hadoop MapReduce sort phase; GNU sort for large files.
+avoid: When the data fits in memory; a plain in-memory sort is much faster.
+flow:
+  Input file [lake: 100 GB] -> Sorter [svc: 1 GB memory] : read 1 GB chunk | The sorter reads one memory-sized chunk with a sequential read.
+  Sorter -> Run files [store: 100 sorted runs] : write sorted run | It sorts the chunk in RAM and writes one sorted run to disk.
+  * Sorter: 100 runs written | After 100 rounds, all data exists as sorted runs.
+  Run files -> Merger [svc: 100-way heap] : 10 MB buffer per run | The merger reads a buffer from each run.
+  Merger -> Output file [lake: sorted] : sequential write | The smallest element is always taken next, and written in order.
+ref: paper | The Input/Output Complexity of Sorting and Related Problems | Aggarwal & Vitter, Communications of the ACM, 1988 |
+
+== Page-sized B-tree nodes for disk-resident indexes
+kind: index-table, memory-tiering
+when: An index of billions of keys lives on disk, and a lookup must read as few pages as possible.
+how: The cost unit is one disk page read, for example 8 KB in PostgreSQL or 16 KB in InnoDB. A binary tree of 1 billion keys is 30 levels deep, and each level could be a page read. A B-tree makes each node one page, with hundreds of keys and children.
+With about 1,000 children per node, a tree of 3 levels holds about 1 billion keys. The top levels are hot, so the buffer pool keeps them in memory. A lookup usually needs one or two disk reads for the leaf, not 30.
+The same model explains B+tree leaf links, which make range scans sequential, and why LSM trees write big sorted batches. All of them are built to move large blocks, not single records.
+used: PostgreSQL and MySQL InnoDB indexes; SQLite and LMDB B-trees; file systems such as ext4 (htree) and NTFS.
+avoid: When writes are very heavy and mostly random; an LSM tree turns them into sequential writes.
+flow:
+  Query [client] -> Buffer pool [cache: root + level 2] : find key 7,019,332 | The lookup starts at the root page, which is always in memory.
+  * Buffer pool: level 2 page found | The child pointer leads to a level-2 page that is also cached, so no disk read yet.
+  Buffer pool -> Disk [store: leaf pages 8 KB] : read leaf page | Only the leaf page is read from disk, in one block transfer.
+  Disk -> Buffer pool : page with 400 keys | One read brings 400 keys, so nearby keys are free.
+  Buffer pool -> Query : row pointer | The key is found with 1 disk read, instead of up to 30.
+ref: paper | Organization and Maintenance of Large Ordered Indices | Bayer & McCreight, 1972 |
+
+@@ fft
+== OFDM radio: inverse FFT to send, FFT to receive
+kind: layered-protocol, pipeline-stages
+when: A radio link must carry high data rates over a channel with echoes (multipath), without a complex equalizer for one wide signal.
+how: OFDM splits the band into many narrow subcarriers. Wi-Fi at 20 MHz uses 64 subcarriers, 52 of them used, spaced 312.5 kHz apart. The transmitter maps bits to symbols (for example QAM), puts one symbol on each subcarrier, and runs a 64-point inverse FFT. The result is one block of time samples.
+It adds a guard interval, a copy of the end of the block put at the front (0.8 microseconds in Wi-Fi). Echoes shorter than the guard do not mix neighbouring blocks. The receiver drops the guard, runs the FFT, and gets back one symbol per subcarrier. Each subcarrier then needs only one small complex correction.
+A direct transform would need N squared steps, which is 4,096 multiplications per block. The FFT needs about N log2 N, which is about 384, so chips can do it every 4 microseconds at low power.
+used: Wi-Fi (802.11a/g/n/ac/ax); 4G LTE and 5G NR downlinks; DVB-T digital TV; DSL modems.
+avoid: When the device needs very low peak power, since OFDM has a high peak-to-average ratio; LTE uses SC-FDMA for the uplink.
+flow:
+  Bits [log: data stream] -> Mapper [svc: QAM] : bit groups | Bits are mapped to one complex symbol per subcarrier.
+  Mapper -> IFFT [svc: 64-point] : 52 symbols | The inverse FFT turns subcarrier symbols into time samples.
+  IFFT -> Radio [svc: antenna] : samples + guard interval | A guard interval is added, and the block is sent over the air.
+  Radio -x> FFT [svc: receiver] : echoes | Echoes arrive late, but they fall inside the guard interval.
+  FFT -> Equalizer [svc: 1 tap each] : 52 symbols | After the guard is removed, the FFT recovers one symbol per subcarrier.
+  Equalizer -> Bits : decoded stream | Each subcarrier gets a small correction, and the bits are decoded.
+ref: docs | Orthogonal frequency-division multiplexing | IEEE 802.11 standard, clause 17 (OFDM PHY) | 
+
+== Spectrogram front end for speech and audio models
+kind: pipeline-stages, offload-accelerator
+when: A model must learn from audio, and the raw waveform is too long and not informative.
+how: The audio, for example 16,000 samples per second, is cut into short overlapping frames, such as 25 ms long with a 10 ms step. Each frame is multiplied by a window function, and an FFT turns it into the strength of each frequency. The result over time is a spectrogram.
+The strengths are grouped into mel bands, which follow human hearing, and then the log is taken. Whisper, for example, uses an 80-channel or 128-channel log-mel spectrogram. The model reads this picture-like array instead of 16,000 numbers per second.
+The FFT runs in batches on a GPU with cuFFT, or in the data loader with FFTW or a CPU library, so that training does not wait for the front end. Use the same settings in training and in serving, or accuracy falls.
+used: OpenAI Whisper; speech recognition with Kaldi, wav2vec and Conformer models; music tagging and audio fingerprinting.
+avoid: For end-to-end models that learn from the raw waveform; they skip the hand-made front end, but need more data.
+flow:
+  Microphone [client: 16 kHz] -> Framer [svc: 25 ms window] : waveform | The audio is cut into overlapping frames with a 10 ms step.
+  Framer -> FFT [svc: cuFFT or FFTW] : windowed frames | Each frame is transformed into frequency strengths.
+  FFT -> Mel filter [svc: 80 bands] : power spectrum | The strengths are grouped into bands that follow human hearing.
+  Mel filter -> Speech model [model: encoder] : log-mel array | The model gets a compact picture of the sound.
+  Speech model -> Transcript [store] : text | The model decodes the text.
+ref: paper | Robust Speech Recognition via Large-Scale Weak Supervision | Radford et al., OpenAI, 2022 | https://arxiv.org/abs/2212.04356
+
+@@ graphsalgo
+== Topological order for a DAG task scheduler
+kind: scheduler-agent
+when: A workflow has hundreds of tasks that depend on each other, and each must run after its inputs and as early as possible.
+how: The workflow is a directed acyclic graph (DAG): tasks are nodes, and dependencies are edges. The scheduler counts the incoming edges of each task. Tasks with count zero are ready, and go to the worker queue.
+When a task finishes, the scheduler lowers the count of each downstream task by one. A task that reaches zero becomes ready. This is Kahn's algorithm for topological sort. It takes O(V + E) time in total, and it runs ready tasks in parallel.
+If some tasks never reach zero, there is a cycle, and the scheduler reports it when the DAG is loaded, before running anything. Recovery after a failure re-runs the failed task and its downstream tasks only.
+used: Apache Airflow and Dagster; Bazel and Make build graphs; Spark's DAG scheduler; dbt model graphs.
+avoid: When the dependencies change while the job runs in ways that you cannot predict; use an event-driven design.
+flow:
+  DAG file [note: 5 tasks] -> Scheduler [svc: indegree counts] : load, check cycles | The scheduler loads the graph and counts the incoming edges of each task.
+  Scheduler -> Worker pool [queue: ready tasks] : extract, in-degree 0 | Only tasks with zero unmet inputs are queued.
+  Worker pool -> Scheduler : extract done | A worker reports success.
+  Scheduler -> Worker pool : clean, validate | Two downstream tasks reach zero, and run in parallel.
+  Worker pool -x> Scheduler : validate failed | A failure stops its downstream tasks only.
+  * Scheduler: retry validate, then load | The scheduler retries the failed task, and later runs what depends on it.
+ref: docs | Airflow DAGs | Apache Airflow documentation | https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html
+
+== Connected components to build an identity graph
+kind: identity-graph
+when: Many records carry different ids for one person or household, and links between ids must be merged into one profile.
+how: Every id (cookie, device id, hashed email, login id) is a node. Every observed link, such as "this login used this device", is an edge. The connected components of the graph are the candidate profiles: ids in one component belong to one entity.
+At large scale, the job runs in a distributed engine, such as Spark GraphFrames or a union-find job. Each round, every node adopts the smallest label among its neighbours, until no label changes. The result is one component id per node, written to a table that other jobs join with.
+Quality needs care. One shared public device can join thousands of unrelated people into a giant component. So jobs cap the component size, cut weak edges, or give edges weights, and then split a giant component.
+used: Identity graphs in ad tech and CDPs; GraphFrames connectedComponents in Spark; fraud rings found by linked accounts.
+avoid: When linking is only by exact id and no transitive merging is needed; a simple join is enough.
+flow:
+  ID events [log: logins, ad requests] -> Edge builder [svc: Spark] : cookie A + email E | The job turns each event into an edge between two ids.
+  Edge builder -> Components job [svc: label spreading] : edge list | The graph job runs in rounds, and each node takes the smallest neighbour label.
+  * Components job: labels stable after 6 rounds | No label changes any more, so each component has one id.
+  Components job -> Component table [store: id to person_id] : id and person_id | Every id gets the id of its component.
+  Component table -x> Components job : component with 40,000 ids | A shared device made a giant component, so the job cuts weak edges and splits it.
+  Ad server [svc] -> Component table : lookup cookie A | Serving looks up the person id for one cookie.
+ref: docs | GraphFrames: connected components | GraphFrames documentation | https://graphframes.io/
+
+@@ greedydc
+== Scatter-gather top-k over shards
+kind: scatter-gather, map-reduce
+when: A query must search a dataset split across many machines, and the answer is the best k items overall.
+how: Divide and conquer has three steps: split, solve the parts, combine. A coordinator sends the query to every shard. Each shard finds its own top k, for example 10, using its local index. This is the scatter step.
+The coordinator merges the shard lists with a heap of size equal to the number of shards. It takes the best 10 of 10 times the number of shards. The global top 10 is always inside the union of local top 10 lists, so nothing is lost. The cost is O(S k log S) on the coordinator, for S shards.
+The slowest shard decides the latency, so systems use timeouts and may return partial results. A deeper query often asks each shard for more than k, to fix ranking differences.
+used: Elasticsearch and OpenSearch query-then-fetch; Solr distributed search; Cassandra and ClickHouse distributed queries.
+avoid: For deep paging with a large offset, since each shard must return offset plus k results; use a cursor or search_after.
+flow:
+  Client [client] -> Coordinator [svc: merge] : search, top 10 | The client sends a query to any node.
+  Coordinator -> Shard 1 [svc: local index], Shard 2 [svc: local index], Shard 3 [svc: local index] : top 10 locally | The coordinator scatters the query to all shards.
+  Shard 1 -> Coordinator : 10 hits | Each shard returns only its own best 10.
+  + Shard 2 -> Coordinator : 10 hits
+  Shard 3 -x> Coordinator : slow: timeout | One shard is slow, so the coordinator may return a partial result and flag it.
+  * Coordinator: heap merge of 20 hits | It merges the sorted lists with a small heap.
+  Coordinator -> Client : global top 10 | The client receives the best 10 overall.
+ref: docs | Search shards and the query-then-fetch phases | Elasticsearch Guide | https://www.elastic.co/docs/reference/elasticsearch/rest-apis/search-shard-routing
+
+== Earliest-deadline-first scheduling with a priority queue
+kind: priority-queue
+when: Tasks have deadlines, and you must meet as many as possible with one worker or one CPU.
+how: Earliest deadline first (EDF) is a greedy rule: always run the task whose deadline is soonest. For one processor and tasks that can be paused, EDF meets all deadlines whenever any schedule can. The proof is an exchange argument: swapping two tasks that are out of deadline order never makes a deadline worse.
+The tasks wait in a min-heap keyed by deadline. Insert and extract-min cost O(log n). A new urgent task goes to the top of the heap, and can preempt the running task.
+If the total load is above capacity, EDF can fail many tasks at once, so a system adds admission control: it refuses a task if the deadlines cannot be met.
+used: Linux SCHED_DEADLINE; real-time operating systems; request schedulers that serve the soonest deadline first (common in storage and network queues).
+avoid: When tasks have different values and not all can run; use a value-based or weighted priority rule.
+flow:
+  Clients [client] -> Admission check [svc: load test] : task, deadline 40 ms | A new task arrives with a deadline.
+  Admission check -> Deadline heap [queue: min-heap by deadline] : accepted | The task is accepted only if total demand is below capacity.
+  Admission check -x> Clients : rejected | A task that would overload the CPU is refused at once.
+  Deadline heap -> Worker [svc: CPU] : extract-min | The worker takes the task with the earliest deadline.
+  Clients -> Admission check : urgent task, deadline 5 ms | An urgent task arrives while a job is running.
+  Deadline heap -> Worker : preempt | The new task is at the top of the heap, so it runs first.
+ref: docs | Deadline Task Scheduling | Linux kernel documentation | https://docs.kernel.org/scheduler/sched-deadline.html
+
+@@ hashtables
+== Hash join: build a table, then probe it
+kind: stream-table-join
+when: Two large inputs must be joined on equal keys, and a nested loop of n times m comparisons is too slow.
+how: The engine picks the smaller input and builds an in-memory hash table keyed by the join column. This is the build phase. Then it streams the larger input and, for each row, computes the hash and looks up matching rows. This is the probe phase. The cost is O(n + m) on average, not O(n times m).
+If the build side does not fit in memory, the engine partitions both inputs by hash into files (Grace hash join), so each partition pair can be joined in memory on its own. Matching keys are always in the partition with the same number.
+Stream processors use the same shape: a table of reference data stays in a hash map in memory, and each event probes it for enrichment.
+used: PostgreSQL, MySQL 8, Spark and DuckDB hash joins; Flink and Kafka Streams stream-table enrichment.
+avoid: For range or inequality joins; a hash cannot match them, so use sort-merge or an index.
+flow:
+  Customers [store: 1M rows] -> Hash table [cache: key to row] : build on customer_id | The smaller table is read once to build a hash table in memory.
+  Orders [lake: 500M rows] -> Join operator [svc: probe] : stream rows | The large table is streamed one row at a time.
+  Join operator -> Hash table : lookup customer_id | Each row asks for the matching customer, with one hash lookup.
+  Hash table -> Join operator : customer row | The matching row comes back, in O(1) on average.
+  Join operator -> Result [store: joined rows] : order + customer | The operator emits the joined row.
+  Hash table -x> Join operator : build side too large | If memory is too small, the engine spills partitions to disk and joins them one by one.
+ref: paper | Join Processing in Database Systems with Large Main Memories | Shapiro, ACM TODS, 1986 |
+
+== Hash partitioning of keys over shards
+kind: sharding, consistent-hashing
+when: A dataset or a stream is too large for one machine, and each key must always go to the same place.
+how: A router computes hash(key) and maps the result to a partition. The simple rule is hash(key) mod N. A good hash spreads keys evenly, even when keys are similar, such as sequential user ids. All records for one key land in one partition, so keyed state and joins can stay local.
+The weakness of mod N is resizing. If N changes from 8 to 9, about 8 of every 9 keys move. So many systems use a fixed large number of slots (Redis Cluster uses 16,384) and move whole slots between nodes. Others use consistent hashing, where adding a node moves only about 1 of N keys.
+Hot keys remain a problem, because a hash makes every key land in one place, even a key with huge traffic. Split such a key by adding a random suffix, and merge the results later.
+used: Redis Cluster hash slots; Kafka partitioner (murmur2 of the record key); Cassandra and DynamoDB partition keys.
+avoid: When range queries over the key are common; range partitioning keeps neighbours together.
+flow:
+  Producer [client] -> Router [svc: hash(key) mod 16384] : key user-42 | The router hashes the key to a slot number.
+  Router -> Slot map [store: slot to node] : slot 7,431 | The slot map says which node owns that slot.
+  Slot map -> Router : node B | The route is found.
+  Router -> Node B [db: slots 5461-10922] : write user-42 | All writes for this key go to node B.
+  * Slot map: slot 7,431 moved to node D | Later, a slot is moved to a new node, and only that slot's keys move.
+  Router -x> Node B : MOVED 7431 to node D | An old route is refused, and the client updates its map.
+ref: docs | Redis Cluster specification: hash slots | Redis documentation | https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/
+
+@@ heuristicsearch
+== Road routing with A* and landmark heuristics
+kind: precompute
+when: A routing service must find shortest drives on a road graph with millions of edges, with answers in milliseconds.
+how: A* expands the node with the lowest cost so far plus an estimate of the remaining cost. Straight-line distance is a safe estimate, because it never exceeds the real road distance. It makes the search lean towards the goal, and visit far fewer nodes than Dijkstra.
+Straight-line distance can be weak on twisty roads. The landmark method (ALT) precomputes the distance from every node to a few landmark nodes, often 16. Then the triangle inequality gives a better lower bound for any pair of nodes. The estimate stays safe, so the first path found is still the best.
+Cost and time are the trade-offs: the landmark tables use memory, and they must be rebuilt when road weights change. Live traffic can break the safe estimate if costs can go below the stored values, so use free-flow times as the base.
+used: GraphHopper offers A* and landmark-based routing; Google Maps and other map services use heavier precomputation (common in route planners).
+avoid: When one query needs distances from one source to all nodes; use Dijkstra. For continent-scale speed, use contraction hierarchies.
+flow:
+  Offline job [svc: preprocessing] -> Landmark tables [store: dist to 16 landmarks] : distances | Offline, the job computes distances from all nodes to each landmark.
+  App [client] -> Router [svc: A*] : route from A to B | A user asks for a route.
+  Router -> Landmark tables : lower bound for n to B | For each node, the router reads a stored lower bound to the goal.
+  Landmark tables -> Router : h(n) | The bound is safe, so it never overestimates.
+  Router -> Road graph [store: 20M edges] : expand best f = g + h | The router expands the node with the lowest cost plus estimate.
+  Router -> App : route, 12 ms | The first path that reaches the goal is optimal, and far fewer nodes were visited.
+ref: paper | Computing the Shortest Path: A* Search Meets Graph Theory | Goldberg & Harrelson, SODA 2005 |
+
+== Navmesh pathfinding in a game engine
+kind: precompute, pipeline-stages
+when: Many characters need paths through a 3D level every frame, with a budget of a fraction of a millisecond each.
+how: At build time, the level geometry is turned into a navigation mesh: a graph of convex polygons that characters can walk on. The mesh is baked once and stored with the level. This lowers the search space from millions of grid cells to a few thousand polygons.
+At run time, the engine runs A* over the polygons, with the straight-line distance between polygon centres as the estimate. Then a funnel step pulls the polygon path tight into a short list of corner points. Characters steer along them.
+The search can run over several frames. It is split into small slices, so one long path does not stall a frame. If the level changes, such as a door closing, only the affected tiles of the mesh are rebuilt.
+used: Recast and Detour (used in many engines); Unreal Engine and Unity navigation meshes; Hybrid A* in autonomous vehicle planners.
+avoid: For very open worlds with changing terrain; use a grid or a hierarchical search.
+flow:
+  Level geometry [lake: level assets] -> Navmesh baker [svc: build step] : triangles | At build time, the baker finds the walkable surface.
+  Navmesh baker -> Navmesh [store: 3,000 polygons] : convex polygons | It saves the mesh with the level.
+  NPC [client: character] -> Pathfinder [svc: A*] : go to the door | A character asks for a path.
+  Pathfinder -> Navmesh : expand by f = g + h | A* searches the polygon graph, not the raw 3D world.
+  Pathfinder -> NPC : corner points after funnel | The path is pulled tight into a few corner points.
+  NPC -x> Pathfinder : door closed: repath | A change makes the old path wrong, so it asks again.
+ref: docs | Recast Navigation | Recast and Detour project | https://github.com/recastnavigation/recastnavigation
+
+@@ lca
+== Finding the merge base of two branches
+kind: three-way-merge
+when: Two lines of history have diverged, and a tool must find the last shared point to do a three-way merge.
+how: Commits form a directed acyclic graph, where each commit points to its parents. The merge base of two branch tips is their lowest common ancestor: the newest commit that both can reach. The merge compares both tips with that base, to see what each side changed.
+A simple method walks back from both tips, in order of commit time, and marks commits as reachable from one side, the other side, or both. Large repositories keep a commit-graph file with generation numbers (the longest distance from a root). A node with a lower generation number than the other cannot be a descendant, so walks stop early.
+In a history with criss-cross merges there can be several best common ancestors. Git's ort strategy merges those bases first into one virtual base and then uses it for the final merge.
+used: git merge-base, git merge and git diff A...B; GitHub pull request diffs show changes since the merge base.
+avoid: When history is a simple chain; the base is just the older tip.
+flow:
+  Developer [user] -> Git [svc: merge] : merge feature into main | A developer starts a merge of two diverged branches.
+  Git -> Commit graph [store: parents + generation] : walk back from both tips | Git walks the parents of both tips, marking which side reached each commit.
+  Commit graph -> Git : first commit both reach | The newest commit marked by both sides is the merge base.
+  * Git: three-way compare done | Git compares base, ours and theirs to find what each side changed since the base.
+  Git -x> Developer : conflict in app.py | If both sides changed the same lines, the developer must resolve them.
+ref: docs | git-merge-base | Git documentation | https://git-scm.com/docs/git-merge-base
+
+== Binary lifting for hierarchy queries
+kind: precompute
+when: A service answers millions of "what is the closest shared parent of these two nodes?" questions on a large tree, such as an org chart or a category taxonomy.
+how: At load time, one depth-first walk records the depth of each node and its parent. Then a table up[k][v] stores the 2 to the power k-th ancestor of v, for k up to log2 of the depth. For a tree of 1 million nodes this is 20 columns, or 20 million integers.
+A query first lifts the deeper node up until both are at the same depth, using the bits of the depth difference. Then it jumps both nodes up together, from the largest power to the smallest, whenever the two ancestors differ. The parent of the last pair is the LCA. A query costs O(log n), which is about 20 steps.
+When the tree changes rarely, the table is rebuilt in a batch. Where updates are frequent, use link-cut trees, or store the paths as materialized strings and compare the prefixes.
+used: Competitive-programming style libraries; taxonomy and category services that find a shared parent (common in e-commerce catalogs); phylogenetic and ontology tools.
+avoid: When the tree is shallow, such as 10 levels; walk up the parent pointers.
+flow:
+  Loader [svc: batch job] -> Ancestor table [store: up k of v] : depth + 2^k ancestors | A batch job walks the tree once and fills the table.
+  Client [client] -> Taxonomy service [svc: LCA] : common parent of A and B | A client asks for the closest shared category.
+  Taxonomy service -> Ancestor table : lift A to depth of B | The service lifts the deeper node with a few table reads.
+  Taxonomy service -> Ancestor table : jump both up together | It jumps both nodes up together, from big steps to small steps.
+  Ancestor table -> Taxonomy service : parents are equal | The parent of the two final nodes is the answer.
+  Taxonomy service -> Client : Electronics > Audio | The client receives the lowest shared category after about 20 steps.
+ref: paper | Fast Algorithms for Finding Nearest Common Ancestors | Harel & Tarjan, SIAM Journal on Computing, 1984 |

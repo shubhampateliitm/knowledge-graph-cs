@@ -1,0 +1,669 @@
+@@ linkedlist
+== LRU cache: hash map plus doubly linked list
+kind: cache-aside
+when: A cache has a fixed size, and the oldest-unused entry must be dropped in constant time on every hit and every insert.
+how: The cache keeps two structures over the same entries. A hash map goes from key to a list node, so a lookup is O(1). A doubly linked list orders the nodes by recency: the head is the most recent, the tail is the least recent.
+On a hit, the cache finds the node through the map, unlinks it (four pointer writes) and links it at the head. On a miss, the caller loads the value from the database, inserts a new node at the head and adds it to the map. If the cache is over capacity, it removes the tail node and deletes that key from the map.
+A singly linked list would not work, because unlinking a node needs its predecessor. Large caches often avoid the cost of touching the list on every read: Redis samples a few keys and evicts the oldest of them, which is an approximate LRU.
+used: Memcached keeps an LRU list per slab class; the Linux page cache keeps active and inactive lists; Python's functools.lru_cache and Java's LinkedHashMap (access order) use the same design.
+avoid: When one lock around the list becomes a bottleneck on many cores; use sampling, sharded caches or a CLOCK approximation instead.
+flow:
+  App [client] -> Cache map [cache: key to node] : get user:7 | The app asks for key user:7; the hash map finds its list node in O(1).
+  Cache map -> LRU list [store: doubly linked] : move node to head | On a hit, the node is unlinked and re-linked at the head with a few pointer writes.
+  App -> Database [db] : read user:9 | On a miss, the app reads the source of truth.
+  Database -> Cache map : row | The new entry is added to the map and put at the head of the list.
+  LRU list -x> Cache map : evict tail node | When the cache is full, the tail node is removed from the list and its key from the map.
+ref: docs | Key eviction | Redis documentation | https://redis.io/docs/latest/develop/reference/eviction/
+
+== Intrusive free list in an allocator or kernel
+kind: none
+when: A system creates and destroys many same-size objects, and each allocation must be fast and must not call the general allocator.
+how: The allocator keeps one list of free blocks per size class. The pointer to the next free block is stored inside the free block itself, so the list needs no extra memory. This is an intrusive list.
+To allocate, the allocator pops the head of the list: two memory reads and one write. To free, it pushes the block back at the head. Both are O(1) and need no search. The most recently freed block is reused first, and it is likely still warm in the CPU cache.
+The Linux kernel uses the same idea with `list_head`, a circular doubly linked list embedded in the user's struct. One struct can sit on several lists at once, such as a timer list and a task list, with no extra allocation. Removal of a known entry is O(1).
+The risk is memory safety: a use-after-free can corrupt the next pointer, and attackers have used this to hijack control flow.
+used: The Linux kernel list_head and the slab allocator; glibc malloc bins and tcache; jemalloc and tcmalloc size classes.
+avoid: When objects vary a lot in size or need compaction; use an arena or a general allocator with coalescing.
+flow:
+  Request [client] -> Allocator [svc: size class 64 B] : alloc(64) | A caller asks for 64 bytes.
+  Allocator -> Free list [store: 64 B blocks] : pop head | The allocator takes the first free block and moves the head to its next pointer.
+  Allocator -> Request : block address | The caller gets the block with no search.
+  Request -> Allocator : free(block) | The caller returns the block.
+  Allocator -> Free list : push at head | The block becomes the new head; its first 8 bytes now hold the old head address.
+  Allocator ~> Heap [lake: big chunks] : refill when empty | When the list is empty, the allocator asks the heap for a big chunk and cuts it into blocks.
+
+@@ localsearch
+== Rebalancer improving placement by local moves
+kind: control-loop
+when: Workloads or shards are already placed on machines, load drifts, and a full re-plan would move too much data.
+how: A rebalancer reads current load per machine and defines a cost, for example the sum of squared utilization or the maximum utilization. The neighborhood is small: move one shard to another machine, or swap two shards.
+Each round, it scores many candidate moves with a cheap delta (only two machines change) and applies the best one if it lowers the cost. Moves that cost too much, such as large data copies, carry a penalty. It stops at a local optimum or after a move budget, so the cluster never churns without limit.
+Plain descent can get stuck. Some systems add a little simulated annealing or random restarts in the planning step, but they still apply only the few moves of the final plan to the live cluster.
+used: Kubernetes descheduler; Elasticsearch shard rebalancing; Kafka partition reassignment tools such as Cruise Control; common in cluster schedulers.
+avoid: When the problem is small and an exact solver can finish in seconds; or when moves are very expensive and one global plan is better.
+flow:
+  Metrics [store: per-node load] -> Rebalancer [svc: cost = load spread] : node utilization | The rebalancer reads CPU and disk use of every node.
+  * Rebalancer: scoring moves | It scores each candidate move by how much the cost changes; only two nodes are affected.
+  Rebalancer -> Plan [note: 5 moves] : best improving moves | It keeps the moves that lower cost and stops at the move budget.
+  Plan -> Cluster API [svc] : move shard 17 to node C | The plan is applied as a few real moves.
+  Cluster API ~> Metrics : new load | New metrics arrive and the loop repeats on the next cycle.
+  Cluster API -x> Plan : move rejected | A move that breaks a rule, such as two replicas on one node, is dropped.
+
+== Construct, then improve with a time budget
+kind: none
+when: A hard routing or scheduling problem needs a good answer in seconds, and a perfect answer is not required.
+how: A solver first builds any valid solution with a fast greedy rule, such as nearest-neighbor or cheapest insertion for delivery routes. This gives an answer in milliseconds.
+Then it runs local search until the time limit. Moves are cheap and keep the solution valid: relocate one stop, swap two stops, or reverse a segment (2-opt). Simulated annealing or a guided metaheuristic lets the search leave local optima. The solver keeps the best solution seen so far.
+Because the search can stop at any time, the caller sets a deadline, for example 5 seconds, and always gets a valid plan. More time gives a better plan, with smaller gains each time. Doubling the time often gains only a few percent.
+used: Google OR-Tools routing solver (first-solution strategies plus local search metaheuristics); chip placement tools in the TimberWolf family; timetabling and rostering software.
+avoid: When a proof of optimality is required, or when a linear program or flow model solves the problem exactly in the time available.
+flow:
+  Dispatcher [client] -> Solver [svc: 100 stops, 5 s] : stops, vehicles, deadline | The caller sends the problem with a time limit.
+  Solver -> First plan [note: valid plan] : cheapest insertion | A greedy step builds a valid plan fast.
+  * Solver: local search, length 520 | Local search tries relocate and 2-opt moves and scores each by its delta.
+  * Solver: annealing, T falling | Annealing sometimes accepts a worse move, so the search can leave a local optimum.
+  * Solver: best length 497 | The best plan so far is kept; its cost has fallen from 540 to 497.
+  Solver -> Dispatcher : best plan at deadline | At the deadline the solver returns the best plan found.
+
+@@ maxflow
+== Impression allocation as a flow problem
+kind: none
+when: Guaranteed ad campaigns promise a number of impressions, and the supply of impressions is split among audiences that campaigns target.
+how: Build a graph. Supply nodes are audience segments with a forecast of impressions. Demand nodes are campaigns with a goal. An edge exists when a segment matches the campaign's targeting, with capacity equal to the supply.
+Add a source linked to each segment and each campaign linked to a sink. A max-flow tells how many impressions can be delivered. A min-cost flow adds a cost per edge, for example to prefer valuable placements. If the flow is below the total goals, the min cut shows which segments are the bottleneck.
+The solution is a plan: how much of each segment goes to each campaign. The ad server turns it into serving probabilities. It re-solves the plan as forecasts change, often every few hours.
+used: Described in published work on guaranteed display ad allocation; common in ad servers that sell reserved inventory; the same model fits job-to-machine assignment.
+avoid: When the choice is made per request with a real-time auction; use an RTB auction and pacing instead.
+flow:
+  Forecast [store: supply by segment] -> Planner [svc: build graph] : segment supply | The planner reads the forecast of impressions per segment.
+  Campaigns [db: goals, targeting] -> Planner : goals and targeting | It reads each campaign goal and targeting rule.
+  Planner -> Flow solver [svc: max-flow / min-cost] : graph with capacities | Source, segments, campaigns and sink become one graph with capacities.
+  Flow solver -> Planner : flow per edge | The solver returns how many impressions go from each segment to each campaign.
+  Flow solver -x> Planner : min cut shows shortfall | If goals exceed supply, the cut names the segments that limit delivery.
+  Planner -> Ad server [svc: serving rates] : allocation plan | The plan becomes serving rates for live traffic.
+
+== Min cut to split or protect a network
+kind: none
+when: You must find the cheapest set of links or pixels whose removal separates two parts, or find the weakest point of a network.
+how: Model the network as a graph with capacities. The max-flow min-cut theorem says the largest flow from source to sink equals the capacity of the smallest cut that separates them. So after a max-flow run, the cut comes free: nodes still reachable from the source in the residual graph on one side, the rest on the other.
+In image segmentation, pixels are nodes, neighbor edges cost more when colors are similar, and the user marks a few pixels as foreground and background. The min cut gives the cheapest outline. In network planning, the min cut between two data centers is the set of links whose failure disconnects them, so it measures resilience.
+Dinic's algorithm or push-relabel solves large instances in a short time on one machine.
+used: Graph-cut segmentation (GrabCut in OpenCV is based on graph cuts); capacity and failure analysis for backbone networks; project selection problems.
+avoid: When there are more than two terminals and exact answers matter; multiway cut is NP-hard, so use an approximation.
+flow:
+  Planner [client] -> Graph builder [svc: capacities] : topology and link capacity | The planner gives the network and link capacities.
+  Graph builder -> Max-flow [svc: Dinic] : source DC1, sink DC2 | The builder picks two data centers as source and sink.
+  * Max-flow: no path left | Max-flow keeps pushing along paths with spare capacity until none remain.
+  Max-flow -> Cut finder [svc: residual graph] : residual graph | Nodes still reachable from the source form one side of the cut.
+  Cut finder -> Planner : cut = 3 links, 120 Gbps | The cut lists the weakest links and the total flow they carry.
+  Planner ~> Graph builder : add a link and re-run | The planner adds capacity at the cut and checks again.
+
+@@ monostack
+== Sliding-window max in a stream operator
+kind: windowed-agg
+when: A stream job must report the maximum or minimum over the last N seconds for every new event, and a rescan of the window each time is too slow.
+how: The operator keeps a deque of candidates, ordered so that values decrease from front to back. A new event first pops every back entry that is smaller, because those can never be the maximum again: the new one is newer and larger. Then it pushes itself at the back.
+The front always holds the window maximum. When the front's timestamp falls out of the window, it is popped. Each event is pushed once and popped once, so the cost is O(1) amortized per event, and the state is small: at most the number of events in the window, and often far fewer.
+Note that the state is a deque, not just one number, because after the max expires the next one must already be known. This needs no sorted index or heap.
+used: Window aggregation in stream processors such as Flink and Kafka Streams can use this idea for min/max; rolling-high and rolling-low in time-series and trading analytics.
+avoid: For sum, count or average, keep a running total instead; for percentiles use a quantile sketch.
+flow:
+  Events topic [log: price ticks] -> Window operator [svc: 60 s window] : tick 98 at t=100 | A new price tick arrives at the operator.
+  Window operator -> Candidate deque [store: front = max] : pop smaller from back | Candidates smaller than 98 are removed, since they can never be the maximum again.
+  Window operator -> Candidate deque : push 98 | The new tick joins the back, so values decrease from front to back.
+  Candidate deque -> Window operator : front = 120 | The front is the current maximum, read in O(1).
+  Candidate deque -x> Window operator : front expires at t=140 | When the front leaves the window, it is popped and the next entry becomes the maximum.
+  Window operator -> Dashboard [client] : max = 105 | The operator emits the new maximum.
+
+@@ mst
+== Single-linkage clustering from a spanning tree
+kind: none
+when: Records must be grouped by similarity without choosing the number of groups in advance, and you want to try several cut levels cheaply.
+how: Treat each record as a node and each similar pair as an edge with a distance. Run Kruskal: sort the edges by distance and add each one unless union-find says its ends are already joined. The result is a minimum spanning tree.
+Single-linkage clusters at threshold d are exactly the connected pieces that remain when you delete the tree edges longer than d. So one tree gives the whole hierarchy. To get k clusters, drop the k-1 longest edges. Changing k later costs a scan of the tree, not a new run.
+Building the full graph is the costly part: n records have about n²/2 pairs. Real pipelines first limit the edges with a nearest-neighbor index or blocking keys, then run Kruskal on the sparse graph.
+The known weakness is chaining: one noisy bridge edge can merge two real groups.
+used: Single-linkage in SciPy and scikit-learn (the MST route is the fast way); entity resolution and record deduplication jobs; network-cable layout planning uses the same tree.
+avoid: When clusters are round and of similar size; use k-means. When noise is high; use density-based methods such as HDBSCAN.
+flow:
+  Records [lake: 10M items] -> Neighbor index [svc: top 10 per item] : embeddings | An index finds the 10 nearest records for each item, which keeps the graph sparse.
+  Neighbor index -> Edge list [log: 100M edges] : pairs with distance | The pairs and their distances are written as a list of edges.
+  Edge list -> Kruskal job [svc: sort edges] : edges by distance | The job sorts edges from the smallest distance.
+  Kruskal job -> Union-find [store: components] : union a b | An edge is kept only if the two ends are in different components.
+  Union-find -x> Kruskal job : same set, skip | If both ends are already joined, the edge would make a cycle and is skipped.
+  Kruskal job -> Cluster table [db: tree edges] : MST with distances | Cutting the tree at any distance gives the clusters for that level.
+
+@@ onlinealgo
+== Rent or buy: reserved versus on-demand capacity
+kind: autoscaling
+when: Demand is uncertain, and you must choose between paying a flat price for committed capacity and paying a higher rate only when you use it.
+how: This is the rent-or-buy problem. Buying costs B up front. Renting costs r per period. If you knew the future, you would buy only when total use is longer than B / r periods. You do not know it.
+The simple rule: rent until your total rent equals B, then buy. Its total cost is never more than twice the cost of the best choice made with full knowledge. Whatever the future turns out to be, you cannot be hit worse than 2x. This is called being 2-competitive, and no deterministic rule does better.
+Cloud teams use the same logic when they split capacity. They cover the steady base with reserved instances or savings plans, and let on-demand or spot capacity handle spikes. They also review usage from billing data, and commit more only after a service has run steadily for months.
+used: Reserved instances and savings plans in AWS, Azure and Google Cloud; autoscalers that wait before they scale down; TCP and cache sizing follow similar rules.
+avoid: When the future is predictable from history; forecast the load and commit to it. When a commitment cannot be changed, be more careful than the 2x rule.
+flow:
+  Usage meter [store: hours per month] -> Capacity planner [svc: rent until B] : total on-demand spend | The planner tracks how much it has spent on on-demand capacity so far.
+  Capacity planner -> On-demand pool [svc: pay per hour] : launch for spikes | While the spend is below the price of a commitment, it keeps renting.
+  * Capacity planner: spend reached B | Total rent now equals the commitment price, so the rule says to buy.
+  Capacity planner -> Reserved pool [svc: 1 year commit] : buy commitment | The planner buys the base capacity for a flat price.
+  Reserved pool -> Workloads [client] : steady base load | The base load now runs at the lower reserved rate.
+  On-demand pool -> Workloads : burst load | Short spikes still run on demand.
+
+== Cache eviction is an online paging problem
+kind: memory-tiering
+when: A cache is smaller than the data set, and the next request is unknown, so you must decide which item to drop now.
+how: Eviction is the paging problem. The best offline rule (Belady's) drops the item used farthest in the future, but it needs the future. An online rule decides from the past only.
+Competitive analysis compares them. For a cache of k pages, LRU and FIFO make at most k times as many misses as the best offline rule, on any request sequence, plus a constant. No deterministic rule can do better than k. Random eviction is also close to this bound against an oblivious adversary. This is why LRU is a safe default: no input can make it fail badly, relative to what was possible.
+In real traffic, requests have locality, so LRU does far better than the worst case. Production caches add extras on top, such as scan resistance (a large scan must not flush hot pages) and frequency counts.
+used: Operating system page caches; database buffer pools; CPU caches; CDN caches. Many use LRU variants such as 2Q, ARC or LRU-K.
+avoid: When access is a long loop over data larger than the cache; LRU then misses every time, so use MRU, a scan-resistant policy or a bigger cache.
+flow:
+  Client [client] -> Cache [cache: k = 3 pages] : read page 4 | A request arrives for page 4.
+  Cache -x> Client : miss | Page 4 is not in the cache.
+  Cache -> Backing store [store: disk] : fetch page 4 | The cache loads page 4 from the slower store.
+  * Cache: pages 1 2 3 full | The cache is full, so one page must go.
+  Cache -> Eviction policy [svc: LRU] : choose victim | The policy picks page 1, the least recently used, using only the past.
+  Eviction policy -> Cache : evict page 1 | Page 1 is dropped; page 4 takes its place.
+ref: paper | Amortized efficiency of list update and paging rules | Sleator & Tarjan, CACM 1985 |
+
+@@ prefixsums
+== Cumulative counts in OLAP rollups
+kind: pre-aggregation
+when: Dashboards ask for totals over arbitrary date ranges, and scanning the raw rows for each query is too slow.
+how: A batch job groups raw events by day and keeps one total per day. It then stores the running total: cum[d] is the sum of all days up to d. Any range total from day a to day b is cum[b] - cum[a-1]: two reads and one subtraction, whatever the length of the range.
+The same trick works for cumulative metrics, such as total signups to date, which databases compute with a window function: SUM(x) OVER (ORDER BY day). Two-dimensional tables use a summed-area table, so any rectangle sum needs four reads.
+The limit is updates. If an old day changes, every later running total changes too, so a prefix array suits data that is appended or rebuilt in batches. For live updates use a Fenwick tree.
+Note that this works for sums and counts, which can be subtracted. It does not work for maximum or distinct counts.
+used: SQL window frames in Postgres, BigQuery and Snowflake; NumPy cumsum; summed-area tables (integral images) in computer vision; rollup tables in analytics stores.
+avoid: When the data changes all the time; use a Fenwick tree or a segment tree. For distinct counts use HyperLogLog sketches.
+flow:
+  Event log [lake: raw events] -> Daily rollup job [svc: group by day] : events | A nightly job groups raw events by day.
+  Daily rollup job -> Rollup table [db: day and total] : 365 rows per year | It writes one total per day, which is tiny compared with the raw data.
+  Rollup table -> Prefix job [svc: running total] : daily totals | The job adds each day to the total before it.
+  Prefix job -> Cumulative table [db: cum by day] : cum[d] | The running totals are stored in a table keyed by day.
+  Dashboard [client] -> Cumulative table : Mar 1 to Mar 31 | A user picks a date range.
+  Cumulative table -> Dashboard : cum[31] minus cum[0] | The answer is one subtraction of two stored values.
+
+== Difference array for range updates and overlap counts
+kind: none
+when: Many ranges must be added to an array, and the final values are needed once, such as how many bookings overlap at each time.
+how: Instead of adding v to every cell from a to b, write +v at position a and -v at position b+1 in a difference array. This is two writes, O(1) per range, whatever its length. After all ranges are written, one prefix sum pass over the difference array gives the final value of every cell.
+For a calendar or capacity check, each booking adds +1 at its start and -1 after its end. Sort the events by time (a sweep line), and the running total is the number of concurrent bookings. The maximum of this total is the peak load. If it is above the capacity, the plan fails.
+Cost: O(m) for m ranges plus one O(n) pass, instead of O(m * n). The method is offline: you read the values only after all updates are in. If you need to read between updates, use a Fenwick tree.
+used: Capacity planning for meeting rooms, ad flights and bookings; line sweeps in computational geometry; batch image and grid updates in competitive programming.
+avoid: When queries and updates are mixed; use a Fenwick or segment tree with range updates.
+flow:
+  Booking API [svc: bookings] -> Event buffer [queue: start and end events] : +1 at 9:00 and -1 at 10:30 | Each booking becomes two events, not a range of cells.
+  Event buffer -> Planner [svc: sweep] : events sorted by time | The planner sorts events by time once.
+  Planner -> Diff array [store: delta per slot] : write +1 and -1 | Each range costs two writes, however long it is.
+  Diff array -> Planner : prefix sum pass | One pass over the array turns deltas into the number of concurrent bookings.
+  * Planner: peak = 12 | The largest value in the pass is the peak load.
+  Planner -x> Booking API : reject, capacity is 10 | If the peak is above capacity, the new booking is refused.
+
+@@ queuesbuf
+== Ring buffer between a producer and a consumer
+kind: producer-consumer, load-leveling
+when: One thread or process produces items fast, another consumes them, and you want no allocation and no locks on the hot path.
+how: A ring buffer is a fixed array used in a circle. The producer writes at the head index and the consumer reads at the tail index. Each index only moves forward and wraps at the end. If the size is a power of two, wrapping is one bit mask: index & (size - 1).
+With one producer and one consumer, no lock is needed. The producer owns the head and the consumer owns the tail, and each only reads the other's index. When head - tail equals the size, the buffer is full, and the producer waits or drops. This bound gives backpressure for free.
+There is no allocation per item, and the memory is contiguous, so it is friendly to the CPU cache. Head and tail should sit on different cache lines, to avoid false sharing.
+used: LMAX Disruptor; Linux kfifo and the io_uring submission and completion rings; NIC receive and transmit rings; audio buffers; log buffers in databases.
+avoid: When many producers write at once and order matters; use a multi-producer design (Disruptor sequencing) or a queue with locks.
+flow:
+  Producer [svc: writes head] -> Ring buffer [queue: 8 slots] : write slot 5 | The producer puts the item in slot head & 7 and then advances the head.
+  Ring buffer -> Consumer [svc: reads tail] : read slot 2 | The consumer reads at its own tail index and advances it.
+  * Ring buffer: head 10 and tail 2 | The distance between head and tail is the number of items waiting.
+  Producer -x> Ring buffer : full, head - tail = 8 | When the buffer is full, the producer must wait or drop.
+  Consumer -> Ring buffer : advance tail | Freed slots can be written again.
+ref: paper | Disruptor: High performance alternative to bounded queues | Thompson et al., LMAX, 2011 |
+
+== Skip list as the in-memory table of an LSM store
+kind: lsm-compaction
+when: A store must take fast random writes in memory, keep keys sorted, and later flush them in order to disk.
+how: New writes go to the write-ahead log (for safety) and to a memtable. The memtable is a skip list: a sorted linked list with extra express levels. Each node gets a random height, such as one more level with probability 1/2. A search starts at the top level and drops down, so it takes O(log n) steps on average.
+A skip list is easy to make concurrent: readers can walk it while one writer links new nodes with a few pointer writes. A balanced tree needs rotations that are harder to do without locks.
+When the memtable reaches a size limit, for example 64 MB, it becomes read-only. A background thread walks it in key order and writes a sorted file (an SSTable). Sorted order comes for free, so the flush is a plain sequential write.
+used: RocksDB and LevelDB memtables (skip list is the default in RocksDB); Redis sorted sets use a skip list with a hash table; HBase uses a concurrent skip list in its MemStore.
+avoid: When memory use per key matters more than write speed; a skip list has extra pointers per node. Other memtable types (hash, vector) exist for special loads.
+flow:
+  Client [client] -> WAL [log: append only] : put k=v | The write is first appended to the log, so it survives a crash.
+  Client -> Memtable [store: skip list] : insert k | The key is inserted in sorted position in O(log n).
+  Client -> Memtable : get k | A read searches the memtable first and finds the newest value.
+  * Memtable: full 64 MB | The memtable reaches its size limit and becomes read-only.
+  Memtable ~> SSTable [lake: sorted file] : flush in key order | A background thread writes the keys in sorted order, with no extra sorting.
+  SSTable ~> WAL : drop old log segment | The log for that memtable is no longer needed.
+
+@@ randalgo
+== Power of two random choices in load balancing
+kind: horizontal-scale
+when: Many clients send requests to many servers, and a central, always-correct view of server load is too costly or too slow.
+how: A pure random choice is simple but uneven: with n requests on n servers, the busiest server gets about log n / log log n requests. Checking all servers is exact but slow, and every balancer would pile onto the same quiet server at once.
+The fix: pick two servers at random, and send the request to the one with fewer active requests. This small change cuts the maximum load to about log log n, an exponential improvement. Picking a third choice helps only a little more.
+Each balancer needs only the load of two servers per request, which it can track locally. Random choice also avoids the herd effect, where many balancers choose the same server because it looked idle.
+used: Envoy's least-request load balancer picks from two random hosts by default; NGINX has a "random two least_conn" option; HAProxy offers a similar "random" balancing with a choice count.
+avoid: When requests differ a lot in cost and the count of active requests is a poor sign of load; use weighted or latency-based selection. When session affinity is needed; use consistent hashing.
+flow:
+  Client [client] -> Load balancer [svc: tracks open requests] : request 1042 | A request reaches one of many balancers.
+  Load balancer -> Server A [svc: 7 open], Server B [svc: 3 open] : sample 2 at random | The balancer picks two servers at random from the pool of 100.
+  Server A -> Load balancer : open = 7 | The balancer knows A has 7 open requests.
+  Server B -> Load balancer : open = 3 | It knows B has 3 open requests.
+  Load balancer -> Server B : forward to B | The request goes to the less loaded one of the two.
+  * Server B: 4 open | B now has 4 open requests; the load stays near level without a global view.
+
+== Randomized backoff with jitter
+kind: retry-backoff
+when: Many clients fail at the same moment, and if they all retry together, they overload the service again.
+how: After an outage, a fixed retry delay makes every client retry at the same instants. The service sees spikes again and again. Exponential backoff spreads retries over longer times, but clients that failed together still stay in step.
+Randomness breaks the lock-step. Full jitter picks the delay uniformly from 0 to min(cap, base * 2^attempt). With base 100 ms, cap 20 s, the fourth retry waits a random time between 0 and 1.6 s. Clients now spread over the whole interval, and the load on the service is smooth.
+In the AWS Architecture Blog's simulation, full jitter cut the number of calls and the finish time compared with plain exponential backoff. Randomness is the key part, not the average delay. Each client needs no state about the others.
+used: AWS SDKs retry with exponential backoff and jitter; the gRPC retry policy; Ethernet CSMA/CD and Wi-Fi random backoff use the same idea; Raft randomizes election timeouts.
+avoid: When the call is not idempotent and a retry could duplicate an effect; use idempotency keys first. Put a retry budget in place so retries cannot add more than about 10 percent of load.
+flow:
+  Client 1 [client] -x> Service [svc: overloaded] : request | Many clients get an error at the same time.
+  Client 2 [client] -x> Service : request | The second client fails at the same moment.
+  * Client 1: waits 80 ms | Client 1 draws a random delay between 0 and 400 ms.
+  * Client 2: waits 310 ms | Client 2 draws a different delay, so the two are no longer in step.
+  Client 1 -> Service : retry | The first retry arrives alone and succeeds.
+  Client 2 -> Service : retry | The second retry arrives later; the service never sees one big spike.
+ref: blog | Exponential Backoff And Jitter | Marc Brooker, AWS Architecture Blog, 2015 | https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+
+@@ rangeq
+== Updatable range aggregates over time buckets
+kind: pre-aggregation
+when: A service must answer sum, count or max over any time range, while new values keep arriving all the time.
+how: A plain prefix sum is fast to read but costly to update. A Fenwick tree (binary indexed tree) keeps partial sums for blocks whose sizes are powers of two. An update touches about log n cells, and a prefix query reads about log n cells. For one million buckets, that is about 20 steps each.
+A segment tree stores the aggregate of every interval in a binary tree. It handles max, min, gcd and other merges that cannot be subtracted, and with lazy propagation it can add a value to a whole range in O(log n).
+In a metrics service, each leaf is one minute of counts. A write adds to one leaf and updates its log n ancestors. A query for a range reads a few nodes and merges them. State is O(n), small enough to keep in memory.
+used: Fenwick trees in rank and order-book counting code; segment trees for range aggregates over time series in services and in many programming contest solutions; database indexes with pre-aggregated nodes apply the same idea.
+avoid: When data is static; use prefix sums or a sparse table for O(1) reads. When answers can be approximate over huge data, a sketch is smaller.
+flow:
+  Metrics ingest [svc: counter per minute] -> Fenwick tree [store: 1M buckets] : add 5 at bucket 700 | A new count updates about 20 nodes, not the whole array.
+  Dashboard [client] -> Query service [svc: range sum] : sum of minutes 600 to 900 | A user asks for the total in a time range.
+  Query service -> Fenwick tree : prefix(900) | The service reads about 20 nodes for the end of the range.
+  Query service -> Fenwick tree : prefix(599) | It reads about 20 nodes for the start of the range.
+  * Query service: sum = p900 minus p599 | The answer is one subtraction of two prefix results.
+  Query service -> Dashboard : total 4210 | The reply comes in microseconds, and the data stays live.
+
+== Sparse table for static range minimum queries
+kind: precompute
+when: The data is fixed, and the program asks for the minimum over many ranges, so each query must take constant time.
+how: For each start i and each length 2^k, precompute min of a[i .. i + 2^k - 1]. Level k is built from level k-1 by taking the min of two halves, which is a small dynamic program. The table has n log n entries: for one million values, about 20 million numbers.
+To answer a query on [l, r], take k = floor(log2(length)) and return the min of two precomputed blocks, one that starts at l and one that ends at r. They may overlap, which is fine for min, so a query is two reads. No loop, no tree walk.
+This is the basis of fast lowest common ancestor queries: write the Euler tour of a tree, and the LCA of two nodes is the range minimum of depths between them. The same table gives longest common prefix queries in a suffix array.
+used: LCA in tree and graph libraries; suffix array LCP queries in string indexes; programming contests. The idea is common in read-only indexes built once.
+avoid: When values change; the table must be rebuilt. Use a segment tree. When memory is tight, use a blocked variant with O(n) space.
+flow:
+  Build job [svc: runs once] -> Sparse table [store: n log n cells] : min over 2^k blocks | The job fills level after level; each level uses the one before it.
+  Index file [lake: built offline] -> Query server [svc: loads table] : load table | The server loads the finished table into memory.
+  Client [client] -> Query server : min of 5 to 10 | A client asks for the minimum of a range of 6 items.
+  Query server -> Sparse table : read blocks 5-8 and 7-10 | Here k = 2, so two blocks of 4 cover the range; they overlap, which is fine.
+  Sparse table -> Query server : two values | The server takes the smaller of the two values.
+  Query server -> Client : answer | The answer needs two reads and no loop.
+
+@@ roadrouting
+== Contraction hierarchy: preprocess once, query fast
+kind: precompute
+when: A routing service answers many queries on a road graph that changes slowly, and Dijkstra over the whole graph is far too slow.
+how: Offline, the preprocessor orders nodes by importance and contracts them one by one, least important first. When it removes a node, it adds a shortcut edge between two neighbors if the path through that node was their only shortest path. The result is a graph with shortcuts, kept next to the original.
+An online query runs a bidirectional Dijkstra: one search from the source and one from the target. Each search goes only upward in the order, so it visits a few hundred nodes. On the Western Europe graph (18 million nodes), plain Dijkstra reads about 9 million nodes in seconds; a contraction hierarchy needs well under a millisecond.
+Cost: preprocessing takes minutes and extra memory for shortcuts, which is fine for a map that is rebuilt on a schedule.
+used: OSRM and GraphHopper, two open-source routers, offer contraction hierarchies; RoutingKit, a research library; common in navigation backends.
+avoid: When edge weights change every second for all edges; use customizable methods that keep the order and only redo the weights. For very small graphs plain Dijkstra is enough.
+flow:
+  OSM extract [lake: road graph] -> Preprocessor [svc: contraction] : nodes and edges | The preprocessor reads the road graph once.
+  Preprocessor -> Shortcut graph [store: edges plus shortcuts] : node order and shortcuts | It writes the graph with shortcut edges and the importance order.
+  Client [client] -> Routing server [svc: loads graph] : route A to B | A user asks for a route.
+  Routing server -> Shortcut graph : upward search from A and B | Two searches go only upward and meet in the middle; a few hundred nodes are visited.
+  Shortcut graph -> Routing server : best meeting node | The best meeting node gives the shortest path with shortcuts.
+  Routing server -> Client : route and ETA | The server expands the shortcuts into real roads and replies in under 1 ms.
+ref: paper | Exact Routing in Large Road Networks Using Contraction Hierarchies | Geisberger, Sanders, Schultes & Delling, 2012 |
+
+== Live traffic as a fast-changing weight layer
+kind: event-driven, materialized-view
+when: Road speeds change every minute because of traffic, and the routing graph shape must stay fixed.
+how: The topology (nodes, edges, node order) changes rarely, so it is preprocessed once. The edge weights (travel times) change often. A traffic pipeline turns probe data from phones and vehicles into a speed per road segment every minute or so.
+A customization step takes the new weights and recomputes only the shortcut weights, in the fixed order. It is much cheaper than a full rebuild: seconds for a large country with a customizable method such as customizable route planning (CRP) or customizable contraction hierarchies. The router then swaps in the new weight array, and old queries finish on the old one.
+Queries then use current speeds. For arrival-time forecasts, a service can also keep typical speeds by time of day, and blend them with live ones.
+used: Customizable route planning, from Microsoft Research (Delling and others); OSRM supports updating speeds with a partial rebuild in its MLD mode; common in ride-hail and delivery routing.
+avoid: When live traffic is not needed, a static graph is simpler. For a few routes, call a routing API instead of running your own router.
+flow:
+  Probe stream [log: GPS pings] -> Speed estimator [svc: per segment] : pings | Phone and vehicle pings are matched to road segments.
+  Speed estimator -> Weight store [store: travel time per edge] : speeds each minute | The store keeps one travel time for each edge.
+  Weight store -> Customizer [svc: recompute shortcuts] : changed weights | The customizer recomputes only shortcut weights, in the fixed node order.
+  Customizer -> Routing server [svc: weights v812] : new weight array | The router switches to the new weights at once; running queries finish on the old ones.
+  Client [client] -> Routing server : route A to B | A new query starts.
+  Routing server -> Client : route with live ETA | The route uses speeds from the last minute.
+
+@@ sorting
+== External merge sort for data larger than memory
+kind: external-sort
+when: A query or job must sort more data than fits in RAM, such as ORDER BY on 500 GB with 8 GB of memory.
+how: Phase 1 makes sorted runs. Read as much as fits in memory, sort it with an in-memory sort, and write it to disk as one sorted run. Repeat until all input is read. With 8 GB of memory and 500 GB of data, that gives about 63 runs.
+Phase 2 merges runs. Open all runs together (a k-way merge), keep one buffer per run, and repeatedly take the smallest head item with a min-heap. Write it to the output. If there are too many runs to open together, merge in several passes.
+The cost is a small number of passes over the data, each fully sequential, so disks and SSDs run at their best speed. With one merge pass, the data is read twice and written twice in total. In-memory sort is only the first step.
+used: Database sort operators (Postgres sorts spill to temporary files); Unix sort; the sort inside the Spark and Hadoop shuffle.
+avoid: When data fits in memory; use an in-memory sort. When only the top k items are needed; use a heap and skip the full sort.
+flow:
+  Input [lake: 500 GB] -> Run generator [svc: 8 GB buffer] : read 8 GB | The job reads one memory-sized chunk of the input.
+  Run generator -> Run files [store: 63 sorted runs] : write sorted run | It sorts the chunk in memory and writes it as one sorted run.
+  * Run generator: 63 runs done | All input has been turned into sorted runs.
+  Run files -> Merger [svc: min-heap of 63] : one buffer per run | The merger opens all runs and keeps a heap of their front items.
+  Merger -> Output [lake: sorted] : smallest item next | It writes the smallest front item and refills that run's buffer.
+  Merger -x> Run files : too many runs, extra pass | With more runs than buffers, the merge needs more than one pass.
+
+== LSM compaction as a k-way merge
+kind: lsm-compaction
+when: A write-heavy store keeps many sorted files, and it needs to keep reads fast and remove old versions of keys.
+how: An LSM tree flushes memory into immutable sorted files. Over time, many files pile up, and a read may have to check each of them. Compaction merges several sorted files into fewer, larger sorted files.
+Compaction is a k-way merge, the second phase of external merge sort. It opens the input files, reads them in key order with a heap, and writes one sorted output. When the same key appears in several files, the newest version wins, and old versions and deleted keys (tombstones) are dropped.
+Everything is sequential. Because inputs are sorted, memory use is just one block per input file. The price is write amplification: each byte is rewritten many times as it moves down levels, often 10 to 30 times in leveled compaction.
+used: RocksDB and LevelDB; Cassandra and ScyllaDB; HBase; Lucene segment merging works in a similar way.
+avoid: When write volume is low and read latency is key; a B-tree has lower read cost and no write amplification from merging.
+flow:
+  Level 0 [store: 4 small files] -> Compaction job [svc: k-way merge] : 4 sorted files | The job picks several overlapping sorted files.
+  Level 1 [store: 1 large file] -> Compaction job : overlapping key range | It also picks the files of the next level that overlap the same keys.
+  Compaction job -> Level 1 : one merged sorted file | A heap merge writes one new file in key order.
+  Compaction job -x> Level 1 : drop old versions | Old versions and deleted keys are dropped from the output.
+  Level 1 ~> Reader [client] : fewer files to check | Reads now check fewer files, so reads get faster.
+
+@@ streamalgo
+== Mergeable sketches: summarize per partition, merge at query
+kind: pre-aggregation, map-reduce
+when: You need distinct counts, top items or quantiles over huge event streams, and exact answers need too much memory.
+how: Each ingest worker reads its own part of the stream and keeps small sketches in memory: HyperLogLog for distinct users, count-min for frequencies, a quantile sketch for latency. One sketch takes kilobytes, whatever the number of events. Each event is processed once, in O(1) time.
+At the end of each window, the worker writes its sketches to storage as binary values. Sketches are mergeable: merging two HyperLogLogs is a max of registers, and merging count-min tables is a sum. So a query can combine thousands of partition sketches into one answer, and the order of merging does not matter.
+The error is known in advance. A HyperLogLog with 16,384 registers has a typical error near 0.8 percent. You pay with exactness, and you cannot list the items. Also, a plain distinct-count cannot be subtracted, which is why sketches per time bucket are stored and merged for each query range.
+used: Apache Druid and Apache Pinot (theta and HLL sketches); BigQuery and Spark HLL functions; Redis HyperLogLog; Apache DataSketches library; common in ad reach and frequency reports.
+avoid: When exact values are needed, such as billing; keep raw events or exact aggregates. When the key space is small, a plain hash map is simpler.
+flow:
+  Event stream [log: user events] -> Ingest worker [svc: HLL per hour] : user_id | Each worker hashes the user id and updates one register; memory stays at a few KB.
+  Ingest worker -> Sketch store [db: one sketch per hour] : serialized sketch | At the end of the hour, the worker stores its small sketch.
+  Analyst [client] -> Query engine [svc: merge sketches] : reach for last 7 days | An analyst asks for unique users over a week.
+  Query engine -> Sketch store : read 168 sketches | The engine reads one sketch per hour for the week, and not the raw events.
+  * Query engine: merged, estimate 4.2M | Merging takes the max of each register, so the result is one sketch.
+  Query engine -> Analyst : 4.2M, error about 1% | The answer has a small, known error and arrives in milliseconds.
+ref: paper | HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm | Flajolet, Fusy, Gandouet & Meunier, 2007 |
+
+== Reservoir sample for debugging and monitoring
+kind: reservoir-sampling
+when: A stream is too large to keep, and you want a fair, fixed-size sample for inspection, offline checks or model monitoring.
+how: Reservoir sampling keeps k items so that every item seen so far has the same chance, k/n, to be in the sample. Keep the first k items. For item number n after that, pick a random integer from 1 to n. If it is at most k, replace a random slot in the reservoir with the new item.
+The reservoir uses O(k) memory and one pass, and it needs no knowledge of the stream length. At any time, you can read it out as an unbiased sample. It can be sampled per key as well, so that rare customers still get entries.
+A sample lets a team look at real requests, test a new query on realistic data, or compare the live feature distribution with the training one. Sample statistics have an error that falls as 1 over the square root of k.
+used: Reservoir samples in log and trace pipelines; sampling of requests for model drift checks; Spark and database engines use samples for statistics. Common in observability tools.
+avoid: When rare events matter, such as errors; keep all of them and sample the rest. When you need counts of all items, use count-min or exact counters, since a sample is not a count.
+flow:
+  Event stream [log: millions per hour] -> Sampler [svc: reservoir k = 1000] : event n | The sampler sees each event once and never stores the whole stream.
+  Sampler -> Sample store [store: 1000 events] : replace slot j | With probability k/n the event replaces a random slot.
+  * Sampler: seen 5M events | The reservoir stays at 1000 items, and each item had an equal chance.
+  Sample store -> Drift monitor [svc: compare to training] : read the sample | A monitor reads the sample, not the full stream.
+  Drift monitor -> Alerts [queue: pages] : feature X shifted | If the sample's distribution has moved, an alert is raised.
+  Engineer [user] -> Sample store : inspect real events | An engineer reads real, unbiased examples to debug a problem.
+
+@@ stringmatch
+== Content-defined chunking for deduplicated backups
+kind: content-addressing
+when: Backups or file sync must store only new data when a file changes slightly, even when bytes are inserted in the middle.
+how: Fixed-size blocks fail when one byte is inserted: every later block shifts, and all of them look new. Content-defined chunking picks block borders from the data itself.
+A rolling hash is computed over a sliding window of, say, 48 bytes. It is updated in O(1) per byte: remove the oldest byte, add the new one. When the low 20 bits of the hash are zero, the position is a chunk border. This gives an average chunk size of 1 MB, with limits on minimum and maximum size. An insert changes only the chunks near it; later borders are found at the same places.
+Each chunk is hashed with SHA-256 and looked up in an index. If the hash is known, the chunk is only referenced. Otherwise it is compressed, encrypted and stored. The backup is then a list of chunk ids per file.
+used: restic and borg backup tools (rolling-hash chunkers); rsync uses a rolling checksum to find matching blocks; Git pack files use delta compression; many deduplicating file systems.
+avoid: When data is already compressed or encrypted and random; chunking finds little. When files are very small, chunk metadata costs more than it saves.
+flow:
+  File [store: 10 GB VM image] -> Chunker [svc: rolling hash] : bytes | The chunker slides a 48-byte window over the file, one byte at a time.
+  Chunker -> Chunk list [note: border when low 20 bits are 0] : border at byte 1,048,611 | A border is cut when the hash has 20 zero low bits, about every 1 MB.
+  Chunk list -> Dedup index [db: SHA-256 of chunks] : lookup chunk hash | Each chunk is hashed and looked up in the index.
+  Dedup index -x> Chunk list : hash found, skip | A known chunk is not stored again; the backup keeps a reference.
+  Chunk list -> Backup repo [lake: object storage] : upload new chunks only | Only chunks that are new go to storage.
+  Chunk list -> Backup repo : snapshot = list of ids | The snapshot is a small list of chunk ids.
+
+== Literal prefilter before the regex engine
+kind: pipes-filters
+when: A search must scan gigabytes of text for a regular expression, and most of the text cannot match.
+how: Regex engines are slower per byte than plain substring search. So the engine first extracts literal strings that every match must contain, such as "error" in the pattern `error \d+ at .*`. It scans the text for those literals with a very fast substring routine, which uses SIMD instructions and, for several literals, an automaton such as Aho-Corasick.
+Only the places where a literal is found go to the full regex engine, which is guaranteed linear time in engines like RE2 and Rust's regex crate. On a typical log, 99 percent of the bytes are skipped by the cheap first stage.
+For a single literal, libc uses a fast algorithm, such as Two-Way in glibc's memmem. For many patterns, an automaton gives one pass over the text, whatever the number of patterns.
+used: ripgrep and the Rust regex crate; RE2's filtered matching; Hyperscan; log search and intrusion detection engines that match many signatures.
+avoid: When the pattern has no required literal, such as `\d+`; the filter is useless. When data is small, the complexity is not worth it.
+flow:
+  Query [client] -> Planner [svc: regex analysis] : error \d+ at .* | A user submits a regex.
+  Planner -> Literal scanner [svc: SIMD substring] : required literal: error | The planner finds a literal that every match must contain.
+  Log files [lake: 50 GB] -> Literal scanner : bytes | The scanner reads the files at memory speed.
+  Literal scanner -x> Log files : 99 percent skipped | Most blocks have no literal and are dropped at once.
+  Literal scanner -> Regex engine [svc: linear time] : candidate lines | Only lines with the literal go to the full regex.
+  Regex engine -> Query : matches | The user gets the matching lines.
+
+@@ suffixarrays
+== Substring index over a genome or a large text
+kind: index-table
+when: A fixed, huge text such as a reference genome is searched many times for short patterns, and scanning it for each query is too slow.
+how: Build the index once. A suffix array lists the start positions of all suffixes in sorted order. Any substring is the start of some suffix, so all matches of a pattern sit together in one block of the array. A binary search finds that block in O(m log n) time for a pattern of length m.
+The array takes about 4 bytes per character (n log n bits), which is large for 3 billion bases. So genome tools use the Burrows-Wheeler transform and the FM-index, which are built from the suffix array and use about 1 to 2 bytes per base with the same kind of search.
+Construction is the hard part: algorithms such as SA-IS take linear time. Building is done once offline, and the finished index file is loaded or memory-mapped by every query worker.
+used: BWA and Bowtie read aligners use the FM-index; the suffix array is the basis of many full-text and genome search tools; suffix arrays and trees help find repeats in text.
+avoid: When the text changes often; the index must be rebuilt. For word search over documents, use an inverted index.
+flow:
+  Reference genome [lake: 3 billion bases] -> Index builder [svc: SA-IS and BWT] : text | The builder sorts all suffixes once, in linear time with SA-IS.
+  Index builder -> Index file [store: FM-index] : compressed suffix array | It writes a compact index, a few GB, and it is built once.
+  Index file -> Aligner [svc: memory-mapped] : load index | Every aligner worker maps the same read-only file.
+  Reads [queue: sequencing reads] -> Aligner : read of 100 bases | Millions of short reads arrive from the sequencer.
+  Aligner -> Index file : backward search per base | Each base narrows the block of matching suffixes; no scan of the text.
+  Aligner -> Results [db: positions] : match positions | The positions of the read in the genome are stored.
+
+@@ trees
+== Trie for prefix autocomplete
+kind: precompute
+when: A search box must suggest completions after every keystroke, within a few milliseconds, from millions of known queries.
+how: Build a trie of popular queries offline. Each node is one character, and each path from the root spells a prefix. At each node, store the top k completions by popularity, for example the 10 best. A lookup walks one node per typed character, so it takes O(length of prefix), and the answer is already stored at the end node.
+A batch job builds the trie from query logs, for example every hour. The service loads the new trie into memory and swaps it in, so reads need no locks. The memory cost is large for millions of strings, so production systems often share suffixes too (a DAWG or an FST) or cache the answers for short prefixes.
+Because the work is done at build time, the request path is a few pointer steps. The cost is staleness: new queries show up only after the next build, so some systems add a small live overlay for trending items.
+used: Autocomplete in search engines and e-commerce sites is commonly built this way; Lucene's suggesters use FSTs; Redis and Elasticsearch offer completion features.
+avoid: When suggestions need fuzzy matching or typo repair; add edit-distance search. When the set is small, a sorted array with binary search is enough.
+flow:
+  Query logs [lake: search history] -> Trie builder [svc: hourly batch] : queries and counts | A batch job counts queries and inserts each into a trie.
+  Trie builder -> Trie snapshot [store: top 10 per node] : precomputed top 10 | Each node keeps its top 10 completions, so the lookup needs no search below it.
+  Trie snapshot -> Suggest service [svc: in memory] : load and swap | The service swaps in the new snapshot without a lock.
+  Browser [client] -> Suggest service : prefix: "kub" | The browser sends the prefix after each keystroke.
+  Suggest service -> Trie snapshot : walk k-u-b | The service follows 3 nodes, one per letter.
+  Suggest service -> Browser : kubernetes and 9 more | The stored top 10 is returned in about 1 ms.
+
+== Top-k with a heap in scatter-gather search
+kind: scatter-gather
+when: A query goes to many shards, each shard has its own best results, and the caller needs one global top k.
+how: Each shard scores its documents and keeps a min-heap of size k. For each new score, it compares with the heap's smallest value, and replaces it if the new one is better. This takes O(log k) per candidate and O(k) memory, so no full sort is needed.
+Each shard sends back only its k best results. The coordinator merges N lists of k results with another heap: it takes the best head item N times as needed. It never needs more than N times k items, so a query over 1 billion documents moves only a few hundred rows over the network.
+This is correct because a global top-k item must be in the top k of its own shard. Deep pagination is the weak spot: the page at offset 10,000 needs 10,000 plus k results from every shard.
+used: Elasticsearch and OpenSearch (priority queue per shard, merged on the coordinating node); Solr; Cassandra and many distributed databases for ORDER BY with LIMIT.
+avoid: For deep paging; use a cursor (search_after) with a sort key. When a global exact count of all matches is needed, the heap does not give it.
+flow:
+  Client [client] -> Coordinator [svc: merges] : query, size 10 | The client asks for the 10 best results.
+  Coordinator -> Shard 1 [svc: heap of 10], Shard 2 [svc: heap of 10], Shard 3 [svc: heap of 10] : search, top 10 | The coordinator sends the query to each shard.
+  Shard 1 -> Coordinator : 10 scored docs | Each shard keeps a min-heap of 10 while scoring, then sends only that heap.
+  Shard 2 -> Coordinator : 10 scored docs | The second shard sends its own best 10.
+  Shard 3 -> Coordinator : 10 scored docs | The third shard sends its own best 10.
+  * Coordinator: merged 30 into 10 | A heap merge of the 30 candidates gives the global top 10.
+  Coordinator -> Client : top 10 | The client gets the final list.
+
+@@ twopointers
+== Sort-merge join of two sorted inputs
+kind: sort-merge-join
+when: Two large tables must be joined on a key, both are already sorted by that key (or can be sorted), and a hash table would not fit in memory.
+how: A sort-merge join keeps one pointer in each sorted input. If the left key is smaller, advance the left pointer. If the right key is smaller, advance the right one. If they are equal, emit the matching rows, and advance. Each pointer moves forward only, so the join reads each input once: O(n + m) after sorting.
+Because it reads in order and holds almost nothing in memory, it works on inputs larger than RAM, and it streams the result. If an index or file layout already gives sorted order, the sort step is free. Otherwise the cost is the external sort, which is often the larger part.
+Duplicates need care: for a run of equal keys on both sides, the join emits every pair in the run, so the output can be larger than either input.
+used: Sort-merge join in Postgres, Spark SQL (the default for large equi-joins) and most databases; the reduce side of MapReduce joins; merging posting lists in search engines.
+avoid: When one side is small; use a broadcast hash join. When there is no sort order and the data fits in memory; a hash join is often faster.
+flow:
+  Orders [lake: sorted by customer] -> Merge join [svc: two pointers] : read next order | The left pointer reads orders in key order.
+  Customers [lake: sorted by id] -> Merge join : read next customer | The right pointer reads customers in key order.
+  * Merge join: left 41 and right 40 | The right key is smaller, so only the right pointer moves ahead.
+  Merge join -> Result [lake: joined rows] : emit matches for 41 | When both keys are equal, the join writes the pairs and advances.
+  Merge join -x> Orders : no customer for 43 | A key with no match on the other side is skipped, or kept for an outer join.
+  Result -> Report [client] : stream of rows | Rows stream out while the inputs are still being read.
+
+== Sliding-window rate limiter
+kind: rate-limit
+when: An API must allow at most N requests per user in any rolling window, such as 100 per minute, without the burst at fixed window borders.
+how: Keep the timestamps of a user's recent requests in a sorted structure, such as a Redis sorted set or a queue. A new request at time t is handled with two pointers: the tail pointer removes timestamps older than t minus the window, and the head adds the new one. If the number left is below N, the request is allowed.
+Each timestamp is added once and removed once, so the work is O(1) amortized per request. The limit is exact over any window of 60 seconds. A fixed counter per minute lets a user send 100 requests at 12:00:59 and 100 more at 12:01:00; the sliding window blocks this.
+Memory is O(N) per user. For a large scale, an approximation keeps two counters, the current and the previous window, and weights them. That is cheaper and close to exact.
+used: Redis-based limiters using sorted sets; the sliding-window counter in Cloudflare's rate limiting design; API gateways such as Kong and NGINX offer window-based limits.
+avoid: When a burst is allowed up to a bucket size; use a token bucket. When memory per user must be tiny, use the two-counter approximation.
+flow:
+  Client [client] -> API gateway [svc: limit 100 per 60 s] : request at t=12:01:10 | A request arrives at the gateway.
+  API gateway -> Window store [cache: timestamps per user] : drop entries before 12:00 | The tail pointer drops timestamps older than 60 seconds.
+  Window store -> API gateway : count = 87 | The count left in the window is 87.
+  API gateway -> Window store : add 12:01:10 | The new timestamp is added at the head, since 87 is below 100.
+  API gateway -> Backend [svc] : forward | The request is allowed and goes on.
+  API gateway -x> Client : 429 when count is 100 | At 100 requests in the window, the next request is rejected.
+
+@@ unionfind
+== Identity resolution: merge IDs into one person or household
+kind: identity-graph
+when: Events carry different IDs (cookie, device ID, email hash), and records that share a link must be grouped into one entity.
+how: Treat each ID as a node and each observed link as a union: a login joins a cookie and an email hash, a shared device joins two accounts. Union-find keeps one tree per group. Find follows parents to the root, which names the group. Union joins two roots.
+With path compression and union by rank, each operation costs about the inverse Ackermann function, which is at most 4 for any real input. So a batch job can process billions of links in one pass with a small array of parent pointers. This is the connected components of the identity graph.
+The group id is then written back as a person or household id on every event. The weak point is over-merging: one bad link, such as a shared public computer, can join two real people, and union-find cannot undo a union. So pipelines filter noisy links first, and often keep the link list so the groups can be rebuilt.
+used: Identity graphs in ad tech and CDPs are commonly built as connected components; connected-components jobs in Spark GraphFrames and similar tools; entity resolution in data lakes.
+avoid: When links must be removed again over time; rebuild the groups, or use a dynamic connectivity structure. When confidence matters, use a probabilistic match instead of a hard merge.
+flow:
+  Event stream [log: logins and ad calls] -> Link extractor [svc: pairs of IDs] : cookie, email hash | The job pulls pairs of IDs that were seen together.
+  Link extractor -> Union-find [store: parent array] : union(cookie 7, email 3) | Each pair joins two trees in near constant time.
+  * Union-find: 3 groups after 5M links | After all links, each group has one root.
+  Union-find -> Id table [db: id to person id] : find(id) per ID | A final pass writes the root of each ID as its person id.
+  Id table -> Reporting [client] : events with person id | Reports and frequency caps now use one id per person.
+  Link extractor -x> Union-find : noisy link filtered | A link from a shared public device is dropped first, because a union cannot be undone.
+
+@@ workspan
+== Fork-join with work stealing
+kind: fork-join
+when: A computation splits into independent parts that can run in parallel, and the parts differ in size so a fixed split would leave cores idle.
+how: A task splits its input in two and forks one half as a new task, then works on the other half, and joins at the end. This builds a tree of tasks. Work is the total number of operations. Span is the longest chain of dependent steps, here the depth of the tree.
+A scheduler on p cores finishes in about work / p + span. For a parallel sum of one billion numbers, work is a billion adds, but span is only about 30 levels, so many cores help. A loop that must go in order has span equal to work, and no core count can speed it up.
+Each core has its own deque of tasks. It pushes and pops at one end. An idle core steals from the other end of a random busy core, where the largest tasks sit. This balances the load with little coordination. Stop splitting below a cutoff, such as 1000 items, so task overhead stays small.
+used: Java ForkJoinPool and parallel streams; Rayon in Rust; Cilk and Intel oneTBB; Go and .NET schedulers use work stealing; OpenMP tasks.
+avoid: When tasks block on I/O; use an event loop or async runtime. When the work is tiny, one core is faster than the cost of forking.
+flow:
+  Caller [client] -> Root task [svc: sum 1B numbers] : parallel sum | The caller starts one big task.
+  Root task -> Task L [svc: left half], Task R [svc: right half] : fork two halves | The task splits in two; each half may split again until a small cutoff.
+  Task L -> Core 1 [svc: own deque] : run leaf sums | Core 1 runs the left side with its own deque.
+  Core 2 [svc: idle] -x> Core 1 : steal oldest task | An idle core takes a large task from the far end of the deque of a busy core.
+  Core 2 -> Task R : run stolen task | Core 2 now works on the other half.
+  Task L -> Root task : partial sum | Both parts finish and join; the root adds the two results.
+
+== Tree reduction and scan on a GPU
+kind: offload-accelerator, data-parallel
+when: A large array must be summed or prefix-summed, and one thread in a loop would use only a tiny part of a GPU.
+how: A sequential sum has span n. A tree reduction pairs up neighbors: step 1 adds pairs, step 2 adds pairs of pairs. For n values, it needs log2 n steps, and each step runs in parallel. For one million values, that is 20 steps instead of one million. Work stays n, so it wastes nothing.
+A GPU thread block does this in fast shared memory: each thread loads values, and the block reduces them in log steps with barriers between steps. Each block writes one partial result, and a second small kernel (or atomic add) combines the partials.
+A parallel prefix sum (scan) has the same shape with an up-sweep and a down-sweep, so it also takes O(log n) span with O(n) work. Scan is a building block of sort, stream compaction and join kernels.
+used: CUB and Thrust in NVIDIA's CUDA libraries; PyTorch and NumPy-style sum and cumsum kernels on GPU; GPU database engines.
+avoid: When the array is small; copying data to the GPU costs more than the sum. When the data stays on the CPU and the sum is memory bound, vectorized CPU code is enough.
+flow:
+  Host [client] -> GPU memory [store: 1M floats] : copy array | The host copies the array to the device.
+  Host -> Reduce kernel [svc: 1024 blocks] : launch | The host launches one kernel; each block takes 1,024 values.
+  GPU memory -> Reduce kernel : read values | Threads load values with coalesced reads.
+  * Reduce kernel: 10 steps per block | In each step the number of active threads halves.
+  Reduce kernel -> Partials [store: 1024 sums] : one sum per block | Each block writes one partial sum.
+  Partials -> Host : final sum | A second small step combines the partial sums, and the host reads one number.
+
+@@ binary
+== Roaring bitmaps as a filter index
+kind: index-table
+when: A search or analytics engine must combine many filters (country is DE and device is mobile) over millions of rows, fast.
+how: For each value of a column, keep a bitmap with one bit per row: bit i is 1 if row i has that value. A filter becomes bitwise AND, OR and NOT on 64-bit words. One CPU instruction handles 64 rows, and SIMD handles 256 or 512. A million rows are 125 KB per bitmap, and AND takes microseconds.
+Plain bitmaps waste space when the value is rare. Roaring bitmaps split the row space into chunks of 65,536 rows. Each chunk uses a sorted array if it has few rows, a bitmap if it is dense, or runs if rows are consecutive. This keeps both memory and speed good.
+The result bitmap is then used to fetch only the matching rows, or to count them: popcount counts the set bits quickly.
+used: Roaring bitmaps are used in Apache Lucene (for filters), Apache Druid, Apache Pinot, Spark, ClickHouse and Elasticsearch; bitmap indexes in databases such as Oracle and Postgres bitmap scans.
+avoid: When a column has very many distinct values and the index must cover all of them; use a B-tree or inverted lists. When rows change very often.
+flow:
+  Query [client] -> Query engine [svc: country=DE and mobile] : two filters | A user asks for German mobile traffic.
+  Query engine -> Country index [store: bitmap for DE], Device index [store: bitmap for mobile] : load bitmaps | The engine loads one bitmap per filter value.
+  Country index -> Query engine : 1.2M bits set | The DE bitmap has 1.2 million set bits.
+  Device index -> Query engine : 3.0M bits set | The mobile bitmap has 3 million set bits.
+  * Query engine: AND of 2 bitmaps | Bitwise AND is done 64 rows per instruction.
+  Query engine -> Row store [db: columns] : fetch matching rows | Only rows with a set bit are read.
+
+== Packed 64-bit IDs (timestamp, worker, sequence)
+kind: time-ordered-ids
+when: Many servers must create unique, roughly time-ordered IDs without asking a central database for each one.
+how: A 64-bit integer is split into bit fields. In the Snowflake layout: 1 sign bit that is unused, 41 bits of milliseconds since a custom epoch, 10 bits for a worker id, and 12 bits for a per-millisecond sequence. 41 bits of milliseconds last about 69 years. 12 bits allow 4,096 IDs per millisecond per worker.
+Each worker builds an id with shifts and ORs: (time << 22) | (worker << 12) | sequence. No network call is needed. IDs sort by time, so they are friendly to B-tree inserts, and the time can be read back with a shift.
+Because the high bit stays zero, the value fits a signed 64-bit integer in all languages. The risks are clock going backward (the worker must wait or refuse) and worker id clashes, which need a small coordination service at start-up.
+used: Twitter Snowflake; similar layouts at Discord and Instagram (Instagram builds IDs in Postgres); ULID and UUID v7 use the same idea with more bits.
+avoid: When IDs must not leak time or volume; use random IDs. When strict global order is needed; use a single sequencer.
+flow:
+  Worker boot [svc: startup] -> Coordinator [svc: ZooKeeper or DB] : request worker id | At start, a worker gets a unique 10-bit worker id.
+  Coordinator -> Worker boot : worker id 37 | The coordinator hands out id 37 for this process.
+  Client [client] -> ID service [svc: worker 37] : new id | A caller asks for an ID.
+  * ID service: ms=1000 seq=0 | The service reads the clock and resets the sequence for a new millisecond.
+  ID service -> Client : id from time, 37, seq | The service builds the ID with shifts and ORs; no network call is needed.
+  ID service -x> Client : clock moved back, wait | If the clock goes backward, the service waits so it never repeats an ID.
+  Client -> Orders DB [db: B-tree on id] : insert row with id | IDs grow with time, so new rows append at the right edge of the index.
+
+@@ branchpred
+== Branch-free selection in a vectorized query engine
+kind: pipeline-stages
+when: A scan filters millions of rows with a condition that is true for about half of them, and a wrongly predicted branch on each row would dominate the cost.
+how: A modern CPU runs a pipeline of 15 to 20 stages. It guesses the outcome of each branch and keeps going. A wrong guess flushes the pipeline and costs about 15 to 20 cycles. If the filter outcome is random, such as price > 50 on unsorted data, the guess is wrong about half the time.
+A vectorized engine avoids the branch. It evaluates the predicate on a batch of 1,024 values and writes the result without a jump: sel[k] = i; k += (price[i] > 50). The write always happens, and k only moves if the row matches. The next operator reads the list of selected row numbers, called a selection vector, instead of testing each row again.
+The loop has no data-dependent branch, so its speed does not depend on selectivity. When the filter is almost always true or false, a branchy loop is fast, since the guess is right. This is why engines pick a variant by statistics.
+used: MonetDB/X100 and DuckDB selection vectors; ClickHouse and Velox filters; branch-free code in compilers via conditional moves.
+avoid: When the condition is very predictable (for example 99 percent true) or the work after the test is expensive; a plain branch skips that work.
+flow:
+  Column file [store: price column] -> Scan operator [svc: batch of 1024] : read 1024 prices | The scan reads a batch of values into a small array.
+  Scan operator -> Filter [svc: price > 50] : batch | The filter gets the whole batch at once, not row by row.
+  * Filter: no jumps in loop | Each value is tested and the index is written with arithmetic, so there is nothing to mispredict.
+  Filter -> Selection vector [store: 487 row ids] : write row ids | The result is a list of row ids that passed.
+  Selection vector -> Aggregate [svc: sum by key] : only passing rows | The next operator works on the 487 selected rows.
+  Filter -x> Scan operator : branchy loop would flush | A loop with an if per row would flush the pipeline about every second row.
+
+== Profile-guided layout of hot and cold code
+kind: interpreter-compiler
+when: A large program has hot paths and rare error paths, and the CPU front end stalls on poor code layout and wrong branch guesses.
+how: A compiler cannot know which branch is usually taken. With profile-guided optimization (PGO), you build an instrumented binary, run it on typical load, and collect counts of how often each branch goes each way. The compiler then rebuilds the program with this profile.
+It places the likely side of each branch directly after it (a fall-through), so the common path runs straight-line code. It moves cold code, such as error handling, to the end of the binary, which keeps hot code dense in the instruction cache and in the branch predictor tables. It also inlines hot calls more eagerly.
+Gains of 5 to 20 percent on large server programs are typical. Sampling-based variants (AutoFDO) use profiles from production, so no special instrumented build is needed. The profile must match real traffic; a stale profile can hurt.
+used: Clang and GCC PGO; Google's AutoFDO and Meta's BOLT post-link optimizer for large servers; Chrome and Firefox builds use PGO; the Linux kernel supports likely() and unlikely() hints.
+avoid: When the load changes shape often; the profile is stale. For code that must run in constant time, such as crypto, since data-dependent branches leak timing.
+flow:
+  Source [store: code] -> Instrumented build [svc: counts branches] : compile with counters | The first build counts how often each branch is taken.
+  Instrumented build -> Profile [store: branch counts] : run on typical load | A benchmark or a shadow of production traffic fills the profile.
+  Profile -> Optimizing compiler [svc: PGO pass] : branch counts | The compiler reads the profile in the second build.
+  Optimizing compiler -> Release binary [store: hot path first] : hot path first, cold last | Likely paths become straight-line code, and cold code moves away.
+  Release binary -> Server [svc: production] : deploy | The server runs with fewer mispredicted branches and instruction cache misses.
+  Server ~> Profile : sampled profile later | Production samples refresh the profile for the next build.
+
+@@ cachelines
+== Columnar and struct-of-arrays layout
+kind: memory-tiering
+when: A query reads one or two fields of many records, and a row layout would waste most of the memory bandwidth.
+how: The CPU moves memory in cache lines of 64 bytes (128 on Apple M-series). If a record has 20 fields in 160 bytes and a query needs only one 8-byte field, a row layout loads a whole line for every 8 useful bytes, which is about 12 percent use of the bandwidth.
+In a columnar layout, each field is stored in its own array. A line then holds 8 values of the same column, and all 64 bytes are useful. The hardware prefetcher sees a sequential pattern and loads the next lines before they are needed. The scan can reach many GB per second per core, and SIMD works well on the dense array.
+Compression helps further: sorted or low-cardinality columns shrink, so a line holds even more values. The cost is on writes and point lookups, which must touch one array per field.
+used: Parquet, ORC and Arrow; ClickHouse, DuckDB, Snowflake and Pinot; game engines use struct-of-arrays for entity data.
+avoid: When most queries read whole records by key (OLTP); a row store keeps one record in one or two lines.
+flow:
+  Analyst [client] -> Query engine [svc: SUM of price] : sum price by day | A query needs only the price and day fields.
+  Query engine -> Row store [db: 160 B per row] : scan rows | A row layout loads 160 bytes to use 8; most of each cache line is wasted.
+  Row store -x> Query engine : 12 percent useful | Only about one byte in eight of the loaded memory is used.
+  Query engine -> Column store [lake: one array per field] : scan price column | A columnar layout reads only the price array.
+  Column store -> Query engine : 8 prices per line | Each 64-byte line holds 8 useful values, and the prefetcher streams the next lines.
+  Query engine -> Analyst : result | The scan runs several times faster for the same data.
+
+== Padded per-core counters to avoid false sharing
+kind: sharding
+when: Many threads update a shared counter or statistic at a high rate, and one hot variable limits the speed of all cores.
+how: When two cores write to different variables that sit on the same 64-byte cache line, the line bounces between their caches on each write. This is false sharing. It can slow code down by 10 times or more, although the threads share no data.
+A striped counter gives each thread, or each core, its own slot, and pads each slot to a full cache line so no two slots share one. A thread increments only its own slot with no contention. A reader sums all slots when it needs the value, which is cheap and slightly stale.
+The price is memory, 64 bytes per slot, and a more costly read. This trade is good for metrics and counts that are written often and read rarely.
+used: Java LongAdder (striped cells padded with the Contended annotation); Linux per-CPU variables and percpu counters; thread-per-core databases such as ScyllaDB avoid shared state; many metrics libraries.
+avoid: When you need an exact value on every read or an atomic compare-and-set; use one atomic variable. When there are few updates, plain atomics are fine.
+flow:
+  Thread 1 [svc: core 1] -> Slot 1 [cache: own line] : increment | Thread 1 adds to its own padded slot.
+  Thread 2 [svc: core 2] -> Slot 2 [cache: own line] : increment | Thread 2 adds to a different line, so the two never fight.
+  Thread 3 [svc: core 3] -x> Shared counter [cache: one line] : increment | With one shared counter, the line bounces between cores and writes wait.
+  Metrics reader [client] -> Slot 1 : read | A reader needs the total only now and then.
+  Metrics reader -> Slot 2 : read | It reads each slot.
+  * Metrics reader: total = sum of slots | The reader adds the slots; a small delay in the total is acceptable.

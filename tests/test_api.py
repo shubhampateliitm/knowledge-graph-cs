@@ -190,6 +190,54 @@ class API(unittest.TestCase):
         self.assertIn("sample-lru-eviction", [x["id"] for x in ev]); self.assertTrue(all(x["concept"] == "eviction" for x in ev))
         self.assertEqual(self.get("/api/scenes?concept=nope")[0], 404)
 
+    def test_patterns(self):
+        s, g = self.get("/api/graph")
+        cat = {c["id"]: c for c in g["pcatalog"]}
+        self.assertGreater(len(cat), 100)
+        for c in cat.values(): self.assertTrue(c["name"] and c["fam"] and c["s"], c["id"])
+        ids = {n["id"] for n in g["nodes"]}
+        kafka = [x for x in g["patterns"] if x["concept"] == "kafka"]
+        self.assertEqual([x["i"] for x in kafka], list(range(len(kafka)))); self.assertGreaterEqual(len(kafka), 3)
+        for x in g["patterns"]:                                                                     # summaries only: no text body, no scene
+            self.assertIn(x["concept"], ids); self.assertNotIn("scene", x); self.assertNotIn("how", x)
+            for k in x["kinds"]: self.assertIn(k, cat)
+        s, r = self.get("/api/read/kafka"); self.assertEqual(s, 200)
+        self.assertEqual([x["title"] for x in r["patterns"]], [x["title"] for x in kafka])
+        p0 = r["patterns"][0]
+        self.assertTrue(p0["when"] and p0["how"] and p0["scene"]["steps"] and p0["scene"]["actors"])
+        self.assertEqual(len(p0["scene"]["steps"]), kafka[0]["n"])
+        self.assertEqual(self.get("/api/patterns?concept=kafka")[1], r["patterns"])
+        s, allp = self.get("/api/patterns"); self.assertEqual(s, 200)
+        self.assertEqual([(x["concept"], x["title"]) for x in allp], [(x["concept"], x["title"]) for x in g["patterns"]])
+        self.assertEqual(self.get("/api/patterns?concept=nope")[0], 404)
+        s, r = self.get("/api/read/L4"); self.assertNotIn("patterns", r)                            # layer essays have none
+        s, h = self.get("/api/search?q=consumer%20lag%20retention%20slowest%20useful%20reader"); self.assertIn("kafka", [x["id"] for x in h["results"]])   # pattern text is indexed
+
+    def test_handson(self):
+        s, g = self.get("/api/graph"); self.assertGreater(g["stats"]["handson"], 200)
+        s, r = self.get("/api/read/dimmodel"); self.assertEqual(s, 200)
+        self.assertGreaterEqual(len(r["handson"]), 2)
+        for x in r["handson"]:
+            self.assertEqual(x["concept"], "dimmodel"); self.assertTrue(x["u"].startswith("http") and x["t"] and x["d"])
+            self.assertIn(x["kind"], ("playground", "simulator", "puzzles", "exercises", "lab", "ctf", "game", "dataset", "kata"))
+            self.assertIn(x["access"], ("open-source", "free", "free-tier"))
+        s, r = self.get("/api/read/L4"); self.assertNotIn("handson", r)
+
+    def test_schools(self):
+        s, g = self.get("/api/graph"); cur = g["curriculum"]
+        sch = {x["id"]: x for x in cur["schools"]}
+        self.assertTrue({"stanford", "mit", "caltech"} <= set(sch))
+        for x in cur["programs"] + cur["courses"]: self.assertIn(x["school"], sch)
+        progs = {p["id"]: p for p in cur["programs"]}
+        self.assertEqual((progs["bs"]["school"], progs["mit-63"]["school"], progs["caltech-cs"]["school"]), ("stanford", "mit", "caltech"))
+        self.assertEqual(progs["mit-meng"]["short"], "MEng")
+        codes = {c["code"]: c for c in cur["courses"]}
+        self.assertEqual(codes["MIT 6.5840"]["school"], "mit"); self.assertIn("raft", codes["MIT 6.5840"]["concepts"])
+        self.assertEqual(codes["CS103"]["school"], "stanford")
+        for p in cur["programs"]:
+            for gr in p["groups"]:
+                for c in gr["courses"]: self.assertEqual(codes[c]["school"], p["school"], c)   # groups stay within one school
+
     def test_scene_build_validation(self):
         """build.py fails on an invalid scene, accepts a valid folder, and a missing folder means no scenes"""
         bad = tempfile.mkdtemp()
@@ -230,6 +278,15 @@ class API(unittest.TestCase):
         body = c.getresponse().read().decode(); self.assertNotIn("import argparse", body); self.assertIn("<!doctype html>", body)
 
     # ---------- problem map (tests/fixtures/problemmap_sample.json: 27 problems, closed under prerequisites) ----------
+    def test_lessons(self):
+        s, pm = self.get("/api/problemmap"); self.assertEqual(s, 200)
+        ids = {d["id"] for d in pm["ideas"]}
+        L = pm.get("lessons", {})
+        for k, v in L.items():
+            self.assertIn(k, ids)
+            for f in ("what", "signals", "code", "walk", "steps", "bugs", "cost"): self.assertTrue(v[f], (k, f))
+            compile(v["code"], k, "exec")
+
     def test_problemmap(self):
         s, g = self.get("/api/graph")
         pm = g["problemmap"]

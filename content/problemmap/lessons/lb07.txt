@@ -1,0 +1,1039 @@
+@@ catalan
+what: Some counts split into a left part and a right part around one chosen element. Fix that element, multiply the ways to build the left side by the ways to build the right side, then add up over every choice. Storing the answer for each smaller size means each size is solved once, not many times.
+signals: "number of structurally unique" trees or shapes ; "valid parentheses" pairs counted, not listed ; "ways to split" into two independent parts ; count the answers for n, not print them ; small n but the answer grows very fast
+code:
+```python
+def num_trees(n: int) -> int:
+    dp = [0] * (n + 1)      # dp[k] = number of BSTs with k nodes
+    dp[0] = 1               # the empty tree counts as one way
+    for nodes in range(1, n + 1):
+        for root in range(1, nodes + 1):
+            left = root - 1             # nodes smaller than the root
+            right = nodes - root        # nodes larger than the root
+            dp[nodes] += dp[left] * dp[right]
+    return dp[n]
+```
+walk: #96 Unique Binary Search Trees
+step: Input n = 3. Set dp = [1, 0, 0, 0]. The empty tree is one way.
+step: nodes = 1: only root 1, so dp[1] = dp[0] * dp[0] = 1.
+step: nodes = 2: root 1 gives dp[0] * dp[1] = 1, root 2 gives dp[1] * dp[0] = 1. So dp[2] = 2.
+step: nodes = 3, root 1: dp[0] * dp[2] = 2. Root 2: dp[1] * dp[1] = 1. Root 3: dp[2] * dp[0] = 2.
+step: dp[3] = 2 + 1 + 2 = 5, so the answer is 5.
+bugs: Setting dp[0] = 0, which makes every product zero ; Forgetting that the empty side counts as one way, not zero ; Using left = root instead of root - 1, which counts one node twice ; Adding the two sides instead of multiplying them
+cost: O(n^2) time and O(n) extra space, because each dp[k] sums k products and every size is stored once. The closed form C(2n, n) / (n + 1) is O(n).
+
+@@ convexhull
+what: The convex hull is the smallest convex shape that holds all points, like a rubber band around nails. Sort the points by x, then walk left to right with a stack. If the last two stack points and the new point turn clockwise, the middle point is inside, so pop it. Do this once for the lower half and once on the reversed list for the upper half.
+signals: "smallest fence" or "enclose all points" ; "points on the boundary of the polygon" ; "outermost points" of a set ; "convex polygon" that covers every point ; rubber band, rope or wall around trees
+code:
+```python
+def outer_trees(trees: list[list[int]]) -> list[list[int]]:
+    pts = sorted(map(tuple, trees))
+
+    def cross(o, a, b):  # > 0 left turn, 0 straight, < 0 right turn
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    def half(seq):
+        h = []
+        for p in seq:
+            # pop only on a strict right turn, so straight points stay
+            while len(h) >= 2 and cross(h[-2], h[-1], p) < 0:
+                h.pop()
+            h.append(p)
+        return h
+
+    hull = set(half(pts)) | set(half(pts[::-1]))
+    return [list(p) for p in hull]
+```
+walk: #587 Erect the Fence
+step: Input trees = [[1,1],[2,0],[2,2],[2,4],[3,3],[4,2]]. Sorted by x then y, the order is the same.
+step: Lower half: (3,3) arrives and (2,4) turns right, so pop (2,4). Then (2,2) also turns right, so pop it.
+step: (4,2) arrives, and (3,3) turns right, so pop (3,3). The lower half is (1,1), (2,0), (4,2).
+step: Upper half walks backwards from (4,2). It keeps (4,2), (3,3), (2,4). When (1,1) arrives, it pops (2,0) and (2,2).
+step: The upper half is (4,2), (3,3), (2,4), (1,1). The union has 5 points; (2,2) is inside and is dropped.
+bugs: Popping when cross is less than or equal to zero, which drops points that lie on an edge when the problem wants them ; Forgetting to deduplicate the two halves, since the end points appear in both ; Using the wrong sign for cross and building the hull inside out ; Not sorting by both x and y, which breaks vertical lines
+cost: O(n log n) time and O(n) extra space, because sorting dominates and each point is pushed and popped at most once per half.
+
+@@ modinv
+what: Under a prime modulus p you cannot divide by a number, but you can multiply by its inverse. By Fermat's little theorem, the inverse of a is a^(p-2) mod p, found fast with pow(a, p-2, p). This lets you compute n! / (k! (n-k)!) mod p, so binomials work even when n! is far too large.
+signals: "return the answer modulo 10^9 + 7" ; count of paths, arrangements or selections ; formula needs a division of large factorials ; many nCk queries with the same n limit ; p is prime
+code:
+```python
+MOD = 10**9 + 7
+
+def number_of_ways(start_pos: int, end_pos: int, k: int) -> int:
+    d = abs(end_pos - start_pos)
+    if d > k or (k - d) % 2:      # too far, or wrong parity
+        return 0
+    right = (k + d) // 2          # steps taken toward the target
+    fact = [1] * (k + 1)
+    for i in range(1, k + 1):
+        fact[i] = fact[i - 1] * i % MOD
+    # nCk = k! / (right! * (k - right)!), division becomes multiply by inverse
+    denom = fact[right] * fact[k - right] % MOD
+    return fact[k] * pow(denom, MOD - 2, MOD) % MOD
+```
+walk: #2400 Number of Ways to Reach a Position After Exactly k Steps
+step: Input startPos = 1, endPos = 2, k = 3. The distance is d = 1, and k - d = 2 is even, so it is possible.
+step: Steps toward the target: right = (3 + 1) // 2 = 2. We need to choose which 2 of 3 steps go right: C(3, 2).
+step: Factorials: fact = [1, 1, 2, 6].
+step: denom = fact[2] * fact[1] = 2. Its inverse is 2^(p-2) mod p = 500000004.
+step: Answer = 6 * 500000004 mod p = 3. The walks are RRL, RLR and LRR.
+bugs: Dividing with // or / after taking the modulus, which gives wrong numbers ; Using pow(a, p-2, p) when p is not prime ; Forgetting the parity and distance checks before computing the binomial ; Forgetting to reduce after every multiplication, which is slow and may overflow in other languages
+cost: O(k + log p) time and O(k) extra space, because the factorial table takes k steps and one modular power takes about log p multiplications.
+
+@@ multiples
+what: To handle every divisor d up to n, loop over d, 2d, 3d and so on. The loop for d runs n / d times. Adding n/1 + n/2 + n/3 + ... gives about n ln n, far less than n times n. This works well when you must ask, for each d, which values are multiples of d.
+signals: "for every d" in a range with an upper bound near 10^5 or 10^6 ; gcd of a subset of numbers ; count values that divide or are divided by others ; "multiples of" a number ; values are bounded by a small maximum
+code:
+```python
+from math import gcd
+
+def count_different_subsequence_gcds(nums: list[int]) -> int:
+    present = set(nums)
+    top = max(nums)
+    count = 0
+    for d in range(1, top + 1):
+        g = 0
+        for m in range(d, top + 1, d):   # visit d, 2d, 3d, ...
+            if m in present:
+                g = gcd(g, m)            # gcd of all multiples of d seen
+                if g == d:               # cannot get lower than d
+                    break
+        if g == d:
+            count += 1
+    return count
+```
+walk: #1819 Number of Different Subsequences GCDs
+step: Input nums = [6, 10, 3]. The maximum is 10, so d goes from 1 to 10.
+step: d = 1: the multiples reach 3, 6 and 10, and gcd(3, 6, 10) = 1. So 1 counts.
+step: d = 2: among 2, 4, 6, 8, 10 only 6 and 10 are present, and gcd(6, 10) = 2. So 2 counts.
+step: d = 3 and d = 6 and d = 10: each has a present multiple equal to itself, so g = d. All three count.
+step: d = 4, 5, 7, 8, 9: either nothing is present (g = 0) or the gcd is a larger number (d = 5 gives 10). None counts.
+step: The counted values are 1, 2, 3, 6, 10, so the answer is 5.
+bugs: Checking all pairs of numbers instead of looping over multiples ; Stopping a multiples loop early without checking the gcd, so a smaller gcd is missed ; Looping the inner range with step 1 and testing divisibility, which is O(n^2) ; Looping only up to the length of nums instead of the maximum value
+cost: O(M log M) time and O(n) extra space, where M is the maximum value, because the inner loops add up to M/1 + M/2 + ... = M ln M, plus gcd costs.
+
+@@ weightedpick
+what: Turn the weights into running totals, so item i owns a range of numbers whose length equals its weight. Draw one random whole number from 0 up to the total, then find which range it falls in with binary search. Bigger weights own longer ranges, so they are drawn more often.
+signals: "random pick with weight" ; probability proportional to a given value ; pick an index many times after building once ; "w[i] / sum(w)" chance ; sample from a custom distribution
+code:
+```python
+import random
+from bisect import bisect_right
+
+class Solution:
+    def __init__(self, w: list[int]):
+        self.prefix = []
+        total = 0
+        for x in w:
+            total += x
+            self.prefix.append(total)    # end of this item's range
+        self.total = total
+
+    def pick_index(self) -> int:
+        r = random.randrange(self.total)         # 0 .. total - 1
+        return bisect_right(self.prefix, r)      # first prefix > r
+```
+walk: #528 Random Pick with Weight
+step: Input w = [1, 3, 2]. The prefix sums are [1, 4, 6] and the total is 6.
+step: Index 0 owns the number 0. Index 1 owns 1, 2 and 3. Index 2 owns 4 and 5.
+step: Suppose r = 0. The first prefix value greater than 0 is 1, at position 0, so we return 0.
+step: Suppose r = 3. The first prefix value greater than 3 is 4, at position 1, so we return 1.
+step: Suppose r = 5. The first prefix value greater than 5 is 6, at position 2, so we return 2. Index 1 is drawn 3 times out of 6.
+bugs: Using bisect_left, which puts r = 1 into index 0 when prefix[0] = 1 ; Drawing r up to and including the total, which can run past the last index ; Rebuilding the prefix sums on every pick instead of once in the constructor ; Choosing a random index first and then rejecting by weight, which is not exact
+cost: O(n) to build and O(log n) per pick, with O(n) extra space for the prefix sums.
+
+@@ paritymask
+what: Keep one bit per item (here, per vowel) that flips each time that item appears. The mask at index i describes the odd or even count of each item in the whole prefix. If the same mask shows up at two indexes, every count between them changed by an even amount. A hash map from mask to first index finds the longest such stretch in one pass.
+signals: "even number of" each vowel or letter ; "each character appears an even number of times" ; substring whose counts are all even or odd ; only a small alphabet (up to about 20 symbols) ; XOR of a range equals zero
+code:
+```python
+def find_the_longest_substring(s: str) -> int:
+    vowels = "aeiou"
+    first = {0: -1}         # mask -> earliest index where it was seen
+    mask = best = 0
+    for i, c in enumerate(s):
+        if c in vowels:
+            mask ^= 1 << vowels.index(c)    # flip this vowel's bit
+        if mask in first:
+            best = max(best, i - first[mask])
+        else:
+            first[mask] = i
+    return best
+```
+walk: #1371 Find the Longest Substring Containing Vowels in Even Counts
+step: Input s = "leetcode". Start with first = {0: -1} and mask = 0. Bit 0 is a, bit 1 is e, bit 3 is o.
+step: "l" is not a vowel. mask = 0 is in first, so best = 0 - (-1) = 1.
+step: "e" flips bit 1, so mask = 2. It is new, so first[2] = 1. The next "e" flips it back to 0, and best = 2 - (-1) = 3.
+step: "t" and "c" keep mask = 0, so best grows to 4 and then 5.
+step: "o" sets mask = 8 and first[8] = 5. "d" gives length 6 - 5 = 1. The last "e" makes mask = 10 and it is new.
+step: The longest stretch is "leetc" with one vowel pair, so the answer is 5.
+bugs: Starting the map empty instead of {0: -1}, so a prefix with all-even counts is missed ; Updating first[mask] on every visit, which shortens the length ; Using + instead of ^ so the bit does not flip back ; Resetting the mask when a conflict appears, as in a sliding window
+cost: O(n) time and O(2^k) extra space for k tracked symbols (32 masks for 5 vowels), because each character is handled once and the map holds at most 2^k masks.
+
+@@ xortrie
+what: A binary trie stores each number as a path of bits from the highest bit down. To maximise x XOR y, you want y to differ from x at the highest bit possible. So at each level, step to the child with the opposite bit if it exists. Otherwise take the same bit. This finds the best partner in about 32 steps instead of scanning all numbers.
+signals: "maximum XOR of two numbers" ; "XOR with any element of the array" asked many times ; maximise XOR of a range or path ; numbers fit in 32 bits ; pair that gives the largest bitwise result
+code:
+```python
+def find_maximum_xor(nums: list[int]) -> int:
+    bits = max(nums).bit_length()
+    root: dict = {}
+    for x in nums:                          # insert from the top bit down
+        node = root
+        for b in range(bits - 1, -1, -1):
+            node = node.setdefault((x >> b) & 1, {})
+    best = 0
+    for x in nums:
+        node, cur = root, 0
+        for b in range(bits - 1, -1, -1):
+            bit = (x >> b) & 1
+            if (bit ^ 1) in node:           # opposite bit makes this XOR bit 1
+                cur |= 1 << b
+                node = node[bit ^ 1]
+            else:
+                node = node[bit]
+        best = max(best, cur)
+    return best
+```
+walk: #421 Maximum XOR of Two Numbers in an Array
+step: Input nums = [2, 4, 5]. The top value 5 has 3 bits, so each number is a path of 3 bits: 2 = 010, 4 = 100, 5 = 101.
+step: The trie has two branches at the top: 0 leads to 10, and 1 leads to 00 and 01.
+step: Query x = 2 (010). Top bit is 0, the opposite child 1 exists, so cur = 100 and we move into the 1 branch.
+step: Next bit of 2 is 1, the opposite child 0 exists, so cur = 110. Next bit of 2 is 0, the opposite child 1 exists, so cur = 111 = 7.
+step: The path we followed spells 101 = 5, and 2 XOR 5 = 7. Other queries give less, so the answer is 7.
+bugs: Inserting bits from the lowest bit up, which breaks the greedy order ; Searching for the same bit instead of the opposite bit ; Forgetting that a node may have only one child, and crashing on a missing key ; Using too few bits, so the largest number is cut off ; Looping to 32 bits for every number without need, which wastes time but is safe
+cost: O(n * B) time and O(n * B) extra space for B bits per number, because each number inserts and queries one path of B nodes.
+
+@@ iterator
+what: An iterator gives one item at a time and does not build the whole list. To add a peek, read one item ahead and keep it in a buffer. next returns the buffered item and refills the buffer. For lazy structures like a tree or nested list, keep a stack that holds where you are, and advance it only when asked.
+signals: "implement an iterator" with next and hasNext ; "peek" at the next element without moving ; flatten a nested list lazily ; "in-order traversal" as an iterator, with O(h) memory ; do not copy all the elements up front
+code:
+```python
+class PeekingIterator:
+    def __init__(self, iterator):
+        self.it = iterator
+        self._load()
+
+    def _load(self) -> None:         # read one item ahead
+        self.has = self.it.hasNext()
+        self.val = self.it.next() if self.has else None
+
+    def peek(self) -> int:
+        return self.val
+
+    def next(self) -> int:
+        out = self.val
+        self._load()
+        return out
+
+    def has_next(self) -> bool:
+        return self.has
+```
+walk: #284 Peeking Iterator
+step: The wrapped iterator holds [1, 2, 3]. The constructor loads the first item: val = 1, has = True.
+step: next() returns 1 and loads the next item, so val = 2.
+step: peek() returns 2 and changes nothing; calling it again still gives 2.
+step: next() returns 2 and loads 3. next() returns 3 and tries to load, but there is none, so has = False.
+step: has_next() returns False. The order of values returned was 1, 2, 3.
+bugs: Calling the inner next() inside peek, which loses an item ; Not refilling the buffer after next, so peek returns a stale value ; Using None as the "empty" marker when None or 0 could be real data ; Copying the whole sequence into a list, which breaks for large or infinite input
+cost: O(1) time per call and O(1) extra space, because only one look-ahead item is kept. A tree iterator that keeps the left spine on a stack uses O(h) space.
+
+@@ lru
+what: A least recently used cache needs get and put in constant time. A hash map finds a node by key at once. A doubly linked list keeps nodes in order from least recent to most recent, so moving or removing a node is O(1) once you hold it. Together they give O(1) for both, while a list alone would need O(n) to find a key.
+signals: "least recently used" or "evict the oldest" ; get and put must run in O(1) ; fixed capacity that removes an entry when full ; "recently used" order changes on every read ; design a cache
+code:
+```python
+class Node:
+    def __init__(self, key=0, val=0):
+        self.key, self.val = key, val
+        self.prev = self.next = None
+
+class LRUCache:
+    def __init__(self, capacity: int):
+        self.cap = capacity
+        self.map: dict[int, Node] = {}
+        self.head, self.tail = Node(), Node()      # sentinels
+        self.head.next, self.tail.prev = self.tail, self.head
+
+    def _remove(self, n: Node) -> None:
+        n.prev.next, n.next.prev = n.next, n.prev
+
+    def _add_front(self, n: Node) -> None:         # right after head = most recent
+        n.next, n.prev = self.head.next, self.head
+        self.head.next.prev = n
+        self.head.next = n
+
+    def get(self, key: int) -> int:
+        if key not in self.map:
+            return -1
+        n = self.map[key]
+        self._remove(n); self._add_front(n)
+        return n.val
+
+    def put(self, key: int, value: int) -> None:
+        if key in self.map:
+            self._remove(self.map[key])
+        n = self.map[key] = Node(key, value)
+        self._add_front(n)
+        if len(self.map) > self.cap:
+            old = self.tail.prev                   # least recent
+            self._remove(old)
+            del self.map[old.key]
+```
+walk: #146 LRU Cache
+step: Capacity 2. put(1, 1) and put(2, 2). The list from most to least recent is 2, 1.
+step: get(1) returns 1 and moves key 1 to the front. The order is now 1, 2.
+step: put(3, 3) adds key 3 at the front, so there are 3 keys. Over capacity, so the tail node, key 2, is removed. The order is 3, 1.
+step: get(2) returns -1 because key 2 was evicted. put(4, 4) evicts key 1, and the order is 4, 3.
+step: get(1) returns -1, get(3) returns 3, and get(4) returns 4.
+bugs: Updating an existing key without moving it to the front ; Evicting from the head side, which removes the most recent item ; Removing the node from the list but not from the map, so the size never drops ; Storing only the value in the node, so you cannot find the map key to delete on eviction ; Forgetting that get also counts as a use
+cost: O(1) time per get and put, and O(capacity) extra space, because the map lookup and the pointer swaps take constant work.
+
+@@ orderedset
+what: An ordered set keeps keys sorted while you insert, so you can ask for the nearest key below or above a value. Python has no built-in one, but a sorted list with bisect gives the same queries: binary search finds the position in O(log n). Checking only the two neighbours of that position is enough to tell if a new interval overlaps anything.
+signals: "floor" or "ceiling" of a value ; the closest earlier or later entry ; "book" an interval only if it does not overlap ; keep keys sorted under inserts and deletes ; rank or k-th smallest in a changing set
+code:
+```python
+from bisect import bisect_left
+
+class MyCalendar:
+    def __init__(self):
+        self.starts: list[int] = []     # sorted start times
+        self.ends: list[int] = []       # ends[i] belongs to starts[i]
+
+    def book(self, start: int, end: int) -> bool:
+        i = bisect_left(self.starts, start)          # first start >= new start
+        if i > 0 and self.ends[i - 1] > start:       # earlier event runs into us
+            return False
+        if i < len(self.starts) and self.starts[i] < end:   # later event begins inside us
+            return False
+        self.starts.insert(i, start)
+        self.ends.insert(i, end)
+        return True
+```
+walk: #729 My Calendar I
+step: Empty calendar. book(10, 20): no neighbours, so insert it. starts = [10], ends = [20]. Return True.
+step: book(15, 25): bisect_left gives i = 1. The earlier event ends at 20, which is more than 15, so return False.
+step: book(20, 30): i = 1 again. The earlier event ends at 20, which is not more than 20, so no clash. There is no later event, so insert and return True.
+step: Now starts = [10, 20] and ends = [20, 30]. book(5, 12) gives i = 0, and starts[0] = 10 < 12, so it returns False.
+bugs: Using <= in the overlap test, which rejects events that only touch at one end point ; Checking only the earlier neighbour or only the later one ; Scanning all events in O(n) instead of using binary search ; Forgetting that intervals are half open, so [10, 20) and [20, 30) do not overlap
+cost: O(log n) to search and O(n) to insert into a Python list (a shift of memory), with O(n) space. A balanced tree such as SortedList makes the insert about O(log n).
+
+@@ rankcount
+what: To count smaller items to the right, scan from the right and keep a Fenwick tree that counts how many values of each rank were already seen. Ranks replace raw values so the tree stays small, even when values are huge. For each number, one prefix query gives how many smaller ranks were added, and one update adds the number itself.
+signals: "count of smaller numbers after self" ; for each element count items before or after it that are smaller or larger ; "inversions" in an array ; values are large or negative but only their order matters ; need an answer per index, not one total
+code:
+```python
+def count_smaller(nums: list[int]) -> list[int]:
+    ranks = {v: i + 1 for i, v in enumerate(sorted(set(nums)))}   # 1-based ranks
+    n = len(ranks)
+    tree = [0] * (n + 1)
+    out = []
+    for x in reversed(nums):
+        r = ranks[x]
+        i, s = r - 1, 0                 # query: how many ranks below r were added
+        while i > 0:
+            s += tree[i]
+            i -= i & -i
+        out.append(s)
+        i = r                           # update: add this value
+        while i <= n:
+            tree[i] += 1
+            i += i & -i
+    return out[::-1]
+```
+walk: #315 Count of Smaller Numbers After Self
+step: Input nums = [5, 2, 6, 1]. The ranks are 1 to 1, 2 to 2, 5 to 3, 6 to 4. The tree starts empty.
+step: Scan from the right. x = 1 has rank 1. Ranks below 1: none, so the count is 0. Add rank 1.
+step: x = 6 has rank 4. Ranks 1 to 3 hold one item (the 1), so the count is 1. Add rank 4.
+step: x = 2 has rank 2. Ranks below 2 hold one item, so the count is 1. Add rank 2.
+step: x = 5 has rank 3. Ranks 1 and 2 hold two items, so the count is 2.
+step: The collected list is [0, 1, 1, 2]. Reversed to match the input order, the answer is [2, 1, 1, 0].
+bugs: Querying r instead of r - 1, which counts equal values as smaller ; Scanning left to right, which counts items before, not after ; Using 0-based ranks, since a Fenwick tree needs index 1 and up ; Forgetting to reverse the output at the end
+cost: O(n log n) time and O(n) extra space, because sorting, and each query and update walk about log n tree cells.
+
+@@ segtree-lazy
+what: A range update on a segment tree would touch many leaves if done one by one. Instead, when an update covers a whole node, store the update on that node as a pending tag and stop. Push the tag down to the children only when a later operation needs to look inside that node. Each update and query then costs O(log n).
+signals: "add or assign to a whole range" many times ; range update and range maximum or sum together ; squares or boxes dropped over an interval ; "height over a range" after each step ; q operations on n up to 10^5
+code:
+```python
+def falling_squares(positions: list[list[int]]) -> list[int]:
+    xs = sorted({x for l, s in positions for x in (l, l + s)})
+    pos = {x: i for i, x in enumerate(xs)}
+    n = len(xs) - 1                      # cells between neighbouring coordinates
+    mx = [0] * (4 * n)
+    lz = [0] * (4 * n)                   # pending "raise to at least" tag
+
+    def apply(o, h):
+        mx[o] = max(mx[o], h); lz[o] = max(lz[o], h)
+
+    def push(o):
+        if lz[o]:
+            apply(2 * o, lz[o]); apply(2 * o + 1, lz[o]); lz[o] = 0
+
+    def update(o, lo, hi, l, r, h):
+        if r < lo or hi < l: return
+        if l <= lo and hi <= r: apply(o, h); return
+        push(o); mid = (lo + hi) // 2
+        update(2 * o, lo, mid, l, r, h); update(2 * o + 1, mid + 1, hi, l, r, h)
+        mx[o] = max(mx[2 * o], mx[2 * o + 1])
+
+    def query(o, lo, hi, l, r):
+        if r < lo or hi < l: return 0
+        if l <= lo and hi <= r: return mx[o]
+        push(o); mid = (lo + hi) // 2
+        return max(query(2 * o, lo, mid, l, r), query(2 * o + 1, mid + 1, hi, l, r))
+
+    out, best = [], 0
+    for l, s in positions:
+        a, b = pos[l], pos[l + s] - 1
+        h = query(1, 0, n - 1, a, b) + s
+        update(1, 0, n - 1, a, b, h)
+        best = max(best, h)
+        out.append(best)
+    return out
+```
+walk: #699 Falling Squares
+step: Input positions = [[1,2],[2,3],[6,1]]. The coordinates 1, 2, 3, 5, 6, 7 become cells 0 to 4.
+step: Square 1 covers x from 1 to 3, which is cells 0 and 1. The query gives 0, so its height is 2. We tag the node for cells 0 to 1 with 2. Answer so far 2.
+step: Square 2 covers x from 2 to 5, which is cells 1 and 2. The query reads cell 1 (height 2) and cell 2 (height 0), so the base is 2. Its height is 2 + 3 = 5.
+step: Square 3 covers x from 6 to 7, which is cell 4 only. The base is 0, so the height is 1. The tallest stack stays 5.
+step: The answer is [2, 5, 5].
+bugs: Treating a square as covering [l, l + s] in cells, which makes squares that only touch seem to overlap ; Forgetting to push the tag down before visiting the children ; Forgetting to recompute the parent from its children after the update ; Using the sum of heights instead of the maximum
+cost: O(n log n) time and O(n) extra space, because each of the n squares does one query and one update over O(log n) nodes, and the tree has O(n) nodes.
+
+@@ segtree-merge
+what: Sometimes a node must keep a small summary, not one number. For the longest run of equal letters, a node stores its prefix run, suffix run, best run and size. Two children combine in O(1): the best run may cross the middle if the two letters at the join are equal. A point change then fixes only the O(log n) nodes on its path.
+signals: "longest substring of one repeating character" after each update ; longest run, longest subarray or best segment under point updates ; answer must come after every query ; a combine step that needs more than a sum or max ; n and q up to 10^5
+code:
+```python
+def longest_repeating(s: str, query_characters: str, query_indices: list[int]) -> list[int]:
+    n = len(s)
+    chars = list(s)
+    tree = [None] * (4 * n)       # node = (prefix run, suffix run, best run, size)
+
+    def merge(a, b, mid):
+        pa, sa, ba, na = a
+        pb, sb, bb, nb = b
+        pre, suf, best = pa, sb, max(ba, bb)
+        if chars[mid] == chars[mid + 1]:       # runs join across the middle
+            if pa == na: pre = na + pb
+            if sb == nb: suf = nb + sa
+            best = max(best, sa + pb)
+        return (pre, suf, best, na + nb)
+
+    def build(o, lo, hi):
+        if lo == hi:
+            tree[o] = (1, 1, 1, 1); return
+        mid = (lo + hi) // 2
+        build(2 * o, lo, mid); build(2 * o + 1, mid + 1, hi)
+        tree[o] = merge(tree[2 * o], tree[2 * o + 1], mid)
+
+    def update(o, lo, hi, i):
+        if lo == hi: return                    # a leaf is always (1, 1, 1, 1)
+        mid = (lo + hi) // 2
+        if i <= mid: update(2 * o, lo, mid, i)
+        else: update(2 * o + 1, mid + 1, hi, i)
+        tree[o] = merge(tree[2 * o], tree[2 * o + 1], mid)
+
+    build(1, 0, n - 1)
+    out = []
+    for c, i in zip(query_characters, query_indices):
+        chars[i] = c
+        update(1, 0, n - 1, i)
+        out.append(tree[1][2])
+    return out
+```
+walk: #2213 Longest Substring of One Repeating Character
+step: Input s = "babacc" with queries "bcb" at indexes [1, 3, 3]. The root splits into "bab" and "acc". The root best run is 2 (the "cc").
+step: Query 1 sets index 1 to "b", so the string is "bbbacc". The left half becomes one run of 3, so the root best is 3.
+step: Query 2 sets index 3 to "c", giving "bbbccc". The right half is now a run of 3. The middle letters b and c differ, so the best stays 3.
+step: Query 3 sets index 3 to "b", giving "bbbbcc". The middle letters are b and b, so the left suffix 3 joins the right prefix 1, and the best is 4.
+step: The answer is [3, 3, 4].
+bugs: Joining runs across the middle without checking that the two letters are equal ; Forgetting that a full-length prefix of the left child can extend into the right child ; Updating chars after the tree update, so the merge reads the old letter ; Rebuilding the whole tree on every query, which is O(n) per query
+cost: O(n + q log n) time and O(n) extra space, because the build visits each node once and each query recomputes the log n nodes above one leaf.
+
+@@ timemap
+what: For each key, store its history as two parallel lists in time order: timestamps and values. New sets always have larger timestamps, so the list stays sorted without extra work. To read at time t, binary search for the last timestamp at or before t. This is O(log n) instead of scanning the whole history.
+signals: "get the value at or before a timestamp" ; "set" with a timestamp that always increases ; history of a key, or snapshot at a past time ; return an empty string or -1 when nothing is old enough ; many reads against a growing log
+code:
+```python
+from bisect import bisect_right
+from collections import defaultdict
+
+class TimeMap:
+    def __init__(self):
+        self.times = defaultdict(list)     # key -> timestamps, increasing
+        self.vals = defaultdict(list)      # key -> values, same order
+
+    def set(self, key: str, value: str, timestamp: int) -> None:
+        self.times[key].append(timestamp)
+        self.vals[key].append(value)
+
+    def get(self, key: str, timestamp: int) -> str:
+        ts = self.times.get(key)
+        if not ts:
+            return ""
+        i = bisect_right(ts, timestamp)    # entries with time <= timestamp
+        return self.vals[key][i - 1] if i else ""
+```
+walk: #981 Time Based Key-Value Store
+step: set("foo", "bar", 1). Now times["foo"] = [1] and vals["foo"] = ["bar"].
+step: get("foo", 1): bisect_right([1], 1) = 1, so we read vals[0] = "bar".
+step: get("foo", 3): bisect_right([1], 3) = 1, so the latest value at or before 3 is still "bar".
+step: set("foo", "bar2", 4). The lists are now [1, 4] and ["bar", "bar2"].
+step: get("foo", 4) gives i = 2, so "bar2". get("foo", 0) gives i = 0, so there is no old enough entry and the answer is "".
+bugs: Using bisect_left, which misses an entry whose time equals the query time ; Not handling i = 0, which would read index -1 and return the newest value ; Returning the first value at or after the time instead of the last at or before ; Scanning the list from the start on every get, which is O(n)
+cost: O(1) per set and O(log n) per get, with O(total sets) extra space, because appends keep the lists sorted and each get is one binary search.
+
+@@ timewindow
+what: Keep the timestamps of recent events in a queue. Time only moves forward, so the oldest events are at the front. Before answering, remove from the front every event that is outside the window. What is left is exactly the events in the window, and each event is added once and removed once.
+signals: "hits in the past 5 minutes" ; "number of requests in the last k seconds" ; timestamps arrive in non-decreasing order ; rate limiter or moving counter ; old events can be forgotten
+code:
+```python
+from collections import deque
+
+class HitCounter:
+    WINDOW = 300
+
+    def __init__(self):
+        self.q: deque[int] = deque()      # timestamps, oldest first
+
+    def hit(self, timestamp: int) -> None:
+        self.q.append(timestamp)
+
+    def get_hits(self, timestamp: int) -> int:
+        while self.q and self.q[0] <= timestamp - self.WINDOW:   # too old
+            self.q.popleft()
+        return len(self.q)
+```
+walk: #362 Design Hit Counter
+step: hit(1), hit(2), hit(3). The queue is [1, 2, 3].
+step: get_hits(4): the cutoff is 4 - 300 = -296. Nothing is that old, so the answer is 3.
+step: hit(300). The queue is [1, 2, 3, 300]. get_hits(300): the cutoff is 0, nothing is removed, so the answer is 4.
+step: get_hits(301): the cutoff is 1. The front value 1 is at or below 1, so remove it. The queue is [2, 3, 300] and the answer is 3.
+bugs: Using < instead of <= for the cutoff, which keeps an event that is exactly 300 seconds old ; Forgetting to drop old events inside get_hits, so the count never goes down ; Storing a counter per second in a fixed array without clearing stale slots ; Scanning the whole list on each query instead of popping from the front
+cost: O(1) amortised time per call and O(w) extra space for the events inside the window, because each event is pushed once and popped at most once.
+
+@@ threads
+what: Threads may start in any order, so you make later steps wait. A semaphore is a counter: acquire waits until the count is above zero and then lowers it, and release raises it. Start each semaphore at zero. A step calls acquire on the signal of the step before it, runs, then releases the signal for the next step.
+signals: "print in order" even if threads run in any order ; "thread A must finish before thread B" ; alternate between two or more threads ; "the same instance of the class is passed to three threads" ; use a lock, semaphore or condition variable
+code:
+```python
+from threading import Semaphore
+
+class Foo:
+    def __init__(self):
+        self.a = Semaphore(0)     # released when first() is done
+        self.b = Semaphore(0)     # released when second() is done
+
+    def first(self, print_first) -> None:
+        print_first()
+        self.a.release()          # let second run
+
+    def second(self, print_second) -> None:
+        self.a.acquire()          # wait for first
+        print_second()
+        self.b.release()          # let third run
+
+    def third(self, print_third) -> None:
+        self.b.acquire()          # wait for second
+        print_third()
+```
+walk: #1114 Print in Order
+step: Both semaphores start at 0. The threads happen to start in the order third, second, first.
+step: third() calls b.acquire(). The count of b is 0, so this thread waits.
+step: second() calls a.acquire(). The count of a is 0, so this thread waits too.
+step: first() prints "first" and calls a.release(). The count of a is 1, so second wakes up.
+step: second prints "second" and releases b. third wakes up and prints "third". The output is "firstsecondthird".
+bugs: Starting a semaphore at 1 instead of 0, so the waiting step does not wait ; Releasing before printing, which lets the next step print too early ; Using a plain boolean flag and busy waiting, which wastes the CPU and can be wrong without a lock ; Forgetting to release at the end of a step, so the next thread waits forever
+cost: O(1) time and O(1) extra space for the three calls. Waiting threads sleep and use no CPU while blocked.
+
+@@ sweep-active
+what: Sweep a line from left to right over the interesting x coordinates, which are the starts and ends of the items. Keep a heap of the items that are open right now, with the best one on top. An item that has ended but is not on top can stay in the heap until it reaches the top, then it is thrown away. At each x, the top of the heap is the answer.
+signals: "skyline" or "outline" of buildings ; maximum or minimum among overlapping intervals at each point ; "currently open" intervals ; meeting rooms, tallest building, or earliest deadline at each time ; events sorted by position
+code:
+```python
+import heapq
+
+def get_skyline(buildings: list[list[int]]) -> list[list[int]]:
+    xs = sorted({x for l, r, h in buildings for x in (l, r)})
+    heap: list[tuple[int, int]] = []        # (-height, right edge)
+    i, out = 0, []
+    for x in xs:
+        while i < len(buildings) and buildings[i][0] <= x:     # buildings that start now
+            l, r, h = buildings[i]
+            heapq.heappush(heap, (-h, r)); i += 1
+        while heap and heap[0][1] <= x:                          # top has ended
+            heapq.heappop(heap)
+        height = -heap[0][0] if heap else 0
+        if not out or out[-1][1] != height:                      # only record changes
+            out.append([x, height])
+    return out
+```
+walk: #218 The Skyline Problem
+step: Input buildings = [[2,9,10],[3,7,15],[5,12,12]]. The sweep stops at x = 2, 3, 5, 7, 9, 12.
+step: x = 2: push the height 10 building. The top is 10 and it is a change, so record [2, 10].
+step: x = 3: push height 15. The top is 15, so record [3, 15]. x = 5: push 12. The top is still 15, so no record.
+step: x = 7: the 15 building ends at 7, so it is popped. The new top is 12, so record [7, 12].
+step: x = 9: the 10 building has ended but it is below the top, so it stays hidden. The top is still 12, no record.
+step: x = 12: pop the 12 building, then the dead 10 building. The heap is empty, so record [12, 0]. The answer is [[2,10],[3,15],[7,12],[12,0]].
+bugs: Popping only one ended building and not looping, so a second dead building stays on top ; Recording a point at every x instead of only when the height changes ; Comparing the heap top's end with < x instead of <= x, so a building that ends exactly at x still counts ; Pushing the plain height into Python's min-heap, so it returns the shortest building
+cost: O(n log n) time and O(n) extra space, because each building is pushed and popped once and each heap step costs log n.
+
+@@ contribution
+what: Instead of listing every subarray and finding its minimum, ask how many subarrays each element is the minimum of. If an element can reach a left steps to the left and b steps to the right before meeting a smaller value, it is the minimum of a times b subarrays. The answer is the sum of value times a times b. A monotonic stack finds the reach of every element in one pass.
+signals: "sum of subarray minimums" or maximums ; sum over all subarrays of some min, max or range ; n up to 3 * 10^4 or more, so O(n^2) fails ; each element is counted by how many windows it controls ; "next smaller element" on both sides
+code:
+```python
+def sum_subarray_mins(arr: list[int]) -> int:
+    MOD = 10**9 + 7
+    n = len(arr)
+    left, right = [0] * n, [0] * n
+    st: list[int] = []
+    for i in range(n):                          # choices for the left end
+        while st and arr[st[-1]] >= arr[i]:
+            st.pop()
+        left[i] = i - (st[-1] if st else -1)
+        st.append(i)
+    st = []
+    for i in range(n - 1, -1, -1):              # choices for the right end
+        while st and arr[st[-1]] > arr[i]:
+            st.pop()
+        right[i] = (st[-1] if st else n) - i
+        st.append(i)
+    return sum(arr[i] * left[i] * right[i] for i in range(n)) % MOD
+```
+walk: #907 Sum of Subarray Minimums
+step: Input arr = [3, 1, 2, 4]. Find, for each element, the number of left ends and right ends it may use.
+step: Left counts are [1, 2, 1, 1]. The value 1 can start at index 0 or 1 because nothing on its left is smaller.
+step: Right counts are [1, 3, 2, 1]. The value 1 can end at index 1, 2 or 3.
+step: Contributions: 3 * 1 * 1 = 3, then 1 * 2 * 3 = 6, then 2 * 1 * 2 = 4, then 4 * 1 * 1 = 4.
+step: The sum is 3 + 6 + 4 + 4 = 17, so the answer is 17.
+bugs: Using the same strict test on both sides, so subarrays with equal values are counted twice or not at all ; Forgetting the modulus, or applying it only to some terms ; Counting a + b instead of a * b ; Using the distance to the next smaller element but forgetting to add one for the element itself
+cost: O(n) time and O(n) extra space, because each index is pushed and popped once on each pass and the two span arrays have size n.
+
+@@ bsfeasible
+what: Sometimes you cannot compute the best limit directly, but you can check whether one given limit works with a quick greedy pass. If a limit works, any bigger limit works too. That order lets you binary search over the limit and find the smallest one that passes. The cost is log of the range times the cost of one check.
+signals: "minimum speed" or "minimum capacity" such that a task finishes in time ; "minimise the maximum" of something ; "at most h hours" or "within d days" ; if x works then x + 1 also works ; answer is a number in a known range, not an index
+code:
+```python
+def min_eating_speed(piles: list[int], h: int) -> int:
+    def hours(speed: int) -> int:           # the greedy check for one speed
+        return sum((p + speed - 1) // speed for p in piles)    # ceil(p / speed)
+
+    lo, hi = 1, max(piles)                  # hi surely works: one pile per hour
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if hours(mid) <= h:
+            hi = mid                        # mid works, try slower
+        else:
+            lo = mid + 1                    # mid is too slow
+    return lo
+```
+walk: #875 Koko Eating Bananas
+step: Input piles = [3, 6, 7, 11], h = 8. The speed range is lo = 1 to hi = 11.
+step: mid = 6: hours are 1 + 1 + 2 + 2 = 6, which is at most 8, so hi = 6.
+step: mid = 3: hours are 1 + 2 + 3 + 4 = 10, which is more than 8, so lo = 4.
+step: mid = 5: hours are 1 + 2 + 2 + 3 = 8, which fits, so hi = 5. Then mid = 4: hours are 1 + 2 + 2 + 3 = 8, which fits, so hi = 4.
+step: Now lo = hi = 4, so the answer is 4.
+bugs: Setting lo = 0, which divides by zero ; Using floor division for hours instead of rounding up ; Moving lo = mid instead of mid + 1, which loops forever ; Searching with the wrong direction when the check is "at least" instead of "at most" ; Forgetting that a bigger limit must always keep working, which is what makes binary search valid
+cost: O(n log M) time and O(1) extra space, where M is the largest pile, because there are log M guesses and each check reads all n piles.
+
+@@ bskth
+what: To find the k-th smallest value, guess a value v and count how many items are at most v. If the count is below k, the answer is bigger than v. Otherwise the answer is v or smaller. Binary search over the value range finds the smallest v whose count reaches k, and that v is always a real item. In a sorted matrix, one staircase walk counts in O(n).
+signals: "k-th smallest" in a sorted matrix or multiplication table ; the structure is sorted, but you cannot index into the sorted order ; counting items at most v is easy ; memory limit forbids putting all items into a list ; values are in a known range
+code:
+```python
+def kth_smallest(matrix: list[list[int]], k: int) -> int:
+    n = len(matrix)
+
+    def count_le(v: int) -> int:          # items <= v, walking a staircase
+        r, c, cnt = n - 1, 0, 0
+        while r >= 0 and c < n:
+            if matrix[r][c] <= v:
+                cnt += r + 1              # the whole column above is <= v
+                c += 1
+            else:
+                r -= 1
+        return cnt
+
+    lo, hi = matrix[0][0], matrix[-1][-1]
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if count_le(mid) >= k:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+```
+walk: #378 Kth Smallest Element in a Sorted Matrix
+step: Input matrix = [[1,5,9],[10,11,13],[12,13,15]] and k = 8. The value range is lo = 1 to hi = 15.
+step: mid = 8: only 1 and 5 are at most 8, so the count is 2. That is below 8, so lo = 9.
+step: mid = 12: the items 1, 5, 9, 10, 11, 12 are at most 12, so the count is 6. Still below 8, so lo = 13.
+step: mid = 14: the count is 8 (every item except 15), which reaches 8, so hi = 14. Then mid = 13: the count is 8 again, so hi = 13.
+step: Now lo = hi = 13. The sorted order is 1, 5, 9, 10, 11, 12, 13, 13, 15, and the 8th item is 13.
+bugs: Using the count of items below v instead of at most v, which can return a value not in the matrix ; Using lo = mid + 1 when the count is at least k, which skips the answer ; Searching over indexes instead of values ; Starting the staircase at the top-left corner, where neither move is a clear choice
+cost: O(n log(max - min)) time and O(1) extra space, because the value search takes log of the range steps and each count walks at most 2n cells.
+
+@@ bsreal
+what: When the answer is a real number, you cannot shrink the range to one integer. Instead, halve the interval again and again until it is smaller than the precision the problem allows. As with integer search, you need a check that is false below the answer and true above it. About 50 to 100 halvings are enough for double precision.
+signals: "answers within 10^-6 of the actual answer are accepted" ; minimise a maximum distance, speed or length that is a real number ; "minimize max distance" with a limited number of additions ; the check is monotone in the real value ; a floating point result
+code:
+```python
+def minmax_gas_dist(stations: list[int], k: int) -> float:
+    gaps = [b - a for a, b in zip(stations, stations[1:])]
+
+    def stations_needed(d: float) -> int:      # new stations so every gap <= d
+        return sum(int(g / d) for g in gaps)
+
+    lo, hi = 0.0, max(gaps)
+    while hi - lo > 1e-7:
+        mid = (lo + hi) / 2
+        if stations_needed(mid) <= k:
+            hi = mid                           # mid is enough, try smaller
+        else:
+            lo = mid                           # not enough stations, need bigger d
+    return hi
+```
+walk: #774 Minimize Max Distance to Gas Station
+step: Input stations = 1 to 10 and k = 9. All 9 gaps are 1, so lo = 0 and hi = 1.
+step: mid = 0.5: each gap needs int(1 / 0.5) = 2 new stations, so 18 in total. That is more than 9, so lo = 0.5.
+step: mid = 0.75: each gap needs int(1 / 0.75) = 1, so 9 in total. That fits, so hi = 0.75.
+step: mid = 0.625 gives 1 per gap, so hi = 0.625. Then mid = 0.5625 gives 1 per gap, so hi = 0.5625.
+step: The interval keeps shrinking towards 0.5. Any d just above 0.5 still needs only 9 stations, and any d below 0.5 needs 18. When hi - lo is under 1e-7 we return hi, about 0.5.
+bugs: Looping while lo != hi, which may never end with floats ; Using an integer midpoint such as // 2, which stops the interval from shrinking ; Setting lo = mid + 1 as in integer search ; Choosing a precision tighter than the float can hold, which causes an infinite loop
+cost: O(n log(R / e)) time and O(n) extra space for the gaps, where R is the starting range and e is the precision, because each check reads all gaps and the interval halves each time.
+
+@@ bidirbfs
+what: A normal BFS spreads out in a growing circle around the start, so its work grows fast with distance. Bidirectional BFS grows one frontier from the start and one from the goal, and stops when they touch. Two small circles hold far fewer states than one big circle. Always expand the smaller frontier to keep the work low.
+signals: "shortest transformation sequence" between two words or states ; both the start and the goal are known ; branching factor is large and depth is big ; moves are reversible ; "minimum number of steps" in an implicit graph
+code:
+```python
+def ladder_length(begin_word: str, end_word: str, word_list: list[str]) -> int:
+    words = set(word_list)
+    if end_word not in words:
+        return 0
+    front, back = {begin_word}, {end_word}
+    steps = 1                                   # words on the path so far
+    while front and back:
+        if len(front) > len(back):              # expand the smaller side
+            front, back = back, front
+        nxt = set()
+        for w in front:
+            for i in range(len(w)):
+                for c in "abcdefghijklmnopqrstuvwxyz":
+                    cand = w[:i] + c + w[i + 1:]
+                    if cand in back:            # the two searches meet
+                        return steps + 1
+                    if cand in words:
+                        words.remove(cand)      # mark as visited
+                        nxt.add(cand)
+        front = nxt
+        steps += 1
+    return 0
+```
+walk: #127 Word Ladder
+step: Input begin = "hit", end = "cog", list = [hot, dot, dog, lot, log, cog]. front = {hit}, back = {cog}, steps = 1.
+step: Expand hit: only hot is in the list, so front = {hot} and steps = 2.
+step: Expand hot: dot and lot are found, so front = {dot, lot} and steps = 3.
+step: front has 2 words and back has 1, so swap. Expand cog: dog and log are found, so front = {dog, log} and steps = 4.
+step: Expand dog: changing one letter gives dot, which is in back = {dot, lot}. The searches meet, so return steps + 1 = 5.
+step: The path is hit, hot, dot, dog, cog, which has 5 words.
+bugs: Not removing visited words, so the search loops or repeats work ; Forgetting to swap the sets, so one side grows huge ; Checking the meeting only after the whole layer instead of at each candidate, which gives the wrong length ; Not checking that end_word is in the list before starting ; Counting edges when the problem asks for words, which is off by one
+cost: O(N * L * 26) time at worst and O(N * L) extra space for N words of length L, but in practice the two small frontiers visit far fewer words than a one-sided BFS.
+
+@@ bipartite
+what: A graph is bipartite if you can colour nodes with two colours so every edge joins different colours. Colour a start node, then give each neighbour the opposite colour. If an edge ever joins two nodes of the same colour, the graph has an odd cycle and the answer is no. Run this from every uncoloured node so that all components are checked.
+signals: "split the nodes into two groups" with no edge inside a group ; "is the graph bipartite" ; "possible bipartition" of people who dislike each other ; no odd length cycle ; two-colouring or two teams
+code:
+```python
+def is_bipartite(graph: list[list[int]]) -> bool:
+    color = [-1] * len(graph)                  # -1 = not coloured yet
+    for s in range(len(graph)):
+        if color[s] != -1:
+            continue
+        color[s] = 0
+        stack = [s]
+        while stack:
+            u = stack.pop()
+            for v in graph[u]:
+                if color[v] == -1:
+                    color[v] = color[u] ^ 1    # opposite colour
+                    stack.append(v)
+                elif color[v] == color[u]:     # same colour on both ends of an edge
+                    return False
+    return True
+```
+walk: #785 Is Graph Bipartite
+step: Input graph = [[1,2,3],[0,2],[0,1,3],[0,2]]. Start at node 0 and give it colour 0. stack = [0].
+step: Pop 0. Its neighbours 1, 2 and 3 are new, so each gets colour 1. stack = [1, 2, 3].
+step: Pop 3. Its neighbour 0 has colour 0, which differs from 1, so it is fine.
+step: Next neighbour of 3 is node 2. Node 2 has colour 1, the same as node 3, so the edge 2-3 is a conflict.
+step: Return False. The nodes 0, 2, 3 form a triangle, an odd cycle, so no split exists.
+bugs: Starting only from node 0, so other components are never checked ; Marking nodes visited without storing a colour, so conflicts cannot be seen ; Failing when a neighbour is merely already visited, instead of already visited with the same colour ; Treating a self loop as fine, when it is always a conflict
+cost: O(V + E) time and O(V) extra space, because each node is coloured once and each edge is looked at twice, and the colour array and stack hold at most V entries.
+
+@@ components
+what: A connected component is a group of nodes that can reach each other. Scan every node. When you meet one you have not visited, that is a new component, so add one to the count and flood it with DFS or BFS to mark all of its nodes. Each node is marked once, so the whole scan is linear.
+signals: "number of islands" ; "number of provinces" or groups ; count connected regions ; how many separate clusters ; cells or nodes joined by neighbours
+code:
+```python
+def num_islands(grid: list[list[str]]) -> int:
+    rows, cols = len(grid), len(grid[0])
+    count = 0
+    for r in range(rows):
+        for c in range(cols):
+            if grid[r][c] != "1":
+                continue
+            count += 1                        # a new, unvisited island
+            grid[r][c] = "0"                  # mark visited by sinking it
+            stack = [(r, c)]
+            while stack:
+                x, y = stack.pop()
+                for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                    if 0 <= nx < rows and 0 <= ny < cols and grid[nx][ny] == "1":
+                        grid[nx][ny] = "0"
+                        stack.append((nx, ny))
+    return count
+```
+walk: #200 Number of Islands
+step: Input grid = ["110", "011", "001"] as rows of "1" (land) and "0" (water). Scan from the top-left.
+step: Cell (0, 0) is land. count = 1. Flood from it: (0, 1) is land, then (1, 1), then (1, 2), then (2, 2). All are marked "0".
+step: The scan reaches (0, 1), (1, 1), (1, 2) and (2, 2), which are all already water now, so nothing happens.
+step: No other "1" remains. The scan ends with count = 1, because all the land cells touch each other.
+step: If cell (2, 2) were "0" and cell (2, 0) were "1", the scan would find a second flood start there and the count would be 2.
+bugs: Counting every land cell instead of every flood start ; Not marking a cell until it is popped, so the same cell is pushed many times ; Including diagonal neighbours when the problem says only four directions ; Forgetting that the grid holds strings "1", not integers
+cost: O(R * C) time and O(R * C) extra space in the worst case, because each cell is visited a constant number of times and the stack can hold many cells at once. The input grid is changed.
+
+@@ cycle-dir
+what: In a directed graph, a plain visited set cannot tell a cycle from two paths that meet. Give each node one of three colours: white (not seen), grey (on the current DFS path) and black (finished and known safe). If DFS reaches a grey node, it has walked back into its own path, so there is a cycle. A node is safe only if every path out of it ends without a cycle.
+signals: "eventual safe states" ; "does the directed graph contain a cycle" ; every path from the node leads to a terminal node ; deadlock or dependency loops ; "can all tasks finish" in a directed graph
+code:
+```python
+def eventual_safe_nodes(graph: list[list[int]]) -> list[int]:
+    color = [0] * len(graph)          # 0 = white, 1 = grey (on path), 2 = black (safe)
+
+    def safe(u: int) -> bool:
+        if color[u]:
+            return color[u] == 2      # grey here means we found a cycle
+        color[u] = 1
+        for v in graph[u]:
+            if not safe(v):
+                return False          # u stays grey: it is not safe
+        color[u] = 2
+        return True
+
+    return [u for u in range(len(graph)) if safe(u)]
+```
+walk: #802 Find Eventual Safe States
+step: Input graph = [[1,2],[2,3],[5],[0],[5],[],[]]. Start DFS at node 0, and mark it grey.
+step: Go 0 to 1 to 2 to 5. Node 5 has no edges, so it turns black. Then node 2 turns black.
+step: Back at node 1, try its other edge 1 to 3. Node 3 goes grey and has an edge to 0, which is grey.
+step: Reaching a grey node means a cycle 0, 1, 3. So 3 is not safe, and 1 and 0 are not safe either. They stay grey.
+step: Node 2 is black, so it is safe. Node 4 goes to 5, which is black, so 4 is safe. Nodes 5 and 6 are safe. The answer is [2, 4, 5, 6].
+bugs: Using only a visited set, which reports a cycle when two paths simply meet ; Setting a node back to white when it is unsafe, so work is repeated ; Treating black and grey the same way in the check ; Forgetting to start DFS from every node, since the graph may be disconnected
+cost: O(V + E) time and O(V) extra space, because each node changes colour at most twice and each edge is followed once, and recursion goes at most V deep.
+
+@@ topo
+what: A topological order lists every node after all the nodes it depends on. Kahn's algorithm counts, for each node, how many prerequisites remain. Put every node with zero into a queue, remove one, and lower the count of the nodes that depended on it. If fewer than all nodes come out of the queue, the rest wait on each other, which means there is a cycle.
+signals: "course schedule" or prerequisites ; "build order" or task dependencies ; "can you finish all courses" ; "return any valid ordering" ; detect a cycle in a directed graph
+code:
+```python
+from collections import deque
+
+def can_finish(num_courses: int, prerequisites: list[list[int]]) -> bool:
+    adj = [[] for _ in range(num_courses)]
+    indeg = [0] * num_courses
+    for course, pre in prerequisites:
+        adj[pre].append(course)
+        indeg[course] += 1                 # one more prerequisite to wait for
+    q = deque(i for i in range(num_courses) if indeg[i] == 0)
+    taken = 0
+    while q:
+        u = q.popleft()
+        taken += 1
+        for v in adj[u]:
+            indeg[v] -= 1                  # u is done, so v waits for one less
+            if indeg[v] == 0:
+                q.append(v)
+    return taken == num_courses            # fewer means a cycle
+```
+walk: #207 Course Schedule
+step: Input numCourses = 4 and prerequisites = [[1,0],[2,0],[3,1],[3,2]]. In-degrees are [0, 1, 1, 2]. Queue = [0].
+step: Pop 0 (taken = 1). Courses 1 and 2 drop to 0, so both join the queue.
+step: Pop 1 (taken = 2). Course 3 drops from 2 to 1. Pop 2 (taken = 3). Course 3 drops to 0 and joins the queue.
+step: Pop 3 (taken = 4). All 4 courses were taken, so the answer is True.
+step: With prerequisites [[1,0],[0,1]], both in-degrees are 1, the queue starts empty, taken = 0, so the answer is False.
+bugs: Reversing the edge direction, so the in-degrees describe the wrong nodes ; Not counting duplicate edges in the in-degree but removing them each time ; Comparing the queue size, not the number of taken nodes, at the end ; Forgetting that nodes with no edges also need to start in the queue
+cost: O(V + E) time and O(V + E) extra space, because every node enters the queue once and every edge is relaxed once, and the adjacency list stores all edges.
+
+@@ ufkey
+what: Union-find keeps groups of items, and merges two groups with a small amount of work. When items share a key, such as the same email, an equal sign or a common factor, union them. At the end, items are in the same group exactly when they are linked by a chain of shared keys. Read the groups with find. For "not equal" rules, check them after all unions.
+signals: "equations" with == and != ; accounts that share an email belong to one person ; merge items that share a value ; "same group" if linked through a chain ; process all the links first, then answer
+code:
+```python
+def equations_possible(equations: list[str]) -> bool:
+    parent = list(range(26))                  # one node per letter
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]     # path halving
+            x = parent[x]
+        return x
+
+    for e in equations:                       # first: apply every ==
+        if e[1] == "=":
+            parent[find(ord(e[0]) - 97)] = find(ord(e[3]) - 97)
+    for e in equations:                       # then: check every !=
+        if e[1] == "!" and find(ord(e[0]) - 97) == find(ord(e[3]) - 97):
+            return False
+    return True
+```
+walk: #990 Satisfiability of Equality Equations
+step: Input equations = ["a==b", "b!=c", "c==a"]. Each letter starts as its own group.
+step: First pass, a==b: join a and b. Group {a, b}.
+step: First pass, c==a: join c with the group of a. Group {a, b, c}.
+step: Second pass, b!=c: find(b) and find(c) are the same group, but the equation says they differ.
+step: Return False. For ["a==b", "b==c", "a==c"] there is no != rule, so the answer would be True.
+bugs: Handling != in the same pass as ==, so a later == can break an earlier check ; Reading the wrong characters of the string: the operator is at index 1 and the second letter is at index 3 ; Skipping find and comparing the raw letters ; Forgetting that "a!=a" is always false
+cost: O(n * alpha(26)) time, which is about O(n), and O(1) extra space for the 26 letters, because each union and find is almost constant with path compression.
+
+@@ ufoffline
+what: When queries ask "is there a path using only edges lighter than w", you do not need to answer them in the given order. Sort the edges by weight and the queries by limit. Walk through the queries from the smallest limit, union every edge that is below the limit, and answer with find. Each edge is added once, and the groups only grow.
+signals: "path with every edge less than limit" ; many connectivity queries with different limits ; answers do not need to be given in order ; edge lengths or weights bounded per query ; "check existence" of a path under a constraint
+code:
+```python
+def distance_limited_paths_exist(n: int, edge_list: list[list[int]],
+                                 queries: list[list[int]]) -> list[bool]:
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    edges = sorted(edge_list, key=lambda e: e[2])
+    order = sorted(range(len(queries)), key=lambda i: queries[i][2])
+    out = [False] * len(queries)
+    e = 0
+    for qi in order:                            # smallest limit first
+        a, b, limit = queries[qi]
+        while e < len(edges) and edges[e][2] < limit:
+            parent[find(edges[e][0])] = find(edges[e][1])
+            e += 1
+        out[qi] = find(a) == find(b)
+    return out
+```
+walk: #1697 Checking Existence of Edge Length Limited Paths
+step: Input n = 3, edges [[0,1,2],[1,2,4],[2,0,8],[1,0,16]], queries [[0,1,2],[0,2,5]]. Sorted edges have weights 2, 4, 8, 16.
+step: The queries are already in order of limit: 2, then 5. The pointer e starts at 0.
+step: Query 0 has limit 2. The first edge has weight 2, which is not below 2, so no edge is added. find(0) and find(1) differ, so out[0] = False.
+step: Query 1 has limit 5. Add the edges of weight 2 and 4, which join 0 to 1 and 1 to 2. Now find(0) equals find(2), so out[1] = True.
+step: The answer is [False, True], returned in the original query order.
+bugs: Answering in the sorted order and returning the answers in that order ; Using <= for the limit when the problem says strictly less ; Forgetting to remember the original index of each query ; Rebuilding the union-find for every query, which is O(q * n)
+cost: O((E + Q) log(E + Q)) time and O(n + Q) extra space, because sorting dominates and the unions and finds are almost constant each.
+
+@@ ufreverse
+what: Union-find can merge groups but cannot split them, so deleting items is hard going forward. Run time backwards instead. First remove all the items that will ever be deleted, build the groups, and then add the items back in reverse order. Each deletion in the original order becomes a union in the reversed order. The change in a group's size gives the answer for that step.
+signals: "bricks fall" after each hit ; deletions that change connectivity ; "after removing" edges or cells, how many are still connected ; offline: all the removals are known in advance ; union-find has no split
+code:
+```python
+def hit_bricks(grid: list[list[int]], hits: list[list[int]]) -> list[int]:
+    R, C = len(grid), len(grid[0])
+    roof = R * C
+    g = [row[:] for row in grid]
+    for r, c in hits:
+        g[r][c] -= 1                       # 1 -> 0 (removed), 0 -> -1 (was empty)
+    parent, size = list(range(roof + 1)), [1] * (roof + 1)
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        a, b = find(a), find(b)
+        if a != b:
+            parent[a] = b
+            size[b] += size[a]
+
+    def link(r: int, c: int) -> None:      # join (r, c) to the roof and to neighbours
+        if r == 0:
+            union(c, roof)
+        for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+            if 0 <= nr < R and 0 <= nc < C and g[nr][nc] == 1:
+                union(r * C + c, nr * C + nc)
+
+    for r in range(R):
+        for c in range(C):
+            if g[r][c] == 1:
+                link(r, c)
+    out = []
+    for r, c in reversed(hits):
+        if g[r][c] == -1:                  # nothing was there to put back
+            out.append(0)
+            continue
+        before = size[find(roof)]
+        g[r][c] = 1
+        link(r, c)
+        out.append(max(0, size[find(roof)] - before - 1))   # minus the brick itself
+    return out[::-1]
+```
+walk: #803 Bricks Falling When Hit
+step: Input grid = [[1,0,0,0],[1,1,1,0]] and hits = [[1,0]]. Remove the brick at row 1, column 0 first.
+step: Build the groups. The roof group holds the roof and the brick at (0,0), so its size is 2. Bricks (1,1) and (1,2) form their own group of size 2.
+step: Process the hit in reverse. before = 2, the size of the roof group.
+step: Put the brick back at (1,0). It touches (0,0), which is in the roof group, and (1,1), which brings its group of 2 along.
+step: The roof group size is now 5. The change is 5 - 2 = 3, minus the restored brick itself gives 2.
+step: The answer is [2]. Two bricks fell when the brick at (1,0) was hit.
+bugs: Forgetting to subtract the restored brick, so the answer is one too large ; Putting back a hit on an empty cell as if it were a brick ; Not handling a repeated empty cell with the -1 trick ; Answering in reverse order and forgetting to reverse the list at the end ; Joining bricks in row 0 to the roof only when they are first built, and not when they are restored
+cost: O((R * C + H) * alpha) time and O(R * C) extra space, because the build and each restore do a constant number of unions, each almost constant with path compression.
+
+@@ ufweight
+what: A weighted union-find stores, on each link to a parent, a ratio or an offset. The ratio of x is x divided by its parent. When find follows the path to the root, it multiplies the ratios along the way and shortens the path. Two items in the same group are then related by one division of their ratios to the root.
+signals: "a / b = 2.0" style equations with queries ; relation between pairs, such as ratio, difference or distance ; answer "-1" when the relation is unknown ; variables are strings, not numbers ; chains of equations
+code:
+```python
+def calc_equation(equations: list[list[str]], values: list[float],
+                  queries: list[list[str]]) -> list[float]:
+    parent: dict[str, str] = {}
+    ratio: dict[str, float] = {}           # ratio[x] = x / parent[x]
+
+    def find(x: str) -> str:
+        if parent[x] != x:
+            p = parent[x]
+            root = find(p)
+            ratio[x] *= ratio[p]           # now x / root
+            parent[x] = root
+        return parent[x]
+
+    for (a, b), v in zip(equations, values):        # a / b = v
+        for x in (a, b):
+            parent.setdefault(x, x)
+            ratio.setdefault(x, 1.0)
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+            ratio[ra] = v * ratio[b] / ratio[a]     # ra / rb
+
+    out = []
+    for a, b in queries:
+        if a in parent and b in parent and find(a) == find(b):
+            out.append(ratio[a] / ratio[b])
+        else:
+            out.append(-1.0)
+    return out
+```
+walk: #399 Evaluate Division
+step: Input equations [["a","b"],["b","c"]] with values [2.0, 3.0]. So a / b = 2 and b / c = 3.
+step: Union a, b with value 2: parent[a] = b and ratio[a] = 2.
+step: Union b, c with value 3: parent[b] = c and ratio[b] = 3.
+step: Query a / c: find(a) goes to b and then to c. ratio[a] becomes 2 * 3 = 6, and ratio[c] = 1, so the answer is 6 / 1 = 6.0.
+step: Query b / a: ratio[b] = 3 and ratio[a] = 6, so 3 / 6 = 0.5. A query with an unknown letter such as "e" gives -1.0.
+bugs: Not updating the ratio of a node when its path is shortened ; Forgetting to check that both names exist before calling find ; Storing a value in the wrong direction, so the answers are inverted ; Multiplying ratios with the parent's ratio read after changing the parent ; Returning 1.0 for an unknown letter divided by itself, when the answer is -1.0
+cost: O((E + Q) log V) time at worst, nearly constant per step with path compression, and O(V) extra space for the parent and ratio maps.

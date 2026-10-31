@@ -38,6 +38,8 @@ try {
     DATA.nodes.forEach(n=>{ READS[n.id]={id:n.id, rd:n.rd, refs:n.refs}; n.b=(n.rd.value||[""])[0]; n.q=(n.rd.intuition||[""])[0]; n.nr=n.refs.length; });
     DATA.layers.forEach(l=>{ READS[l.id]={id:l.id, rd:l.rd, refs:l.refs}; });
     (DATA.scenes||[]).forEach(s=>{ const r=READS[s.concept]; if(r) (r.scenes=r.scenes||[]).push(s); });
+    (DATA.patterns||[]).forEach(x=>{ const r=READS[x.concept]; if(r) (r.patterns=r.patterns||[]).push(x); });
+    (DATA.handson||[]).forEach(x=>{ const r=READS[x.concept]; if(r) (r.handson=r.handson||[]).push(x); });
   } else {
     DATA = await api("GET","/api/graph");
   }
@@ -61,11 +63,24 @@ const deepList = DATA.nodes.filter(n=>n.deep).sort((a,b)=>a.l-b.l||byLabel(a,b))
 const CUR = DATA.curriculum || {programs:[], courses:[]};
 const COURSE = {}; CUR.courses.forEach(c=>COURSE[c.code]=c);
 const TAUGHT = {}; CUR.courses.forEach(c=>c.concepts.forEach(id=>(TAUGHT[id]=TAUGHT[id]||[]).push(c.code)));
-const courseLabel = code => code.replace(/^([A-Z]+)(\d)/,"$1 $2");
+// schools: Stanford codes are bare ("CS103" -> "CS 103"); other schools' codes carry the school ("MIT 6.1210", "Caltech CS 124")
+const SCHOOLS = (CUR.schools && CUR.schools.length ? CUR.schools : [{id:"stanford", short:"Stanford"}]).slice().sort((a,b)=>(a.id==="stanford"?0:1)-(b.id==="stanford"?0:1));
+const SCHOOL = {}; SCHOOLS.forEach(x=>SCHOOL[x.id]=x);
+const schoolOf = code => (COURSE[code] && COURSE[code].school) || "stanford";
+const courseLabel = code => /\s/.test(code) ? code : code.replace(/^([A-Z]+)(\d)/,"$1 $2");
+const courseShort = code => /\s/.test(code) ? code.replace(/^\S+\s/,"") : courseLabel(code);
+// a concept's courses grouped by school, in school order: [[school, [codes]], ...]
+const taughtBy = id => SCHOOLS.map(x=>[x, (TAUGHT[id]||[]).filter(c=>schoolOf(c)===x.id)]).filter(g=>g[1].length);
 // system design questions: summaries in server mode (full text from /api/design/<id>), full objects in standalone mode
 // animated scenes: summaries for every scene (standalone DATA.scenes holds them in full; the server sends them in each read)
 const SCENES = (DATA.scenes||[]).filter(s=>N[s.concept]).map(s=>({id:s.id, concept:s.concept, title:s.title||s.id, n:s.n!==undefined?s.n:(s.steps||[]).length}));
 let SCENE_ALL = STANDALONE ? (DATA.scenes||[]) : null;
+// architecture patterns (content/patterns/): summaries for every pattern (standalone DATA.patterns holds them in full, the server
+// sends them in each read), and the catalog of canonical patterns they name in "kinds"
+const PCAT = DATA.pcatalog || [], PCATI = {}; PCAT.forEach(c=>PCATI[c.id]=c);
+const PATS = []; { const k={}; (DATA.patterns||[]).forEach(x=>{ if(!N[x.concept]) return; const i = x.i!==undefined ? x.i : (k[x.concept]=(k[x.concept]||0)+1)-1; PATS.push({concept:x.concept, i, title:x.title, kinds:x.kinds||[], when:x.when}); }); }
+const PIMPL = {}; PATS.forEach(x=>x.kinds.forEach(k=>(PIMPL[k]=PIMPL[k]||[]).push(x)));
+const PFAMS = [...new Set(PCAT.map(c=>c.fam))];
 const DESIGNS = (DATA.designs||[]).map(d=>{ if(d.rd && d.summary===undefined) d.summary=(d.rd.summary||[""])[0]; return d; });
 const DES = {}, DES_FULL = {}; DESIGNS.forEach(d=>{ DES[d.id]=d; if(d.rd) DES_FULL[d.id]=d; });
 const USES = {}; DESIGNS.forEach(d=>d.concepts.forEach(id=>{ if(N[id]) (USES[id]=USES[id]||[]).push(d.id); }));
@@ -220,7 +235,7 @@ const markHTML = id => { const s=Store.status(id); return s==="read"?`<span clas
 
 /* ---------------- state ---------------- */
 const firstJourney = DATA.tours.findIndex(isJourney);
-const state = { algo:{tab:"viz", viz:"bubble", prob:null}, program:"bs", course:"CS111", view:"explore", start:0, path:["kafka","commitlog","wal"], sel:"wal", tour:Math.max(0, firstJourney), tstep:0, filter:"", expand:{}, libKind:"all", libQ:"", libN:120 };
+const state = { algo:{tab:"viz", viz:"bubble", prob:null}, program:"bs", course:"CS111", view:"explore", start:0, path:["kafka","commitlog","wal"], sel:"wal", tour:Math.max(0, firstJourney), tstep:0, filter:"", expand:{}, libKind:"all", libQ:"", libN:120, pfam:"", pkind:null };
 
 /* ---------------- strip ---------------- */
 function renderStrip(){
@@ -328,7 +343,7 @@ function renderPanel(){
   if(insp.length) h += `<h3>Inspired by (analogy)</h3>` + relList(insp, e=>`<button type="button" data-sel="${e.t}"><span class="bar dash" style="--c:${lc(N[e.t].l)}"></span><span><span class="rn">${esc(N[e.t].label)}</span><span class="kind">L${N[e.t].l}</span><span class="rw">${esc(e.r)}</span></span></button>`);
   h += `<h3>Used by · ${ups.length} directly, ${upTot} in total</h3>` + (ups.length ? relList(ups, e=>`<button type="button" data-sel="${e.s}"><span class="bar${e.k==="inspired"?" dash":""}" style="--c:${lc(N[e.s].l)}"></span><span><span class="rn">${esc(N[e.s].label)}</span><span class="kind">L${N[e.s].l}</span><span class="rw">${esc(e.r)}</span></span></button>`) : `<p class="empty">Nothing in this map is built on it yet: it is a top-level product.</p>`);
   if(n.side.length) h += `<h3>Related · ${n.side.length}</h3>` + relList(n.side, s=>`<button type="button" data-sel="${s.o}"><span class="bar" style="--c:${lc(N[s.o].l)}"></span><span><span class="rn">${esc(N[s.o].label)}</span><span class="kind">${SIDE[s.t]||s.t}</span><span class="rw">${esc(s.r)}</span></span></button>`);
-  if(TAUGHT[n.id]) h += `<h3>Taught in · Stanford</h3><div class="chips">${TAUGHT[n.id].map(code=>`<button type="button" class="chip" style="--c:var(--fg)" data-course="${code}"><span class="sw"></span>${esc(courseLabel(code))} ${esc(COURSE[code].title)}</button>`).join("")}</div>`;
+  if(TAUGHT[n.id]) h += `<h3>Taught in · ${taughtBy(n.id).map(g=>esc(g[0].short)).join(", ")}</h3><div class="chips">${TAUGHT[n.id].map(code=>`<button type="button" class="chip" style="--c:var(--fg)" data-course="${esc(code)}"><span class="sw"></span>${esc(courseLabel(code))} ${esc(COURSE[code].title)}</button>`).join("")}</div>`;
   const pmc = hasPM() && (PMS().concepts||{})[n.id];
   if(pmc) h += `<h3>Problems that use this · ${(pmc[0]+pmc[1]).toLocaleString("en-US")}</h3><p class="pm-panelpin">${pmc[0]} LeetCode problem${pmc[0]===1?" is":"s are"} about it directly and ${pmc[1]} use it along the way. <button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-pmconcept="${n.id}">See them in the problem map</button></p>`;
   if(USES[n.id]) h += `<h3>Appears in design questions · ${USES[n.id].length}</h3><div class="chips">${USES[n.id].map(did=>`<button type="button" class="chip" style="--c:var(--fg)" data-design="${did}"><span class="sw"></span>${esc(DES[did].title)}</button>`).join("")}</div>`;
@@ -364,11 +379,12 @@ function renderCourses(){
   if(!prog){ $("v-courses").innerHTML = `<p class="empty">No curriculum loaded.</p>`; return; }
   const c = COURSE[state.course] || COURSE[prog.groups[0].courses[0]];
   const done = id => Store.status(id)==="read";
-  const card = code => { const k=COURSE[code]; if(!k) return ""; const d=k.concepts.filter(done).length; return `<button type="button" class="tcard" data-course="${code}" aria-pressed="${c&&c.code===code}"><span class="tt">${esc(courseLabel(code))} · ${esc(k.title)}</span><span class="ts">${k.concepts.length} concepts${d?` · ${d} read`:""}</span><span class="tl" aria-hidden="true">${k.concepts.map(id=>`<span style="--c:${lc(N[id].l)};${done(id)?"":"opacity:.45"}"></span>`).join("")}</span></button>`; };
+  const card = code => { const k=COURSE[code]; if(!k) return ""; const d=k.concepts.filter(done).length; return `<button type="button" class="tcard" data-course="${esc(code)}" aria-pressed="${c&&c.code===code}"><span class="tt">${esc(courseLabel(code))} · ${esc(k.title)}</span><span class="ts">${k.concepts.length} concepts${d?` · ${d} read`:""}</span><span class="tl" aria-hidden="true">${k.concepts.map(id=>`<span style="--c:${lc(N[id].l)};${done(id)?"":"opacity:.45"}"></span>`).join("")}</span></button>`; };
   const lays = c ? [0,1,2,3,4,5].map(l=>c.concepts.filter(id=>N[id].l===l).length) : [];
-  $("v-courses").innerHTML = `<div class="tlist"><div class="filters" role="group" aria-label="Program" style="margin:0 0 4px">${CUR.programs.map(p=>`<button type="button" data-program="${p.id}" aria-pressed="${p.id===prog.id}">${esc(p.id.toUpperCase())}</button>`).join("")}</div>
+  const progBtn = p => `<button type="button" data-program="${esc(p.id)}" aria-pressed="${p.id===prog.id}" title="${esc(p.name)}">${esc(p.short||p.id.toUpperCase())}</button>`;
+  $("v-courses").innerHTML = `<div class="tlist">${SCHOOLS.filter(x=>CUR.programs.some(p=>(p.school||"stanford")===x.id)).map(x=>`<div class="filters sch-row" role="group" aria-label="${esc(x.short)} programs" style="margin:0 0 4px"><span class="sch">${esc(x.short)}</span>${CUR.programs.filter(p=>(p.school||"stanford")===x.id).map(progBtn).join("")}</div>`).join("")}
     <p class="ts" style="font-size:12px;color:var(--muted);margin:0 0 6px">${esc(prog.name)} · ${esc(prog.year)}. ${esc(prog.summary)} <a href="${esc(prog.url)}" target="_blank" rel="noopener noreferrer" style="color:var(--muted)">Requirements ↗</a></p>
-    ${prog.groups.map(g=>`<div class="cat" style="position:static;padding:8px 0 2px" title="${esc(g.note)}">${esc(g.name)}</div>${g.courses.map(card).join("")}`).join("")}</div>
+    <div class="tcards">${prog.groups.map(g=>`<div class="cat" style="position:static;padding:8px 0 2px" title="${esc(g.note)}">${esc(g.name)}</div>${g.courses.map(card).join("")}`).join("")}</div></div>
   <div class="tsteps">${c?`<h2>${esc(courseLabel(c.code))}: ${esc(c.title)}</h2><p class="sub">${c.concepts.length} concepts in this map · ${esc(c.text)}${c.term&&c.term!=="—"?` · latest public term: ${esc(c.term)}`:""}${c.url?` · <a href="${esc(c.url)}" target="_blank" rel="noopener noreferrer" style="color:inherit">course site ↗</a>`:" · course site not verified"}</p>
     <div class="under" role="img" aria-label="Concepts by layer" style="margin:0 0 6px">${lays.map((k,l)=>k?`<span style="background:${lc(l)};flex:${k}" title="L${l}: ${k}"></span>`:"").join("")}</div>
     <div class="btnrow" style="margin:6px 0 14px"><button type="button" class="btn primary" data-rcourse="${c.code}">Study this course · ${c.concepts.reduce((s,id)=>s+N[id].rm,0)} min</button></div>
@@ -671,6 +687,42 @@ function fillTry(root){
   if(!root || !window.DTSAlgo || !window.DTSAlgo.forConcept) return;
   root.querySelectorAll("[data-trycon]").forEach(p=>{ const v=window.DTSAlgo.forConcept(p.dataset.trycon); p.innerHTML = v.map(x=>`<button type="button" data-tryviz="${esc(x.id)}">Try it yourself: ${esc(x.title)}</button>`).join(""); p.hidden = !v.length; });
 }
+/* architecture patterns in a concept read: one tab per pattern; each panel has the pattern's text and its animated diagram */
+function patternsHTML(id, list){
+  const tabs = list.length>1 ? `<div class="sc-tabs" role="tablist" aria-label="Architecture patterns">${list.map((x,i)=>`<button type="button" role="tab" class="sc-tab ap-tab" data-aptab="${i}" aria-selected="${i===0}" tabindex="${i===0?0:-1}" id="apt-${i}" aria-controls="app-${i}">${esc(x.title)}</button>`).join("")}</div>` : "";
+  const kinds = x => x.kinds.filter(k=>PCATI[k]).map(k=>`<button type="button" class="ap-kind" data-pkind="${esc(k)}" title="${esc(PCATI[k].s)}">${esc(PCATI[k].name)}</button>`).join("");
+  const panel = (x,i) => `<div class="ap-panel" id="app-${i}" role="${list.length>1?"tabpanel":"group"}"${list.length>1?` aria-labelledby="apt-${i}"`:` aria-label="${esc(x.title)}"`}${i?" hidden":""}>
+    <h3 class="ap-t">${esc(x.title)}</h3>${kinds(x)?`<p class="ap-kinds"><span class="ap-lbl">Pattern</span>${kinds(x)}</p>`:""}
+    <p class="ap-when"><b>When to use it.</b> ${RI(x.when)}</p>${P(x.how)}
+    <div class="ap-scene" data-apscene="${i}"></div>
+    ${x.used?`<p class="ap-used"><b>Used by.</b> ${RI(x.used)}</p>`:""}${x.avoid?`<p class="ap-avoid"><b>Avoid when.</b> ${RI(x.avoid)}</p>`:""}
+    ${(x.refs||[]).length?refsHTML(x.refs):""}</div>`;
+  return `<p class="stand-sum">How real systems place ${esc(N[id].label)} among other components. ${list.length>1?`${list.length} patterns: pick one above. `:""}Step through each diagram with Back and Next, or press Play.</p><div class="ap-wrap" data-pats="${id}">${tabs}${list.map(panel).join("")}</div>`;
+}
+/* hands-on practice links (content/handson/): places on the web to try the idea, free and open-source first */
+const HO_KIND = {playground:"Playground", simulator:"Simulator", puzzles:"Puzzles", exercises:"Exercises", lab:"Lab", ctf:"CTF", game:"Game", dataset:"Dataset", kata:"Kata"};
+const HO_ACC = {"open-source":"Open source", "free":"Free", "free-tier":"Free tier"};
+function handsonHTML(list){
+  const ord = {"open-source":0, "free":1, "free-tier":2};
+  return `<p class="stand-sum">Places on the web to try this yourself, free and open-source first. Each opens in a new tab.</p><ul class="ho-list">${list.slice().sort((a,b)=>ord[a.access]-ord[b.access]).map(x=>`<li><a class="ho" href="${esc(x.u)}" target="_blank" rel="noopener noreferrer">
+    <span class="ho-t">${esc(x.t)} <span aria-hidden="true">↗</span></span>
+    <span class="ho-m"><span class="ho-k">${esc(HO_KIND[x.kind]||x.kind)}</span><span class="ho-a ${esc(x.access)}">${esc(HO_ACC[x.access]||x.access)}</span>${x.w?`<span>${esc(x.w)}</span>`:""}</span>
+    <span class="ho-d">${RI(x.d)}</span></a></li>`).join("")}</ul>`;
+}
+function patTab(wrap, i){
+  const list = (READS[wrap.dataset.pats]||{}).patterns||[]; if(!list[i]) return null;
+  wrap.querySelectorAll(".ap-tab").forEach((b,j)=>{ b.setAttribute("aria-selected", String(j===i)); b.tabIndex = j===i?0:-1; });
+  const cur = wrap.querySelectorAll(".ap-tab")[i], bar = cur && cur.parentNode; if(bar && bar.scrollWidth > bar.clientWidth) bar.scrollTo({left: cur.offsetLeft - 8, behavior: "auto"});
+  wrap.querySelectorAll(".ap-panel").forEach((p,j)=>{ p.hidden = j!==i; });
+  wrap.querySelectorAll(".ap-scene").forEach(h=>{ const old = h.firstElementChild && h.firstElementChild.__player; if(old) old.destroy(); h.innerHTML=""; });
+  const host = wrap.querySelector(`[data-apscene="${i}"]`);
+  return host && window.DTSScene && list[i].scene ? window.DTSScene.mount(host, list[i].scene, {title:false}) : null;
+}
+function mountPatterns(root, at){
+  const w = root.querySelector(".ap-wrap"); if(!w) return null;
+  const n = ((READS[w.dataset.pats]||{}).patterns||[]).length;
+  return patTab(w, at>=0 && at<n ? at : 0);
+}
 function sec(id, no, title, body, tag){ return body ? `<section class="rd-sec" id="rs-${id}" aria-labelledby="rh-${id}"><h2 id="rh-${id}"><span class="no">${no}</span><span class="h2-t">${title}</span>${tag?`<span class="h2-tag">${tag}</span>`:""}</h2>${body}</section>` : ""; }
 function srow(id, reason, dash, meta){ const m=N[id]; return `<button type="button" class="srow" style="--c:${lc(m.l)}" data-read="${id}"><span class="bar${dash?" dash":""}"></span><span><span class="sn">${esc(m.label)}</span><span class="sm">${meta||"L"+m.l}</span>${markHTML(id)}<span class="sr">${esc(reason)}</span></span></button>`; }
 function groupByLayer(list, key){
@@ -706,8 +758,8 @@ function nodeRead(n, r, ctx){
   if(ctx) h += `<div class="rd-ctx"><b>${esc(ctx.k)}</b>${RI(ctx.t)}</div>`;
   h += ladderHTML(n);
   if(USES[n.id]) h += `<p class="ladder-cap">Appears in design questions: ${USES[n.id].map(did=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-design="${did}">${esc(DES[did].title)}</button>`).join(", ")}.</p>`;
-  if(TAUGHT[n.id]) h += `<p class="ladder-cap">Taught in Stanford ${TAUGHT[n.id].map(code=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-course="${code}">${esc(courseLabel(code))}</button>`).join(", ")}.</p>`;
-  const toc = [["value","Why it exists"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How it works"],(r.scenes||[]).length&&["watch","Watch it work"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],rd.tradeoffs&&["tradeoffs","It depends: trade-offs"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],rd.interview&&["interview","In the interview"],rd.quiz&&["quiz","Check yourself"],pmPins(n.id)&&["problems","Problems that use this"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
+  if(TAUGHT[n.id]) h += `<p class="ladder-cap">Taught in ${taughtBy(n.id).map(([x, codes])=>`${esc(x.short)} ${codes.map(code=>`<button type="button" class="essay-link" style="display:inline;--c:${lc(n.l)}" data-course="${esc(code)}">${esc(courseShort(code))}</button>`).join(", ")}`).join("; ")}.</p>`;
+  const toc = [["value","Why it exists"],rd.terms&&["terms","Key terms"],rd.history&&["history","How we got here"],["how","How it works"],(r.scenes||[]).length&&["watch","Watch it work"],(r.patterns||[]).length&&["apat","Architecture patterns"],rd.example&&["example","A worked example"],downs.length&&["stands","What it stands on"],["intuition","Why it makes sense"],rd.mistakes&&["mistakes","Common misunderstandings"],rd.tradeoffs&&["tradeoffs","It depends: trade-offs"],["friction","Where it still hurts"],rd.practice&&["practice","In practice"],rd.interview&&["interview","In the interview"],rd.quiz&&["quiz","Check yourself"],(r.handson||[]).length&&["handson","Practice it yourself"],pmPins(n.id)&&["problems","Problems that use this"],ups.length&&["built","What's built on it"],n.side.length&&["side","Neighbours"],["deeper","Go deeper"],["notes","Notes"]].filter(Boolean);
   h += `<nav class="toc" aria-label="Sections">${toc.map(([id,t])=>`<a href="#rs-${id}" data-jump="rs-${id}">${t}</a>`).join("")}</nav>`;
   let no=0; const NO=()=>String(++no).padStart(2,"0");
   h += sec("value", NO(), "Why it exists", P(rd.value,"lead"));
@@ -715,6 +767,7 @@ function nodeRead(n, r, ctx){
   if(rd.history) h += sec("history", NO(), "How we got here", P(rd.history));
   h += sec("how", NO(), "How it works", P(rd.how) + diagramHTML(rd.diagram) + animHTML(rd.animation));
   if((r.scenes||[]).length) h += sec("watch", NO(), "Watch it work", watchHTML(n.id, r.scenes));
+  if((r.patterns||[]).length) h += sec("apat", NO(), "Architecture patterns", patternsHTML(n.id, r.patterns), r.patterns.length+" pattern"+(r.patterns.length===1?"":"s"));
   if(rd.example) h += sec("example", NO(), "A worked example", exampleHTML(rd.example));
   if(downs.length||insp.length) h += sec("stands", NO(), "What it stands on",
     `<p class="stand-sum">${esc(n.label)} rests directly on ${downs.length} idea${downs.length===1?"":"s"}. Counting everything beneath those, it stands on ${tot} concepts across ${lays.length} layer${lays.length===1?"":"s"} (${lays.map(l=>"L"+l).join(", ")}). Each line says what that lower layer contributes.</p>` +
@@ -726,6 +779,7 @@ function nodeRead(n, r, ctx){
   if(rd.practice) h += sec("practice", NO(), "In practice", P(rd.practice));
   if(rd.interview) h += sec("interview", NO(), "In the interview", qaHTML(rd.interview, "Questions a staff-level interviewer asks about this. Say your answer out loud first, then open it to compare."), "Staff level");
   if(rd.quiz) h += sec("quiz", NO(), "Check yourself", quizHTML(rd.quiz, n.id));
+  if((r.handson||[]).length) h += sec("handson", NO(), "Practice it yourself", handsonHTML(r.handson), r.handson.length+" link"+(r.handson.length===1?"":"s"));
   if(pmPins(n.id)) h += sec("problems", NO(), "Problems that use this", `<div class="pm-pins" data-pmpins="${n.id}"><p class="empty">Loading the problem map…</p></div>`, pmPins(n.id).toLocaleString("en-US")+" problems");
   if(ups.length) h += sec("built", NO(), "What's built on it", `<p class="stand-sum">${ups.length} concept${ups.length===1?"":"s"} use ${esc(n.label)} directly.</p>` + groupByLayer(ups,"s"));
   if(n.side.length) h += sec("side", NO(), "Neighbours", n.side.map(s=>srow(s.o, s.r, false, SIDE[s.t]||s.t)).join(""));
@@ -832,6 +886,25 @@ function renderDesign(){
   el.innerHTML = `<h2 class="vh">System design</h2><p class="vsub">${DESIGNS.length} interview question${DESIGNS.length===1?"":"s"}, each worked through: requirements, estimates with the arithmetic, API, data model, the design, deep dives, trade-offs, failure modes and the follow-up questions. Every design links to the concepts it uses, so you can study what it stands on.</p>` +
     cats.map(c=>`<h3 class="ysec">${esc(c)}</h3><div class="dgrid">${DESIGNS.filter(d=>d.category===c).map(card).join("")}</div>`).join("");
 }
+/* ---------------- architecture patterns: the catalog by family, with every concept that implements each pattern ---------------- */
+function renderArch(){
+  const el = $("v-architecture"), fam = PFAMS.includes(state.pfam) ? state.pfam : "";
+  if(!PCAT.length){ el.innerHTML = `<h2 class="vh">Architecture patterns</h2><p class="vsub">No patterns yet. Add files to content/patterns/ and run python3 tools/build.py.</p>`; return; }
+  const ncon = new Set(PATS.map(x=>x.concept)).size;
+  // one chip per concept (a concept can implement a pattern more than once); it opens the concept's first such pattern
+  const impl = c => { const by = {}; (PIMPL[c.id]||[]).forEach(x=>(by[x.concept]=by[x.concept]||[]).push(x));
+    return Object.values(by).map(xs=>{ const x=xs[0], m=N[x.concept]; return `<button type="button" class="chip" style="--c:${lc(m.l)}" data-patopen="${x.concept}/${x.i}" title="${esc(xs.map(y=>y.title).join("; "))}"><span class="sw"></span>${esc(m.label)}${xs.length>1?` <span class="mono" style="color:var(--muted);font-size:11px">×${xs.length}</span>`:""}</button>`; }); };
+  const card = c => { const ch = impl(c), ref = c.ref||{};
+    return `<div class="dcard ap-cat${state.pkind===c.id?" on":""}" id="apc-${esc(c.id)}"><span class="tt">${esc(c.name)}</span><span class="ts">${ch.length} concept${ch.length===1?"":"s"}</span><span class="ap-sum">${esc(c.s)}</span>
+      ${ref.t?`<span class="ap-src">${esc(KIND[ref.k]||ref.k||"")} · ${ref.u?`<a href="${esc(ref.u)}" target="_blank" rel="noopener noreferrer">${esc(ref.t)}</a>`:esc(ref.t)} · ${esc(ref.w||"")}</span>`:""}
+      ${ch.length?`<div class="chips ap-impl">${ch.slice(0,10).join("")}${ch.length>10?`<details><summary>${ch.length-10} more</summary><div class="chips">${ch.slice(10).join("")}</div></details>`:""}</div>`:""}</div>`; };
+  const other = PATS.filter(x=>!x.kinds.some(k=>PCATI[k]));
+  el.innerHTML = `<h2 class="vh">Architecture patterns</h2><p class="vsub">${PCAT.length} canonical patterns in ${PFAMS.length} families, from the Azure Architecture Center, Patterns of Distributed Systems, Enterprise Integration Patterns, microservices.io and the original papers. ${PATS.length} worked patterns on ${ncon} concepts show where each one appears in real systems, with an animated diagram. Pick a concept to open its pattern.</p>
+    <div class="filters" role="group" aria-label="Pattern family"><button type="button" data-pfam="" aria-pressed="${!fam}">All · ${PCAT.length}</button>${PFAMS.map(f=>`<button type="button" data-pfam="${esc(f)}" aria-pressed="${fam===f}">${esc(f)} · ${PCAT.filter(c=>c.fam===f).length}</button>`).join("")}</div>` +
+    PFAMS.filter(f=>!fam||f===fam).map(f=>`<h3 class="ysec">${esc(f)}</h3><div class="dgrid">${PCAT.filter(c=>c.fam===f).map(card).join("")}</div>`).join("") +
+    (other.length && !fam ? `<h3 class="ysec">Other patterns · ${other.length}</h3><div class="chips">${other.map(x=>`<button type="button" class="chip" style="--c:${lc(N[x.concept].l)}" data-patopen="${x.concept}/${x.i}"><span class="sw"></span>${esc(N[x.concept].label)}: ${esc(x.title)}</button>`).join("")}</div>` : "");
+  if(state.pkind){ const t = $("apc-"+state.pkind); if(t) requestAnimationFrame(()=>t.scrollIntoView({block:"center"})); }
+}
 function renderAlgoView(){
   const el = $("v-algorithms");
   if(window.DTSAlgo) window.DTSAlgo.render(el, state.algo);
@@ -884,6 +957,8 @@ async function renderReader(){
   animWatch(el);
   const sp = mountScenes(el, c.scene);
   if(c.scene && sp){ const w=$("rs-watch"); if(w) w.scrollIntoView({block:"start"}); try{ sp.root.focus({preventScroll:true}); }catch(e){} }
+  const pp = mountPatterns(el, c.pat);
+  if(c.pat!==undefined){ const w=$("rs-apat"); if(w) w.scrollIntoView({block:"start"}); const t=el.querySelector(`.ap-tab[data-aptab="${c.pat}"]`); try{ (t||(pp&&pp.root)||w).focus({preventScroll:true}); }catch(e){} }
 }
 function updProg(){
   const el=$("reader"), p=$("rprog"); if(!p) return;
@@ -895,8 +970,8 @@ function updProg(){
     if(spent>=need){ Store.setProgress(id,"read").then(()=>{ toast("Marked as read"); refreshMarks(); }).catch(()=>{}); }
   }
 }
-function hashFor(c){ return c.type==="node" ? "#read/"+c.id : c.type==="layer" ? "#layer/"+c.l : c.type==="design" ? "#design/"+c.id : "#reading-list"; }
-const viewHash = () => state.view==="algorithms" && window.DTSAlgo ? window.DTSAlgo.hash(state.algo) : state.view==="problems" && window.DTSPM ? window.DTSPM.hash() : "#"+state.view;
+function hashFor(c){ return c.type==="node" ? (c.pat!==undefined ? "#pattern/"+c.id+"/"+(c.pat+1) : "#read/"+c.id) : c.type==="layer" ? "#layer/"+c.l : c.type==="design" ? "#design/"+c.id : "#reading-list"; }
+const viewHash = () => state.view==="architecture" ? "#architecture"+(state.pkind?"/"+state.pkind:"") : state.view==="algorithms" && window.DTSAlgo ? window.DTSAlgo.hash(state.algo) : state.view==="problems" && window.DTSPM ? window.DTSPM.hash() : "#"+state.view;
 function openRead(c, opts={}){
   flushTime();
   if(R.open && R.cur && !opts.replace) R.hist.push(R.cur);
@@ -916,15 +991,17 @@ const pathSeq = () => ({name:"Your path", ids:state.path.slice()});
 function refreshMarks(){ if(R.open){ const a=$("reader").querySelector(".rd-actions"); const id=curId(); if(a&&id){ a.outerHTML = actionsHTML(id, getComputedStyle($("reader")).getPropertyValue("--c")); } } else render(false); }
 
 /* ---------------- render ---------------- */
-const VIEWS = ["explore","tours","courses","design","algorithms","problems","atlas","library","you"];
+const VIEWS = ["explore","tours","courses","design","algorithms","architecture","problems","atlas","library","you"];
 function render(scrollCols){
   $("tab-problems").hidden = !hasPM();
   renderStrip();
   const v = state.view;
   document.querySelectorAll(".tabs button").forEach(b=>b.setAttribute("aria-pressed", String(b.dataset.view===v)));
+  const tb = document.querySelector('.tabs button[aria-pressed="true"]'), bar = tb && tb.parentNode;
+  if(tb && bar.scrollWidth > bar.clientWidth) bar.scrollTo({left: tb.offsetLeft - (bar.clientWidth - tb.offsetWidth)/2, behavior: "auto"});
   $("v-explore").hidden = v!=="explore"; $("cols").hidden = v!=="explore";
-  $("v-design").hidden = v!=="design"; $("v-algorithms").hidden = v!=="algorithms"; $("v-problems").hidden = v!=="problems";
-  document.querySelector(".desk").classList.toggle("wide", v==="design"||v==="algorithms");
+  $("v-design").hidden = v!=="design"; $("v-algorithms").hidden = v!=="algorithms"; $("v-architecture").hidden = v!=="architecture"; $("v-problems").hidden = v!=="problems";
+  document.querySelector(".desk").classList.toggle("wide", v==="design"||v==="algorithms"||v==="architecture");
   document.querySelector(".desk").classList.toggle("pmv", v==="problems");
   $("v-tours").hidden = v!=="tours"; $("v-courses").hidden = v!=="courses"; $("v-atlas").hidden = v!=="atlas"; $("v-library").hidden = v!=="library"; $("v-you").hidden = v!=="you";
   if(v==="explore"){ renderTrail(); renderCols(scrollCols); }
@@ -932,6 +1009,7 @@ function render(scrollCols){
   if(v==="courses") renderCourses();
   if(v==="design") renderDesign();
   if(v==="algorithms") renderAlgoView();
+  if(v==="architecture") renderArch();
   if(v==="problems"){ if(window.DTSPM) window.DTSPM.render($("v-problems")); else $("v-problems").innerHTML = `<p class="empty">Loading the problem map…</p>`; }
   if(v==="atlas") renderAtlas();
   if(v==="library") renderLibrary();
@@ -941,7 +1019,7 @@ function render(scrollCols){
 function revealPanel(){ if(narrow()) $("panel").scrollIntoView({behavior:reduced?"auto":"smooth",block:"start"}); else $("panel").scrollTop = 0; }
 function select(id, opts={}){ state.sel = id; state.expand = {}; render(false); if(opts.reveal!==false) revealPanel(); }
 function exploreFrom(id){ state.view="explore"; state.start=N[id].l; state.filter=""; state.path=[id]; state.sel=id; state.expand={}; try{history.replaceState(null,"","#explore")}catch(e){} render(true); revealPanel(); }
-function setView(v){ state.view=v; try{history.replaceState(null,"",viewHash())}catch(e){} if(v==="tours"){ state.sel = DATA.tours[state.tour].steps[state.tstep][0]; } if(v==="explore"){ state.sel = state.path[state.path.length-1]||null; } render(v==="explore"); if(["library","you","design","algorithms","problems"].includes(v)) $("main").scrollTop=0; }
+function setView(v){ state.view=v; try{history.replaceState(null,"",viewHash())}catch(e){} if(v==="tours"){ state.sel = DATA.tours[state.tour].steps[state.tstep][0]; } if(v==="explore"){ state.sel = state.path[state.path.length-1]||null; } render(v==="explore"); if(["library","you","design","algorithms","architecture","problems"].includes(v)) $("main").scrollTop=0; }
 
 document.addEventListener("click", async e=>{
   const j = e.target.closest("a[data-jump]"); if(j){ e.preventDefault(); const t=document.getElementById(j.dataset.jump); if(t) t.scrollIntoView({behavior:reduced?"auto":"smooth",block:"start"}); return; }
@@ -951,6 +1029,10 @@ document.addEventListener("click", async e=>{
   const d = b.dataset;
   try{
     if(d.anim){ const f=b.closest(".anim"); if(f) animAct(f.id, d.anim); return; }
+    if(d.aptab!==undefined){ const w=b.closest(".ap-wrap"); if(w){ patTab(w, +d.aptab); if(R.open && R.cur && R.cur.type==="node"){ R.cur.pat=+d.aptab; try{history.replaceState(null,"",hashFor(R.cur))}catch(e){} } } return; }
+    if(d.pkind){ if(R.open) closeRead(); state.pkind=d.pkind; state.pfam=""; return setView("architecture"); }
+    if(d.pfam!==undefined){ state.pfam=d.pfam; state.pkind=null; try{history.replaceState(null,"",viewHash())}catch(e){} return renderArch(); }
+    if(d.patopen){ const [cid, i] = d.patopen.split("/"); if(N[cid]) return openRead({type:"node", id:cid, pat:+i}, {seq:null}); return; }
     if(d.sctab!==undefined){ const w=b.closest(".sc-wrap"); if(w) sceneTab(w, +d.sctab); return; }
     if(d.sceneopen){ const s=SCENES.find(x=>x.id===d.sceneopen); if(s) return openRead({type:"node", id:s.concept, scene:s.id}, {seq:null}); return; }
     if(d.tryviz){ if(R.open) closeRead(); state.algo.tab="viz"; state.algo.viz=d.tryviz; return setView("algorithms"); }
@@ -996,12 +1078,32 @@ document.addEventListener("keydown", e=>{
   if(e.key==="Escape" && R.open && document.activeElement!==$("q")){ e.preventDefault(); return backRead(); }
   if(e.key==="Enter" && e.target.closest && e.target.closest("[data-gsel]")){ select(e.target.closest("[data-gsel]").dataset.gsel); }
   if(e.key==="Enter" && e.target.closest && e.target.closest("[data-gread]")){ openRead({type:"node", id:e.target.closest("[data-gread]").dataset.gread}, {seq:null}); }
+  const atb = e.target.closest && e.target.closest(".ap-tab");
+  if(atb && (e.key==="ArrowLeft"||e.key==="ArrowRight")){ e.preventDefault(); const all=[...atb.parentNode.querySelectorAll(".ap-tab")], i=(all.indexOf(atb)+(e.key==="ArrowRight"?1:all.length-1))%all.length; all[i].focus(); all[i].click(); return; }
   const tb = e.target.closest && e.target.closest(".sc-tab");
   if(tb && (e.key==="ArrowLeft"||e.key==="ArrowRight")){ e.preventDefault(); const all=[...tb.parentNode.querySelectorAll(".sc-tab")], i=(all.indexOf(tb)+(e.key==="ArrowRight"?1:all.length-1))%all.length; all[i].focus(); sceneTab(tb.closest(".sc-wrap"), i); return; }
   const an = e.target.closest && e.target.closest(".anim");
   if(an && (e.key==="ArrowLeft"||e.key==="ArrowRight") && !/INPUT|TEXTAREA/.test(e.target.tagName)){ e.preventDefault(); animAct(an.id, e.key==="ArrowLeft"?"prev":"next"); }
   if(e.key==="/" && !/INPUT|TEXTAREA/.test(document.activeElement.tagName)){ e.preventDefault(); if(R.open) closeRead(); $("q").focus(); }
 });
+
+/* ---------------- swipe ---------------- */
+// a horizontal swipe on a drawing presses its Back or Next button; vertical movement keeps scrolling the page
+(function(){
+  let t0 = null;
+  const target = el => el && el.closest && el.closest(".sc-stage, #av-stage, .an-stage");
+  document.addEventListener("touchstart", e=>{ const el = target(e.target); if(!el || e.touches.length!==1){ t0 = null; return; }
+    const t = e.touches[0]; t0 = {el, x:t.clientX, y:t.clientY, at:Date.now(), scroll: el.scrollWidth > el.clientWidth + 1}; }, {passive:true});
+  document.addEventListener("touchend", e=>{ if(!t0) return; const s = t0; t0 = null; const t = e.changedTouches[0];
+    const dx = t.clientX - s.x, dy = t.clientY - s.y;
+    if(s.scroll || Date.now() - s.at > 700 || Math.abs(dx) < 45 || Math.abs(dy) > Math.abs(dx) * 0.6) return;
+    const fwd = dx < 0, el = s.el; let b = null;
+    if(el.classList.contains("sc-stage")){ const r = el.closest(".scene"); b = r && r.querySelector(fwd ? '[data-sc="next"]' : '[data-sc="back"]'); }
+    else if(el.id === "av-stage") b = document.querySelector(fwd ? '[data-aact="next"]' : '[data-aact="back"]');
+    else { const a = el.closest(".anim"); b = a && a.querySelector(fwd ? '[data-anim="next"]' : '[data-anim="prev"]'); }
+    if(b && !b.disabled) b.click(); }, {passive:true});
+  document.addEventListener("touchcancel", ()=>{ t0 = null; }, {passive:true});
+})();
 
 /* ---------------- search ---------------- */
 const q=$("q"), sres=$("sres"); let hits=[], hi=0, sq=0;
@@ -1031,6 +1133,10 @@ function route(initial){
   if(ml){ if(R.open && curId()==="L"+ml[1]) return; if(initial) render(true); return openRead({type:"layer", l:+ml[1]}, {seq:null}); }
   const msc = h.match(/^scene\/(.+)$/), scn = msc && SCENES.find(x=>x.id===msc[1]);
   if(scn){ if(R.open && curId()===scn.concept && R.cur.scene===scn.id) return; if(initial) render(true); exploreFrom(scn.concept); return openRead({type:"node", id:scn.concept, scene:scn.id}, {seq:null}); }
+  const mpt = h.match(/^pattern\/([a-z0-9-]+)\/(\d+)$/);
+  if(mpt && N[mpt[1]]){ const i=+mpt[2]-1; if(R.open && curId()===mpt[1] && R.cur.pat===i) return; if(initial) render(true); exploreFrom(mpt[1]); return openRead({type:"node", id:mpt[1], pat:i}, {seq:null}); }
+  const mar = h.match(/^architecture(?:\/([a-z0-9-]+))?$/);
+  if(mar){ if(R.open) closeRead(); state.view="architecture"; state.pkind = mar[1] && PCATI[mar[1]] ? mar[1] : null; render(true); return; }
   if(h==="animations"){ if(R.open) closeRead(); state.view="algorithms"; state.algo.tab="anim"; render(true); return; }
   if(h==="patterns"){ if(R.open) closeRead(); state.view="algorithms"; state.algo.tab="patterns"; render(true); return; }
   const md = h.match(/^design\/(.+)$/);
@@ -1043,7 +1149,7 @@ function route(initial){
     if(R.open) closeRead();
     if(VIEWS.includes(h)) state.view = h;
     if(state.view==="tours") state.sel=DATA.tours[state.tour].steps[state.tstep][0];
-    if(initial && ["atlas","library","you","design","algorithms","problems"].includes(state.view)) state.sel=null;
+    if(initial && ["atlas","library","you","design","algorithms","architecture","problems"].includes(state.view)) state.sel=null;
     render(true);
   }
 }

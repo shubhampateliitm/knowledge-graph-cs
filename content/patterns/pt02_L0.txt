@@ -1,0 +1,856 @@
+@@ codingagents
+== Agent loop with permission gates
+kind: agent-loop
+when: A developer gives a goal in plain language, and the agent must read, edit and test code on the developer's own machine.
+how: The CLI sends the goal, the system prompt and the tool list (read file, search, edit, shell) to the model. The model replies with a tool call instead of a final answer. The harness runs the call and appends the result to the conversation, then calls the model again. This repeats, often 10 to 50 turns for one task, until the model answers without a tool call.
+Before a risky call runs, a permission gate checks it against allow rules. Reads are usually allowed. A shell command or a file write asks the human, unless a rule already approves it. A denied call returns an error text to the model, which then picks another path.
+The loop's context grows with each turn. The harness trims old tool output or summarizes it, so the model keeps the goal in view.
+used: Claude Code and the Codex CLI both work this way; many open-source terminal agents copy the same loop.
+avoid: When the steps are fixed and known; write a normal script or CI job, which is cheaper and repeatable.
+flow:
+  Developer [user] -> Agent CLI [svc: harness loop] : fix failing test | The developer states the goal. The harness builds the prompt with the tool list.
+  Agent CLI -> LLM API [model: Claude or GPT] : goal + tools | Each turn sends the whole conversation so far to the model.
+  LLM API -> Agent CLI : tool call: run tests | The model asks to run the test command instead of answering.
+  Agent CLI -> Developer : allow this command? | The permission gate asks the human, because shell commands are not pre-approved.
+  Agent CLI -> Repo and shell [store: files and git] : npm test | After approval the harness runs the command in the project folder.
+  Repo and shell -> Agent CLI : 2 failures + stack trace | The output goes back into the conversation as a tool result.
+  Agent CLI -x> Repo and shell : rm -rf blocked | A denied call returns an error to the model. It must choose another way.
+  LLM API -> Developer : final summary | When no tool call is needed, the loop stops and the model reports.
+ref: blog | Building effective agents | Anthropic, 2024 | https://www.anthropic.com/engineering/building-effective-agents
+
+== Parallel subagents in isolated worktrees
+kind: fork-join, llm-workflow
+when: A big task splits into independent parts, such as one change in six services, and one long conversation would be slow and cluttered.
+how: A lead agent plans the work and starts several subagents. Each subagent gets its own fresh context window and a narrow brief. Code changes run in separate git worktrees, which are separate checkouts of one repository, so two agents never edit the same file on disk.
+Each subagent works through its own loop and returns only a short summary and a branch name. The lead agent never sees the long tool output, so its own context stays small. When all subagents finish, the lead merges the branches, runs the full test suite and fixes conflicts.
+The cost is tokens: five subagents use about five times the tokens of one. Work that depends on shared state, or where parts touch the same files, gains little.
+used: Subagent features in Claude Code; Codex cloud tasks that run in parallel; teams that migrate many services with one prompt.
+avoid: When the parts depend on each other step by step; use one agent loop in one worktree.
+flow:
+  Lead agent [svc: plans and merges] -> Subagent A [svc: worktree a], Subagent B [svc: worktree b], Subagent C [svc: worktree c] : brief per service | The lead splits the task and starts three subagents, each with a small brief.
+  Subagent A -> Git repo [store: branches] : branch svc-a | Each subagent edits its own worktree and pushes its own branch.
+  + Subagent B -> Git repo : branch svc-b
+  + Subagent C -> Git repo : branch svc-c
+  Subagent A -> Lead agent : summary, 40 lines | Only a short summary returns. The long tool output stays in the subagent.
+  Lead agent -> Git repo : merge + run tests | The lead merges all branches and runs the full test suite once.
+  Subagent C -x> Lead agent : tests fail | One branch fails. The lead sends a fix request back to that subagent only.
+ref: blog | How we built our multi-agent research system | Anthropic, 2025 | https://www.anthropic.com/engineering/multi-agent-research-system
+
+== Cloud agent from issue to pull request
+kind: async-request-reply, webhook-callback
+when: Tasks should run without a developer watching, started from an issue, a chat message or a CI event.
+how: An event, for example an issue label, a PR comment or a scheduled run, starts a job through the agent's API or a webhook. The service creates a fresh sandbox container, clones the repository and runs the same agent loop in headless mode, with no human prompts.
+The sandbox has limited network access and short-lived credentials. Allowed commands are fixed by policy, because nobody is present to approve them. The agent edits code, runs tests and pushes a branch.
+At the end the agent opens a pull request and posts the link back to the issue. A human reviews the diff and merges. The agent's output is a proposal, not a deploy.
+The main risk is hostile text in issues and files that tries to steer the agent. This is called prompt injection. Keep secrets out of the sandbox and give the token write access to branches only.
+used: Codex cloud tasks; Claude Code in GitHub Actions or the Agent SDK in CI; background agents in several IDE products.
+avoid: When the task needs a human decision every few minutes; use the interactive terminal loop.
+flow:
+  Issue tracker [svc: label: agent] -> Agent service [svc: job API] : webhook: issue 812 | A label on the issue sends a webhook. The service accepts it and returns a job id at once.
+  Agent service -> Sandbox [svc: container no secrets] : clone + start agent | The service starts a clean container with the repository and a branch-only token.
+  Sandbox -> LLM API [model] : plan and edit | The headless loop runs the tool turns inside the sandbox.
+  Sandbox -> Git host [store: repo] : push branch fix-812 | The agent pushes its work to a new branch.
+  Sandbox ~> Issue tracker : PR link posted | A callback posts the pull request link on the issue.
+  Reviewer [user] -> Git host : review and merge | A human reads the diff and decides. The agent never merges alone.
+ref: docs | Claude Code overview | Anthropic | 
+
+@@ cursor
+== Codebase index for retrieval
+kind: rag, precompute
+when: The model must answer questions about a large repository, and the repository does not fit in its context window.
+how: The editor splits files into chunks, usually by function or class. An embedding model turns each chunk into a vector. The vectors go into a vector index, with file path and line range as metadata.
+When you ask a question, the editor embeds the question, finds the nearest chunks, and adds them to the prompt together with the open file. The model then answers from real code and not from guesses.
+Re-indexing the whole repository on every save is too slow. A common method is to hash every file and keep a tree of hashes. Only files whose hash changed are chunked and embedded again. A first index of a big monorepo can take minutes, and later updates take seconds.
+Retrieval is only a guide. Names, paths and exact matches also need plain text search, so agents mix both.
+used: Cursor and GitHub Copilot both build codebase indexes; the same idea is common in Sourcegraph and open-source code assistants.
+avoid: When the repository is small enough to fit in context, or the question is about one open file; send the file directly.
+flow:
+  Editor [client: IDE] -> Chunker [svc: split by symbol] : changed files only | The editor sends only files whose hash changed since the last sync.
+  Chunker -> Embedding model [model] : 800 chunks | Each chunk of code becomes one vector.
+  Embedding model -> Vector index [db: vectors + paths] : upsert vectors | The vectors are stored with file path and line range.
+  Editor -> Vector index : question vector | Your question is embedded and used as a search key.
+  Vector index -> Editor : top 20 chunks | The nearest code chunks come back with their locations.
+  Editor -> Chat model [model: large LLM] : question + chunks + file | The prompt now holds real code, so the answer can point to real files.
+ref: paper | Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks | Lewis et al., NeurIPS 2020 | https://arxiv.org/abs/2005.11401
+
+== Fast completion path and slow agent path
+kind: llm-workflow, hedged-requests
+when: One product needs keystroke-speed suggestions and also deep multi-file work, and one model cannot serve both.
+how: Tab completion must answer in well under a second, or the user has already typed on. So the editor sends a small context (the text around the cursor and recent edits) to a small, fast model. Providers use tricks such as speculative decoding and prefix caching to cut delay. Stale requests are cancelled when the user types again.
+Agent requests are different. They go to a large model, may run for minutes, and call tools. They stream progress to a side panel, and the user can stop them.
+A router in the editor backend picks the path by the kind of request. Each path has its own model, timeout, rate limit and cost. A fast path that is slow is worse than none, so it has a short deadline and shows nothing if it misses.
+used: Cursor Tab beside its agent mode; GitHub Copilot inline suggestions beside Copilot agent mode.
+avoid: When one general model is fast enough for your users; then skip the second path.
+flow:
+  Editor [client: IDE] -> Router [svc: picks model path] : keystroke or chat | Every request carries its type, so the router can choose the path.
+  Router -> Small model [model: fast 100 ms] : 2 KB around cursor | Completion gets a small context and a very short deadline.
+  Small model -> Editor : ghost text | The suggestion appears in grey. Tab accepts it.
+  Router -> Large model [model: agent minutes] : task + repo context | An agent request goes to the large model and may call tools for several minutes.
+  Large model ~> Editor : streamed steps | Progress streams to the side panel so the user can watch or stop.
+  Router -x> Small model : cancel stale request | When the user types again, the older completion request is cancelled.
+ref: docs | Cursor documentation | Anysphere | 
+
+== Agent edits with diff review and checkpoints
+kind: agent-loop, checkpoint-restart
+when: An agent edits many files inside an editor, and the developer must be able to inspect and undo every change.
+how: The agent runs inside the IDE. It reads files, searches, and proposes edits. A big model writes a plan or a sketch of the change. A smaller apply model, or a plain diff algorithm, turns the sketch into exact edits on the file. This split is cheaper and more reliable than asking the big model to rewrite a whole file.
+Edits land in the working tree as a visible diff. The developer accepts or rejects each hunk. Before each agent step the editor saves a checkpoint, so one click restores the earlier state.
+The agent also gets feedback from the language server, such as type errors and lint output, and from terminal runs. It uses them to fix its own mistakes before the human looks. Tools from MCP servers can be added, for example a ticket system or a database client.
+used: Cursor agent mode with checkpoints; Copilot agent mode in VS Code; Cline and similar editor agents.
+avoid: When no human will review the result; run headless in a sandbox with tests as the gate.
+flow:
+  Developer [user] -> Agent panel [client: IDE agent] : add retry to client | The developer describes the change in the side panel.
+  Agent panel -> Planner model [model: large LLM] : task + context | The big model reads code and plans the edits.
+  Planner model -> Apply model [model: small and fast] : edit sketch | A smaller model turns the sketch into exact line edits.
+  Apply model -> Working tree [store: files] : diff applied | The edits appear as a diff. A checkpoint is saved first.
+  Language server [svc: types and lint] -> Agent panel : 2 type errors | Type errors go back to the agent as feedback. It fixes them.
+  Developer -> Working tree : accept or reject hunks | The developer keeps good hunks. A bad run is undone from the checkpoint.
+ref: docs | Cursor documentation | Anysphere | 
+
+@@ deepseek
+== Self-hosted open weights behind a gateway
+kind: horizontal-scale, continuous-batching, api-gateway
+when: A company wants a strong model on its own GPUs, for privacy, cost control or no vendor lock-in.
+how: DeepSeek publishes weights, so you can run them. An inference server such as vLLM or SGLang loads the model on a group of GPUs and applies continuous batching. It adds and removes requests at every decoding step. Each such group is one replica.
+A gateway sits in front. It checks API keys, sets rate limits per team, and exposes an OpenAI-compatible HTTP API, so clients need no code change. It sends each request to the least loaded replica, ideally one that already holds the prompt prefix in its KV cache.
+A large model needs several GPUs per replica, so scaling out means adding whole replicas. Queue depth, not CPU, is the useful autoscaling signal. Remember licence and data-residency checks before you ship.
+used: Companies that run DeepSeek models with vLLM or SGLang; cloud model hubs that host the same weights.
+avoid: When traffic is small or spiky; the hosted API is cheaper than idle GPUs. Check where hosted data is processed first.
+flow:
+  App [client] -> LLM gateway [svc: auth and quota] : chat request | The app calls an OpenAI-style endpoint with an API key.
+  LLM gateway -> Replica 1 [svc: vLLM, 8 GPUs] : least queue | The gateway picks the replica with the shortest queue.
+  Replica 1 -> LLM gateway : streamed tokens | Tokens stream back as they are decoded.
+  LLM gateway -x> App : 429 over quota | A team that passes its quota gets a rejection, not a slow queue.
+  Autoscaler [svc: queue depth] -> Replica 2 [svc: new 8 GPUs] : start replica | When queue depth stays high, a whole new replica is started.
+  LLM gateway -> Replica 2 : new traffic | After the weights load, the gateway sends it part of the traffic.
+ref: paper | DeepSeek-V3 Technical Report | DeepSeek-AI, 2024 | https://arxiv.org/abs/2412.19437
+
+== Expert parallelism for mixture-of-experts serving
+kind: model-parallel, scatter-gather
+when: A mixture-of-experts model is too big for one GPU, and only a few experts are used per token.
+how: A mixture-of-experts layer has many small expert networks plus a router. For each token the router picks a few experts, for example 8 of 256 in DeepSeek-V3-style designs. Only those experts do work, so compute per token is small, but all experts must sit in memory.
+In expert parallelism each GPU holds a share of the experts. After the router decides, the tokens are sent to the GPUs that own their experts (an all-to-all send), the experts run, and results are sent back and combined by router weight.
+The network is the cost. All-to-all traffic can dominate step time, so serving systems overlap communication with compute and balance the load so no GPU gets all the popular experts. Prefill and decode are often run on separate GPU pools because their load differs.
+used: DeepSeek's own serving design as published in their papers; vLLM and SGLang expert-parallel modes.
+avoid: When the model is dense or fits on one GPU; plain data parallel replicas are simpler.
+flow:
+  Batch of tokens [queue: 4096 tokens] -> Router layer [svc: top 8 of 256] : hidden states | The router scores all experts for every token and keeps the best few.
+  Router layer -> GPU 0 [svc: experts 0-31], GPU 1 [svc: experts 32-63] : all-to-all send | Each token travels to the GPU that holds its chosen experts.
+  GPU 0 -> Combine step [svc: weighted sum] : expert outputs | Each GPU computes its experts and returns the results.
+  + GPU 1 -> Combine step : expert outputs
+  Combine step -> Next layer [svc] : merged hidden state | The outputs are merged by router weight. The next layer repeats this.
+  * GPU 0: overloaded and hot | One GPU holds popular experts and slows the whole step.
+ref: paper | DeepSeekMoE: Towards Ultimate Expert Specialization | Dai et al., 2024 | https://arxiv.org/abs/2401.06066
+
+== Cheap model first, premium model on fallback
+kind: llm-workflow, circuit-breaker
+when: Most requests are easy, and cost matters more than the best possible answer on every call.
+how: Use an open-weight model such as DeepSeek as the default, because its price per token is low. A router sends each request to it first. The router sees the answer's quality signal: a validator, unit tests, a schema check or a small judge model.
+When the check fails, or the model times out, the router retries once on a premium model from another provider. Over time you measure what share of calls falls back. If it is 5%, you pay the premium price on only 5% of traffic.
+A circuit breaker watches the default endpoint. After repeated errors it stops calling it for a while and sends all traffic to the fallback. Prefix caching helps too: a long fixed system prompt costs less on repeated calls.
+Check the data rules. A hosted API may process data in another country, so sensitive data may need your own hosting.
+used: Common in LLM gateways such as LiteLLM and OpenRouter-style routers, which support fallbacks.
+avoid: When one wrong answer is very costly; use the strongest model with human review.
+flow:
+  App [client] -> LLM router [svc: policy] : request | The app calls one endpoint. The router owns the model choice.
+  LLM router -> DeepSeek model [model: cheap default] : prompt | The first try goes to the cheap model.
+  DeepSeek model -> Validator [svc: schema + tests] : answer | The answer is checked by code, not by trust.
+  Validator -> LLM router : fail: bad JSON | The check fails, so the router needs another answer.
+  LLM router -> Premium model [model: other provider] : same prompt | The router retries once on the premium model.
+  Premium model -> App : valid answer | The user gets a valid answer. The fallback rate is logged.
+  LLM router -x> DeepSeek model : breaker open | After many errors the router skips the cheap model for a short time.
+ref: docs | LiteLLM routing and fallbacks | LiteLLM docs | 
+
+@@ gemini
+== Context caching for repeated long prompts
+kind: precompute, cache-aside
+when: Many requests share one very large prefix, such as a 500-page manual or a code base, and only the question changes.
+how: Gemini models accept very long inputs, so you can place a whole document set in the prompt. Sending it again on every call is slow and costly, because each call pays for all input tokens.
+With context caching, you upload the large content once and store it as a cache object with a time to live. Later requests name the cache and send only the new question. The service reuses the processed prefix, so those cached tokens are billed at a lower rate, and the call starts faster. Storage is billed for as long as the cache lives, so set the time to live to match real use.
+The app keeps the cache name in its own store. On a miss or expiry it rebuilds the cache and tries again, which is the cache-aside rule.
+used: Document question-answer tools and code assistants that call the Gemini API with a fixed large corpus.
+avoid: When each request has a different large input; caching gives no gain. Use retrieval to pick only the useful parts.
+flow:
+  Support app [svc: Q and A tool] -> Gemini API [svc: model endpoint] : create cache: manual | The app uploads the 400-page manual once and gets a cache name.
+  Gemini API -> Support app : cache id, ttl 1 h | The cache lives for one hour unless extended.
+  Support app -> Cache registry [cache: name and expiry] : store id | The app remembers the cache name for the next requests.
+  Support app -> Gemini API : question + cache id | A later call sends only the short question and the cache name.
+  Gemini API -> Support app : answer | The prefix is reused, so the call is faster and cheaper.
+  Gemini API -x> Support app : cache expired | After expiry the call fails. The app rebuilds the cache and retries.
+ref: docs | Context caching | Google AI for Developers | https://ai.google.dev/gemini-api/docs/caching
+
+== Grounding answers with live search
+kind: rag, llm-workflow
+when: Answers must use fresh or checkable facts that are not in the model's training data.
+how: The app asks Gemini a question and turns on the search grounding tool. The model decides whether it needs outside facts. If so, it writes one or more search queries, and the platform runs them on Google Search.
+The top results are put into the model's context, and the model writes an answer from them. The response carries grounding metadata: the queries used, the source links, and which parts of the answer rest on which source. The app can show these as citations.
+This is retrieval-augmented generation where the retriever is a web search engine. Search adds delay and cost per call, so the app should ground only the questions that need it. Always show the sources, because users must be able to check them.
+used: Gemini API and Vertex AI search grounding; Google products that show cited answers.
+avoid: When the answer lives in private documents; use your own retriever over a private index, or Vertex AI Search over your data.
+flow:
+  User [user] -> App [svc: chat backend] : who won yesterday? | A question needs a fact newer than the model's training data.
+  App -> Gemini [model: grounding tool on] : prompt + search tool | The app enables the search tool on the request.
+  Gemini -> Search [svc: Google Search] : 2 queries | The model writes its own search queries.
+  Search -> Gemini : top results | Snippets and links come back into the model's context.
+  Gemini -> App : answer + sources | The answer carries source links and a map of claims to sources.
+  App -> User : answer with citations | The app shows the citations so users can check them.
+ref: docs | Grounding with Google Search | Google AI for Developers | https://ai.google.dev/gemini-api/docs/google-search
+
+== Batch extraction from media files
+kind: claim-check, load-leveling
+when: A back office must turn thousands of PDFs, call recordings or videos into structured records, and nobody waits for each result.
+how: Large files do not belong in a request body or a queue message. The pipeline uploads each file to object storage or the Files API, and puts only a file reference on a queue. This is the claim check pattern.
+Workers take a reference and call Gemini with the file and a response schema. The schema forces JSON output in a known shape, for example invoice number, total and due date. A validator checks the JSON. Valid records go to the warehouse. Bad ones go to a review queue.
+The queue levels the load: a burst of 20,000 files waits in line while workers stay within the rate limit. For work without a deadline, the batch interface of the API trades delay for a lower price.
+used: Document and invoice processing, call-centre analytics and media tagging built on multimodal models.
+avoid: When a person waits for the result on screen; call the model directly with streaming.
+flow:
+  Uploader [svc: intake job] -> Object store [store: PDFs and audio] : file 7,314 | Each file is stored once. The queue will carry only its address.
+  Uploader -> Work queue [queue: file refs] : ref + doc type | A small message with the file address is queued.
+  Work queue -> Worker [svc: extractor] : next ref | Workers pull at a pace that fits the API rate limit.
+  Worker -> Gemini [model: JSON schema] : file + schema | The model reads the file and must answer in the schema.
+  Worker -> Warehouse [db: records] : valid JSON row | A valid row is loaded into the table.
+  Worker -x> Review queue [queue: human check] : schema mismatch | A bad record goes to a person and does not block the others.
+ref: docs | Structured output | Google AI for Developers | https://ai.google.dev/gemini-api/docs/structured-output
+
+@@ gpt
+== Function calling tool loop
+kind: agent-loop, request-reply
+when: A chat feature must read live data or take actions, such as looking up an order or booking a slot.
+how: The app sends the user message and a list of function definitions to the model. Each definition has a name, a description and a JSON schema for the arguments. The model does not run anything. It replies with the name of a function and arguments that match the schema.
+Your code runs the function. It validates the arguments, checks that the user is allowed to do this, calls the real service, and sends the result back as a new message. The model reads the result and either calls another function or writes the final answer.
+Keep a limit on turns, for example 8, so a confused loop stops. Log every call. Treat the arguments as untrusted input, like form data from a browser, because the model can be steered by text in the prompt.
+used: OpenAI function calling and the Responses API; support bots, travel assistants and internal copilots built on them.
+avoid: When the flow is fixed; call the services in code and use the model only to write the text.
+flow:
+  User [user] -> Chat backend [svc: your code] : where is order 88? | The user asks a question that needs live data.
+  Chat backend -> GPT API [model: with 3 tools] : message + tool schemas | The backend sends the message and the tool definitions.
+  GPT API -> Chat backend : call get_order(88) | The model returns a function name and arguments. It runs nothing itself.
+  Chat backend -> Orders service [svc: real API] : GET /orders/88 | The backend checks permissions, then makes the real call.
+  Orders service -> Chat backend : shipped, Tue | The result goes back to the backend.
+  Chat backend -> GPT API : tool result | The result is added to the conversation as a tool message.
+  GPT API -> User : It ships Tuesday. | With the data in hand, the model writes the final answer.
+ref: docs | Function calling | OpenAI API documentation | https://platform.openai.com/docs/guides/function-calling
+
+== Retrieval-augmented answers over private documents
+kind: rag, precompute
+when: Users ask about company documents that the model never saw, and answers must stay current and cite sources.
+how: Offline, a job splits documents into chunks of about 300 to 800 tokens. An embedding model turns each chunk into a vector, and the vectors go into a vector store with the text and the source link.
+Online, the app embeds the user's question and fetches the 5 to 20 nearest chunks. Many systems add a reranking step to keep the best few. The chunks go into the GPT prompt with the rule: answer only from this text, and cite the chunk. 
+Quality depends mostly on chunking and retrieval, not on the model. Measure recall on a set of real questions before you tune prompts. When a document changes, re-embed only that document. Remove the vectors of deleted files, so old text is not quoted.
+used: Enterprise search and help-desk assistants built on OpenAI embeddings and models; the pattern is common with pgvector, Pinecone and similar stores.
+avoid: When the whole corpus fits in one prompt, or answers need exact numbers from tables; query the database with SQL instead.
+flow:
+  Doc loader [svc: nightly job] -> Embedding API [model: text embeddings] : 600 token chunks | Each document is cut into chunks and sent for embedding.
+  Embedding API -> Vector store [db: vectors + text] : upsert | Vectors are saved with the chunk text and the source link.
+  User [user] -> Assistant [svc: RAG backend] : refund policy? | A user asks a question about internal policy.
+  Assistant -> Vector store : question vector | The question is embedded and searched.
+  Vector store -> Assistant : top 8 chunks | The closest chunks come back with their source links.
+  Assistant -> GPT API [model: chat] : question + 8 chunks | The model answers only from the given text.
+  GPT API -> User : answer + citation | The user sees the answer and a link to the policy page.
+ref: paper | Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks | Lewis et al., NeurIPS 2020 | https://arxiv.org/abs/2005.11401
+
+== Offline batch jobs through the Batch API
+kind: batching, async-request-reply
+when: A large job such as tagging a million records needs model quality but no answer within seconds.
+how: Online calls are limited by rate limits and charged the full price. For work that can wait, you write all requests into one JSONL file, one request per line with a custom id. You upload the file and create a batch job.
+The service runs the requests in spare capacity. It promises completion within a window, for example 24 hours, and the price is lower than online calls. Your code polls the job status, or checks later, and then downloads an output file. The output order is not guaranteed, so you match results to inputs by the custom id.
+Some lines will fail. Collect the failed ids, and send only those in a second batch. Keep each line small and the output schema strict, so validation is cheap.
+used: Offline classification, summarising and embedding jobs on the OpenAI Batch API; similar batch interfaces exist at other model providers.
+avoid: When a user is waiting, or the next step needs the answer now; use a normal online call.
+flow:
+  Pipeline [svc: nightly job] -> Files API [store: input.jsonl] : 1M lines | The job writes one request per line, each with a custom id.
+  Pipeline -> Batch API [svc: batch jobs] : create batch | The job asks for a batch with a 24 hour window.
+  Batch API -> Pipeline : batch id, queued | It returns at once with an id. Nothing is computed yet.
+  Batch API ~> GPT workers [model: spare capacity] : run requests | The service runs lines when capacity is free, in any order.
+  Pipeline -> Batch API : poll status | The pipeline checks the status now and then.
+  Batch API -> Files API : output.jsonl | When done, the results are saved to an output file.
+  Pipeline -> Files API : download + match ids | The job reads the output and matches results by custom id.
+ref: docs | Batch API | OpenAI API documentation | https://platform.openai.com/docs/guides/batch
+
+@@ llama
+== Self-hosted serving with continuous batching
+kind: continuous-batching, horizontal-scale
+when: You must run an open-weight Llama model on your own GPUs at a good cost per token.
+how: An inference engine such as vLLM, TensorRT-LLM or SGLang loads the weights and serves an HTTP API. Its core idea is continuous batching: at each decoding step it can add a new request or remove a finished one, so GPUs stay busy.
+The engine keeps the attention keys and values of each request in a KV cache. PagedAttention in vLLM stores this cache in small blocks, so memory is not wasted. A larger share of the GPU memory used for cache means more requests in the batch and more tokens per second.
+A load balancer spreads requests over replicas. A model with 70 billion parameters in 16-bit needs about 140 GB for weights, so it is split over several GPUs, or quantized to 8 or 4 bits to fit on fewer. Scale out with more replicas when the queue grows.
+used: vLLM, TensorRT-LLM and SGLang deployments of Llama; cloud services that host Llama weights.
+avoid: When the volume is low; a hosted API costs less than idle GPUs.
+flow:
+  Client [client] -> Load balancer [svc: least queue] : POST /chat | Clients send standard chat requests to one address.
+  Load balancer -> vLLM replica [svc: Llama 70B 4 GPUs] : request 301 | The balancer sends the request to a replica with a short queue.
+  vLLM replica -> KV cache [cache: GPU memory] : allocate blocks | The engine gives the request small cache blocks and not one big array.
+  * vLLM replica: batch of 48 | New requests join the running batch at every step.
+  vLLM replica -> Client : streamed tokens | Each step makes one token for every request in the batch.
+  vLLM replica -x> Load balancer : cache full | When the cache is full, new requests wait or go to another replica.
+ref: paper | Efficient Memory Management for LLM Serving with PagedAttention | Kwon et al., SOSP 2023 | https://arxiv.org/abs/2309.06180
+
+== LoRA fine-tune, shadow test, serve adapters
+kind: online-offline, shadow-ab
+when: A team wants a Llama model that follows its domain style or format, without training all the weights.
+how: Open weights allow fine-tuning. LoRA keeps the base weights frozen and trains small low-rank matrices, often under 1% of the parameters. A training job on one or a few GPUs can finish in hours. The result is an adapter file of tens of megabytes.
+Offline, the job trains on curated examples, then runs an evaluation set against the base model. Online, the new adapter first runs in shadow mode: it sees a copy of live traffic, but its answers are only logged and compared. If metrics hold, a small share of traffic moves to it.
+Some servers load many adapters on one base model and choose per request, so several teams or tenants can share the same GPUs.
+The risk is overfitting and forgetting. Keep a held-out set and watch general quality, not only the new task.
+used: LoRA and QLoRA fine-tunes of Llama with open tools such as Hugging Face PEFT and Axolotl; vLLM multi-adapter serving.
+avoid: When prompts and retrieval already give the quality you need; fine-tuning adds a pipeline to maintain.
+flow:
+  Training data [lake: curated examples] -> LoRA job [svc: 1 GPU, hours] : 20,000 examples | The job freezes the base model and trains small adapter matrices.
+  LoRA job -> Adapter registry [store: adapter v3] : save 80 MB adapter | The adapter is stored with its data version and eval score.
+  Router [svc: traffic split] -> Base model [model: Llama] : live request | Live traffic still gets the old answer.
+  Router ~> Adapter v3 [model: Llama + LoRA] : shadow copy | A copy goes to the new adapter. Its answer is only logged.
+  Adapter v3 -> Eval log [db: compare] : answer pair | Old and new answers are compared offline.
+  Router -> Adapter v3 : 5% live | If the metrics hold, a small share of traffic moves over.
+ref: paper | LoRA: Low-Rank Adaptation of Large Language Models | Hu et al., ICLR 2022 | https://arxiv.org/abs/2106.09685
+
+== Guard model before and after the main model
+kind: pipes-filters, llm-workflow
+when: A public chat feature must block unsafe input and unsafe output without relying on the main model alone.
+how: Put small safety classifiers around the main model. Meta publishes Llama Guard models for this purpose. The input guard reads the user prompt, and the output guard reads the draft answer. Each returns safe or unsafe, with a category, based on a policy you define.
+The flow is a pipeline. An unsafe prompt is stopped before it reaches the main model, and the user gets a fixed refusal. A safe prompt goes through, and the output guard checks the answer before the user sees it.
+Each guard adds delay, often tens to hundreds of milliseconds, so use small models and run the input guard in parallel with the main call when you can. Log every block. Review a sample of blocks to find false alarms. A guard model lowers risk but cannot remove it.
+used: Llama Guard in open-source moderation stacks; the same layered check is common around hosted models.
+avoid: When the system is internal and fully trusted; the extra delay may not be worth it.
+flow:
+  User [user] -> Input guard [svc: Llama Guard] : prompt | The first filter checks the user's prompt against the safety policy.
+  Input guard -x> User : refused: category S9 | An unsafe prompt gets a fixed refusal. The main model never sees it.
+  Input guard -> Main model [model: Llama 70B] : safe prompt | A safe prompt continues to the main model.
+  Main model -> Output guard [svc: Llama Guard] : draft answer | The second filter checks the model's answer before release.
+  Output guard -> User : answer | A safe answer is sent to the user.
+  Output guard ~> Audit log [log: blocks and scores] : decision | Every decision is logged. Reviewers use it to tune the policy.
+ref: paper | Llama Guard: LLM-based Input-Output Safeguard for Human-AI Conversations | Inan et al., Meta, 2023 | https://arxiv.org/abs/2312.06674
+
+@@ sd
+== GPU worker queue for image generation
+kind: load-leveling, competing-consumers, async-request-reply
+when: Users request images at bursty times, and each image takes seconds of GPU time.
+how: One image can take 2 to 20 seconds on a GPU, depending on model, size and number of steps. A web server cannot hold the connection and the GPU for that time. So the API accepts the request, puts a job on a queue and returns a job id at once.
+GPU workers take jobs from the queue. Each worker keeps the model loaded in memory, because loading takes tens of seconds. They are competing consumers: each job goes to one worker. A burst makes the queue longer, not the service slower for jobs already running.
+The finished image is saved to object storage. The client polls the job status, or gets a webhook or a push message. Scale workers on queue length. Add a job timeout, and a dead-letter queue for jobs that keep failing.
+used: Hosted Stable Diffusion services and ComfyUI-based back ends; the pattern is common for any GPU job.
+avoid: When one user runs it on their own machine; call the pipeline directly.
+flow:
+  Web app [client] -> API [svc: job API] : prompt + size | The user submits a prompt. The API checks quota.
+  API -> Job queue [queue: pending jobs] : job 5521 | The API stores the job and returns the id at once.
+  Job queue -> GPU worker 1 [svc: SD loaded], GPU worker 2 [svc: SD loaded] : next job | Idle workers take one job each. No two workers get the same job.
+  GPU worker 1 -> Image store [store: PNG files] : image 5521 | The image is written to object storage.
+  Web app -> API : poll job 5521 | The client checks the status now and then.
+  API -> Web app : done + image URL | The API returns a link to the stored image.
+  GPU worker 2 -x> Job queue : timeout, retry | A stuck job is returned to the queue and tried again later.
+ref: paper | High-Resolution Image Synthesis with Latent Diffusion Models | Rombach et al., CVPR 2022 | https://arxiv.org/abs/2112.10752
+
+== Generate, upscale and safety-check pipeline
+kind: pipes-filters
+when: A product needs finished, safe images and not raw samples from one model call.
+how: Stable Diffusion works in a latent space that is much smaller than the image, which is why it is fast. A raw sample is often 512 to 1024 pixels wide, so most products add stages after it.
+Stage one turns the prompt into text embeddings and runs the denoising steps, then the decoder makes pixels. Optional conditioning adds a ControlNet or an image prompt to fix pose or layout. Stage two upscales the image with a separate model. Stage three runs a safety classifier on the result, and rejects or blurs unsafe images. Stage four writes the file and its metadata.
+Each stage is a separate component, so you can swap an upscaler without touching the rest. Store the prompt, seed and model version with the image. This makes the result reproducible and helps audits.
+used: Automatic1111 and ComfyUI node graphs; Hugging Face diffusers pipelines with a safety checker.
+avoid: When raw drafts are enough, such as quick previews; skip the later stages to save time.
+flow:
+  Prompt [note: text + seed] -> Diffusion model [model: SD 30 steps] : text embeddings | The denoiser removes noise 30 times, guided by the text.
+  Diffusion model -> VAE decoder [svc: latent to pixels] : latent 128x128 | The small latent is turned into a full image.
+  VAE decoder -> Upscaler [model: 4x upscaler] : 512 px image | A second model adds size and detail.
+  Upscaler -> Safety filter [model: classifier] : 2048 px image | A classifier checks the final image.
+  Safety filter -x> Prompt : blocked | An unsafe image is blocked and the user sees a refusal.
+  Safety filter -> Asset store [store: image + metadata] : image + seed + model | The file is saved with the seed and model version.
+ref: docs | Diffusers pipelines | Hugging Face documentation | https://huggingface.co/docs/diffusers/index
+
+== Deterministic result cache with CDN
+kind: cache-aside, cdn-edge
+when: The same prompt, seed and settings are requested many times, and each generation costs GPU time.
+how: With the same model version, prompt, seed, size and sampler settings, a Stable Diffusion run gives the same image on the same software and hardware. So these inputs can be a cache key.
+The API computes a hash of the normalized request and looks it up in a key-value store. On a hit it returns the stored image URL, and no GPU is used. On a miss it queues a job, and the worker saves the image under the same key. A CDN in front of the image store serves repeat downloads from the edge.
+Include the model version in the key, so a new checkpoint does not return old images. Results can differ between GPU types or library versions, so treat exactness as likely and not guaranteed. Set a time to live, and remove images when a user deletes them.
+used: Stock image and avatar generators, and games with a fixed set of styles, where the same inputs repeat.
+avoid: When every request uses a random seed; hit rates will be near zero.
+flow:
+  Client [client] -> API [svc: normalizes request] : prompt, seed 42, v3.5 | The API builds a key from all inputs that change the image.
+  API -> Key-value cache [cache: hash to URL] : lookup hash | The API looks up the hash of the request.
+  Key-value cache -> API : miss | The image was never made, so a job is needed.
+  API -> GPU worker [svc: SD pipeline] : generate | The job runs on a GPU and takes seconds.
+  GPU worker -> Image store [store: object storage] : save image | The image is saved under the hash name.
+  Client -> CDN [cache: edge copies] : GET image | Later downloads come from the edge, close to the user.
+  CDN -> Image store : first fetch | The CDN fetches the image once, then keeps a copy.
+ref: docs | Diffusers reproducibility | Hugging Face documentation | https://huggingface.co/docs/diffusers/using-diffusers/reusing_seeds
+
+@@ beam
+== One pipeline, many runners
+kind: plugin-arch, anti-corruption
+when: A team wants to write a data pipeline once and run it on different engines, or avoid lock-in to one engine.
+how: In Beam you write a pipeline with the Beam SDK (Java, Python or Go). The code builds a graph of transforms such as ParDo, GroupByKey and Combine, and does not name any engine. At run time you choose a runner with one option: Dataflow, Flink, Spark or the local Direct runner.
+The SDK turns the graph into a portable description. The runner translates it into its own jobs. User functions run in an SDK harness process, often in a container, and talk to the runner over gRPC. This also allows a Java I/O connector inside a Python pipeline.
+The benefit is a stable model and code. The cost is a lowest common denominator: you may not reach every engine-specific feature, and performance tuning stays runner-specific.
+used: Google Cloud Dataflow runs Beam pipelines as its managed service; Flink and Spark runners are used by teams on their own clusters.
+avoid: When you are sure of one engine and want its newest features; write for Flink or Spark directly.
+flow:
+  Pipeline code [client: Python SDK] -> Pipeline graph [note: portable proto] : build transforms | The SDK builds a graph of transforms. It names no engine yet.
+  Pipeline graph -> Runner [svc: Dataflow or Flink] : submit with --runner | A single option picks the engine that will execute the graph.
+  Runner -> Worker 1 [svc: runner worker], Worker 2 [svc: runner worker] : bundles of elements | The runner splits the data into bundles and assigns them to workers.
+  Worker 1 -> SDK harness [svc: user code container] : process bundle (gRPC) | The runner calls the user functions in a separate process.
+  SDK harness -> Worker 1 : output elements | Results come back to the runner for the next stage.
+  Worker 2 -> Sink [store: BigQuery or files] : write results | The write step is a Beam connector, so it works on every runner.
+ref: docs | Beam portability framework | Apache Beam documentation | https://beam.apache.org/roadmap/portability/
+ref: paper | The Dataflow Model | Akidau et al., VLDB 2015 |
+
+== Event-time windows with watermarks and late data
+kind: windowed-agg, stream-table-join
+when: A stream arrives out of order, such as mobile events sent late, and counts must be by event time.
+how: Beam separates four questions: what is computed, where in event time, when results are emitted, and how late data is handled. You assign elements to windows by their own timestamp, for example fixed 1-minute windows.
+A watermark is the system's estimate that all events before time T have arrived. When the watermark passes the end of a window, the trigger fires and emits the result. A late event that arrives after that can still be accepted for a time set by allowed lateness, and it produces a corrected result. Accumulation mode decides whether the new output replaces or adds to the old.
+Early triggers can emit a partial count every 10 seconds, so dashboards are not blank. Late data costs state: the runner must keep window state until lateness ends.
+used: Dataflow streaming jobs for click and ad-impression counts; Flink runner pipelines with the same windowing code.
+avoid: When data is always in order and delay does not matter; a simple processing-time batch job is easier.
+flow:
+  Pub/Sub [topic: click events] -> Window step [svc: 1 min windows] : event, time 10:00:42 | Each event gets a window by its own timestamp, not by arrival time.
+  Window step -> Count per key [svc: Combine] : window 10:00 to 10:01 | The count is kept per key and per window.
+  * Count per key: window open, count 812 | State for the window lives in the runner until the window closes.
+  Count per key -> Results table [db: BigQuery] : early result | An early trigger writes a partial result every 10 seconds.
+  Count per key -> Results table : final at watermark | When the watermark passes the window end, the final count is written.
+  Pub/Sub -> Count per key : late event, 10:00:55 | A late event within the allowed lateness updates the window state.
+  Count per key -> Results table : corrected count | The table gets a corrected count for the same window.
+ref: paper | The Dataflow Model | Akidau et al., VLDB 2015 |
+ref: docs | Windowing | Apache Beam documentation | https://beam.apache.org/documentation/programming-guide/#windowing
+
+== Same code for live stream and backfill
+kind: kappa-arch, backfill-replay
+when: A streaming job must also reprocess months of history after a bug fix, without a second implementation.
+how: Beam's model treats a batch as a bounded stream. The same transforms run on an unbounded source, such as Pub/Sub or Kafka, and on a bounded source, such as files in object storage. Only the read step changes. Windows and triggers behave the same, so the answers match.
+For a backfill, you start the same pipeline with the file source and a time range, and write to a new table. When it finishes, you compare totals against the live table and then swap the readers over.
+Keep the transform code in a shared module, and make only the source and sink pluggable. Test with the Direct runner on small bounded input. Bounded runs can use batch-mode optimizations, so they usually run faster than live.
+used: Dataflow teams that reprocess from Cloud Storage or BigQuery with the same pipeline code used for Pub/Sub; the idea matches the Kappa architecture.
+avoid: When live results need state or lookups that do not exist for old data; plan the history source first.
+flow:
+  Pub/Sub [topic: live events] -> Beam job live [svc: streaming mode] : unbounded read | The live job reads the stream and applies the shared transforms.
+  Beam job live -> Table live [db: results] : window results | Results are written by event-time windows.
+  Archive [lake: events in Parquet] -> Beam job backfill [svc: batch mode] : bounded read, 90 days | The backfill job reads old files with the same code.
+  Beam job backfill -> Table v2 [db: rebuilt] : same windows | The same transforms give the same windows, so results are comparable.
+  Beam job backfill -> Table live : compare totals | Totals are compared before any switch. A mismatch shows a bug.
+  Dashboard [client] -> Table v2 : switch reads | After the check, readers move to the new table.
+ref: docs | Basics of the Beam model | Apache Beam documentation | https://beam.apache.org/documentation/basics/
+
+@@ dask
+== Task graph with scheduler and workers
+kind: scheduler-agent, fork-join
+when: Python code on pandas or NumPy must use many cores or many machines without a rewrite in another engine.
+how: Dask turns operations on a big array or dataframe into a task graph. A node is one small Python call on one chunk, and an edge is a data dependency. Nothing runs until you call compute, which keeps the graph lazy and lets Dask optimize it.
+The distributed scheduler is a single process that knows the graph. It sends ready tasks to worker processes and tracks where each result lives. It prefers to run a task on the worker that already holds its inputs, which cuts network copies. Workers also steal tasks from busy workers to balance load.
+If a worker dies, the scheduler re-runs the lost tasks from the graph, because each task is a pure function of its inputs. The scheduler is a single point of failure, and it adds roughly 1 ms of overhead per task. So tasks should take at least 100 ms.
+used: Dask clusters in science and finance for large pandas, NumPy and xarray jobs; the same scheduler also runs custom Python workflows via dask.delayed.
+avoid: When the job is plain SQL over huge tables; use a SQL engine such as Spark or DuckDB instead.
+flow:
+  Client [client: Python script] -> Scheduler [svc: task graph] : submit graph, 4,000 tasks | The client builds a lazy graph and sends it on compute.
+  Scheduler -> Worker A [svc: 8 threads], Worker B [svc: 8 threads] : ready tasks | The scheduler sends ready tasks. It prefers workers that hold the inputs.
+  Worker A -> Worker B : fetch chunk 17 | A worker copies a needed chunk directly from a peer. Data does not go through the scheduler.
+  Worker B -> Scheduler : task done, result at B | Each worker reports finished tasks and where the results are.
+  Worker A -x> Scheduler : worker lost | One worker dies. Its results are gone.
+  Scheduler -> Worker B : re-run lost tasks | The scheduler re-runs the lost tasks from the graph.
+  Scheduler -> Client : final result | The client gets the final value.
+ref: docs | Dask distributed scheduling | Dask documentation | https://distributed.dask.org/en/stable/scheduling-policies.html
+
+== Partitioned dataframe over Parquet in object storage
+kind: map-reduce, data-locality
+when: A table of 500 GB or more sits as Parquet files in S3, and analysts want pandas code on it.
+how: dask.dataframe reads a folder of Parquet files as one logical dataframe. Each file, or each row group, becomes a partition, which is a normal pandas dataframe of about 100 to 300 MB. Dask reads only the columns and row groups the code needs, using the Parquet footer.
+Each operation runs once per partition in parallel: filters, column math and map functions. A groupby does a tree reduction, or a shuffle when the key has many values. A shuffle moves data between workers, and it is the costly step, so filter and select columns first.
+Results are written back as a Parquet folder with partitioned output. Workers should run near the data, in the same cloud region as the bucket, because cross-region reads are slow and charge egress fees.
+used: Dask on cloud clusters for large Parquet analysis; geoscience data with xarray and Zarr uses the same chunked idea.
+avoid: When the data fits in memory on one machine; plain pandas or DuckDB is faster and simpler.
+flow:
+  Analyst [user: notebook] -> Dask dataframe [svc: lazy graph] : read_parquet(s3://...) | The call lists the files and builds partitions. It reads no data yet.
+  Dask dataframe -> Worker pool [svc: 20 workers] : 1,200 partition tasks | Each partition becomes a task on some worker.
+  Worker pool -> S3 [lake: Parquet files] : read needed columns | Workers fetch only the needed columns and row groups.
+  * Worker pool: filter then groupby | Partitions are filtered first. Then partial group results are combined.
+  Worker pool -> Results [store: Parquet output] : write partitions | Each worker writes its part of the result in parallel.
+  Dask dataframe -> Analyst : small summary | The analyst gets a small pandas result for plots.
+ref: docs | Dask DataFrame best practices | Dask documentation | https://docs.dask.org/en/stable/dataframe-best-practices.html
+
+== Adaptive cluster on Kubernetes
+kind: autoscaling, control-loop
+when: Workloads are bursty, such as nightly jobs, and a fixed cluster would sit idle most of the day.
+how: A Dask operator for Kubernetes creates a cluster from a custom resource: one scheduler pod and a group of worker pods. A user in a notebook asks for a cluster object, and gets a client back.
+Adaptive mode lets the scheduler decide how many workers it needs. It looks at the queue of waiting tasks and an estimate of their duration. If the queue is long, it asks Kubernetes for more workers within set minimum and maximum limits. When tasks run out and workers are idle, it removes them.
+New pods need time to start, often tens of seconds, plus node start if the cluster must also add machines. So keep a small minimum, and set a maximum to cap cost. Use spot nodes for workers only, because lost results can be recomputed but a lost scheduler ends the job.
+used: Dask on Kubernetes in cloud data science platforms; Dask Gateway for multi-user clusters.
+avoid: When jobs run all day at steady load; a fixed cluster is simpler and cheaper.
+flow:
+  Notebook [client: user session] -> K8s operator [svc: Dask operator] : create DaskCluster | The user asks for a cluster object. The operator creates it.
+  K8s operator -> Scheduler pod [svc: Dask scheduler] : start | The operator starts one scheduler pod first.
+  Scheduler pod -> K8s operator : need 30 workers | The queue is long, so the scheduler asks for more workers, up to the maximum.
+  K8s operator -> Worker pods [svc: spot nodes] : scale to 30 | The operator creates the worker pods.
+  Worker pods -> Scheduler pod : register | New workers join and start receiving tasks.
+  * Worker pods: scaled down to 2 | When tasks end, idle workers are removed. Two stay as the minimum.
+ref: docs | Dask Kubernetes operator | Dask documentation | 
+
+@@ databricks
+== Medallion layers on Delta Lake
+kind: medallion, open-table-format, etl-elt
+when: Many raw sources feed analytics and ML, and quality and trust must rise step by step.
+how: Data lands unchanged in bronze Delta tables on cloud object storage. A job cleans and joins it into silver tables: duplicates removed, types fixed, keys matched. Another job builds gold tables that hold business aggregates, such as daily revenue per region.
+Each layer is a Delta table: Parquet files plus a transaction log. The log gives ACID writes, time travel and schema checks on cheap object storage. Jobs run as Spark or Photon workloads, started by Databricks Workflows. SQL warehouses serve BI tools from gold.
+Bronze keeps the raw record, so a bug in silver can be fixed by rerunning from bronze. Data quality checks, such as expectations in Lakeflow pipelines, can drop or quarantine bad rows between layers.
+used: The standard Databricks lakehouse layout; the same layered design is used on other table formats such as Iceberg.
+avoid: When one small table is enough; extra layers add jobs and storage with no gain.
+flow:
+  Source systems [svc: CRM app logs] -> Bronze [lake: raw Delta] : append as received | Raw records land with no change, plus a load time.
+  Bronze -> Silver job [svc: Spark or Photon] : read new rows | The job reads only rows added since its last run.
+  Silver job -> Silver [lake: clean Delta] : dedupe + typed | Clean, deduplicated and typed rows are merged into silver.
+  Silver job -x> Quarantine [store: bad rows] : failed check | Rows that fail a quality rule are kept aside for review.
+  Silver -> Gold job [svc: aggregates] : join + group | The job builds daily business summaries.
+  Gold job -> Gold [lake: business Delta] : revenue by region | Gold tables are small and ready for BI.
+  BI tool [client: dashboards] -> Gold : SQL warehouse query | Dashboards read gold and never touch bronze.
+ref: docs | What is the medallion lakehouse architecture? | Databricks documentation | https://docs.databricks.com/aws/en/lakehouse/medallion
+ref: paper | Lakehouse: A New Generation of Open Platforms | Armbrust et al., CIDR 2021 |
+
+== Control plane and data plane split
+kind: control-data-plane, zero-trust
+when: A vendor runs a managed data platform, but the customer's data must stay in the customer's own cloud account.
+how: Databricks keeps its control plane in its own account: the web app, notebooks, job scheduler and cluster manager. The compute plane, which is the clusters that process data, runs in the customer's cloud account for classic compute. Serverless compute runs in a Databricks-managed account instead.
+When a job runs, the control plane asks the cloud provider to start virtual machines in the customer's account. The VMs join the cluster and read data from the customer's storage with their own role, not with a vendor key. Results of notebooks are kept in the customer's storage in the classic case.
+The customer controls networking: private links, no public IPs and firewall rules. This split keeps the vendor's fast release cycle for the control plane, while data stays under the customer's rules.
+used: Databricks workspaces with customer-managed VPC or VNet; similar splits exist in other managed data services.
+avoid: When you need the whole stack on-premises and offline; the control plane is a cloud service.
+flow:
+  Data engineer [user] -> Control plane [svc: Databricks account] : start job | The user starts a job in the web app or through the API.
+  Control plane -> Cloud API [svc: customer account] : create VMs | The control plane asks the cloud to launch machines in the customer account.
+  Cloud API -> Compute plane [svc: Spark clusters] : VMs ready | The new VMs form a cluster in the customer's private network.
+  Compute plane -> Customer storage [lake: S3 or ADLS] : read with instance role | The cluster reads data using a role in the customer's own account.
+  Compute plane ~> Control plane : status + logs | The cluster reports status and logs outbound. The control plane does not read the data.
+  Control plane -x> Customer storage : no direct data access | The control plane has no path to the stored tables.
+ref: docs | Databricks architecture overview | Databricks documentation | https://docs.databricks.com/aws/en/getting-started/overview
+
+== Incremental file ingest with Auto Loader
+kind: checkpoint-restart, etl-elt, idempotent-consumer
+when: Thousands of new files land in cloud storage every hour, and each must be loaded exactly once.
+how: Auto Loader is a Spark Structured Streaming source called cloudFiles. It finds new files in a landing folder and loads them into a bronze Delta table. It can list the folder, or use file notifications from the cloud, which scales to millions of files.
+The state of which files were seen is stored in a checkpoint. After a crash or a restart, the job reads the checkpoint and carries on, without loading a file twice or missing one. Schema inference and evolution handle new columns. Unknown columns can go to a rescued data column instead of failing the job.
+The job can run continuously, or in a trigger-once style on a schedule, which gives low cost with a batch feel. Because the write is a Delta transaction, a failed batch leaves no half-written data.
+used: Databricks landing zones for logs, IoT files and vendor exports; Lakeflow pipelines build on the same source.
+avoid: When data arrives as events on Kafka; read the topic directly with Structured Streaming.
+flow:
+  Vendor feed [svc: SFTP to S3] -> Landing folder [lake: raw CSV and JSON] : file part-9981 | New files arrive any time, in any order.
+  Landing folder ~> Auto Loader [svc: cloudFiles stream] : new file notice | Cloud notifications tell the stream about the new files.
+  Auto Loader -> Checkpoint [store: files seen] : record file part-9981 | The job records each file it has taken in.
+  Auto Loader -> Bronze table [lake: Delta] : append rows | Rows are appended in one transaction per micro-batch.
+  Auto Loader -x> Checkpoint : cluster crash | The job stops in the middle of a batch.
+  * Auto Loader: restarted from checkpoint | After the restart, it resumes. The unfinished batch is run again.
+  Auto Loader -> Rescued column [note: unknown fields] : schema drift | A new column is kept in a side column and the job continues.
+ref: docs | What is Auto Loader? | Databricks documentation | https://docs.databricks.com/aws/en/ingestion/cloud-object-storage/auto-loader/
+
+@@ duckdb
+== Embedded analytics over Parquet in object storage
+kind: embedded-analytics
+when: Analysts or a service need fast SQL on files, and running a warehouse cluster would be too heavy.
+how: DuckDB runs inside your process as a library, in Python, Java, Node, a CLI or a browser. There is no server to deploy. A query can read Parquet, CSV or JSON files directly, including from S3 through the httpfs extension, with a statement such as SELECT ... FROM 's3://bucket/events/*.parquet'.
+DuckDB reads only the needed columns and row groups, using Parquet footers and min and max statistics. It processes data in vectors of about 2,048 values, on all CPU cores. One laptop or one 16-core container can scan hundreds of millions of rows in seconds. If data is larger than memory, operators spill to disk.
+This design moves compute to the data in a simple way: one worker per query, no cluster. The limit is one machine, so datasets of many terabytes, or many concurrent users, need a distributed engine.
+used: Data scientists on laptops; serverless functions and notebooks that query lake files; dbt-duckdb for local transforms; applications that embed analytics.
+avoid: When many users write at once, or data is far beyond one machine; use a warehouse or a lakehouse engine.
+flow:
+  Analyst [user: notebook] -> DuckDB [svc: in-process engine] : SELECT ... FROM parquet | The query runs inside the notebook process. No server is involved.
+  DuckDB -> Lake files [lake: Parquet on S3] : read footers | DuckDB reads Parquet footers to learn row group statistics.
+  DuckDB -> Lake files : fetch needed columns | Only the needed columns and row groups are downloaded.
+  * DuckDB: scanning 2,048-row vectors | Each core processes vectors in a tight loop. All cores work in parallel.
+  DuckDB ~> Local disk [store: spill files] : spill big hash table | If memory is not enough, operators write temporary data to disk.
+  DuckDB -> Analyst : result frame | The result returns as a dataframe, Arrow or a table.
+ref: docs | DuckDB documentation | DuckDB Foundation | https://duckdb.org/docs/
+
+== Local ELT step inside a pipeline task
+kind: etl-elt, medallion
+when: A pipeline needs to clean and aggregate medium-sized data (up to some hundreds of GB) without a cluster.
+how: An orchestrator such as Airflow or Dagster starts a task in a container. The task opens DuckDB, reads the raw files from object storage, and runs SQL: joins, deduplication and aggregation. It writes the result as Parquet to the next layer, or into an open table format.
+The SQL can be managed with dbt using the dbt-duckdb adapter, so models, tests and lineage stay the same as on a warehouse. A task is a short-lived process that can be retried, because its input files are immutable and its output goes to a fresh path.
+This costs little: no idle cluster and a simple local debug loop, since the same SQL runs on a laptop. When data outgrows one machine, the SQL moves to a warehouse with small changes.
+used: Small and medium data teams with dbt-duckdb, Dagster or Airflow tasks; MotherDuck and similar services run the same engine in the cloud.
+avoid: When a single step needs terabytes, or strict multi-writer table commits are needed; use Spark or a warehouse.
+flow:
+  Orchestrator [svc: Airflow or Dagster] -> Task container [svc: DuckDB + dbt] : run daily model | The orchestrator starts a short container for each daily run.
+  Task container -> Raw zone [lake: Parquet files] : read day = 2026-10-27 | The task reads only one day of raw files.
+  * Task container: SQL join and dedupe | DuckDB runs the SQL on all cores of the container.
+  Task container -> Curated zone [lake: Parquet output] : write to new path | The task writes to a new path, so a retry never conflicts.
+  Task container -x> Orchestrator : task failed | If the task fails, the orchestrator retries it. Input is unchanged.
+  Task container -> Orchestrator : success + row counts | The orchestrator records success and starts later tasks.
+ref: docs | dbt-duckdb adapter | dbt-duckdb project | 
+
+== Per-tenant database files built ahead of time
+kind: precompute, sharding
+when: A product shows each customer their own analytics, and a shared warehouse would be costly or slow for many small queries.
+how: A nightly job builds one small DuckDB database file, or one Parquet folder, per tenant. The files hold pre-joined and pre-aggregated tables for that tenant's dashboard. They are uploaded to object storage.
+The query service is a pool of stateless containers. For a request, the service finds the tenant's file, downloads it to local disk or opens it directly in read-only mode, and runs SQL. A local copy is cached, so later queries are fast, often milliseconds for a small file.
+Each tenant is isolated by file, which also makes deletion and data export simple. The cost is freshness: data is as new as the last build, and a tenant with huge data needs another approach. Many readers can open one file read-only. Writers need one process at a time.
+used: Customer-facing dashboards and embedded analytics products; the idea is common with SQLite and DuckDB files.
+avoid: When data must be fresh to the second, or tenants vary hugely in size; use a real-time OLAP store.
+flow:
+  Nightly build [svc: batch job] -> Tenant file store [store: one file per tenant] : acme.duckdb 40 MB | The job builds one file per tenant and uploads it.
+  Dashboard [client: web app] -> Query service [svc: stateless pods] : GET /stats?tenant=acme | The user asks for charts for one tenant.
+  Query service -> Local disk [cache: file copies] : lookup acme.duckdb | The service checks for a local copy of the tenant file.
+  Query service -> Tenant file store : download on miss | On a miss, it fetches the file once and keeps it.
+  * Query service: read-only SQL, ms | DuckDB opens the file read-only and answers in milliseconds.
+  Query service -> Dashboard : JSON rows | The page gets small result rows.
+ref: docs | Concurrency in DuckDB | DuckDB documentation | https://duckdb.org/docs/stable/connect/concurrency
+
+@@ hdfs
+== Block replication with NameNode metadata
+kind: heartbeat, wal, sharding
+when: Very large files must be stored on cheap machines, and disks and servers will fail every day.
+how: HDFS splits each file into large blocks, 128 MB by default, and stores each block on three DataNodes. The NameNode keeps only metadata in memory: the directory tree, the file-to-block map, and block locations. Clients ask the NameNode where blocks are, then read or write data directly with DataNodes. File bytes never pass through the NameNode.
+A write goes through a pipeline: the client sends a block to the first DataNode, which forwards it to the second, then the third. Replica placement uses rack awareness, usually two racks, so a rack failure does not lose a block.
+DataNodes send heartbeats every 3 seconds and block reports on a schedule. If heartbeats stop, the NameNode marks the node dead and orders new copies from the surviving replicas. Every metadata change goes to an edit log first, which is a write-ahead log.
+used: Hadoop clusters at Yahoo, Facebook and many others; the storage layer under Hive, Spark and HBase on-premises.
+avoid: When there are millions of tiny files, because the NameNode holds each one in memory; or when you need cheap elastic storage, use object storage.
+flow:
+  Client [client] -> NameNode [svc: metadata in RAM] : create /logs/a.log | The client asks for a new file. The NameNode logs the change to its edit log.
+  NameNode -> Client : block 1 on DN1, DN4, DN7 | The NameNode returns three DataNodes on two racks.
+  Client -> DataNode 1 [svc: rack 1] : stream block 1 | The client sends the block to the first DataNode only.
+  DataNode 1 -> DataNode 4 [svc: rack 2] : forward | Each DataNode forwards the data to the next in the pipeline.
+  DataNode 4 -> DataNode 7 [svc: rack 2] : forward | The second DataNode passes the block to the third. All three copies exist when the write is acknowledged.
+  DataNode 7 ~> NameNode : heartbeat every 3 s | Each DataNode reports it is alive. Missing heartbeats mark it dead.
+  NameNode -x> DataNode 7 : dead after 10 min | A silent node is declared dead, and its blocks are copied again.
+ref: docs | HDFS architecture | Apache Hadoop documentation | https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html
+ref: paper | The Google File System | Ghemawat, Gobioff & Leung, SOSP 2003 |
+
+== NameNode high availability with journal quorum
+kind: active-passive, quorum, fencing-token
+when: The NameNode is a single point of failure, and the cluster must survive its loss within seconds.
+how: In an HA cluster there are two NameNodes: one active and one standby. The active one writes every edit to a group of JournalNodes, usually three. An edit is committed when a majority, two of three, has it. The standby reads the same edits and keeps its memory state almost current. DataNodes send block reports to both.
+A ZooKeeper Failover Controller (ZKFC) on each NameNode host holds a ZooKeeper lock for the active role. If the active fails its health check, the lock expires, and the other ZKFC takes it and promotes the standby.
+The old active may still be alive but cut off, which is the split-brain danger. So a fencing step runs first: the JournalNodes accept writes only from the newest epoch, and fencing methods such as SSH kill can stop the old process. Only then does the new active serve clients.
+used: Production HDFS clusters in HA mode with QJM; the standard layout since Hadoop 2.
+avoid: When a cluster is small and short downtime is fine; one NameNode with a secondary for checkpoints is simpler.
+flow:
+  Client [client] -> Active NameNode [svc: serving] : mkdir /data/x | Clients talk to the active NameNode only.
+  Active NameNode -> JournalNodes [log: 3 nodes] : edit 90412 | The edit is written to three JournalNodes. A majority of two commits it.
+  JournalNodes -> Standby NameNode [svc: tailing edits] : new edits | The standby reads the edits and keeps its namespace current.
+  ZKFC [svc: failover controller] -> Active NameNode : health check | The controller checks the active NameNode.
+  Active NameNode -x> ZKFC : no response | The active NameNode hangs. Its ZooKeeper lock expires.
+  ZKFC -> Standby NameNode : fence old, promote | The controller fences the old active and promotes the standby. Journals accept only the new epoch.
+ref: docs | HDFS High Availability with QJM | Apache Hadoop documentation | https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HDFSHighAvailabilityWithQJM.html
+
+== Compute scheduled next to its blocks
+kind: data-locality, scatter-gather
+when: A job reads terabytes, and moving them across the network would be the main cost.
+how: Because the NameNode knows where each block lives, a scheduler can ask for the block locations of a job's input. YARN then tries to place each map task on a node that holds a replica of its block. This is node-local. If that node is busy, the next choice is another node in the same rack, then any node.
+Reading a local disk avoids network hops and keeps top-of-rack and core switches free. With three replicas, a scheduler has three chances for a local slot. Some schedulers wait a short time, delay scheduling, for a local slot before they accept a remote one.
+HDFS also allows short-circuit local reads, where a client on the same machine reads block files directly and skips the DataNode's network stack. The idea weakens when storage and compute are separated, as with object storage, where caches replace locality.
+used: MapReduce, Spark and Hive on YARN with HDFS; the original goal of the Hadoop design.
+avoid: When data sits in object storage; locality is not available, so use caching and fast networks.
+flow:
+  Job [client: Spark or MR job] -> NameNode [svc: block map] : where is /logs/day1? | The job asks for block locations of its input files.
+  NameNode -> Job : block 7 on DN2, DN5, DN9 | Each block returns with the nodes that hold its replicas.
+  Job -> YARN scheduler [svc: ResourceManager] : block 7, prefer DN2 | The job asks for a container on a node that has a replica.
+  YARN scheduler -> DataNode 2 [svc: runs task] : container on DN2 | The container starts on the node that holds the block.
+  DataNode 2 -> Local disk [store: block 7] : short-circuit read | The task reads the block from local disk, with no network hop.
+  YARN scheduler -x> DataNode 2 : node full | If the node has no free slot, the scheduler tries the same rack, then any node.
+ref: paper | MapReduce: Simplified Data Processing on Large Clusters | Dean & Ghemawat, OSDI 2004 |
+
+@@ hive
+== Shared metastore as the table catalog
+kind: shared-catalog
+when: Several engines, such as Spark, Trino and Hive, must see the same tables, schemas and partitions over the same files.
+how: The Hive Metastore (HMS) is a service with a relational database, often MySQL or Postgres. It stores table names, column types, file format, location and partition lists. The data stays in files on HDFS or object storage. HMS holds no data, only the description.
+Engines connect to HMS over Thrift. A Spark job asks for the table, gets the schema and the file locations, and reads the files itself. Trino and Presto do the same, so a table made by Hive can be queried by them.
+Partition lists in HMS let engines skip folders without listing the storage. Table formats such as Iceberg and Delta can also use HMS as the catalog that points to the current table metadata. HMS can become a bottleneck with millions of partitions, so keep partition counts sane and cache metadata.
+used: Hive Metastore under Spark, Trino, Presto, Impala and Flink in many companies; AWS Glue Data Catalog offers a compatible interface.
+avoid: When you need fine-grained governance and lineage across many formats; use a modern catalog such as Unity Catalog or Apache Polaris with it.
+flow:
+  Hive CLI [client: CREATE TABLE] -> Metastore service [svc: Thrift API] : create table events | The first engine registers the table: schema, format, location.
+  Metastore service -> Metastore DB [db: MySQL or Postgres] : save schema | Metadata is saved in a relational database. No data bytes are stored.
+  Spark job [client: reader] -> Metastore service : get table events | A second engine asks for the same table by name.
+  Metastore service -> Spark job : schema + partition list | It returns the columns and the folder for each partition.
+  Spark job -> Warehouse files [lake: ORC or Parquet] : read 3 partitions | Spark reads only the folders it needs, straight from storage.
+  Trino [client: reader] -> Metastore service : get table events | Trino uses the same metadata and sees the same table.
+ref: docs | Hive Metastore administration | Apache Hive wiki | https://cwiki.apache.org/confluence/display/Hive/AdminManual+Metastore+Administration
+
+== SQL compiled to a distributed DAG
+kind: interpreter-compiler, data-locality
+when: Analysts write SQL, and the platform must run it over huge files on a cluster without hand-written jobs.
+how: HiveServer2 accepts a HiveQL query over JDBC. The compiler parses it into a syntax tree, resolves tables and columns with the metastore, and builds a logical plan. The cost-based optimizer (Calcite) reorders joins and prunes columns, using table statistics.
+The physical planner then makes a DAG of stages for the execution engine, today usually Tez, in older setups MapReduce. Each stage is a vertex: scans, joins, aggregations, and the edges are shuffles. Containers run these vertices on YARN, close to the data.
+Vectorized execution processes 1,024 rows per batch. Columnar formats such as ORC allow predicate pushdown, so stripes that cannot match are skipped. LLAP can keep long-lived daemons with caches for fast interactive queries. Statistics must be refreshed with ANALYZE, or the optimizer picks bad plans.
+used: HiveServer2 with Tez in Hadoop data warehouses; the same parse, optimize, execute design is used in Spark SQL and Trino.
+avoid: When queries must return in a few hundred milliseconds; use an MPP engine or a serving store.
+flow:
+  BI tool [client: JDBC] -> HiveServer2 [svc: parse + plan] : SELECT region, SUM(x) ... | The query arrives over JDBC and is parsed into a tree.
+  HiveServer2 -> Metastore [svc: schemas + stats] : resolve tables | The compiler needs column types, partitions and statistics.
+  HiveServer2 -> Optimizer [svc: Calcite CBO] : logical plan | The optimizer reorders joins and prunes unused columns.
+  Optimizer -> Tez on YARN [svc: DAG of vertices] : physical DAG | The physical plan becomes a DAG: scan, shuffle, aggregate.
+  Tez on YARN -> Warehouse files [lake: ORC on HDFS] : scan with pushdown | Vertices read ORC stripes. Stripes that cannot match are skipped.
+  Tez on YARN -> BI tool : result rows | The final aggregate streams back through HiveServer2.
+ref: docs | Apache Hive documentation | Apache Hive | https://hive.apache.org/docs/latest/
+
+== Partitioned warehouse with daily batch loads
+kind: sharding, etl-elt
+when: A data warehouse on files must load logs every day and answer queries by date without full scans.
+how: The table is partitioned by date: each day is a folder, such as dt=2026-10-27, holding ORC or Parquet files. A nightly job writes one new partition with INSERT OVERWRITE PARTITION. Because it replaces a whole partition, a rerun after a failure gives the same result, so the job is safe to retry.
+A query with WHERE dt BETWEEN two dates lets the planner read only those folders. This is partition pruning, and it turns a scan of 3 years into a scan of 7 days. Add bucketing on a join key to help big joins, and keep the partition count in thousands, not millions.
+Hive ACID tables also allow UPDATE and DELETE through delta files that a background compaction merges. Use them for late corrections. Raw data stays in a bronze zone, and curated tables are rebuilt from it.
+used: Daily log and event warehouses on Hive, since Facebook's original deployment; Spark and Trino read the same partitioned layout.
+avoid: When data arrives continuously and needs fresh results in seconds; use streaming ingestion into a table format such as Iceberg.
+flow:
+  Scheduler [svc: Airflow daily] -> Load job [svc: Hive on Tez] : run for dt=2026-10-27 | The scheduler starts the load for one day only.
+  Load job -> Raw logs [lake: JSON in HDFS] : read one day | The job reads that day's raw files.
+  Load job -> Events table [lake: partitioned ORC] : OVERWRITE dt=2026-10-27 | The job replaces the whole day folder, so a retry is safe.
+  Load job -> Metastore [svc: partition list] : add partition | The new partition is registered in the metastore.
+  Analyst [user] -> Events table : WHERE dt in last 7 days | The query names a date range.
+  Events table -> Analyst : read 7 of 1,095 folders | The planner prunes the other folders and reads only 7 days.
+ref: docs | Hive language manual: DDL | Apache Hive wiki | https://cwiki.apache.org/confluence/display/Hive/LanguageManual+DDL
+
+@@ mapreduce
+== Map, shuffle, reduce over HDFS blocks
+kind: map-reduce, data-locality
+when: A huge file set must be grouped or counted by key, with automatic parallelism and fault handling.
+how: The input is split by HDFS block, often 128 MB. One map task runs per split, ideally on a node that holds the block. A mapper reads records and emits key-value pairs, for example (word, 1).
+Each mapper sorts its output by key and writes it to local disk, split into one file per reducer using a hash of the key. In the shuffle, every reducer fetches its part from all mappers over the network. The reducer merges the sorted streams, so all values of one key arrive together, and writes the result to HDFS.
+A combiner can pre-sum on the map side, which cuts shuffle data a lot. Intermediate output is local, not replicated, so the model is simple and cheap. But every job writes to disk, which makes iterative work slow.
+used: Google's original design, Hadoop jobs at Yahoo and Facebook; still the model behind the Hive on MR and Sqoop era.
+avoid: When the job is iterative or interactive; use Spark, Tez or an SQL engine that keeps data in memory between stages.
+flow:
+  Input blocks [lake: 400 HDFS blocks] -> Mapper 1 [svc: on block holder], Mapper 2 [svc: on block holder] : read split | Each mapper reads one block on the node that stores it.
+  Mapper 1 -> Local disk [store: sorted by key] : spill by key | A mapper sorts its output by key and writes one part per reducer.
+  Local disk -> Reducer 1 [svc: keys a to m], Reducer 2 [svc: keys n to z] : shuffle fetch | Each reducer pulls its parts from every mapper. This is the network-heavy step.
+  Reducer 1 -> Output [lake: HDFS result] : merge + reduce | A reducer merges sorted input and writes the final counts.
+  + Reducer 2 -> Output : merge + reduce
+  Mapper 2 -x> Local disk : map task failed | A failed task is simply run again on another node.
+ref: paper | MapReduce: Simplified Data Processing on Large Clusters | Dean & Ghemawat, OSDI 2004 |
+ref: docs | MapReduce tutorial | Apache Hadoop documentation | https://hadoop.apache.org/docs/stable/hadoop-mapreduce-client/hadoop-mapreduce-client-core/MapReduceTutorial.html
+
+== Task re-execution and speculative backups
+kind: scheduler-agent, hedged-requests, heartbeat
+when: A job runs on hundreds of cheap machines, where some will fail and some will be slow.
+how: The ApplicationMaster (or the master in the original design) tracks every task. Workers send heartbeats. If a worker stops, its running tasks are scheduled again on other nodes. Completed map tasks on that node must also be rerun, because their output was on its local disk and is lost.
+Tasks are deterministic and have no side effects until their output is committed. So running a task twice is safe. Output is written to a temporary file and moved to the final path only when the task is accepted, so a duplicate cannot produce a double result.
+A few slow tasks, called stragglers, can delay the whole job. Near the end the framework starts a speculative copy of a slow task on another node. The first copy to finish wins, and the other is killed. This costs a little extra work, and the Google paper reported large speedups on some jobs.
+used: Hadoop MapReduce, as speculative execution; Spark and Tez use the same ideas.
+avoid: When tasks have side effects such as writing to an external database; turn speculation off or make writes idempotent.
+flow:
+  ApplicationMaster [svc: job master] -> Worker A [svc: runs map 41], Worker B [svc: runs map 42] : assign tasks | The master assigns each task to a worker.
+  Worker A ~> ApplicationMaster : heartbeat + progress 90% | Heartbeats carry progress, so the master knows who is slow.
+  Worker B -x> ApplicationMaster : heartbeat lost | Worker B goes silent. Its tasks and its stored map output are lost.
+  ApplicationMaster -> Worker C [svc: replacement] : re-run map 42 | The master reruns the lost task on another worker.
+  ApplicationMaster -> Worker D [svc: speculative copy] : backup of slow map 17 | A straggler gets a backup copy near the end of the job.
+  Worker D -> ApplicationMaster : map 17 done first | The first copy to finish is accepted. The slow copy is killed.
+ref: paper | MapReduce: Simplified Data Processing on Large Clusters | Dean & Ghemawat, OSDI 2004 |
+
+== Map-side join with a small table in the cache
+kind: map-reduce, batching
+when: A large fact file must be joined with a small lookup table, and a full shuffle would be wasteful.
+how: A reduce-side join sends both inputs through the shuffle, tagged by source, and joins them in reducers. This moves all the big data across the network. When one table is small, for example 50 MB, there is a cheaper way.
+The job copies the small table to every node with the distributed cache. Each mapper loads it into a hash map in memory during setup. Then, for each record of the big file, the mapper looks up the key and writes the joined row. There is no reduce phase for this step, and nothing is shuffled.
+The limit is memory: the small table must fit in each task's heap. Both inputs must also use the same join key. Hive and later engines automate this as a map join or broadcast join.
+used: Hadoop jobs that enrich logs with dimension tables; Hive map join; Spark broadcast join follows the same logic.
+avoid: When both tables are large; use a reduce-side join, or sort-merge join on partitioned data.
+flow:
+  Job client [client] -> Distributed cache [store: users.csv 50 MB] : ship small table | The job copies the small table to every worker node.
+  Big log splits [lake: 2 TB in blocks] -> Mapper [svc: hash map in RAM] : read split | Each mapper reads one block of the big file.
+  Distributed cache -> Mapper : load at setup | The mapper loads the small table into memory once.
+  Mapper -> Mapper output [lake: HDFS joined rows] : lookup + write row | For each record the mapper finds the user and writes a joined row.
+  Mapper -x> Job client : out of memory | A table that is too large for the heap fails the task. Use a reduce-side join then.
+ref: docs | MapReduce tutorial: distributed cache | Apache Hadoop documentation | https://hadoop.apache.org/docs/stable/hadoop-mapreduce-client/hadoop-mapreduce-client-core/MapReduceTutorial.html
+
+@@ mesos
+== Two-level scheduling with resource offers
+kind: scheduler-agent
+when: Several frameworks, such as Spark and a service scheduler, must share one cluster, and each knows its own needs best.
+how: Mesos agents run on every machine and report free CPU and memory to the Mesos master. The master does not decide what runs. Its allocator makes resource offers to frameworks, for example "agent 7 has 4 CPUs and 8 GB". Dominant resource fairness decides which framework is offered resources next.
+Each framework has its own scheduler. It accepts an offer, fully or in part, and replies with tasks to launch, or it declines. The master then tells the agent to start an executor, and the framework's tasks run in it. Declined resources go back to the pool and are offered to others.
+This is two-level scheduling. The master shares resources between frameworks, and each framework places its own tasks. The cost is that a framework with special needs may wait for the right offer, and it cannot see the whole cluster at once. Mesos was retired to the Apache Attic in 2025, so new systems use Kubernetes or YARN.
+used: Twitter, Apple (Siri back end) and Airbnb ran large Mesos clusters in the 2010s; Spark supported Mesos until version 4.0.
+avoid: For any new cluster; Mesos is retired. Use Kubernetes, or YARN for Hadoop-style work.
+flow:
+  Agent [svc: node: 4 CPU 8 GB] -> Master [svc: allocator] : free resources | Every agent reports its free CPU and memory to the master.
+  Master -> Spark scheduler [svc: framework] : offer: agent 7, 4 CPU | The allocator offers resources to the framework that is fairest to serve next.
+  Spark scheduler -> Master : launch 2 tasks, 2 CPU each | The framework accepts part of the offer and names its tasks.
+  Master -> Agent : run executor + tasks | The master tells the agent to start the tasks. It does not choose them.
+  Spark scheduler -x> Master : decline offer | A framework with no work declines. The resources go to another framework.
+  Agent ~> Spark scheduler : task status: running | The agent reports task status to the framework that owns the tasks.
+ref: paper | Mesos: A Platform for Fine-Grained Resource Sharing in the Data Center | Hindman et al., NSDI 2011 |
+ref: paper | Dominant Resource Fairness: Fair Allocation of Multiple Resource Types | Ghodsi et al., NSDI 2011 |
+
+== Master high availability with ZooKeeper
+kind: leader-election, consistent-core
+when: The cluster master must survive a crash, and running tasks must not be lost while a new master takes over.
+how: A Mesos cluster runs three or five masters. They use ZooKeeper to elect a leader: each master creates an ephemeral node, and the one with the lowest sequence number leads. The other masters stay on standby and watch.
+Agents and frameworks find the leader by reading ZooKeeper. When the leader dies, its ephemeral node disappears. The standby masters elect a new leader within seconds. The new leader rebuilds its state by asking agents to re-register and frameworks to reconnect. Tasks keep running on the agents during the change, because the master is not on the data path of a running task.
+Agent re-registration uses a timeout. If an agent does not return, its tasks are marked lost, and frameworks can restart them.
+used: Mesos clusters in production in the 2010s; the same ZooKeeper election method is used by Kafka before KRaft, HBase and HDFS HA.
+avoid: When you can use a platform with built-in consensus, such as Kubernetes with etcd.
+flow:
+  Master 1 [svc: leader] -> ZooKeeper [store: ensemble of 3] : ephemeral node 0001 | Each master registers an ephemeral node. The lowest number leads.
+  Master 2 [svc: standby] -> ZooKeeper : ephemeral node 0002 | The other masters wait and watch the leader's node.
+  Agent [svc: node] -> ZooKeeper : who leads? | Agents and frameworks read ZooKeeper to find the leader.
+  Master 1 -x> ZooKeeper : session lost | The leader crashes. Its ephemeral node is deleted.
+  ZooKeeper -> Master 2 : you are leader | The watcher fires and Master 2 becomes the leader.
+  * Master 2: leader, rebuilding | The new leader has no task state at first.
+  Agent -> Master 2 : re-register + tasks | Agents re-register and report their running tasks. Tasks never stopped.
+ref: docs | Mesos high availability | Apache Mesos documentation | https://mesos.apache.org/documentation/latest/high-availability/
+
+== Long-running services with Marathon-style health checks
+kind: control-loop, health-check, service-discovery
+when: Web services, not batch jobs, must run on a shared cluster and be restarted automatically.
+how: Marathon was a framework on Mesos for long-running apps. A user submits an app definition: command or container, CPU, memory, instance count 10, and a health check URL. Marathon accepts offers from Mesos and launches 10 tasks.
+Marathon keeps comparing wanted and actual state, which is a reconciliation loop. If a task dies or fails its health check, Marathon starts a new one on another offer. A rolling upgrade replaces tasks in small groups while keeping a minimum healthy share.
+Service discovery was done outside Marathon: a tool such as Mesos-DNS or Marathon-LB (HAProxy) read the task list and updated names or the load balancer. Kubernetes later made this model standard with Deployments and Services, and Marathon is no longer maintained. New designs should use those.
+used: Marathon with Mesos in many 2015 to 2019 platforms such as DC/OS; replaced in most places by Kubernetes.
+avoid: For new work; use Kubernetes Deployments, which cover the same loop with a large ecosystem.
+flow:
+  Operator [user] -> Marathon [svc: app scheduler] : app web, 10 instances | The operator submits the wanted state: image, resources, health URL.
+  Marathon -> Mesos master [svc: offers] : accept offers, launch 10 | Marathon accepts offers and launches the tasks.
+  Mesos master -> Agents [svc: 10 tasks running] : run tasks | Agents start the containers.
+  Marathon -> Agents : GET /health | Marathon checks each instance on a timer.
+  Agents -x> Marathon : instance 4 unhealthy | One instance fails the check, so actual state differs from wanted state.
+  Marathon -> Mesos master : launch replacement | The loop starts a replacement on a new offer.
+  Marathon ~> Load balancer [svc: HAProxy] : updated task list | The load balancer is updated and sends traffic only to healthy tasks.
+ref: docs | Apache Mesos documentation | Apache Mesos | https://mesos.apache.org/documentation/latest/
+
+@@ photon
+== Native engine replaces Spark operators with fallback
+kind: strangler-fig
+when: A team wants a faster SQL engine without rewriting their jobs or changing their Spark code.
+how: Photon is a C++ engine inside Databricks Runtime. It does not replace Spark. The Spark planner builds its usual physical plan. Then Photon walks the plan from the scan upward and swaps each supported operator, such as scan, filter, join, aggregate, for its native version.
+Operators that Photon does not support stay on the JVM Spark path. A converter changes the data between formats at the border. So a query can be part native and part JVM, with no change to the SQL, DataFrame code or results.
+The Photon share of a plan shows in the query profile. If an unsupported operator or user function sits in the middle, it splits the native part and adds conversion cost, so check the profile before you tune. Photon is billed with higher rates per unit, so measure whether the speed gain beats the price.
+used: Databricks SQL and clusters with Photon turned on; Photon is a Databricks product and runs only there.
+avoid: When workloads are mostly Python UDFs or RDD code; Photon helps little, so skip the extra price.
+flow:
+  SQL query [client: DataFrame or SQL] -> Spark planner [svc: Catalyst] : parse + optimize | The same Spark planner makes the physical plan as before.
+  Spark planner -> Photon rewrite [svc: swap operators] : physical plan | Photon walks the plan and marks operators it can run natively.
+  Photon rewrite -> Native stages [svc: C++ operators] : scan, filter, join, agg | Supported operators run in C++ on columnar batches.
+  Photon rewrite -> JVM stages [svc: Spark operators] : Python UDF stage | An unsupported operator stays on the usual Spark path.
+  JVM stages -> Native stages : convert at border | Data is converted at the edge. This costs time, so keep native stretches long.
+  Native stages -> Result [store: query result] : rows | The result is the same as with plain Spark, only faster.
+ref: paper | Photon: A Fast Query Engine for Lakehouse Systems | Behm et al., SIGMOD 2022 |
+
+== Vectorized columnar execution
+kind: vectorized-execution
+when: CPU time, not disk, is the bottleneck for SQL over columnar files, and you want more rows per second per core.
+how: A row-at-a-time engine calls a function for every value, with high overhead. A vectorized engine works on batches: a column of about 1,000 to 4,000 values is held in a tight array. An operator runs one simple loop over the array. The loop stays in CPU cache, avoids branches and can use SIMD instructions, which handle many values in one step.
+Filters make a selection vector, which lists the surviving row positions, so rows are not copied. A hash join builds a table from one side, then probes it with a batch of keys at once. Code is written in C++ and compiled for the machine, and does not run through the JVM's object model, which is how Photon differs from Spark's generated Java code.
+Operators are chained so that each hands a batch to the next, and the data format is columnar from the file to the output. This matches Parquet and Delta files.
+used: Photon, DuckDB, ClickHouse and Velox all use batch-at-a-time columnar execution; the MonetDB/X100 paper started the idea.
+avoid: When queries touch few rows through an index, as in OLTP; a row engine is better.
+flow:
+  Parquet file [lake: columns on storage] -> Scan operator [svc: decode to vectors] : column chunks | The scan decodes whole columns into arrays of about 4,000 values.
+  Scan operator -> Filter operator [svc: SIMD compare] : batch of 4,000 | The filter tests the whole array in one tight loop.
+  Filter operator -> Hash join [svc: build + probe] : selection vector | Only a list of passing positions is passed on. No rows are copied.
+  Hash join -> Aggregate [svc: group and sum] : batch of matches | Matching rows are produced in batches for the next operator.
+  * Aggregate: partial sums in cache | Partial sums stay in CPU cache and not in main memory.
+  Aggregate -> Result [store: columnar output] : final groups | The final groups are written out.
+ref: paper | MonetDB/X100: Hyper-Pipelining Query Execution | Boncz, Zukowski & Nes, CIDR 2005 |
+
+== Disk cache for remote lakehouse files
+kind: tiered-storage, cache-aside
+when: Queries read the same Parquet or Delta files from cloud object storage again and again.
+how: Object storage has high delay, often tens of milliseconds per request, and charges per request. Databricks clusters have local SSDs, and a disk cache keeps copies of recently read file parts there. It caches the data pages, which are decoded fast by the native engine.
+A scan first checks the local cache. On a hit it reads from SSD at a very high rate. On a miss it reads from object storage and stores a copy. Eviction is least recently used. Because Delta data files are immutable, a cached file never goes stale. A changed table means new file names, so there is no invalidation work.
+Scans also skip data: file statistics, data skipping and partition pruning keep reads small before the cache is even used. The cache is lost when a cluster stops, and a new cluster starts cold, so the first run of a query is the slow one.
+used: Databricks disk cache on worker nodes with SSDs; similar local file caches exist in Trino, Snowflake and Alluxio.
+avoid: When each file is read once, such as a one-time load; the cache only adds writes.
+flow:
+  Photon scan [svc: native scan] -> Disk cache [cache: local NVMe SSD] : read file part 0042 | The scan asks the local cache first.
+  Disk cache -> Photon scan : hit: SSD read | A hit is served from local disk. No cloud request is made.
+  Disk cache -x> Photon scan : miss | The part is not cached yet.
+  Photon scan -> Object storage [lake: S3 or ADLS Delta] : GET range | On a miss the scan reads the byte range from object storage.
+  Object storage -> Disk cache : file part | The part is stored in the cache for the next query.
+  * Disk cache: 80% full, LRU on | Cache fills up. The oldest parts are removed first.
+ref: docs | Disk cache | Databricks documentation | https://docs.databricks.com/aws/en/optimizations/disk-cache

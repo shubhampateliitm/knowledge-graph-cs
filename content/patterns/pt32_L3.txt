@@ -1,0 +1,790 @@
+@@ unicode
+== Decode once at the edge, normalize, then pass clean text
+kind: anti-corruption, pipes-filters
+when: Text arrives from many sources and encodings, and the rest of the system must see one clean form.
+how: At the system edge, a small stage decodes the incoming bytes as strict UTF-8. It rejects bad input: overlong forms such as C0 AF, lone surrogates, and values above U+10FFFF. Old sources that send Latin-1 or Shift-JIS are converted here, once, using the declared charset.
+The next stage normalizes the text to NFC, so "é" typed as one code point and as "e" plus U+0301 become the same bytes. Then control characters are removed or flagged. Everything after this stage handles only valid UTF-8 and never guesses an encoding.
+The cost is a small CPU step per record, and a policy choice for bad bytes: reject the record, or replace with U+FFFD. Keep a counter of rejected records per source, so a broken upstream feed shows up quickly.
+used: Browsers and web servers (UTF-8 is the default for HTML and JSON); Kafka and Spark ingestion jobs that clean app names and search queries; Python 3 and Go, which decode at the I/O boundary.
+avoid: When the data is opaque binary, such as images or encrypted blobs; keep it as bytes and never decode it.
+flow:
+  Mobile app [client: sends bytes] -> Ingest API [svc: strict UTF-8] : raw bytes | The app posts bytes with a charset header. The API decodes them as strict UTF-8.
+  Ingest API -x> Reject counter [store: per source] : overlong C0 AF | A bad sequence is rejected and counted per source, so a broken feed is noticed.
+  Ingest API -> Normalizer [svc: NFC] : code points | Valid text moves on as code points. Mixed forms of the same letter are not yet equal.
+  Normalizer -> Kafka topic [log: UTF-8 only] : NFC UTF-8 bytes | After NFC, equal text gives equal bytes, so downstream joins and group-bys work.
+  Kafka topic -> Parquet lake [lake: UTF-8 strings] : strings | Spark and Parquet store the clean strings. No consumer needs to guess an encoding.
+ref: spec | UTF-8, a transformation format of ISO 10646 (RFC 3629) | Yergeau, IETF, 2003 | https://www.rfc-editor.org/rfc/rfc3629
+ref: spec | Unicode Standard Annex 15: Unicode Normalization Forms | Unicode Consortium | https://www.unicode.org/reports/tr15/
+
+== Normalized search key beside the display text
+kind: index-table
+when: Users search or deduplicate names, but the same name can be typed in many visually equal ways.
+how: Store the original text for display and add a second column, the search key. The key is made by NFKC normalization, then case folding, then optional removal of accents. A byte compare on keys then works.
+A user who searches "Zoë" finds "ZOË" and "Zoe" (the last one only if accent removal is on). The index is built on the key column, not on the raw text. For sorting by language, use a collation (the Unicode Collation Algorithm) at query time, because byte order is not alphabetical order in most languages.
+Be careful with locale rules. Turkish dotted and dotless "i" and German "ß" fold differently by language, so keep the key rules fixed and written down. Changing them later means rebuilding the whole index.
+used: PostgreSQL and ICU collations; Elasticsearch and Lucene analyzers with ICU folding; ad-tech systems that match app names and search queries across countries.
+avoid: When exact, case-sensitive matches are required, such as passwords or file hashes; compare raw bytes there.
+flow:
+  Writer [svc] -> Name table [db: raw display text] : INSERT name | The writer stores the exact text the user typed, for display.
+  Writer -> Key builder [svc: NFKC + casefold] : "Zoë" | A key builder makes a search key from the same text.
+  Key builder -> Key index [store: B-tree on key] : zoe | The key is stored in an index. All visually equal spellings land on one key.
+  Searcher [client] -> Key builder : query "ZOË" | The query goes through the same key builder, so both sides use identical rules.
+  Key builder -> Key index : lookup zoe | A plain byte lookup finds the row.
+  Key index -> Name table : fetch row | The row is fetched and the original text is shown.
+ref: spec | Unicode Technical Standard 10: Unicode Collation Algorithm | Unicode Consortium | https://www.unicode.org/reports/tr10/
+
+@@ usb
+== Host-polled bus with enumeration and class drivers
+kind: plugin-arch, layered-protocol
+when: Many kinds of cheap devices must plug into one host with no manual setup and no custom driver for each.
+how: The host controller is the only master. After plug-in it resets the device, gives it an address, and reads its descriptors. The descriptors name the vendor and product, the class code and the endpoints.
+The kernel matches the class code (HID, mass storage, audio) to a generic driver. A new keyboard works with no new driver. Only unusual devices need a vendor driver, matched by vendor and product ID.
+Data then moves by one of four transfer types. Control moves commands. Bulk moves disk data with retries but no timing promise. Interrupt gives bounded latency for keystrokes by polling. Isochronous reserves bandwidth for audio and video and never retries. The host plans each 1 ms frame, so a device never has to fight for the bus.
+used: Linux USB core and Windows USB stack; every phone, laptop and monitor with USB-C; USB audio class used by headsets and microphones.
+avoid: When you need long cables, many meters of reach, or many fast peer-to-peer links; use Ethernet or PCI Express instead.
+flow:
+  USB device [client: flash drive] -> Host controller [svc: xHCI] : plug-in | A pull-up resistor tells the root hub that a device is attached.
+  Host controller -> USB device : reset, SET_ADDRESS | The host resets the device and gives it a free address from 1 to 127.
+  USB device -> Host controller : descriptors | The device returns its 18-byte device descriptor, then its configuration with endpoints.
+  Host controller -> Kernel USB core [svc: matches class] : device added | The kernel reads the class code, here mass storage.
+  Kernel USB core -> Storage driver [svc: generic class driver] : bind | A generic class driver binds to the device. No vendor driver is needed.
+  Storage driver -> USB device : bulk IN/OUT | Bulk transfers copy file data, using whatever bandwidth is left on the bus.
+ref: docs | USB 2.0 Specification and USB Implementers Forum documents | USB-IF | https://www.usb.org/documents
+
+== Security key challenge-response over USB or NFC
+kind: challenge-response
+when: A website must be sure the user holds a specific device, and a stolen password alone must not be enough.
+how: At registration the security key creates a key pair for that site and gives the site the public key. The private key never leaves the key. At login the site sends a random challenge to the browser.
+The browser passes the challenge to the key over USB, NFC or Bluetooth, together with the site's origin. The user touches the key. The key signs the challenge and the origin with the private key and returns the signature. The site checks it with the stored public key.
+Because the origin is signed in, a fake site cannot reuse the answer on the real site. This is the core of FIDO2 and passkeys. USB is only the carrier here: the host sends a packet, the key answers when polled.
+used: YubiKey and other FIDO2 keys; passkeys on phones that use NFC or USB to a laptop; workforce sign-in at companies that require phishing-resistant MFA.
+avoid: When users cannot carry a device and have no phone; use a platform passkey or a one-time code as a fallback.
+flow:
+  Website [svc: has public key] -> Browser [client] : random challenge | At login the website sends a fresh random challenge.
+  Browser -> Security key [svc: private key inside] : challenge + origin | The browser forwards the challenge and the site origin over USB or NFC.
+  Security key -> User [user: touch] : wait for touch | The key waits for a touch so that malware cannot sign silently.
+  User -> Security key : touch | The user touches the key to approve.
+  Security key -> Browser : signature | The key signs challenge and origin, and returns the signature.
+  Browser -> Website : signed assertion | The website checks the signature with the public key and opens a session.
+ref: spec | Web Authentication: An API for accessing Public Key Credentials | W3C | https://www.w3.org/TR/webauthn-3/
+
+@@ vonneumann
+== Bytecode interpreter: the program is data in memory
+kind: interpreter-compiler
+when: You need to run the same logic on many machines, or change behaviour without rebuilding the host program.
+how: A stored-program computer treats code as data. A virtual machine copies this idea one level up. The program is compiled to bytecode and held in an array. A program counter (pc) indexes the array.
+The interpreter loop does fetch, decode and execute in software. It reads the opcode at pc, jumps to its handler, runs it on a value stack or registers, then advances pc. A jump instruction just writes a new value into pc. A call pushes the return address, which is only a number stored in memory.
+Typical cost is 10 to 50 machine instructions per bytecode, so a plain interpreter is several times slower than native code. Its gains are portability, safety checks and fast start. Many runtimes add a JIT compiler for the hot code only.
+used: CPython bytecode loop; the JVM interpreter before JIT; WebAssembly runtimes; SQLite's VDBE virtual machine runs every SQL statement as bytecode.
+avoid: When raw speed in a hot inner loop matters most; compile ahead of time or use a JIT.
+flow:
+  Source file [store: app.py] -> Compiler [svc: front end] : parse | The compiler parses the source text once.
+  Compiler -> Bytecode array [store: code as data] : opcodes | It writes opcodes into an array in memory. The program is now plain data.
+  Bytecode array -> Dispatch loop [svc: pc = 0] : fetch op at pc | The loop fetches the opcode that pc points to, then decodes it.
+  Dispatch loop -> Value stack [store: operands] : execute ADD | The handler pops two values, adds them and pushes the result.
+  * Dispatch loop: pc = 7 | Normal execution advances pc by one instruction.
+  Dispatch loop -> Bytecode array : JUMP 2 | A jump writes a new number into pc, and the loop goes back to instruction 2.
+ref: docs | Inside the Python Virtual Machine | Obi Ike-Nwosu, book online | 
+
+== Split instruction and data caches on one shared memory
+kind: memory-tiering
+when: A CPU must fetch an instruction and read data in the same cycle, but programs and data live in one memory.
+how: Pure von Neumann design has one memory path, so fetch and data access compete. This is the von Neumann bottleneck. Modern CPUs keep one address space but add separate level-1 caches: one for instructions, one for data. This is called a modified Harvard design.
+The fetch unit reads the L1 instruction cache while a load or store reads the L1 data cache, in the same cycle. Both caches miss into a shared L2 and L3, and then into main memory. A typical L1 is 32 to 64 KB and takes about 4 cycles. Main memory takes about 200.
+One cost is self-modifying code. When a JIT writes new code, it goes to the data cache first. The CPU must flush the instruction cache, or the fetch unit may run old bytes. On x86 this is handled in hardware. On Arm software must do it.
+used: Every modern x86 and Arm core; Arm Cortex-M and AVR microcontrollers use true Harvard buses with separate code flash and data RAM.
+avoid: When a tiny chip has no cache; a single simple memory is cheaper and easier there.
+flow:
+  Fetch unit [svc: pc = 0x4000] -> L1 I-cache [cache: 32 KB] : fetch instruction | The fetch unit reads the next instruction from the instruction cache.
+  Load/store unit [svc: executing] -> L1 D-cache [cache: 32 KB] : load x | In the same cycle, a load reads data from the data cache.
+  L1 I-cache -> L2 cache [cache: shared 1 MB] : miss | A miss in either L1 goes to the shared L2.
+  L1 D-cache -> L2 cache : miss | Data misses use the same L2, so code and data meet here.
+  L2 cache -> Main memory [store: one address space] : line fill | On an L2 miss, a 64-byte line is read from the single main memory.
+  Main memory -> L2 cache : 64-byte line | The line returns to L2 and then to the L1 that asked for it.
+ref: book | Computer Architecture: A Quantitative Approach | Hennessy & Patterson, 6th ed., 2017 |
+
+@@ colorsci
+== Linear-light compositing pipeline
+kind: pipes-filters
+when: You blend, blur, resize or light images, and the result must look physically right.
+how: sRGB values are gamma encoded: they spend more codes on dark tones, so they are not proportional to light. Averaging two encoded values gives a wrong, too dark result, such as a dark fringe around a resized image.
+So the pipeline has three stages. First, decode every input to linear light (undo the transfer curve). Second, do all the math in linear space: blending, blur, lighting, mipmaps. Third, encode to the output space only at the end, in the last pass.
+Use 16-bit float or higher for the middle stage. Linear 8-bit loses dark detail and shows banding. GPUs help: sRGB texture formats decode on sampling, and sRGB render targets encode on write, with no extra code.
+used: GPU renderers and game engines with a linear workflow; Photoshop and Blender when linear blending is on; browsers for CSS color mixing in modern color spaces.
+avoid: When data is not color, such as normal maps or masks; read it as raw numbers with no curve.
+flow:
+  sRGB texture [store: 8-bit encoded] -> Decode stage [svc: sRGB to linear] : encoded values | The sampler converts each texel to linear light as it reads it.
+  Decode stage -> Shader [svc: lighting + blend] : linear floats | The shader does lighting and blending on values proportional to light.
+  Shader -> HDR buffer [store: RGBA16F] : linear color | Results are kept in 16-bit float so dark tones keep detail.
+  HDR buffer -> Tone map + encode [svc: last pass] : scene values | A final pass maps scene values into display range and applies the output curve.
+  Tone map + encode -> Display [client: sRGB or P3] : encoded pixels | The display gets encoded pixels and shows them as designed.
+ref: docs | GPU Gems 3, Chapter 24: The Importance of Being Linear | Larry Gritz and Eugene d'Eon, NVIDIA, 2007 | https://developer.nvidia.com/gpugems/gpugems3/part-iv-image-effects/chapter-24-importance-being-linear
+
+== Convert once to a target color space at the edge
+kind: precompute, cdn-edge
+when: Images come in many color spaces, and clients differ: wide-gamut phones, plain monitors, and apps that ignore profiles.
+how: At upload, read the embedded ICC profile of each image. Untagged images are assumed to be sRGB. Convert the pixels to one working space, such as Display P3 or sRGB, using a 3x3 matrix and the transfer curves.
+Then make output variants at the edge: sRGB for old clients, Display P3 for wide-gamut screens. Tag every file with the right profile. The CDN picks the variant, from the Accept header or from client hints, and caches each one.
+Convert once and store, not at every request. Colors outside the target gamut are clipped or mapped, so keep the original file. Without this step, a P3 photo shown in an app that ignores profiles looks washed out.
+used: Image CDNs and services such as Cloudflare Images and Cloudinary; browsers, which convert tagged images to the screen profile; Apple devices that capture in Display P3.
+avoid: When the images are scientific data or masks; do not color-convert them.
+flow:
+  Uploader [client] -> Ingest service [svc: reads ICC] : photo.jpg + profile | The upload carries an embedded ICC profile that says how to read the numbers.
+  Ingest service -> Original store [store: untouched file] : keep original | The original file is saved, because gamut mapping can lose colors.
+  Ingest service -> Converter [svc: 3x3 matrix + curves] : to P3 and sRGB | The converter makes a Display P3 and an sRGB version.
+  Converter -> CDN [cache: both variants] : tagged variants | Each file is tagged with its profile and cached at the edge.
+  Phone [client: P3 screen] -> CDN : GET /photo | A wide-gamut phone asks for the image.
+  CDN -> Phone : P3 variant | The CDN returns the P3 variant from cache, and colors look as shot.
+ref: spec | CSS Color Module Level 4 | W3C | https://www.w3.org/TR/css-color-4/
+
+@@ anycast
+== One IP announced from many sites (CDN or DNS front door)
+kind: cdn-edge, multi-region
+when: Users around the world must reach the nearest site with one address, and a dead site must drop out fast.
+how: Every point of presence (PoP) announces the same IP prefix, for example one /24, over BGP to its neighbours. Routers on the internet pick the best path to that prefix by their own policy, usually the shortest AS path. So each user's packets tend to arrive at a nearby PoP, with no client logic at all.
+Each PoP runs a health check on its own service. If the service fails, the PoP withdraws the prefix. BGP then converges in seconds to a few minutes, and traffic moves to the next nearest PoP. No DNS change and no TTL wait are needed.
+The weak point is that routing picks by AS path, not by latency, so a user can reach a far site. Also, if routes change in the middle of a long TCP connection, packets may land at a different PoP that does not know the connection. Short requests (DNS over UDP) are safe. Long-lived services need a way to handle this.
+used: DNS root servers and public resolvers such as 1.1.1.1 and 8.8.8.8; Cloudflare, where services share anycast addresses; many CDNs and DDoS-scrubbing networks.
+avoid: When one request needs session state held at one site; use GeoDNS or an application-level router instead.
+flow:
+  Mumbai PoP [svc: announces 203.0.113.0/24] -> ISP routers [svc: BGP neighbours] : BGP announce | The Mumbai PoP announces the shared prefix to its upstream networks.
+  Frankfurt PoP [svc: announces same /24] -> ISP routers : BGP announce | Frankfurt announces the very same prefix from another place.
+  User in Pune [client] -> ISP routers : packet to 203.0.113.10 | The ISP knows two paths to the prefix and uses the shorter one.
+  ISP routers -> Mumbai PoP : nearest path | The packet reaches the Mumbai PoP, which answers the user.
+  * Mumbai PoP: unhealthy | The health check at the Mumbai PoP fails.
+  Mumbai PoP -x> ISP routers : withdraw prefix | The PoP withdraws its route, so the ISP stops sending packets there.
+  ISP routers -> Frankfurt PoP : next best path | New packets go to Frankfurt. The user keeps the same IP and sees only a longer round trip.
+ref: spec | Operation of Anycast Services (RFC 4786, BCP 126) | Abley & Lindqvist, IETF, 2006 | https://www.rfc-editor.org/rfc/rfc4786
+
+== GeoDNS steering with health checks
+kind: multi-region, health-check
+when: You run a service in several regions and want each user sent to a close, healthy region by name lookup.
+how: The authoritative DNS server holds a policy for the name, for example api.example.com. When a resolver asks, the server looks at the resolver's IP address (or the EDNS Client Subnet, if the resolver sends it) and maps it to a region. It answers with the address of the best region.
+A health checker probes each region every few seconds. An unhealthy region is removed from answers. The TTL is kept short, 30 to 60 seconds, so a change reaches users soon.
+The limits are real. DNS sees the resolver, not the user, so a user on a far-away public resolver gets the wrong region unless ECS is used. Some resolvers and apps keep answers longer than the TTL, so failover is slow for them. Compared with anycast, GeoDNS gives exact control and handles long TCP sessions well, but it reacts more slowly.
+used: Amazon Route 53 geolocation and latency routing; Google Cloud DNS routing policies; NS1 and Azure Traffic Manager; many multi-region SaaS APIs.
+avoid: When you need failover in under a few seconds for every user; combine it with anycast or a global load balancer.
+flow:
+  Resolver [svc: in Mumbai ISP] -> Authoritative DNS [svc: geo policy] : A api.example.com | The user's resolver asks the authoritative server for the name.
+  Authoritative DNS -> Geo map [store: IP range to region] : lookup resolver IP | The server maps the resolver address to a region, here Asia.
+  Health checker [svc: probes every 10 s] -> Authoritative DNS : ap-south is healthy | The checker reports which regions currently pass.
+  Authoritative DNS -> Resolver : 198.51.100.7, TTL 60 | The server answers with the Asia region address and a short TTL.
+  * Health checker: ap-south down | The checker sees the Asia region fail three probes in a row.
+  Resolver -> Authoritative DNS : A api.example.com | After the TTL ends the resolver asks again.
+  Authoritative DNS -> Resolver : 192.0.2.9 (eu-west) | The server now returns the next nearest healthy region.
+ref: docs | Choosing a routing policy | Amazon Route 53 Developer Guide | https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy.html
+
+@@ arpicmp
+== Path MTU discovery with MSS clamping on a tunnel
+kind: layered-protocol
+when: A path contains a link with a smaller packet size, such as a VPN tunnel, and large packets silently disappear.
+how: A sender marks packets "Don't Fragment". When a router cannot forward a packet because the next link is too small, it drops the packet and sends back an ICMP message: "Fragmentation needed" (IPv4) or "Packet Too Big" (IPv6), with the next-hop MTU. The sender lowers its packet size and resends. This is path MTU discovery (PMTUD).
+It breaks when a firewall blocks all ICMP. Then small packets work (the TCP handshake) but large ones vanish, and the connection hangs. This is called a black hole.
+The common fix is MSS clamping. The tunnel gateway rewrites the TCP maximum segment size in each SYN, for example from 1460 to 1380 for a tunnel with 80 bytes of overhead. Both ends then never send too-large segments. A second fix is to allow ICMP type 3 code 4 and ICMPv6 type 2 on all firewalls.
+used: Linux iptables and nftables TCP MSS clamping; WireGuard and IPsec gateways; cloud VPNs, which publish a recommended MSS; QUIC, which does its own PMTU probing.
+avoid: When all links are known to have the same MTU, such as inside one data-center fabric with jumbo frames; set it once and skip tricks.
+flow:
+  Client [client: MTU 1500] -> VPN gateway [svc: tunnel MTU 1420] : TCP SYN, MSS 1460 | The client offers a segment size that fits its own link only.
+  VPN gateway -> Server [svc: web server] : SYN, MSS clamped to 1380 | The gateway rewrites the MSS option, so the server sends smaller segments.
+  Server -> Client : SYN-ACK, MSS 1380 | Both sides now agree on segments that fit in the tunnel.
+  Server -> VPN gateway : 1500-byte packet, DF | If a sender ignores the MSS, it sends a full-size packet with the DF bit set.
+  VPN gateway -x> Server : ICMP Packet Too Big | The gateway cannot forward it, drops it and returns ICMP with MTU 1420.
+  Server -> VPN gateway : resend at 1420 | The server reads the ICMP message, lowers its packet size and resends.
+ref: spec | Path MTU Discovery (RFC 1191) | Mogul & Deering, IETF, 1990 | https://www.rfc-editor.org/rfc/rfc1191
+
+== Virtual IP failover with gratuitous ARP
+kind: active-passive
+when: A service must keep one IP address while the machine behind it can change, on a single Ethernet segment.
+how: Two nodes run a protocol such as VRRP. The master holds the virtual IP (VIP) and answers ARP for it with its own MAC. Clients and the router keep the mapping VIP to MAC in their ARP cache.
+The master sends advertisements every second. If the backup misses about three, it takes over: it adds the VIP and sends a gratuitous ARP, an unrequested ARP reply that says "VIP is now at my MAC". Switches update their tables and neighbours refresh their caches, so traffic moves in a few seconds.
+Without the gratuitous ARP, neighbours would keep the old MAC until the cache entry expires, often 30 seconds or more. The pattern works only inside one layer-2 network. Across subnets, use BGP or a load balancer.
+used: keepalived (VRRP) in front of HAProxy and NGINX; pfSense and OPNsense CARP failover pairs; Kubernetes load balancers such as kube-vip and MetalLB in layer-2 mode.
+avoid: When nodes sit in different subnets or cloud zones; use DNS or a BGP-announced address instead.
+flow:
+  Router [svc: ARP cache] -> Node A [svc: master, holds VIP] : who has 10.0.0.100? | The router asks for the MAC of the virtual IP.
+  Node A -> Router : VIP is at MAC-A | The master answers with its own MAC, and the router caches it.
+  Node A -> Node B [svc: backup] : VRRP advert every 1 s | The master sends a heartbeat advertisement.
+  * Node A: crashed | Node A fails, and the adverts stop.
+  Node B -> Router : gratuitous ARP, MAC-B | After about 3 missed adverts, the backup claims the VIP and announces it.
+  Router -> Node B : traffic for the VIP | The router updates its cache. New packets go to the backup.
+ref: spec | Virtual Router Redundancy Protocol Version 3 (RFC 5798) | Nadas, IETF, 2010 | https://www.rfc-editor.org/rfc/rfc5798
+
+@@ bgp
+== Multihomed edge with policy and route withdrawal
+kind: active-passive, control-data-plane
+when: An organization has its own IP space and wants two or more internet providers, with automatic failover.
+how: The organization has an autonomous system number (ASN) and its own prefix. It opens a BGP session to each provider and announces the prefix to both. Providers pass it on to the rest of the internet.
+For traffic leaving the network, the edge router uses local preference: for example, 200 on the main provider and 100 on the backup. Higher wins, so the backup is idle until needed. For traffic coming in, the network can add AS-path prepending to the backup announcement, so others see it as longer and prefer the main path.
+If the main link dies, the session drops, its routes are removed, and the backup path takes over, in seconds with fast failure detection (BFD) and longer without it. Good practice adds filters on what you accept and announce, and RPKI origin validation to reject hijacked routes.
+used: Enterprises, hosting providers and cloud on-premise connections; AWS Direct Connect and Google Cloud Interconnect use BGP for route exchange; FRRouting and BIRD as open-source routing daemons.
+avoid: When a small site has one provider; a static default route is simpler and safer.
+flow:
+  Edge router [svc: AS 64500] -> Provider A [svc: AS 64501 main] : announce 203.0.113.0/24 | The router announces its prefix to the main provider.
+  Edge router -> Provider B [svc: AS 64502 backup] : announce, prepend x3 | The same prefix goes to the backup provider with a longer AS path.
+  Provider A -> Internet [svc: other networks] : propagate prefix | The main provider passes the route on. Others see a short path.
+  Internet -> Provider A : inbound traffic | Visitors reach the prefix through the main provider.
+  * Provider A: link down | The BFD check detects that the link to the main provider is dead.
+  Provider A -x> Edge router : session dropped | The BGP session drops, and routes through the main provider are removed.
+  Internet -> Provider B : traffic shifts | Only the backup route is left, so inbound traffic moves to it.
+ref: spec | A Border Gateway Protocol 4 (RFC 4271) | Rekhter, Li & Hares, IETF, 2006 | https://www.rfc-editor.org/rfc/rfc4271
+
+== BGP to the rack: routing for Kubernetes and fabrics
+kind: control-data-plane, service-discovery
+when: Pod or service IPs must be reachable from the rest of the network without an overlay.
+how: Each node runs a BGP speaker, such as Calico, Cilium or MetalLB. It peers with the top-of-rack switch and announces the pod subnet of that node (for example a /24) and the service IPs it hosts.
+The switches learn these routes and spread them over the fabric. Any server or router in the data center can now reach a pod IP directly, with no encapsulation. When a node dies, its BGP session drops and its routes disappear in seconds. Services with the same IP on many nodes get equal-cost multipath, so the fabric spreads the load.
+Large data centers also use BGP as the only routing protocol inside the fabric, one AS per rack or per tier. The reason is that it is simple, scales to tens of thousands of nodes and has strong policy control, as described in RFC 7938.
+used: Calico and Cilium BGP control plane; MetalLB BGP mode for LoadBalancer services; Meta and Microsoft data-center fabrics, as in RFC 7938.
+avoid: When the network team cannot run BGP on the switches; use an overlay such as VXLAN instead.
+flow:
+  Node 1 [svc: BGP speaker] -> ToR switch [svc: top of rack] : announce 10.1.1.0/24 | The node announces its pod subnet to the switch above it.
+  ToR switch -> Spine switch [svc: fabric] : propagate route | The switch passes the route up to the spine layer.
+  Spine switch -> ToR switch 2 [svc: other rack] : route to 10.1.1.0/24 | Other racks learn that this subnet is behind rack one.
+  Client pod [client: on other rack] -> ToR switch 2 : packet to 10.1.1.5 | A pod in another rack sends to the pod IP directly, with no tunnel.
+  * Node 1: died | Node 1 fails and its BGP session goes down.
+  Node 1 -x> ToR switch : session lost | The switch removes the route. Other nodes and clients stop sending there.
+ref: spec | Use of BGP for Routing in Large-Scale Data Centers (RFC 7938) | Lapukhov, Premji & Mitchell, IETF, 2016 | https://www.rfc-editor.org/rfc/rfc7938
+
+@@ cellular
+== Control plane and user plane split in the mobile core
+kind: control-data-plane
+when: A carrier must scale session control and packet forwarding separately, and place forwarding near users.
+how: In 5G, the core splits into a control plane and a user plane. The AMF handles registration and mobility. The SMF sets up the data session and chooses a user plane function. The UPF is the packet forwarder: it carries the user's IP packets inside GTP-U tunnels to the internet.
+When a phone attaches, the radio base station (gNB) forwards its request to the AMF. The AMF checks identity with the home network, then the SMF creates a session and programs the UPF with tunnel IDs and rules. After that, data flows gNB to UPF without touching the control functions.
+The split lets a carrier run many small UPFs close to cities, or inside company sites for low latency, while a few control sites sit in central data centers. The control functions are plain software services that talk over HTTP/2 APIs and scale out.
+used: 3GPP 5G core (AMF, SMF, UPF); the 4G predecessor, CUPS, split the gateway the same way; open-source cores such as Open5GS and free5GC.
+avoid: When a small private network needs the simplest setup; a single integrated core box or 4G EPC lite can be enough.
+flow:
+  Phone [client: 5G device] -> gNB [svc: base station] : registration request | The phone asks to attach over the radio link.
+  gNB -> AMF [svc: access and mobility] : NAS message | The base station passes the request to the core's access function.
+  AMF -> SMF [svc: session manager] : create session | After checking identity the AMF asks the SMF to make a data session.
+  SMF -> UPF [svc: forwarder, near edge] : tunnel IDs and rules | The SMF programs the UPF with tunnel endpoints and filters.
+  Phone -> gNB : user data | The phone sends IP packets after the session is ready.
+  gNB -> UPF : GTP-U tunnel | The packets ride in a tunnel from the base station to the UPF.
+  UPF -> Internet [svc: data network] : plain IP | The UPF removes the tunnel header and sends plain IP out.
+ref: docs | 5G System Architecture (TS 23.501) | 3GPP |
+
+== Handover by re-pointing the tunnel
+kind: none
+when: A moving phone must keep its IP address and its sessions while it changes from one cell to another.
+how: The phone measures nearby cells and reports signal strength to its current base station. When a neighbour is clearly better, the source base station asks the target to prepare. The phone gets the new radio settings and switches over.
+The core keeps the phone's IP address fixed. Only the tunnel endpoint on the radio side changes. In 5G, the AMF and SMF tell the UPF to send downlink packets to the target cell, using a path switch. During the short gap, the source forwards packets it already holds to the target, so few are lost.
+The interruption is usually a few tens of milliseconds. TCP sees this as a small delay, not a broken connection. The same idea explains why IP addresses on a phone do not change as you drive.
+used: LTE X2 handover and 5G Xn handover; 3GPP mobility procedures in every mobile network.
+avoid: Not a choice; it is how mobile networks work. Fixed wireless with no movement needs no handover.
+flow:
+  Phone [client: moving] -> Source gNB [svc: cell A] : measurement report | The phone reports that cell B has a stronger signal.
+  Source gNB -> Target gNB [svc: cell B] : handover request | The source asks cell B to reserve resources for the phone.
+  Target gNB -> Source gNB : accept | Cell B accepts and returns radio settings for the phone.
+  Source gNB -> Phone : switch to cell B | The phone is told to move to cell B.
+  Source gNB ~> Target gNB : forward buffered data | Packets still held at cell A are forwarded to cell B, so fewer are lost.
+  Target gNB -> AMF [svc: core control] : path switch request | Cell B tells the core that the phone now lives here.
+  AMF -> UPF [svc: anchor, same IP] : send downlink to cell B | The core points the downlink tunnel to cell B. The phone's IP does not change.
+ref: docs | NG-RAN overall description (TS 38.300) | 3GPP |
+
+@@ checksums
+== End-to-end checksum on every stored or sent record
+kind: end-to-end-checksum
+when: Data crosses disks, networks and memory, and any silent bit flip must be caught before bad data is used.
+how: The writer computes a checksum over each unit of data, such as a record batch or a file page, and stores it next to the data. The reader recomputes the checksum after reading and compares. A mismatch means corruption, so the reader refuses the data and fetches another copy.
+Choose the code by the threat. A CRC (CRC32C has hardware instructions on x86 and Arm) catches random bit errors and burst errors, and is fast, at several GB per second per core. It does not stop an attacker, because anyone can recompute it. For attackers, use a keyed MAC or a cryptographic hash.
+The checksum must be checked at the end, where the data is used. A check only on one link misses errors that happen in memory, in a disk firmware, or in a switch. This is the end-to-end argument applied to data integrity.
+used: Kafka checks CRC32C on each record batch; Parquet pages can carry a CRC; ext4 and Btrfs checksum metadata or data; Ethernet frames end with a CRC-32; ZFS checksums every block.
+avoid: When data can be changed by an attacker; use an HMAC or a signature, because a CRC offers no security.
+flow:
+  Producer [client] -> Broker [svc: Kafka] : record batch + CRC32C | The producer computes CRC32C over the batch and sends it with the data.
+  Broker -> Disk [store: log segment] : write batch + CRC | The broker stores the batch and its CRC together in the log segment.
+  Disk -x> Broker : one bit flipped | After months on disk, a failing sector flips one bit.
+  Broker -> Consumer [client: verifies CRC] : fetch batch | The consumer fetches the batch with its stored CRC.
+  Consumer -x> Broker : CRC mismatch, reject | The consumer recomputes the CRC, sees a mismatch and discards the batch.
+  Consumer -> Replica broker [svc: follower copy] : refetch | The consumer reads the same offsets from a replica, which has a good copy.
+ref: spec | Computation of the Internet Checksum via Incremental Update (RFC 1624) | Rijsinghani, IETF, 1994 | https://www.rfc-editor.org/rfc/rfc1624
+ref: paper | End-to-End Arguments in System Design | Saltzer, Reed & Clark, 1984 |
+
+== Background scrubbing with repair from replicas
+kind: end-to-end-checksum
+when: Rarely read data can rot silently, and you want to find damage before the last good copy is lost.
+how: Storing a checksum is not enough if nobody reads the data for months. A scrub job reads every block on a schedule, say once per month, and verifies each checksum. It runs slowly at low priority so that user traffic is not hurt.
+When a block fails, the system repairs it from another source: a replica, a mirror disk, a RAID parity set or an erasure-coded stripe. Then the bad copy is rewritten. A system with only one copy can detect the damage but cannot fix it.
+Two replicas can disagree. With a checksum per copy, the system knows which one is good. Without it, it can only guess. This is one reason modern file systems and object stores keep checksums apart from the data they protect.
+used: ZFS and Btrfs scrub; Ceph deep scrub; HDFS block scanner and DataNode verification; backup tools such as restic and Borg that offer a repository check.
+avoid: When data is read often anyway and every read is verified; scrubbing then adds load for little gain.
+flow:
+  Scrub scheduler [svc: monthly job] -> Storage node [svc: holds block A1] : start scrub | A monthly job tells each node to scan its blocks at low priority.
+  Storage node -> Disk [store: blocks + checksums] : read block A1 | The node reads the block and its stored checksum.
+  Storage node -x> Scrub scheduler : checksum mismatch on A1 | The recomputed checksum does not match, so A1 is marked bad.
+  Scrub scheduler -> Replica node [svc: holds block A2] : fetch good copy | The scheduler asks a second node for its copy of the block.
+  Replica node -> Storage node : block A2 | The replica sends a copy whose checksum is correct.
+  Storage node -> Disk : rewrite A1 | The bad block is rewritten with good data, and the scrub continues.
+ref: docs | Checksumming and scrub in Btrfs | Btrfs documentation | https://btrfs.readthedocs.io/en/latest/Scrub.html
+
+@@ congestion
+== Sender-side AIMD or BBR on a shared bottleneck
+kind: control-loop
+when: Many senders share one link with no central coordinator, and each must find its fair share without collapse.
+how: Each sender keeps a congestion window: how many bytes may be in flight. It starts small and doubles every round trip (slow start) until a loss or a delay signal. Then it grows slowly, about one packet per round trip (additive increase).
+On loss, a Reno-style sender halves its window (multiplicative decrease). CUBIC grows by a cubic curve and backs off less, which suits fast long paths. BBR does not wait for loss: it estimates the bottleneck bandwidth and the minimum round-trip time, and paces packets at that rate.
+Because every sender follows the same rule, flows with the same round trip converge to equal shares. The queue at the bottleneck is the shared signal. A deep buffer adds delay (bufferbloat) for loss-based senders. BBR keeps queues short but can take more than its fair share against CUBIC.
+used: Linux default CUBIC; Google uses BBR on YouTube and Google Cloud front ends; QUIC stacks implement the same algorithms in user space.
+avoid: When the network gives explicit rates or reserved capacity; use rate control with admission instead of probing.
+flow:
+  Sender A [client: cwnd 10] -> Bottleneck router [queue: 100-packet buffer] : 10 packets | Sender A starts with 10 packets in flight.
+  Sender B [client: cwnd 10] -> Bottleneck router : 10 packets | Sender B shares the same bottleneck link.
+  Bottleneck router -> Receiver [svc: ACKs] : packets, 1 per slot | The link drains at its fixed rate. The receiver ACKs each packet.
+  Receiver -> Sender A, Sender B : ACKs | Each ACK lets the sender grow its window. Both double per round trip.
+  * Bottleneck router: queue full | Demand exceeds the link rate and the buffer fills.
+  Bottleneck router -x> Sender A : packet dropped | The router drops a packet. Sender A sees duplicate ACKs.
+  * Sender A: cwnd 20 to 10 | Sender A halves its window. Over many rounds, both senders settle near equal shares.
+ref: paper | Congestion Avoidance and Control | Van Jacobson, SIGCOMM 1988 |
+ref: paper | BBR: Congestion-Based Congestion Control | Cardwell et al., ACM Queue, 2016 |
+
+== ECN marking and DCTCP in a data-center switch
+kind: control-loop, load-shedding
+when: Short flows need low delay in a data center, and loss-based senders keep switch queues deep.
+how: A switch watches its own queue. When the queue passes a small threshold, for example 20 packets, it sets a bit (ECN, Congestion Experienced) in the IP header instead of dropping the packet. The receiver echoes the mark back in its ACKs.
+DCTCP uses the fraction of marked packets to cut its window in proportion. If 10% are marked, it cuts by about 5%. A classic sender cuts by half on any loss. So flows adjust smoothly, queues stay short, and the delay of small flows stays at tens of microseconds.
+The switch needs ECN support and the right marking threshold. The senders and switches should be configured together. Mixing DCTCP with plain loss-based traffic on the same queue is unfair to the DCTCP flows, so operators keep them in separate queues.
+used: DCTCP in Linux and Windows Server; Microsoft data centers, where it was first described; RoCEv2 networks use ECN with DCQCN to avoid pause storms.
+avoid: On the public internet, where most routers do not mark; use CUBIC or BBR there.
+flow:
+  Sender [client: DCTCP] -> Leaf switch [svc: ECN threshold 20] : data packets | The sender transmits at a high rate toward a busy receiver.
+  * Leaf switch: queue 24 | The queue goes above the marking threshold.
+  Leaf switch -> Receiver [svc: echoes marks] : packets with CE bit | The switch marks packets instead of dropping them.
+  Receiver -> Sender : ACK with ECN echo | The receiver reports the fraction of marked packets.
+  * Sender: window cut 5% | The sender reduces its window in proportion to the marks, not by half.
+  Sender -> Receiver : next packets | The queue stays short, so there is no loss and no timeout. Small flows keep low delay.
+ref: paper | Data Center TCP (DCTCP) | Alizadeh et al., SIGCOMM 2010 |
+ref: spec | DCTCP: Congestion Control for Data Centers (RFC 8257) | Bensley et al., IETF, 2017 | https://www.rfc-editor.org/rfc/rfc8257
+
+@@ dcnet
+== Leaf-spine Clos fabric with ECMP
+kind: clos-fabric
+when: Thousands of servers need high bandwidth between any two of them, and one switch cannot be big enough.
+how: Every server connects to a leaf switch at the top of its rack. Every leaf connects to every spine switch. Any two servers on different racks are exactly two switch hops apart, through any one of the spines. With 8 spines there are 8 equal-cost paths.
+The switches run IP routing and use ECMP (equal-cost multi-path). A switch hashes the 5-tuple of each packet (source and destination IP and port, plus protocol) and picks one of the paths. All packets of one flow take one path, so they stay in order. Many flows spread over all spines.
+To grow, add spines for more bandwidth or add leaves for more racks. If a spine fails, only 1/8 of the capacity is lost. The risk is hash collisions: two large flows can land on one link, so some fabrics add flowlet switching or adaptive routing.
+used: Google Jupiter; Meta's data center fabric; AWS and Azure regions; the same design in AI clusters with InfiniBand or RoCE.
+avoid: When a site has a few dozen servers; a pair of switches is cheaper. Also not for one huge single flow, where hashing cannot split it.
+flow:
+  Server A [client: rack 1] -> Leaf 1 [svc: top of rack] : packet, 5-tuple H | The server sends a packet to a server in another rack.
+  Leaf 1 -> Spine 1 [svc: fabric] : hash picks path 1 | Leaf 1 hashes the 5-tuple and picks spine 1 out of four equal paths.
+  Leaf 1 -> Spine 2 [svc: fabric] : another flow, path 2 | A different flow hashes to spine 2. Load spreads over spines.
+  Spine 1 -> Leaf 4 [svc: top of rack] : forward | Spine 1 sends the packet down to the leaf of the destination rack.
+  Leaf 4 -> Server B [client: rack 4] : deliver | The leaf delivers the packet to the destination server.
+  * Spine 1: failed | Spine 1 fails. Routing removes it, and flows move to the other spines.
+  Leaf 1 -x> Spine 1 : link down | Leaf 1 stops using spine 1. The fabric loses only one quarter of its capacity.
+ref: paper | A Scalable, Commodity Data Center Network Architecture | Al-Fares, Loukissas & Vahdat, SIGCOMM 2008 |
+ref: paper | Jupiter Rising: A Decade of Clos Topologies at Google | Singh et al., SIGCOMM 2015 |
+
+== Separate lossless fabric for GPU training traffic
+kind: none
+when: A GPU cluster runs collective operations such as all-reduce, and packet loss or slow tails would stall thousands of GPUs.
+how: Training traffic is large, synchronized bursts. Every GPU sends at once, and one slow flow delays the whole step. So operators build a dedicated back-end fabric just for GPU-to-GPU traffic, apart from the front-end network used for storage and management.
+The back-end is a Clos fabric, often rail-optimized: GPU number k of every server connects to the same leaf group, so same-rank traffic crosses one hop. It runs RoCE v2 (RDMA over Ethernet) or InfiniBand. Loss makes RDMA slow, so the fabric uses priority flow control (PFC) and ECN-based congestion control (DCQCN), with no oversubscription.
+The cost is high: many 400 Gb/s links and switch ports per server. The gain is predictable step time. Careful tuning of PFC is needed, because a pause storm can freeze many links.
+used: Meta's published RoCE clusters for AI training; NVIDIA DGX SuperPOD with InfiniBand; large cloud AI clusters that run NCCL collectives.
+avoid: When jobs are small and fit in one server or one rack; use the normal network and NVLink inside the node.
+flow:
+  GPU server 1 [client: 8 GPUs] -> Rail leaf [svc: lossless 400G] : RoCE all-reduce chunk | Each GPU sends its piece over the back-end network.
+  GPU server 2 [client: 8 GPUs] -> Rail leaf : RoCE chunk | Another server sends at the same moment, a synchronized burst.
+  Rail leaf -> Spine [svc: no oversubscription] : forward | The leaf forwards the traffic up through spines at full rate.
+  * Rail leaf: queue above ECN | A queue builds and the switch marks packets with ECN.
+  Rail leaf -> GPU server 1 : ECN notification | The sender slows down in response, so the buffer does not overflow.
+  GPU server 1 -> Storage net [store: front-end network] : checkpoint, dataset reads | Storage and management use a separate front-end network, away from collectives.
+ref: paper | RDMA over Ethernet for Distributed AI Training at Meta Scale | Gangidi et al., SIGCOMM 2024 |
+
+@@ dhcp
+== DHCP relay agents and a failover pair
+kind: active-passive, lease
+when: One DHCP service must hand out addresses to many subnets, and it must stay up if a server fails.
+how: DHCP uses broadcasts, which routers do not forward. So each subnet's router runs a relay agent. It catches the client's DISCOVER, adds its own interface address (giaddr), and sends the message by unicast to the central DHCP servers.
+The server uses giaddr to pick the right subnet pool, and replies through the relay. The client gets an offer, sends a REQUEST, and receives an ACK with the address and a lease time, for example 8 hours. It renews at half the lease, usually by unicast.
+Two servers run as a failover pair and share the lease database. In active-standby mode, one answers and the other waits. In load-balance mode, each answers about half. Each side can also hold part of the pool, so a pair can keep working during a split.
+used: ISC Kea and ISC dhcpd failover; Windows Server DHCP failover; Cisco and Juniper relay (ip helper-address); enterprise campuses with hundreds of VLANs.
+avoid: In small networks with one subnet; a router's built-in DHCP server is enough. Cloud VPCs already include DHCP.
+flow:
+  Laptop [client: no IP yet] -> Router relay [svc: giaddr 10.2.0.1] : DHCPDISCOVER broadcast | The new laptop shouts on its subnet because it has no address.
+  Router relay -> DHCP server A [svc: active] : unicast, giaddr 10.2.0.1 | The relay forwards the message to the server and adds the subnet address.
+  DHCP server A -> Router relay : OFFER 10.2.0.57 | The server picks an address from the pool that matches giaddr.
+  Router relay -> Laptop : OFFER | The relay passes the offer to the client. The client then sends a REQUEST and gets an ACK.
+  DHCP server A -> DHCP server B [svc: standby] : lease update | Each new lease is copied to the partner server.
+  * DHCP server A: crashed | Server A fails.
+  Laptop -> DHCP server B : renew at T1 | At half of the lease, the laptop asks again. Server B knows the lease and answers.
+ref: spec | Dynamic Host Configuration Protocol (RFC 2131) | Droms, IETF, 1997 | https://www.rfc-editor.org/rfc/rfc2131
+
+== DHCP options as the network boot and config channel
+kind: external-config
+when: Machines start with no configuration, and the network must tell them where to find a boot image and services.
+how: A DHCP reply carries more than an address. It has options: the default gateway, DNS servers, the domain name, NTP servers, and for network boot the next server and the boot file name (options 66 and 67). Cloud VMs use the same channel for their DNS and routes.
+In a PXE boot, the firmware of a new server sends DHCPDISCOVER. The reply gives an IP and the address of a TFTP or HTTP boot server. The machine downloads a small boot program and then an operating system installer. This lets a data center install thousands of servers with no keyboard.
+Make sure only trusted servers answer. A rogue DHCP server on the same network can send a bad gateway or DNS. Switches defend with DHCP snooping, which allows replies only from trusted ports.
+used: PXE booting in bare-metal provisioning tools such as MAAS, Foreman and Tinkerbell; VPCs in AWS, GCP and Azure give instances their addresses and DNS through DHCP.
+avoid: When devices have many per-host secrets to receive; DHCP is plain text, so use a secure provisioning channel for those.
+flow:
+  New server [client: PXE firmware] -> DHCP server [svc: PXE options] : DHCPDISCOVER | A bare server has no OS. Its firmware asks the network for help.
+  DHCP server -> New server : IP, gateway, boot file | The reply holds an address, DNS, the boot server and a file name.
+  New server -> Boot server [svc: TFTP or HTTP] : GET bootloader | The server downloads a small boot loader from the named host.
+  Boot server -> New server : loader and kernel | The loader then fetches a kernel and an installer image.
+  New server -> Provisioning DB [db: inventory] : report MAC, register | The installer registers the machine by its MAC address so tools can configure it.
+ref: spec | DHCP Options and BOOTP Vendor Extensions (RFC 2132) | Alexander & Droms, IETF, 1997 | https://www.rfc-editor.org/rfc/rfc2132
+
+@@ dns
+== Caching recursive resolver in front of authoritative servers
+kind: cache-aside, layered-arch
+when: Millions of clients look up names, and the authoritative servers must not see every query.
+how: A client asks a recursive resolver, such as one run by the ISP, the company or a public service. The resolver checks its cache. On a miss, it walks the tree: it asks a root server for the TLD servers, a TLD server for the domain's name servers, and the authoritative server for the record.
+The answer carries a TTL, for example 300 seconds. The resolver keeps it for that time and answers later clients from memory, in under a millisecond. It also caches failures (NXDOMAIN) for a short time, and it keeps the NS records of each zone, so later misses skip the root.
+The owner controls staleness only through the TTL. A long TTL gives fewer queries and faster answers, but slow changes. Before a planned move, lower the TTL a day ahead. DNSSEC lets the resolver verify signatures on the answers.
+used: Unbound, BIND and Knot Resolver; public resolvers 1.1.1.1, 8.8.8.8 and 9.9.9.9; the stub resolver and systemd-resolved on every Linux host.
+avoid: When a client needs a fresh answer for every request, such as some health checks; query the authoritative server directly or use a service API.
+flow:
+  App [client: stub resolver] -> Recursive resolver [cache: TTL-bound] : A shop.example.com | The app asks its configured resolver for the address.
+  Recursive resolver -> Root server [svc: 13 server names] : who runs .com? | On a cache miss, the resolver asks a root server and gets the .com servers.
+  Recursive resolver -> TLD server [svc: .com] : who runs example.com? | The .com server points to the name servers of example.com.
+  Recursive resolver -> Authoritative NS [svc: example.com zone] : A shop.example.com | The authoritative server returns the record and a TTL of 300 seconds.
+  Recursive resolver -> App : 203.0.113.5 | The resolver answers the app and stores the record for 300 seconds.
+  App -> Recursive resolver : A shop.example.com | The next client asks the same name.
+  Recursive resolver -> App : cached answer | The answer comes from cache in under a millisecond. No other server is asked.
+ref: spec | Domain names: concepts and facilities (RFC 1034) | Mockapetris, IETF, 1987 | https://www.rfc-editor.org/rfc/rfc1034
+ref: spec | Domain names: implementation and specification (RFC 1035) | Mockapetris, IETF, 1987 | https://www.rfc-editor.org/rfc/rfc1035
+
+== DNS-based service discovery inside Kubernetes
+kind: service-discovery
+when: Services start, stop and move, and callers need a stable name instead of a changing IP.
+how: Kubernetes runs CoreDNS as a cluster add-on. Each Service gets a name such as orders.shop.svc.cluster.local. A normal Service has a stable virtual IP, and the DNS name maps to it. A headless Service has no virtual IP, so DNS returns the IPs of all ready pods.
+Pods get a resolv.conf that points to CoreDNS and a search list, so a short name such as "orders" works inside the same namespace. CoreDNS watches the API server for Services and EndpointSlices and answers from memory. Names outside the cluster are forwarded to upstream resolvers.
+A known trap is the "ndots:5" setting. A name such as api.example.com has fewer than five dots, so the resolver first tries many search suffixes, and each costs a query. Use a final dot or lower ndots for external names, or run NodeLocal DNSCache.
+used: CoreDNS in every Kubernetes cluster; Consul DNS interface; AWS Cloud Map and Route 53 private zones; StatefulSets that need stable pod names.
+avoid: When clients must balance by load or health with little delay; DNS caching hides changes, so use a client-side library or a service mesh.
+flow:
+  Pod A [svc: caller] -> CoreDNS [svc: cluster DNS] : A orders.shop | A pod looks up the short name of another service.
+  CoreDNS -> API server [store: Services and Endpoints] : watch Services | CoreDNS keeps a live copy of Services and endpoints from the API server.
+  CoreDNS -> Pod A : 10.96.12.7 (ClusterIP) | CoreDNS returns the service's stable virtual IP.
+  Pod A -> kube-proxy [svc: iptables or IPVS] : connect to 10.96.12.7 | The pod connects to the virtual IP. The node's rules pick one pod.
+  kube-proxy -> Orders pod [svc: one of 3 pods] : forward | The packet is rewritten to a real pod IP.
+  * Orders pod: replaced | When a pod is replaced, the Service IP stays the same, and callers need no change.
+ref: docs | DNS for Services and Pods | Kubernetes documentation | https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/
+
+@@ ethernet
+== Learning switch with VLAN segmentation
+kind: none
+when: Many machines share one site, and you want fast local delivery with separate groups on the same hardware.
+how: A switch learns by watching. When a frame arrives on port 3 from source MAC A, the switch records "A is on port 3" in its MAC table. For a destination in the table, it sends the frame out of one port only. For an unknown or broadcast destination, it floods the frame to all ports.
+VLANs split one switch into several isolated broadcast domains. Each port belongs to a VLAN, and the links between switches (trunks) carry a 4-byte 802.1Q tag with a 12-bit VLAN ID, so up to 4094 VLANs. A frame never crosses VLANs except through a router.
+Redundant links between switches create loops, and a loop in a broadcast network can melt the whole LAN. Spanning tree (STP) blocks some links to stop loops. Modern data centers avoid this by routing IP at the leaf.
+used: Every office and campus network; Linux bridge and Open vSwitch on hypervisors; cloud VPCs imitate VLAN-style isolation with software overlays.
+avoid: For very large networks of thousands of hosts in one broadcast domain; use routed leaf-spine fabrics with an overlay.
+flow:
+  Host A [client: MAC A] -> Switch [svc: MAC table empty] : frame A to B | Host A sends a frame to host B. The switch does not know B yet.
+  Switch -> Host B [client: MAC B], Host C [client: MAC C] : flood frame | Unknown destination, so the switch sends the frame out of all other ports in the VLAN.
+  * Switch: learned A on port 1 | The switch recorded that A is reachable through port 1.
+  Host B -> Switch : reply B to A | Host B answers. The switch learns B on port 2.
+  Switch -> Host A : unicast only | Now the switch knows A, and sends the reply to port 1 only. Host C sees nothing.
+  Switch -> Router [svc: inter-VLAN routing] : tagged frame, VLAN 20 | Traffic for another VLAN goes to the router, with an 802.1Q tag on the trunk.
+ref: spec | IEEE 802.1Q: Bridges and Bridged Networks | IEEE | 
+
+== Link aggregation across two switches (MLAG)
+kind: active-passive, horizontal-scale
+when: A server needs more than one link of bandwidth, and it must survive the loss of a link or a whole switch.
+how: LACP (802.3ad) groups several links into one logical link. A server connects one link to each of two switches, and both switches act as one logical device (MLAG or vPC). The server sees a single bonded interface with double the bandwidth.
+Traffic is spread by hashing the headers of each frame, so one flow uses one link and stays in order. Many flows fill both links. If a link or a switch fails, LACP notices in seconds (or in less than a second with fast timers), and the bond keeps working on the remaining link, at half the speed.
+The two switches also hold the same MAC table through a peer link. Any single flow is still limited to one link's speed, for example 25 Gb/s. And the peer link and the keep-alive path need care, or a split brain can happen.
+used: Cisco vPC, Arista MLAG and Juniper MC-LAG; Linux bonding with mode 802.3ad; servers in enterprise and many cloud-like racks.
+avoid: In new large fabrics where each server has routed links to leaf switches with ECMP; this removes MLAG complexity.
+flow:
+  Server [client: bond0] -> Switch 1 [svc: MLAG member], Switch 2 [svc: MLAG member] : LACP hello | The server sends LACP messages on both links. Both switches agree to form one group.
+  Server -> Switch 1 : flow 1 (hash) | The hash of flow 1 selects link 1.
+  Server -> Switch 2 : flow 2 (hash) | The hash of flow 2 selects link 2. Both links carry traffic.
+  Switch 1 -> Switch 2 : peer link sync | The switches share MAC tables over a peer link, so both know the server.
+  * Switch 1: failed | Switch 1 fails or its power goes out.
+  Server -x> Switch 1 : link down | The server sees the link go down within seconds.
+  Server -> Switch 2 : all flows | All flows use the remaining link, at half the total bandwidth.
+ref: spec | IEEE 802.1AX: Link Aggregation | IEEE | 
+
+@@ http
+== Persistent connections and pooling to upstream services
+kind: connection-pool
+when: A service makes many short HTTP calls to the same backends, and each new connection costs too much time.
+how: A new HTTPS connection needs a TCP handshake (1 round trip) and a TLS handshake (1 more with TLS 1.3), so about 2 round trips before the first byte. At 50 ms apart, that is 100 ms of waiting. HTTP/1.1 keep-alive lets a connection carry many requests, one after the other.
+A client pool keeps a set of open connections per host, for example 50. A request takes an idle one, sends, reads, and returns it. With HTTP/2, one connection carries many requests at once as streams, so a small pool of 2 to 4 connections can be enough.
+Limits matter. Set idle timeouts shorter than the server's, or the client may reuse a connection the server just closed and get a reset. Cap the pool size so a slow backend cannot soak up all connections, and set per-request timeouts.
+used: Envoy, NGINX and HAProxy upstream pools; Go net/http transport; Java OkHttp and Apache HttpClient; pgbouncer applies the same idea to databases.
+avoid: For rare calls to many different hosts, where a pool mostly sits idle; open and close per call.
+flow:
+  Service [svc: HTTP client] -> Connection pool [store: 50 keep-alive conns] : GET /orders/9 | The service asks the pool for a connection to the backend.
+  Connection pool -> Backend [svc: orders API] : open TCP + TLS | The first request opens a connection. This costs about two round trips.
+  Backend -> Service : 200 OK | The backend answers. The connection goes back to the pool, still open.
+  Service -> Connection pool : GET /orders/10 | A later request asks for a connection again.
+  Connection pool -> Backend : reuse open connection | The pool reuses the open connection and skips both handshakes.
+  Backend -x> Connection pool : idle close | If a connection stays idle too long, the server closes it. The pool must drop it, not reuse it.
+ref: spec | HTTP Semantics (RFC 9110) | Fielding, Nottingham & Reschke, IETF, 2022 | https://www.rfc-editor.org/rfc/rfc9110
+ref: spec | HTTP/2 (RFC 9113) | Thomson & Benfield, IETF, 2022 | https://www.rfc-editor.org/rfc/rfc9113
+
+== Idempotency keys for safe retries of POST
+kind: idempotent-consumer, retry-backoff
+when: A client must retry a payment or order request after a timeout, and must not be charged twice.
+how: GET, PUT and DELETE are idempotent by definition in HTTP, so a retry is safe. POST is not. If the connection drops after the server processed a POST but before the reply arrived, the client cannot tell whether it worked.
+The client creates a unique key, such as a UUID, and sends it in an Idempotency-Key header on the first try and on every retry. The server stores the key with the result in a database, in the same transaction as the work. On a repeat with the same key, it returns the stored result and does nothing more.
+The client retries with exponential backoff and jitter. The server keeps keys for a limited time, for example 24 hours. If the same key arrives with a different body, the server should reject it with an error.
+used: Stripe's Idempotency-Key header; an IETF draft proposes it as a standard header; payment, order and booking APIs from many providers.
+avoid: When the operation is naturally idempotent, such as PUT with a full resource; no key is needed.
+flow:
+  Client [client: key K1] -> API [svc: checks key] : POST /charge, K1 | The client sends the charge request with a fresh key.
+  API -> Payments DB [db: keys + results] : charge, store K1 + result | The API charges the card and stores the result under K1 in one transaction.
+  API -x> Client : response lost | The reply is lost on the network. The client sees only a timeout.
+  Client -> API : retry POST, K1 | After backoff the client sends the same request with the same key.
+  API -> Payments DB : lookup K1 | The API finds K1 already done.
+  API -> Client : 200, original result | The API returns the saved result. The card is charged once only.
+ref: blog | Designing robust and predictable APIs with idempotency | Brandur Leach, Stripe, 2017 | https://stripe.com/blog/idempotency
+
+@@ httpcaching
+== Immutable hashed assets with a short-lived HTML page
+kind: cdn-edge, cache-aside
+when: A site ships static files often, and returning users must get new versions at once with no stale pages.
+how: The build puts a content hash in each asset name, such as app.3f9a1c.js. Because the name changes when the content changes, the file can be cached forever. It is served with Cache-Control: public, max-age=31536000, immutable. Browsers and CDNs never ask again.
+The HTML page that refers to these names is served with a short lifetime or with no-cache. no-cache means store, but revalidate every time with an ETag. The check is a tiny conditional GET, and the server answers 304 Not Modified with no body.
+A deploy then changes only the HTML. Users get the new HTML, which points to new file names, and the old files stay valid for anyone still on the old page. The hit rate for assets on the CDN is close to 100%. Do not use this for files whose names cannot change.
+used: Webpack, Vite and Next.js hashed build output; static hosting on Cloudflare, Fastly, CloudFront and Netlify; Google Fonts and CDN-hosted libraries.
+avoid: For API responses that must be current to the second; use no-store or a very short max-age with validators.
+flow:
+  Browser [client: first visit] -> CDN [cache: edge cache] : GET /index.html | The browser asks the CDN for the page.
+  CDN -> Origin [svc: web origin] : conditional GET, ETag | The HTML is revalidated at the origin with If-None-Match.
+  Origin -> CDN : 304 Not Modified | The origin says the page has not changed. Only headers travel.
+  CDN -> Browser : HTML, no-cache | The browser gets the HTML, which links to app.3f9a1c.js.
+  Browser -> CDN : GET /app.3f9a1c.js | The browser asks for the hashed file.
+  CDN -> Browser : 200, max-age 1 year | The CDN has it. The browser stores it for a year, and never asks again.
+  * Origin: deploy v2 | A new build makes app.7b20de.js and a new HTML page. Old files are not touched.
+ref: spec | HTTP Caching (RFC 9111) | Fielding, Nottingham & Reschke, IETF, 2022 | https://www.rfc-editor.org/rfc/rfc9111
+ref: docs | HTTP caching | MDN Web Docs | https://developer.mozilla.org/en-US/docs/Web/HTTP/Caching
+
+== Stale-while-revalidate with request coalescing at the CDN
+kind: cdn-edge, batching
+when: A popular page expires at the edge, and many users at once would hit the origin for the same page.
+how: With stale-while-revalidate=60, the cache may serve a stale copy for up to 60 more seconds after expiry, while it fetches a fresh one in the background. Users never wait for the origin. The next user gets the new copy.
+When a cache has no copy at all, many requests for the same URL arrive at once. Request coalescing (also called collapsed forwarding) lets one request go to the origin, and holds the others until the answer returns. The origin sees one request, not thousands.
+A shield tier adds a second cache layer. Edge sites in many cities ask one shield site, so the origin sees one request per object per TTL from the whole world. The cost is a little staleness, so use it for content where 1 minute of age is fine.
+used: Fastly and Cloudflare tiered cache and stale-while-revalidate; NGINX proxy_cache_use_stale with proxy_cache_lock; Varnish grace mode; news sites and video-segment delivery.
+avoid: For personal or per-user content, or data that must be exact, such as prices at checkout.
+flow:
+  User 1 [client] -> Edge cache [cache: copy expired] : GET /home | The stale copy is 10 seconds past expiry.
+  Edge cache -> User 1 : stale copy, at once | Within the 60-second window, the user gets the stale copy with no delay.
+  Edge cache ~> Origin [svc: web origin] : background revalidate | The edge asks the origin for a fresh copy, using the ETag.
+  User 2 [client] -> Edge cache : GET /home | Another user asks during the refresh.
+  Edge cache -> User 2 : stale copy | The edge still answers from the stale copy. No second origin request starts.
+  Origin -> Edge cache : 200 fresh, max-age 30 | The new copy arrives and replaces the stale one.
+  * Edge cache: fresh | Later users get the fresh copy.
+ref: spec | Cache-Control Extensions for Stale Content (RFC 5861) | Nottingham, IETF, 2010 | https://www.rfc-editor.org/rfc/rfc5861
+
+@@ iprouting
+== Control plane programs a fast forwarding table
+kind: control-data-plane
+when: A router must forward millions of packets per second, while routes change slowly and come from many sources.
+how: Routing protocols (BGP, OSPF) and static routes run on the control plane, in software. They compute the best route for each prefix and install it in the forwarding table (FIB). The data plane, often a chip, uses only the FIB.
+For each packet, the data plane does a longest-prefix match on the destination address. For 10.1.2.77, a route 10.1.2.0/24 beats 10.1.0.0/16 and 0.0.0.0/0. The packet leaves on the matching next hop, and the TTL is lowered by 1. This is done in nanoseconds with TCAM or optimized tries.
+A full internet table has more than 1 million IPv4 prefixes. Chips have limited FIB space, so operators filter or summarize routes. If the control plane fails, the data plane can keep forwarding with the last FIB for a short time. This is called graceful restart.
+used: Cisco, Juniper and Arista routers; Linux kernel routing with FRRouting or BIRD; software-defined networks such as Google's Orion and Jupiter control planes.
+avoid: Not a choice for routers. For a single host with one gateway, one default route is enough.
+flow:
+  BGP daemon [svc: control plane] -> Route table [store: RIB] : 203.0.113.0/24 via R2 | The daemon learns a prefix from a neighbour and stores it in the route table.
+  Route table -> FIB chip [svc: data plane] : install prefix | The best route is pushed down to the forwarding chip.
+  Host [client] -> FIB chip : packet to 203.0.113.9 | A packet arrives at the router.
+  * FIB chip: lookup in own table | The chip looks only in its own table. It does not call the control plane.
+  FIB chip -> Next hop R2 [svc: neighbour router] : forward, TTL 63 | Longest prefix match picks R2. The packet leaves with TTL reduced.
+  * BGP daemon: restarted | The control plane restarts, but the FIB still has routes, so forwarding continues.
+ref: spec | Requirements for IP Version 4 Routers (RFC 1812) | Baker, IETF, 1995 | https://www.rfc-editor.org/rfc/rfc1812
+
+== Public and private subnets with route tables
+kind: zero-trust, layered-arch
+when: A cloud network must expose some servers to the internet and keep databases and workers private.
+how: A VPC is split into subnets. Each subnet is linked to a route table. A public subnet has a route 0.0.0.0/0 to an internet gateway. A private subnet has 0.0.0.0/0 to a NAT gateway, or no default route at all.
+Routing uses the most specific route. The local VPC range, such as 10.0.0.0/16, always wins for traffic inside the VPC. So the web tier can talk to the database, but a database in a private subnet has no path for inbound traffic from the internet.
+Security groups and network ACLs add filters on top of routing. The common layout is three tiers: load balancers in public subnets, app servers and databases in private ones, one set per availability zone. Routing alone is not security, so combine it with filters.
+used: AWS VPC, Google Cloud VPC and Azure VNet; Kubernetes clusters on private subnets with a public load balancer; Terraform VPC modules.
+avoid: For a tiny test project, where the default VPC is enough. For strong isolation, add separate accounts or VPCs.
+flow:
+  Internet [client: users] -> Internet gateway [svc: public route] : HTTPS to load balancer | Users reach only the load balancer in the public subnet.
+  Internet gateway -> Load balancer [svc: public subnet] : forward | The route table of the public subnet sends 0.0.0.0/0 to the gateway.
+  Load balancer -> App server [svc: private subnet] : local route 10.0.0.0/16 | Traffic to the app uses the local VPC route, the most specific one.
+  App server -> Database [db: private subnet] : SQL | The app reads and writes the database over the local route.
+  App server -> NAT gateway [svc: public subnet] : outbound call to API | For internet calls, the private route table sends 0.0.0.0/0 to the NAT gateway.
+  Internet -x> Database : no inbound route | No route and no public IP exist, so the internet cannot start a connection to the database.
+ref: docs | Configure route tables | Amazon VPC User Guide | https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Route_Tables.html
+
+@@ nat
+== NAT gateway for outbound-only private subnets
+kind: private-subnet-egress
+when: Servers in a private network need to call the internet, but nobody on the internet may start a connection to them.
+how: Many private hosts share one public IP. The gateway rewrites the source address and port of each outgoing packet, and writes a row in its connection table: private IP and port, public IP and port, remote address, protocol. This is source NAT with port translation (PAT).
+When the reply comes back, the gateway looks up the row, rewrites the destination to the private host, and forwards. A packet that matches no row, such as one that starts from outside, is dropped. This gives an outbound-only path, and a basic stateful firewall as a side effect.
+A public IP has about 64,000 usable ports per remote address and protocol. A busy gateway can run out of ports when one service gets many connections (port exhaustion). Fixes are more public IPs, fewer short connections, or connection reuse. Idle entries expire, TCP after hours, UDP after tens of seconds.
+used: AWS NAT Gateway, Google Cloud NAT and Azure NAT Gateway for private subnets; Linux iptables and nftables masquerade; home routers; carrier-grade NAT at mobile and ISP networks.
+avoid: When you need inbound connections to each host, or when IPv6 is available; IPv6 gives each host a public address, with a firewall for safety.
+flow:
+  Private server [client: 10.0.1.5] -> NAT gateway [svc: public 198.51.100.4] : src 10.0.1.5:40001 | A private host calls an external API. Its address is private.
+  NAT gateway -> Connection table [store: translation rows] : add 40001 to 50022 | The gateway records the mapping from private port to a public port.
+  NAT gateway -> External API [svc: api.example.org] : src 198.51.100.4:50022 | The packet leaves with the shared public address and the new port.
+  External API -> NAT gateway : reply to :50022 | The API replies to the public address and port.
+  NAT gateway -> Private server : dst 10.0.1.5:40001 | The table lookup rewrites the destination back to the private host.
+  Scanner [client: on the internet] -x> NAT gateway : SYN to :50099 | A packet with no table row is dropped. Nobody can start a connection inward.
+ref: spec | Traditional IP Network Address Translator (RFC 3022) | Srisuresh & Egevang, IETF, 2001 | https://www.rfc-editor.org/rfc/rfc3022
+ref: docs | NAT gateways | Amazon VPC User Guide | https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html
+
+== Hole punching with STUN and a TURN relay fallback
+kind: nat-traversal
+when: Two devices behind different NATs must talk directly, as in a video call or a game, with no public address on either.
+how: Each device asks a STUN server, on the public internet, "what address and port do you see for me?" It learns its public mapping. Both devices send these candidate addresses to each other through a signaling server, for example over WebSocket.
+Then both send packets to each other's public address at the same time. Each NAT sees an outgoing packet and creates a mapping, so the other side's packet looks like a reply and is let in. This works with most home NATs.
+Some NATs (symmetric NAT, many carrier-grade NATs) use a new port for each remote host, so the learned address is useless. Then the call falls back to a TURN relay, a server that forwards all media. ICE is the procedure that tries all candidates and chooses the best path. About 10% to 20% of calls often need TURN, which costs bandwidth.
+used: WebRTC in browsers; open-source STUN and TURN server coturn; Tailscale and WireGuard-based meshes for direct links with relay fallback; online games.
+avoid: When both ends can accept inbound connections, such as servers with public IPs; connect directly.
+flow:
+  Peer A [client: behind NAT 1] -> STUN server [svc: public] : what is my address? | Peer A asks a STUN server how its packets look from outside.
+  STUN server -> Peer A : 198.51.100.4:50022 | The STUN server answers with the public address and port.
+  Peer A -> Signaling server [svc: WebSocket] : my candidates | Peer A shares its candidates with peer B through a signaling server.
+  Signaling server -> Peer B [client: behind NAT 2] : A's candidates | Peer B gets the candidates. B sends its own back the same way.
+  Peer A -> Peer B : UDP probe | Both peers send packets at the same time. Each NAT opens a mapping, so the traffic goes through directly.
+  Peer A ~> TURN relay [svc: fallback] : relay if blocked | If the probes fail, both peers send their media through the TURN relay.
+ref: spec | Interactive Connectivity Establishment (RFC 8445) | Keranen, Holmberg & Rosenberg, IETF, 2018 | https://www.rfc-editor.org/rfc/rfc8445
+
+@@ nfc
+== Tap-to-pay with a secure element and a payment token
+kind: none
+when: A phone or card must pay at a terminal over a few centimetres, with no real card number revealed.
+how: At setup, the card is replaced by a token: a different number that is tied to one device. The token and its keys are stored in the secure element (a tamper-resistant chip) or in a protected host-card-emulation service. The real card number never goes into the phone wallet.
+At the terminal, the reader's 13.56 MHz field powers the NFC chip and a short exchange follows, under ISO 14443 and the EMV contactless rules. The device sends the token and a one-time cryptogram, computed over the amount and a counter with a key held in the secure element. The user unlocks the phone first, so a stolen phone cannot pay silently.
+The payment network checks the cryptogram and swaps the token for the real card number, then asks the bank. A copied token and cryptogram cannot be reused for another amount. The whole tap takes a few hundred milliseconds.
+used: Apple Pay, Google Wallet and Samsung Wallet; EMV contactless bank cards; transit systems that accept tap-to-pay.
+avoid: When the transaction needs more than a few centimetres of range or a large data transfer; use Bluetooth, QR codes or Wi-Fi.
+flow:
+  Phone wallet [client: secure element] -> POS terminal [svc: NFC reader] : tap, token + cryptogram | The user unlocks the phone and taps. It sends a token and a one-time cryptogram.
+  POS terminal -> Acquirer [svc: merchant bank] : authorization request | The terminal forwards the request to the merchant's bank.
+  Acquirer -> Card network [svc: token vault] : token + cryptogram | The card network checks the cryptogram, using the key for this device.
+  Card network -> Issuer bank [svc: card issuer] : real card number | The network swaps the token for the real card number and asks the issuing bank.
+  Issuer bank -> POS terminal : approved | The approval comes back along the same path.
+  POS terminal -x> Phone wallet : replay rejected | A copy of the same cryptogram is refused, because the counter has moved on.
+ref: docs | EMV Contactless Specifications for Payment Systems | EMVCo | https://www.emvco.com/emv-technologies/contactless/
+
+== Passkey or security key tap over NFC
+kind: challenge-response
+when: A user logs in from a laptop or phone with a hardware key or phone, and a stolen password must not be enough.
+how: A FIDO2 key holds a private key for each site. At login, the browser sends the site's challenge to the key. Over NFC, the key is powered by the reader's field, so it needs no battery and no cable. The user taps the key against the phone or laptop.
+The key signs the challenge and the site origin, and returns the signature in a short NFC exchange. The server checks it with the stored public key. The signed origin stops fake sites from reusing the answer.
+Some keys ask for a PIN or a fingerprint (user verification) before they sign. On a phone, the same exchange can run over NFC, USB or Bluetooth, and across devices (a phone used to log in on a laptop) through the cross-device flow of passkeys.
+used: YubiKey 5 NFC and Google Titan keys; Android and iPhone NFC reading of FIDO keys; workforce SSO at companies that require phishing-resistant MFA.
+avoid: When the user's device has no NFC reader and cannot connect by USB; use a platform passkey or a phone-based flow.
+flow:
+  Website [svc: has public key] -> Phone browser [client: NFC reader] : random challenge | The site sends a fresh challenge to the browser.
+  Phone browser -> Security key [svc: passive chip] : challenge + origin | The browser sends the challenge and origin. The reader field also powers the key.
+  Security key -> User [user: holds the key] : ask for touch or PIN | The key asks for user verification before it signs.
+  User -> Security key : touch and PIN | The user taps and enters the PIN.
+  Security key -> Phone browser : signed assertion | The key returns the signature in a short NFC exchange.
+  Phone browser -> Website : assertion | The site verifies it with the stored public key and signs the user in.
+ref: spec | Client to Authenticator Protocol (CTAP) 2.1 | FIDO Alliance | https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html
+
+@@ ntp
+== Stratum hierarchy with several upstream sources
+kind: none
+when: A fleet of servers needs clocks within milliseconds of each other and of real time, with no single point of failure.
+how: Stratum 0 devices are atomic clocks and GPS receivers. Stratum 1 servers are attached to them. Stratum 2 servers sync from stratum 1, and so on. Each server and client sends an NTP request and gets four timestamps. From them it computes the offset and the round-trip delay.
+The client queries several sources, for example 4 or more, and the algorithm discards outliers (falsetickers) and combines the rest. It does not step the clock if the error is small. It slews: it speeds up or slows down the clock a little, so time never jumps back. Large errors, over 128 ms by default in ntpd, cause a step.
+Inside a company, a few internal servers sync from several public or GPS sources, and all other machines sync from the internal servers. This keeps the load low and the result consistent. Typical accuracy is about 1 ms on a LAN and tens of milliseconds over the internet.
+used: chrony on Linux; ntpd; NTP pool project; cloud time services such as the Amazon Time Sync Service and Google public NTP; Windows Time.
+avoid: When you need accuracy better than about 100 microseconds; use PTP with hardware timestamps.
+flow:
+  GPS receiver [svc: stratum 0] -> Internal NTP server [svc: stratum 1] : PPS and time | A GPS receiver gives the internal server accurate time.
+  Public NTP pool [svc: stratum 2 sources] -> Internal NTP server : backup sources | The internal server also checks several public servers, to find a bad GPS.
+  Internal NTP server -> App server [svc: chrony client] : NTP reply, 4 timestamps | The client gets the timestamps and works out the offset and delay.
+  * App server: offset 3 ms | The client finds its clock is 3 ms fast.
+  * App server: slewing clock | It slows its clock slightly for a short time. Time never jumps back.
+  Internal NTP server -x> App server : falseticker removed | A source whose time disagrees with the others is excluded.
+ref: spec | Network Time Protocol Version 4 (RFC 5905) | Mills et al., IETF, 2010 | https://www.rfc-editor.org/rfc/rfc5905
+ref: docs | chrony documentation | chrony project | https://chrony-project.org/documentation.html
+
+== Leases that tolerate bounded clock skew
+kind: lease
+when: A lock or leader role expires by time, and the holder and the checker use different clocks.
+how: A lease says "you own this until time T". The holder stops acting before T, and the checker does not give the role to someone else before T. With perfect clocks this is safe. Real clocks drift by tens of parts per million, and NTP error can be milliseconds or more.
+So the design adds a safety margin. If the lease is 10 seconds and the maximum clock error is 500 ms, the holder stops at 9 seconds of its own clock, and the grantor waits the full 10 seconds, plus the margin, before regranting. Using durations measured on a monotonic clock, not wall-clock times, removes the effect of clock steps.
+Clock sync cannot fix a long pause, such as a stop-the-world garbage collection, so a lease is combined with a fencing token. The storage layer rejects writes with an older token, so a late holder cannot do damage.
+used: Chubby, etcd and ZooKeeper sessions; Kubernetes leader election leases; Google Spanner, which uses TrueTime to bound uncertainty; HBase and Kafka controller timeouts.
+avoid: When clocks cannot be bounded, such as on unmanaged devices; use consensus with logical terms, with no time assumptions.
+flow:
+  Node A [svc: leader] -> Lock service [svc: etcd lease] : grant lease | Node A gets a lease that lasts 10 seconds on the service's clock.
+  * Node A: stops at 9 s | Node A uses a margin, so it stops acting after 9 seconds on its own clock.
+  Node A -x> Lock service : renew lost | A network problem stops the renewal.
+  * Lock service: lease expired | The service waits the full 10 seconds, and a margin for clock error, then marks the lease free.
+  Node B [svc: candidate] -> Lock service : acquire, token 8 | Node B takes the lease and receives fencing token 8.
+  Node B -> Storage [db: rejects old tokens] : write, token 8 | The storage accepts the write. Any late write with token 7 from node A would be refused.
+ref: paper | Leases: An Efficient Fault-Tolerant Mechanism for Distributed File Cache Consistency | Gray & Cheriton, SOSP 1989 |
+ref: blog | How to do distributed locking | Martin Kleppmann, 2016 | https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+
+@@ osi
+== Encapsulation: each layer wraps the one above
+kind: layered-protocol
+when: Many applications must work over many different physical networks, and each layer must change on its own.
+how: An application writes bytes to a socket. The transport layer (TCP) cuts them into segments and adds a header with ports, sequence numbers and a checksum. The network layer (IP) adds its own header with source and destination addresses. The link layer (Ethernet) adds a header with MAC addresses and a trailer with a CRC.
+At each router, the frame is unwrapped to the IP header, a new next hop is chosen, and a new link header is added. The IP packet stays unchanged apart from the TTL. The receiver unwraps layer by layer, until the application bytes are delivered to the right socket by port number.
+Because each layer talks only to the one above and below, HTTP can run over Wi-Fi, Ethernet or 5G with no change. The cost is header overhead: about 54 bytes per frame for Ethernet, IPv4 and TCP together, so small packets carry a large share of overhead.
+used: Every network stack, such as the Linux kernel and BSD sockets; tools such as Wireshark that show each header in turn; QUIC, which puts transport features in user space over UDP.
+avoid: When a very tight system needs to skip layers, such as kernel bypass with DPDK or RDMA for speed; use those only for one hot path.
+flow:
+  Browser [client: HTTP request] -> TCP [svc: ports 51512 to 443] : bytes | The app hands bytes to the transport layer. TCP adds ports and a sequence number.
+  TCP -> IP [svc: src and dst address] : segment | IP adds source and destination addresses.
+  IP -> Ethernet [svc: MAC addresses + CRC] : packet | Ethernet adds the MAC of the next hop and a CRC at the end.
+  Ethernet -> Router [svc: new link header] : frame | The router removes the old frame header and keeps the IP packet.
+  Router -> Server [svc: unwraps all layers] : new frame | The router adds a new link header for the next hop, and sends it on.
+  * Server: HTTP bytes to port 443 | The server removes each header in turn and gives the bytes to the socket for port 443.
+ref: paper | End-to-End Arguments in System Design | Saltzer, Reed & Clark, 1984 |
+ref: spec | Internet Protocol (RFC 791) | Postel, IETF, 1981 | https://www.rfc-editor.org/rfc/rfc791
+
+== Choose the layer: L4 or L7 load balancing
+kind: horizontal-scale, api-gateway
+when: Traffic must be spread over many servers, and you must decide how much of the packet the balancer reads.
+how: A layer-4 balancer reads only IP addresses and ports. It picks a backend by a hash of the 5-tuple and forwards the packets, often with no TLS and very little state. It is fast, on the order of millions of packets per second per core, and works for any TCP or UDP protocol.
+A layer-7 balancer terminates the connection and reads the HTTP request. It can route by host name, path, header or cookie, retry on another backend, add or remove headers, and apply rate limits. The price is more CPU, as it holds TLS keys and parses every request.
+A common design uses both. A layer-4 tier, with ECMP or a tool such as Maglev, spreads connections over a fleet of layer-7 proxies. The proxies do the smart routing. Each tier is scaled and replaced on its own.
+used: Google Maglev (layer 4) with Envoy-style proxies; AWS Network Load Balancer and Application Load Balancer; HAProxy, NGINX and Envoy; Meta's Katran for layer 4.
+avoid: When a single server is enough. Use layer 7 only where you need content-based routing; use layer 4 for non-HTTP traffic.
+flow:
+  Client [client] -> L4 balancer [svc: hash of 5-tuple] : TCP SYN to VIP | The client connects to one public address. The layer-4 tier hashes the 5-tuple.
+  L4 balancer -> L7 proxy 1 [svc: terminates TLS], L7 proxy 2 [svc: terminates TLS] : forward packets | The packets go to one of the proxies. All packets of one connection go to the same proxy.
+  L7 proxy 1 -> Orders service [svc: path /orders] : GET /orders/9 | The proxy reads the HTTP path and picks the orders backend.
+  L7 proxy 1 -> Search service [svc: path /search] : GET /search?q=tv | A request for another path on the same connection goes to the search backend.
+  Orders service -x> L7 proxy 1 : 503 | One backend fails.
+  L7 proxy 1 -> Orders service 2 [svc: retry] : retry GET | The proxy retries on another instance. The client sees no error.
+ref: paper | Maglev: A Fast and Reliable Software Network Load Balancer | Eisenbud et al., NSDI 2016 |
+
+@@ overlaynet
+== VXLAN overlay for pod and VM networks
+kind: control-data-plane
+when: Containers or VMs on many hosts must share one flat virtual network, on top of an ordinary routed IP network.
+how: Each host runs a virtual switch or CNI agent. A packet from a pod to a pod on another host is wrapped by the sender host: the original Ethernet frame goes inside a UDP packet (port 4789), with an 8-byte VXLAN header holding a 24-bit network ID (VNI). The outer IP header carries the host addresses, so the physical network sees plain UDP.
+The receiving host strips the outer headers, uses the VNI to pick the right virtual network and delivers the original frame. A control plane tells each host which pod subnet or MAC lives on which host. This can be a Kubernetes API watch, or BGP EVPN.
+Encapsulation adds about 50 bytes, so inner MTU must be lowered, for example from 1500 to 1450, or the underlay must use larger frames. The UDP source port is set from a hash of the inner flow, so ECMP in the underlay can still spread traffic.
+used: Flannel VXLAN and Calico VXLAN mode; Cilium with VXLAN or Geneve tunnel mode; VMware NSX and OpenStack Neutron; BGP EVPN data-center fabrics.
+avoid: When the network can route pod IPs directly with BGP; this removes the overhead and the debug pain of tunnels.
+flow:
+  Pod A [client: 10.1.1.5 on host 1] -> Host 1 [svc: VTEP 192.168.0.1] : inner packet to 10.1.2.7 | Pod A sends to a pod on another host. Host 1 sees an address that is not local.
+  Host 1 -> Control plane [store: pod subnet to host map] : who has 10.1.2.0/24? | Host 1 learns that the subnet is on host 2. The mapping is cached.
+  Host 1 -> Underlay network [svc: plain IP routing] : UDP 4789, VNI 42 | Host 1 wraps the frame in UDP with VNI 42 and sends it to host 2's address.
+  Underlay network -> Host 2 [svc: VTEP 192.168.0.2] : outer packet | The underlay routes the packet like any other UDP packet.
+  Host 2 -> Pod B [client: 10.1.2.7 on host 2] : inner packet | Host 2 removes the outer headers, picks the network by VNI and delivers the frame.
+ref: spec | Virtual eXtensible Local Area Network (VXLAN) (RFC 7348) | Mahalingam et al., IETF, 2014 | https://www.rfc-editor.org/rfc/rfc7348
+ref: spec | Geneve: Generic Network Virtualization Encapsulation (RFC 8926) | Gross et al., IETF, 2020 | https://www.rfc-editor.org/rfc/rfc8926
+
+== WireGuard mesh VPN between sites and laptops
+kind: zero-trust
+when: Laptops, servers and offices in different places must reach private services as if on one network, with strong encryption.
+how: Each peer has a key pair. A peer's configuration lists the public keys of the other peers and, for each, the IP ranges it may use (AllowedIPs). That list is also the routing table and the access filter: a packet from a peer with a source address outside its AllowedIPs is dropped.
+WireGuard wraps each IP packet in UDP and encrypts it with ChaCha20-Poly1305 after a Noise key exchange. Keys are refreshed every few minutes. It is stateless to the user: if no packets flow, nothing is sent, and a roaming peer is found by its new source address. The code is small, about 4,000 lines, and runs inside the Linux kernel (since 5.6).
+Peers behind NAT can use a keepalive of 25 seconds to hold the NAT mapping open. A coordination service, as in Tailscale, hands out the keys and endpoints, and tries direct paths first, with relay fallback. Use ACLs on top, so a VPN does not give broad access to everything.
+used: Tailscale and Netbird meshes; Cloudflare WARP; Cilium and Kubernetes node-to-node encryption; Mullvad and many commercial VPNs; site-to-site links between clouds.
+avoid: When you need standard IPsec for interoperability with old gateways or compliance rules; use IPsec or IKEv2 there.
+flow:
+  Laptop [client: wg0 10.8.0.2] -> Coordination service [svc: key and endpoint list] : register public key | The laptop publishes its public key and learns its peers.
+  Coordination service -> Laptop : peer keys + endpoints | It returns the peers' public keys, AllowedIPs and addresses.
+  Laptop -> Office gateway [svc: wg0 10.8.0.1] : handshake, Noise IK | The laptop starts a short key exchange and both sides derive session keys.
+  Laptop -> Office gateway : encrypted UDP, 10.0.0.0/24 | Packets for the office network are encrypted and sent in UDP.
+  Office gateway -> Internal service [svc: 10.0.0.20] : decrypted IP packet | The gateway decrypts, checks the source against AllowedIPs, and forwards.
+  Office gateway -x> Laptop : spoofed source dropped | A packet from this peer with a source outside its AllowedIPs is dropped.
+ref: paper | WireGuard: Next Generation Kernel Network Tunnel | Jason A. Donenfeld, NDSS 2017 | https://www.wireguard.com/papers/wireguard.pdf

@@ -1,0 +1,808 @@
+@@ a2a
+== Agent card discovery then task delegation
+kind: service-discovery, request-reply
+when: An agent must find a partner agent from another team or vendor and hand it a job, without custom glue code.
+how: The partner publishes an Agent Card, a JSON file usually at /.well-known/agent-card.json. It lists the agent's skills, its endpoint, the transports it speaks and the auth it needs. The client agent fetches the card first, and picks a skill that matches the job.
+The client then sends a message to the endpoint, for example with the SendMessage call over JSON-RPC, gRPC or HTTP+JSON. The server answers with a Task that has an id and a state. The client keeps the task id and uses it for every later call.
+The client never sees the partner's prompts, tools or memory. It only sees messages and artifacts. This keeps each side opaque, which is the main reason to use A2A and not a shared library.
+used: Multi-vendor agent setups built with Google ADK, LangGraph and other frameworks; the Linux Foundation A2A project lists SDKs for Python, Go, Java, JavaScript and .NET.
+avoid: When the partner is only a stateless function; call it as an MCP tool or a plain API instead.
+flow:
+  Client agent [svc: orchestrator] -> Agent Card URL [store: /.well-known] : GET agent-card.json | The client fetches the card and reads skills, endpoint and auth scheme.
+  Client agent -> Partner agent [svc: opaque remote] : SendMessage + token | The client sends a message with a bearer token, as the card required.
+  Partner agent -> Client agent : Task t-81, working | The partner replies at once with a task id and the state working.
+  Client agent -> Partner agent : GetTask t-81 | The client asks for the state later, using only the task id.
+  Partner agent -> Client agent : completed + artifact | The task ends in completed, with a result document as an artifact.
+ref: docs | Agent2Agent protocol specification | A2A project, Linux Foundation | https://a2a-protocol.org/latest/
+
+== Long-running task with streaming and push callback
+kind: async-request-reply, webhook-callback
+when: The partner agent needs minutes or days to finish, and the client cannot hold a connection open that long.
+how: Work between agents is often slow: a background check or a booking can take hours. A2A models this as a Task with states such as submitted, working, input-required and completed. The client can watch the task in three ways.
+For short jobs it streams: the server sends status and artifact updates over server-sent events on one open connection. For long jobs the client registers a push notification URL. The server then calls that webhook when the state changes, and the client fetches the task for details. Polling with GetTask is the simple fallback.
+If the partner needs more data it moves the task to input-required. The client answers with a new message that carries the same task id, and work continues. This is the pattern's main strength over a plain request and response.
+used: Agent hand-offs in enterprise workflows such as hiring or travel booking; any pair of A2A clients and servers built with the official SDKs.
+avoid: For sub-second calls that return one value; a normal API call is simpler.
+flow:
+  Hiring agent [svc] -> Check agent [svc: vendor] : SendMessage + webhook url | The hiring agent submits the job and registers a push notification URL.
+  Check agent -> Hiring agent : Task t-7 submitted | The server returns the task id at once; the connection closes.
+  Check agent -> Hiring agent : input-required | The vendor needs the candidate's consent number, so the task state changes.
+  Hiring agent -> Check agent : message with task t-7 | The client answers on the same task id, so the context is kept.
+  Check agent ~> Webhook receiver [svc: client side] : task t-7 completed | Hours later the server calls the webhook URL with the new state.
+  Webhook receiver -> Check agent : GetTask t-7 | The client fetches the task and reads the result artifact.
+ref: docs | Life of a Task | A2A project | https://a2a-protocol.org/latest/topics/life-of-a-task/
+
+== MCP for tools, A2A for peer agents
+kind: agent-loop, plugin-arch
+when: One agent needs both its own tools and help from specialist agents owned by other teams.
+how: The agent keeps two kinds of outside links. Tools and data sources are reached over MCP: they are passive, have clear schemas and return at once. Other agents are reached over A2A: they are active, have their own goals, and may take a long time.
+The orchestrator loop picks the link by the job. A SQL query goes to an MCP server. "Find three suitable hotels and hold a room" goes to a hotel agent through A2A. The hotel agent may itself use MCP tools and other A2A agents, so the pattern nests.
+Each hop has its own auth and its own audit log. Do not give a remote agent the tools of the caller; give it a task and let it use its own.
+used: The A2A documentation presents this split (MCP vertical, A2A horizontal); common in multi-agent platforms from Google Cloud and other vendors.
+avoid: When one agent with a few tools is enough; extra agents add latency and cost.
+flow:
+  User [user] -> Orchestrator agent [svc: LLM loop] : plan a trip | The user states a goal; the orchestrator plans the steps.
+  Orchestrator agent -> Calendar MCP server [svc: tool] : tools/call | A simple lookup is a tool call over MCP.
+  Calendar MCP server -> Orchestrator agent : free dates | The tool returns a result at once.
+  Orchestrator agent -> Hotel agent [svc: remote agent] : SendMessage | A larger goal is handed over as an A2A task.
+  Hotel agent -> Booking MCP server [svc: tool] : tools/call | The remote agent uses its own tools; the caller never sees them.
+  Hotel agent -> Orchestrator agent : artifact: booking | The hotel agent returns a finished artifact.
+ref: docs | A2A and MCP | A2A project | https://a2a-protocol.org/latest/topics/a2a-and-mcp/
+
+@@ feast
+== Offline store for training, online store for serving
+kind: feature-store, online-offline
+when: A model is trained on history but must read the same features in under 10 ms at prediction time.
+how: Features are declared once in a repo: entities, feature views and their sources. A materialization job (feast materialize) reads the batch source, such as a warehouse table, and writes the latest value per entity key into the online store, for example Redis or DynamoDB.
+For training, the offline store (BigQuery, Snowflake or files) answers get_historical_features. This does a point-in-time join: for every training row it takes the feature value as it was at the row's timestamp, not today's value. This stops label leakage.
+At serving time the model service calls get_online_features with entity ids and gets the latest values by key lookup. Both paths use one definition, so training and serving cannot drift in code.
+used: Teams using Feast with BigQuery, Snowflake, Redshift, Redis or DynamoDB; common in recommender and fraud systems.
+avoid: When there is one model with a few simple features; compute them in the service. Also avoid it when no feature needs sub-second freshness and batch scoring is enough.
+flow:
+  Feature repo [store: feast apply] -> Registry [db: feature definitions] : apply | The repo defines entities and feature views; apply writes them to the registry.
+  Warehouse [lake: BigQuery] -> Feast job [svc: materialize] : read new rows | A scheduled job reads source rows since the last run.
+  Feast job -> Online store [cache: Redis] : latest per user id | Only the newest value per entity key is written, so reads are single lookups.
+  Training job [svc] -> Warehouse : get_historical_features | The training job joins features as of each label timestamp, which avoids leakage.
+  Model service [svc: serving] -> Online store : get_online_features | The service looks up features by user id in a few milliseconds.
+ref: docs | Feast architecture | Feast project | https://docs.feast.dev/getting-started/architecture
+
+== Streaming features pushed to the online store
+kind: feature-store, event-driven
+when: A feature such as "clicks in the last 10 minutes" must be fresh, and a daily batch job is too slow.
+how: A stream job (Flink or Spark Structured Streaming) reads events from Kafka and computes the rolling aggregate. It then calls Feast's push API with the new rows. Feast writes them to the online store, and optionally to the offline store as well.
+The same feature view serves both the batch source and the push source. A batch job still backfills history, so training data and online values are computed from the same logic when possible. Keep the stream logic and the batch logic equal, or the values will differ.
+The cost is one more running system. Streaming jobs need state, checkpoints and monitoring, so only use them for features where minutes matter.
+used: Fraud and ads ranking teams that mix Kafka streams with Feast push sources; the Feast documentation describes push sources for this.
+avoid: When hourly freshness is fine; schedule a materialize job instead.
+flow:
+  Click events [log: Kafka] -> Flink job [svc: 10 min window] : click stream | The stream job reads click events as they arrive.
+  Flink job -> Feast push API [svc] : push rows | Each window result is pushed as a row with an event timestamp.
+  Feast push API -> Online store [cache: Redis] : write latest | The newest aggregate overwrites the old one for that user.
+  Feast push API ~> Offline store [lake: Parquet] : append rows | Rows are also kept for later training joins.
+  Ranker [svc] -> Online store : get_online_features | The ranker reads a feature that is minutes old, not a day old.
+ref: docs | Push source | Feast project | https://docs.feast.dev/reference/data-sources/push
+
+== Feature server behind the model service
+kind: feature-store, horizontal-scale
+when: Many services in different languages need features, and you do not want each to embed a Feast client.
+how: Run the Feast feature server as an HTTP service in front of the online store. Clients send entity ids and feature names as JSON and get values back. The server is stateless, so you run many copies behind a load balancer.
+The model service, the batch scorer and a notebook all use the same endpoint. Access control and feature names are in one place. The registry is read from a shared store, so every copy sees the same definitions after feast apply.
+Latency is the sum of one network hop and one key lookup, so keep the server in the same region as the online store. Cache the registry in memory and refresh it every few minutes.
+used: Feast feature server on Kubernetes, common in teams that serve Python and non-Python callers.
+avoid: When one Python service is the only caller; use the SDK in process and skip the hop.
+flow:
+  Model service [svc: Go] -> Load balancer [svc] : POST get-online-features | A non-Python service sends entity ids over HTTP.
+  Load balancer -> Feature server [svc: stateless x3] : route | Any copy can answer, because none holds state.
+  Feature server -> Registry [db: S3 or SQL] : read definitions | Copies load feature definitions and cache them.
+  Feature server -> Online store [cache: Redis] : lookup by key | The server reads values for the requested ids.
+  Feature server -> Model service : feature vector | The service gets values and calls the model.
+ref: docs | Python feature server | Feast project | https://docs.feast.dev/reference/feature-servers/python-feature-server
+
+@@ hf
+== Hub as model registry with pinned revisions
+kind: external-config, immutable-infra
+when: Many jobs and services load the same model and must get the same weights, and updates must be controlled.
+how: Models, datasets and Spaces live in Git repositories on the Hugging Face Hub. Large files use Git LFS (or Xet storage). Code calls from_pretrained("org/model", revision="<commit sha>"), which downloads the files once and keeps them in a local cache.
+Pinning to a commit hash makes the load repeatable, because a branch name like main can move. In production, copy the model once into your own bucket or an internal mirror, so a Hub outage or a deleted repo cannot stop a deploy.
+Safetensors files are preferred over pickle files, because loading them cannot run code.
+used: Most open-model workflows; teams that mirror Hub models into S3 or an internal artifact store before deploy.
+avoid: When the model is private and tiny; a plain object store with versioned paths is enough.
+flow:
+  Fine-tune job [svc] -> HF Hub [store: Git + LFS] : push model | The training job pushes weights and config as a new commit.
+  Release script [svc] -> HF Hub : resolve main to sha | The release step records the exact commit hash in a config file.
+  Release script -> Internal mirror [store: S3 bucket] : snapshot_download | The files at that commit are copied to the company bucket.
+  Inference pod [svc] -> Internal mirror : from_pretrained(path) | The pod loads the pinned copy; it does not call the public Hub.
+  Inference pod -x> HF Hub : blocked in prod | Production has no outbound route to the Hub, so a Hub outage cannot break it.
+ref: docs | Hugging Face Hub documentation | Hugging Face | https://huggingface.co/docs/hub/index
+
+== Pretrained model, then fine-tune and serve
+kind: online-offline, feedback-loop
+when: You need a model for your own task, but you do not have the data or money to train one from scratch.
+how: Start from a pretrained checkpoint on the Hub. Load it with Transformers, and use Datasets to read your labeled data. Train with the Trainer or with TRL. For large models use PEFT with LoRA, which trains small adapter matrices (often under 1 percent of the weights) and keeps the base frozen.
+Evaluate on a held-out set, then push the model or the adapter back to the Hub. Serving reads the same repo. A LoRA adapter can be merged into the base weights for speed, or loaded at run time so one base model serves many tasks.
+The loop repeats as new labeled data arrives: log hard cases in production, label them, train again.
+used: Open-model fine-tuning with Transformers, PEFT and TRL; many teams then serve through vLLM or Text Generation Inference.
+avoid: When a prompted hosted model already meets the quality target; fine-tuning adds a training and evaluation burden.
+flow:
+  HF Hub [store: base model] -> Training job [svc: GPU] : load checkpoint | The job downloads the base model and its tokenizer.
+  Labeled data [lake: Datasets] -> Training job : stream batches | The data loader reads examples in batches.
+  Training job -> Eval job [svc] : LoRA adapter | The adapter is scored on a held-out set.
+  Eval job -> HF Hub : push if better | Only a better adapter is pushed as a new version.
+  Inference server [svc: vLLM or TGI] -> HF Hub : pull base + adapter | The server loads the base and attaches the adapter.
+  Inference server ~> Labeling queue [queue] : low-confidence cases | Hard cases go to people for labels, for the next round.
+ref: docs | PEFT documentation | Hugging Face | https://huggingface.co/docs/peft
+
+== Inference endpoint with a dedicated model server
+kind: horizontal-scale, continuous-batching
+when: An open model must serve many users with steady latency, and calling pipeline() in a web handler is too slow.
+how: Do not load a Transformers model inside each web process. Run a model server such as Text Generation Inference (TGI) or vLLM on GPU nodes. It loads the weights once and uses continuous batching and a paged key-value cache to share the GPU among many requests.
+An API layer in front handles auth, rate limits and retries, and calls the server over HTTP. Add nodes behind a load balancer when the queue grows. Hugging Face Inference Endpoints runs this setup as a managed service.
+Pin the model revision in the server's start command so a new deploy cannot change weights by accident.
+used: TGI and vLLM deployments of Hub models; Hugging Face Inference Endpoints.
+avoid: For offline scoring of a fixed dataset; run a batch job with the Transformers library instead.
+flow:
+  App [client] -> API gateway [svc: auth + limits] : chat request | The app sends a request with a user token.
+  API gateway -> Model server [svc: TGI + GPU] : /generate | The gateway forwards it to a model server.
+  Model server -> GPU batch [model: continuous batch] : join batch | The request joins the running batch at the next step.
+  GPU batch -> Model server : stream tokens | Tokens are sent back as soon as they are made.
+  Model server -> App : SSE stream | The user sees text appear while the model still decodes.
+ref: docs | Text Generation Inference | Hugging Face | https://huggingface.co/docs/text-generation-inference
+
+@@ jax
+== Compile once with jit, run on any accelerator
+kind: interpreter-compiler, offload-accelerator
+when: A numeric function is called many times on arrays, and Python overhead and unfused operations waste the GPU or TPU.
+how: JAX traces a pure Python function with abstract values and builds a graph of primitive operations. jax.jit sends this graph to XLA, which fuses operations, plans memory, and emits code for the CPU, GPU or TPU. The compiled program is cached by the input shapes and dtypes.
+The first call pays the compile cost, often seconds. Later calls with the same shapes run at once. A new shape triggers a new compile, so pad inputs to a few fixed sizes.
+Functions must be pure: no hidden state, no Python side effects inside the traced code. Random numbers use explicit keys, which makes runs repeatable on any device.
+used: Google DeepMind and Google research code; libraries built on JAX such as Flax, Optax and Orbax.
+avoid: For code with data-dependent Python control flow and changing shapes on every call; it recompiles. Use eager PyTorch or NumPy.
+flow:
+  Python function [svc: pure] -> Tracer [svc: abstract values] : jit(f)(x) | The first call traces f with shapes and dtypes, not real numbers.
+  Tracer -> XLA compiler [svc: fuse + codegen] : jaxpr graph | The graph of primitive operations goes to XLA.
+  XLA compiler -> Executable cache [cache: by shape] : compiled program | The program is stored with its input shapes as the key.
+  Executable cache -> GPU or TPU [model: device] : run | The compiled code runs on the device.
+  Python function -x> XLA compiler : new shape, recompile | A new input shape misses the cache and compiles again.
+ref: docs | Just-in-time compilation | JAX documentation | https://docs.jax.dev/en/latest/jit-compilation.html
+
+== SPMD sharding across many devices
+kind: data-parallel, model-parallel
+when: A model or batch is too big for one device, and you want one program text for 8 or 4,000 chips.
+how: You write the program as if for one device. You then place arrays on a mesh of devices, with named axes such as data and model, and give each array a sharding (a PartitionSpec). The XLA compiler splits the program and inserts the needed collective operations such as all-reduce and all-gather.
+Data parallelism shards the batch axis and replicates weights. Tensor parallelism shards weight axes. You can combine both on a two-dimensional mesh. Changing the layout means changing the specs, not rewriting the model.
+Training on many hosts means every host runs the same Python program, and the runtime joins the devices into one mesh.
+used: Large model training on Google TPU pods with JAX frameworks such as MaxText and Flax; the JAX documentation covers sharded computation.
+avoid: For small models that fit on one GPU; plain jit is enough.
+flow:
+  Training script [svc: same on all hosts] -> Device mesh [note: data x model axes] : create mesh | Each host builds the same mesh over all devices.
+  Device mesh -> Weights [store: sharded] : PartitionSpec | Weights are split along the model axis, and batches along the data axis.
+  Weights -> XLA SPMD [svc: partitioner] : jit step | The compiler splits one step into per-device programs.
+  XLA SPMD -> Devices [model: 8 chips] : step + collectives | Each chip computes its part; all-reduce joins the gradients.
+  Devices -> Checkpoint store [store: Orbax] : save shards | Each host writes its own shards, so a save is parallel.
+ref: docs | Distributed arrays and automatic parallelization | JAX documentation | https://docs.jax.dev/en/latest/sharded-computation.html
+
+== Composable transforms: grad, vmap, jit
+kind: pipes-filters, interpreter-compiler
+when: You need gradients, per-example operations and compiled speed from one plain function.
+how: JAX treats grad, vmap and jit as functions that take a function and return a new function. You write a loss for one example. grad gives the gradient function. vmap maps it over a batch, so you get per-example gradients without a Python loop. jit compiles the result.
+The order is free. jit(vmap(grad(loss))) works because each transform acts on the traced program, not on the numbers. This is why techniques such as per-example gradient clipping, used in differential privacy, are short in JAX.
+Keep the function pure. Print and global state inside it run only at trace time and cause confusing bugs.
+used: JAX research code for per-example gradients, ensembles and physics simulation; libraries such as Optax build on it.
+avoid: When your model is a stack of standard layers and you only need training; PyTorch eager is simpler to debug.
+flow:
+  Loss function [svc: one example] -> grad [svc: transform] : grad(loss) | grad returns a new function that gives the gradient for one example.
+  grad -> vmap [svc: transform] : vmap(grad_fn) | vmap maps it over the batch axis, with no Python loop.
+  vmap -> jit [svc: transform] : jit(batched) | jit compiles the batched gradient into one XLA program.
+  jit -> Accelerator [model: GPU or TPU] : call on batch of 256 | One call returns 256 per-example gradients.
+ref: docs | Automatic differentiation and vectorization | JAX documentation | https://docs.jax.dev/en/latest/automatic-differentiation.html
+
+@@ langchain
+== RAG chain with retriever and vector store
+kind: rag, llm-workflow
+when: A chat answer must use your own documents, and the model must cite them instead of guessing.
+how: At index time a loader reads files, a text splitter cuts them into chunks of a few hundred tokens, an embedding model turns each chunk into a vector, and a vector store (pgvector, Chroma, Pinecone and others) saves vector and text.
+At question time a retriever embeds the question and fetches the top k chunks, for example k = 4. A prompt template places the chunks and the question into one prompt. The chat model answers, and an output parser returns text with the source ids. LangChain gives a common interface for each step, so you can swap the vector store or the model without changing the chain.
+Quality depends mostly on chunking and retrieval, not on the chain code. Measure retrieval hit rate on a test set before you tune prompts.
+used: Document question-answering and support bots built with LangChain and a vector database; common in enterprise knowledge search.
+avoid: When the corpus is small enough to fit in one prompt, or when exact keyword search or SQL answers the question.
+flow:
+  Loader and splitter [svc: index time] -> Vector store [db: pgvector] : chunk + embedding | Documents are cut into chunks and stored with their vectors.
+  User [user] -> Retriever [svc: top k = 4] : question | The question arrives at the retriever.
+  Retriever -> Vector store : nearest 4 vectors | The retriever embeds the question and asks for the four closest chunks.
+  Vector store -> Prompt template [svc] : 4 chunks | The chunks are inserted next to the question.
+  Prompt template -> Chat model [model: LLM] : full prompt | The model answers only from the given context.
+  Chat model -> User : answer + sources | The user gets the answer with the source ids.
+ref: paper | Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks | Lewis et al., NeurIPS 2020 | https://arxiv.org/abs/2005.11401
+
+== LangGraph agent with checkpointed state
+kind: agent-loop, checkpoint-restart
+when: An agent runs many steps, may wait for a person, and must survive a crash without starting over.
+how: LangGraph models the agent as a graph: nodes are functions (call the model, run a tool) and edges choose the next node. A shared state object moves through the graph. After every step a checkpointer saves the state, for example to Postgres, under a thread id.
+If the process dies, the run resumes from the last saved step with the same thread id. A node can call interrupt to pause for human approval, such as before a payment tool runs. The graph stops, the state stays in the database, and the run continues when the person answers.
+Checkpoints also allow time travel: replay from an earlier step or fork the state to try another path.
+used: LangGraph agents with Postgres or SQLite checkpointers; the LangGraph documentation describes persistence and human-in-the-loop.
+avoid: For a fixed two-step flow; a plain chain is simpler than a graph.
+flow:
+  User [user] -> Agent graph [svc: LangGraph] : message, thread 42 | The user sends a message with a thread id.
+  Agent graph -> Chat model [model: LLM] : decide next action | The model node picks a tool call.
+  Agent graph -> Checkpointer [db: Postgres] : save state, step 3 | The state is saved after each step.
+  Agent graph -> Approver [user: human] : interrupt: approve refund? | A sensitive tool call pauses the graph until a person answers.
+  Agent graph -x> Checkpointer : worker crash | The worker dies while waiting; no state is lost.
+  Agent graph -> Checkpointer : resume thread 42 | A new worker loads step 3 and continues after approval.
+ref: docs | LangGraph overview | LangChain | https://docs.langchain.com/oss/python/langgraph/overview
+
+== Tracing every step to an observability back end
+kind: observability-pipeline, feedback-loop
+when: A chain or agent gives odd answers, and you need to see each model call, tool call, prompt, latency and token count.
+how: LangChain calls callbacks at the start and end of every step. A tracer turns these into a tree of runs: the top chain, the retriever call, each model call and each tool call, with inputs, outputs, time and token usage.
+The tracer sends the runs to a back end such as LangSmith, or to any OpenTelemetry collector. Engineers open one failing trace and see which step went wrong. Bad traces can be added to a dataset, and an evaluation job replays them after each prompt change.
+Redact personal data before export, and sample traces in high traffic, because prompts are large.
+used: LangSmith; teams that export LangChain traces through OpenTelemetry to Datadog, Grafana or similar tools.
+avoid: When prompts hold data that must not leave your network; self-host the back end or turn tracing off.
+flow:
+  Agent [svc: LangChain app] -> Tracer [svc: callbacks] : step start and end | Each step reports its inputs, outputs and timing.
+  Tracer -> Redactor [svc: PII filter] : run tree | A filter removes personal data from the run tree.
+  Redactor ~> Trace back end [db: LangSmith or OTel] : batched upload | Runs are uploaded in the background, so users do not wait.
+  Engineer [user] -> Trace back end : open failing trace | The engineer inspects each step of one bad answer.
+  Trace back end -> Eval dataset [store] : save as test case | The bad case is saved and replayed after every prompt change.
+ref: docs | LangSmith observability | LangChain | https://docs.langchain.com/langsmith/observability
+
+@@ llamacpp
+== Quantized local inference with GPU layer offload
+kind: offload-accelerator, memory-tiering
+when: You want to run an LLM on a laptop, a small server or a single consumer GPU with limited memory.
+how: The model is stored as a GGUF file, one file with weights, tokenizer and metadata. Weights are quantized, for example to 4 bits per weight, so a 7B model shrinks from about 14 GB (16-bit) to roughly 4 GB.
+llama.cpp memory-maps the file. With the option -ngl you choose how many transformer layers go to the GPU; the rest run on the CPU. If the model does not fit in video memory, the split lets it run, at lower speed. On Apple Silicon the GPU uses unified memory through Metal.
+Token generation is limited by memory bandwidth, because every token reads all weights. That is why a smaller quantization is often faster, and why quality should be checked on your task.
+used: Local assistants and desktop apps that embed llama.cpp, for example Ollama and LM Studio; edge and offline deployments.
+avoid: For high-throughput serving to many users on data-centre GPUs; use vLLM or SGLang with continuous batching.
+flow:
+  GGUF file [store: Q4 + about 4 GB] -> llama.cpp runtime [svc: mmap] : load weights | The runtime memory-maps the quantized weights from disk.
+  llama.cpp runtime -> GPU [model: 24 of 32 layers] : offload layers | The first 24 layers go to GPU memory.
+  llama.cpp runtime -> CPU threads [svc: 8 threads] : remaining 8 layers | The other layers run on the CPU.
+  User [user] -> llama.cpp runtime : prompt | The prompt is processed in batches.
+  llama.cpp runtime -> User : tokens | Tokens stream back one at a time.
+ref: docs | llama.cpp project | ggml-org | https://github.com/ggml-org/llama.cpp
+
+== llama-server as a local OpenAI-compatible endpoint
+kind: sidecar, api-gateway
+when: Apps already speak the OpenAI API, and you want to point them at a model that runs on your own machine.
+how: llama-server loads one GGUF model and offers HTTP endpoints, including chat completions in the OpenAI format. An app only changes its base URL. A few parallel slots let several requests share the model, and each slot keeps its own context.
+Run it as a sidecar next to the app, or as a small shared service on an internal network. A gateway such as LiteLLM can route some requests to the local model and others to a hosted model, with fallback when the local one is busy.
+Slots are limited, so it suits a team or a desktop app, not thousands of users.
+used: Local development stand-ins for hosted APIs; private on-premises chat tools; Ollama and similar tools wrap llama.cpp in the same way.
+avoid: When you need many concurrent users with strict latency; use a data-centre server.
+flow:
+  App [client: OpenAI SDK] -> Gateway [svc: router] : chat/completions | The app calls its usual API through a router.
+  Gateway -> llama-server [svc: 4 slots] : same request | Simple requests go to the local server.
+  llama-server -> Model [model: GGUF Q4] : decode in a slot | The request takes a free slot and decodes.
+  Gateway -> Hosted API [svc: cloud model] : hard requests | Hard requests go to a hosted model.
+  llama-server -x> Gateway : all slots busy | When slots are busy, the server answers with an error.
+  Gateway -> Hosted API : fallback | The router retries on the hosted model.
+ref: docs | llama.cpp server | ggml-org | https://github.com/ggml-org/llama.cpp
+
+== Speculative decoding with a draft model
+kind: speculative-decoding
+when: Generation is slow because each token waits for one full pass of a large model, and a small model is available.
+how: A small draft model guesses the next several tokens, for example 5. The large target model checks all five in one forward pass. Tokens that match the target's own choice are accepted; at the first mismatch the target's token is used and the rest are dropped.
+The output is the same as the large model alone, but each large pass can yield more than one token. The gain depends on the acceptance rate: code and repeated text accept well, creative text less.
+llama.cpp supports a draft model for llama-server, and also draft-free methods that look up repeated text in the prompt. The draft model needs the same tokenizer and extra memory.
+used: llama.cpp speculative examples; the technique is described in papers by Leviathan et al. and Chen et al., 2023.
+avoid: When memory is already tight, or when acceptance is low; the extra work then slows decoding.
+flow:
+  Prompt [note: user text] -> Draft model [model: 1B] : context | The small model reads the context.
+  Draft model -> Target model [model: 8B] : 5 guessed tokens | The draft proposes five tokens cheaply.
+  * Target model: verifying 5 tokens | The big model scores all five positions in one pass.
+  Target model -> Output [log: tokens] : accept 3, fix 1 | Three guesses match, the fourth is replaced; four tokens came from one big pass.
+ref: paper | Fast Inference from Transformers via Speculative Decoding | Leviathan, Kalman & Matias, ICML 2023 | https://arxiv.org/abs/2211.17192
+
+@@ mcp
+== Host with MCP clients and tool servers
+kind: plugin-arch, agent-loop
+when: An AI application needs to use many outside tools and data sources without writing custom code for each.
+how: The host app (an IDE, a desktop assistant or an agent) starts one MCP client per server. Each client keeps one connection to one server and speaks JSON-RPC. At start they do a handshake and agree on version and capabilities. Then the client calls tools/list, resources/list and prompts/list to learn what the server offers.
+The model sees the tool names, descriptions and JSON schemas. When it picks a tool, the host sends tools/call to the right server and puts the result back into the model's context. The server can be a local process using stdio, or a remote service using Streamable HTTP.
+The host should ask the user before running risky tools. The protocol does not make a tool safe; the host and the server must.
+used: Claude Desktop and Claude Code, VS Code, Cursor and many other hosts; servers for GitHub, Postgres, Slack and file systems.
+avoid: For one fixed API call inside your own code; call the API directly.
+flow:
+  Host app [svc: agent or IDE] -> MCP client [svc: one per server] : initialize | The host opens a connection and agrees on version and capabilities.
+  MCP client -> GitHub MCP server [svc: tool server] : tools/list | The client asks which tools exist.
+  GitHub MCP server -> MCP client : names + JSON schemas | The server returns its tools; the model will see them.
+  Host app -> User [user] : approve create_issue? | The host asks for approval before a write action.
+  MCP client -> GitHub MCP server : tools/call create_issue | After approval the call is sent.
+  GitHub MCP server -> Host app : result text | The result goes back into the model's context.
+ref: docs | MCP architecture | Model Context Protocol project | https://modelcontextprotocol.io/docs/learn/architecture
+
+== Remote MCP server with OAuth in front of an internal API
+kind: api-gateway, federated-identity
+when: A company wants staff agents to reach an internal system, with each person's own rights and an audit trail.
+how: The company runs a remote MCP server over Streamable HTTP. It is an adapter: it turns MCP tool calls into calls to the real internal API. The server acts as an OAuth resource server. A client without a token gets 401 and learns from metadata which authorization server to use.
+The user signs in at the company identity provider. The client gets an access token that is limited to this server, and sends it with each call. The server checks the token, and calls the internal API with the user's identity, not with one shared admin key.
+Every call is logged with user, tool and arguments. Keep tools few and narrow; a tool named run_sql with admin rights is a risk.
+used: Remote MCP servers published by SaaS vendors; the MCP specification defines OAuth-based authorization for HTTP servers.
+avoid: For local single-user tools; a stdio server needs no network auth.
+flow:
+  Agent host [svc] -> Remote MCP server [svc: HTTP adapter] : tools/call, no token | The client calls without a token.
+  Remote MCP server -x> Agent host : 401 + metadata | The server rejects and points to its authorization server.
+  Agent host -> Identity provider [svc: OAuth] : user sign-in | The user signs in and approves the scope.
+  Identity provider -> Agent host : access token | The host receives a token meant for this server only.
+  Agent host -> Remote MCP server : tools/call + token | The call is repeated with the token.
+  Remote MCP server -> Internal API [svc] : call as that user | The server calls the internal API with the user's rights and logs it.
+ref: spec | MCP authorization | Model Context Protocol project | https://modelcontextprotocol.io/specification/latest/basic/authorization
+
+== Resource and prompt servers as a context layer
+kind: rag, pubsub
+when: Several AI tools need the same live context, such as tickets, docs or database schemas, in a uniform way.
+how: Besides tools, an MCP server can expose resources: read-only items with a URI, such as a file, a schema or a ticket. Clients list resources and read them. The host decides which to add to the model's context, so the model does not need to ask.
+A server can tell clients when a resource list or a single resource changed, using notifications, if the client subscribed. The host then refreshes its context. Servers can also offer prompts, which are reusable templates a user picks, such as "review this pull request".
+This makes a shared context layer: one server per source, many hosts. The limit is context size. Send only what the task needs.
+used: Filesystem, database and docs servers used by IDE assistants; the MCP specification defines resources, subscriptions and prompts.
+avoid: When data is huge and needs ranking; put a retrieval index behind a tool instead.
+flow:
+  IDE assistant [svc: host] -> Docs MCP server [svc] : resources/list | The host asks which resources the server exposes.
+  IDE assistant -> Docs MCP server : resources/read api.md | The host reads one resource to place in context.
+  IDE assistant -> Docs MCP server : resources/subscribe | The host asks to be told about changes.
+  Docs source [store: wiki] ~> Docs MCP server : page edited | A page changes in the wiki.
+  Docs MCP server ~> IDE assistant : resource updated | The server tells the host that the resource changed.
+  IDE assistant -> Docs MCP server : resources/read again | The host fetches the new version.
+ref: spec | MCP resources | Model Context Protocol project | https://modelcontextprotocol.io/specification/latest/server/resources
+
+@@ mlflow
+== Tracking server, model registry and alias promotion
+kind: external-config, blue-green
+when: Many people train models, and you need a record of each run and a controlled way to decide which model serves.
+how: Training code calls mlflow.log_param, log_metric and log_model. A tracking server stores runs in a database and files, such as parameters, metrics and artifacts, in object storage like S3. The UI compares runs.
+A good run is registered as a new version of a named model in the Model Registry. Versions are immutable. Aliases such as "champion" and "challenger" point to a version. Serving code loads "models:/fraud@champion", so promotion is only a change of the alias, and rollback is moving the alias back.
+Add checks before the move: a test job scores the challenger on fresh data and compares it to the champion. Record who moved the alias for audit.
+used: Self-hosted MLflow and Databricks Managed MLflow; teams that load models by registry alias in batch and online jobs.
+avoid: When one person trains one model and ships it by hand; a file in a bucket is enough.
+flow:
+  Training job [svc] -> Tracking server [svc: MLflow] : log params, metrics | The job logs parameters and metrics for run 118.
+  Training job -> Artifact store [store: S3] : model files | The model files go to object storage.
+  Tracking server -> Registry [db: model versions] : register fraud v7 | The best run becomes version 7 of the model fraud.
+  Eval job [svc] -> Registry : set alias challenger = v7 | A test job marks v7 as the challenger and scores it.
+  Eval job -> Registry : alias champion = v7 | If v7 beats v6, the champion alias moves to v7.
+  Scoring service [svc: loads @champion] -> Registry : resolve alias | The service resolves the alias on restart and loads v7.
+ref: docs | MLflow Model Registry | MLflow project | https://mlflow.org/docs/latest/model-registry/
+
+== Packaged model served as an immutable container
+kind: immutable-infra, horizontal-scale
+when: A model written with scikit-learn, PyTorch or another library must be deployed the same way every time.
+how: A logged MLflow model is a folder with an MLmodel file, the weights, a Python environment file and a signature of input and output types. The pyfunc flavor gives every model one predict interface, whatever library made it.
+mlflow models build-docker creates an image with the model and its pinned dependencies, and serves it over REST. You push the image to a registry and run it on Kubernetes or a managed service, with several replicas behind a load balancer. The signature rejects bad inputs.
+The image never changes after build. To update, build a new image from the new version and replace the pods.
+used: MLflow model serving on Kubernetes; Databricks Model Serving and cloud services that accept MLflow models.
+avoid: For large language models with heavy GPU needs; use a dedicated inference server such as vLLM.
+flow:
+  Registry [db: fraud v7] -> Build job [svc: build-docker] : fetch model | The build job downloads version 7 and its environment file.
+  Build job -> Image registry [store: ECR] : image fraud:v7 | The model and its libraries are baked into one image.
+  Kubernetes [svc: cluster] -> Image registry : pull fraud:v7 | The cluster pulls the pinned image.
+  Kubernetes -> Model pods [svc: 3 replicas] : start | Three identical pods start behind a load balancer.
+  API client [client] -> Model pods : POST /invocations | The client sends rows; the signature checks the schema.
+  Model pods -> API client : predictions | Predictions come back as JSON.
+ref: docs | MLflow Models | MLflow project | https://mlflow.org/docs/latest/models.html
+
+== Tracing and evaluating a GenAI app
+kind: observability-pipeline, feedback-loop
+when: An LLM app changes often through prompts and tools, and you must find regressions before users do.
+how: MLflow Tracing records each request as a trace: spans for model calls, retrieval and tool calls, with inputs, outputs, latency and tokens. Auto-logging covers common libraries, and you can add spans with a decorator.
+Traces from production are stored on the tracking server. Teams add human feedback or scores from an automatic judge to each trace. Selected traces are saved into an evaluation dataset.
+Before a release, mlflow.genai.evaluate runs the new app version over this dataset and compares scores with the last version. A drop in the score blocks the release. This closes the loop from production back to testing.
+used: MLflow Tracing and GenAI evaluation, used with LangChain, OpenAI SDK and other libraries; Databricks agent evaluation.
+avoid: For classic tabular models; plain metrics and drift monitoring are enough.
+flow:
+  LLM app [svc: prod] -> Tracking server [svc: MLflow] : trace with spans | Each request sends a trace with all its spans.
+  Reviewer [user] -> Tracking server : feedback on trace 9 | A person marks trace 9 as a wrong answer.
+  Tracking server -> Eval dataset [store] : add trace 9 | The bad case becomes a permanent test.
+  CI job [svc: release gate] -> Eval dataset : evaluate new version | The job runs the new app version on the dataset.
+  CI job -> Tracking server : scores v2 vs v1 | Scores of both versions are logged together.
+  CI job -x> LLM app : block deploy | A lower score stops the release.
+ref: docs | MLflow Tracing | MLflow project | https://mlflow.org/docs/latest/genai/tracing/
+
+@@ pytorch
+== Distributed data parallel with all-reduce
+kind: data-parallel
+when: The model fits on one GPU, and you want to train faster by using many GPUs with different data batches.
+how: Launch one process per GPU with torchrun. Each process builds the same model and wraps it in DistributedDataParallel. A DistributedSampler gives each rank a different shard of the data.
+Each rank runs forward and backward on its own batch. DDP groups gradients into buckets, and runs an all-reduce on each bucket with NCCL while backward still computes earlier layers. When backward ends, every rank holds the same averaged gradient, so every optimizer step gives the same weights on all ranks.
+Scaling is limited by network speed and by batch size. Check that step time does not grow when you add GPUs.
+used: Standard multi-GPU training in PyTorch; most vision and mid-size language training jobs on NVLink or InfiniBand clusters.
+avoid: When weights, gradients and optimizer state do not fit on one GPU; use FSDP.
+flow:
+  torchrun [svc: launcher] -> Rank 0 to 7 [svc: 1 process per GPU] : start workers | The launcher starts one process per GPU with the same code.
+  Data sampler [store: shards] -> Rank 0 to 7 : different batches | Each rank gets its own slice of the dataset.
+  * Rank 0 to 7: forward + backward | Each rank computes gradients on its own batch.
+  Rank 0 to 7 -> NCCL [svc: all-reduce] : gradient buckets | Buckets are sent while earlier layers still compute.
+  NCCL -> Rank 0 to 7 : averaged gradient | All ranks get the same gradient and make the same step.
+  Rank 0 to 7 -> Checkpoint [store: rank 0 writes] : save state | One rank saves the model for restart.
+ref: docs | Distributed Data Parallel | PyTorch documentation | https://pytorch.org/docs/stable/notes/ddp.html
+
+== Fully sharded data parallel for large models
+kind: data-parallel, model-parallel
+when: Weights, gradients and optimizer state together do not fit on one GPU.
+how: FSDP shards parameters, gradients and optimizer state across all ranks. Each rank stores about 1/N of the state. Before a layer runs, FSDP does an all-gather to rebuild that layer's full weights on every rank. After use, it frees them.
+In backward it gathers again, then does a reduce-scatter so each rank keeps only its own gradient shard. Optimizer state stays sharded, so for Adam with 16-bit weights the state per GPU falls roughly in proportion to the GPU count.
+The price is more communication than DDP. Wrap at the level of transformer blocks and overlap communication with compute. Use sharded checkpoints for fast save.
+used: Large language model training with PyTorch FSDP; libraries such as torchtitan and Hugging Face Accelerate use it.
+avoid: For models that fit on one GPU; DDP communicates less. For very large models, combine with tensor and pipeline parallelism.
+flow:
+  Training job [svc: 64 ranks] -> Sharded state [store: 1/64 per GPU] : keep own shard | Each rank holds one part of weights and optimizer state.
+  Sharded state -> Layer 12 [model: full weights] : all-gather | The full weights of one layer are rebuilt just in time.
+  Layer 12 -> Training job : forward, free | After forward, the extra weight copies are freed.
+  Training job -> Layer 12 : all-gather again | Backward gathers the weights once more.
+  Layer 12 -> Sharded state : reduce-scatter grads | Each rank receives the summed gradient for its own shard only.
+  Sharded state -> Checkpoint store [store: sharded] : each rank saves | Ranks write shards in parallel.
+ref: docs | Fully Sharded Data Parallel | PyTorch documentation | https://pytorch.org/docs/stable/fsdp.html
+
+== torch.compile from eager code to fused kernels
+kind: interpreter-compiler, offload-accelerator
+when: An eager PyTorch model is limited by many small GPU kernels and Python overhead.
+how: You keep writing normal eager code and add torch.compile(model). TorchDynamo watches the Python bytecode and captures tensor operations into a graph. Where it meets code it cannot trace, it breaks the graph and falls back to Python for that part.
+AOTAutograd builds the backward graph. The default backend, Inductor, fuses operations and generates kernels, with Triton for GPUs. Compiled code is cached, and guards check that shapes and types still match. If a guard fails, the function recompiles.
+The first step is slow, often tens of seconds. Many graph breaks or changing shapes cut the gain. Mark dynamic dimensions or pad to fixed sizes.
+used: PyTorch 2.x training and inference; many open-source model repositories enable it with one line.
+avoid: For short scripts, or code with changing shapes on every call; compile time can exceed the gain.
+flow:
+  Eager model [svc: Python] -> TorchDynamo [svc: capture graph] : torch.compile(model) | Dynamo reads bytecode and captures the tensor operations.
+  TorchDynamo -> Inductor [svc: fuse + codegen] : FX graph | The graph goes to the backend, which fuses operations.
+  Inductor -> Kernel cache [cache: guards] : Triton kernels | Compiled kernels are cached with guards on shape and type.
+  Kernel cache -> GPU [model: device] : run fused kernels | Later steps run fused kernels, with fewer launches.
+  Eager model -x> TorchDynamo : guard fails, recompile | A new shape fails a guard and triggers another compile.
+ref: docs | torch.compile | PyTorch documentation | https://pytorch.org/docs/stable/torch.compiler.html
+
+@@ sglang
+== Radix prefix cache for shared prompt prefixes
+kind: prefix-cache
+when: Many requests share a long start, such as a system prompt, few-shot examples or earlier chat turns, and you want to skip recomputing it.
+how: SGLang's RadixAttention keeps the key-value cache of all processed tokens in a radix tree. Each path in the tree is a token sequence. A new request walks the tree, finds the longest matching prefix, and reuses its cached keys and values. Only the new tokens go through prefill.
+When memory is full, the least recently used leaves are evicted first. Requests that share a prefix are best run together, so the scheduler favours them.
+For a chat with a 3,000-token system prompt, the prefix is computed once, and later requests prefill only their own few hundred tokens. This cuts time to first token and GPU work. It helps agents with repeated tool context and multi-turn use.
+used: SGLang servers for chat, agents and structured-output workloads; vLLM and others have similar automatic prefix caching.
+avoid: When prompts rarely share a prefix; the tree adds bookkeeping with little gain.
+flow:
+  Request A [client: system + Q1] -> SGLang scheduler [svc] : 3,300 tokens | The first request has a long shared system prompt.
+  SGLang scheduler -> Radix tree [cache: KV by prefix] : insert 3,300 tokens | After prefill, the key-value cache is stored by token path.
+  Request B [client: system + Q2] -> SGLang scheduler : 3,250 tokens | A second request starts with the same system prompt.
+  SGLang scheduler -> Radix tree : match prefix | The tree reports 3,000 matching tokens.
+  Radix tree -> GPU [model: prefill 250] : reuse cache | Only the 250 new tokens are prefilled.
+  * Radix tree: evicting old leaves | When memory is low, the least recently used branches are dropped.
+ref: paper | SGLang: Efficient Execution of Structured Language Model Programs | Zheng et al., NeurIPS 2024 | https://arxiv.org/abs/2312.07104
+
+== Prefill and decode on separate GPU pools
+kind: pd-disaggregation
+when: Prefill (reading the prompt) and decode (producing tokens) disturb each other on the same GPUs, and you need both fast first tokens and smooth streaming.
+how: Prefill is compute-heavy and runs once per request. Decode is memory-bound and runs for each token. On one GPU, a long prefill stalls the decode of other users. In disaggregation, one pool of GPUs only does prefill and another pool only does decode.
+A router sends the request to a prefill worker. It builds the key-value cache, and transfers it over a fast link (RDMA or NVLink) to a decode worker. The decode worker streams tokens. You size and scale the pools on their own, for example more decode GPUs for long answers.
+The costs are the cache transfer and a harder system to run. SGLang supports this mode with a router in front.
+used: Large serving fleets; SGLang and vLLM both support disaggregated prefill and decode, and the idea comes from the DistServe paper.
+avoid: For small deployments of one or two GPUs; the transfer cost is larger than the gain.
+flow:
+  User [user] -> Router [svc: SGLang router] : chat request | The router receives the request and picks a prefill and a decode worker.
+  Router -> Prefill pool [svc: compute-heavy GPUs] : prompt | A prefill worker reads the whole prompt.
+  Prefill pool -> Decode pool [svc: memory-heavy GPUs] : KV cache over RDMA | The key-value cache is sent to a decode worker.
+  Decode pool -> User : stream tokens | The decode worker streams tokens without prefill stalls.
+  Decode pool ~> Router : queue depth | The router uses load figures to balance later requests.
+ref: paper | DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving | Zhong et al., OSDI 2024 | https://arxiv.org/abs/2401.09670
+
+== Structured generation and multi-call programs
+kind: llm-workflow, batching
+when: An app needs JSON output that always parses, or a program that makes several dependent model calls.
+how: SGLang has a front-end language, where a Python function calls gen(), select() and fork(). It can run parts in parallel, for example three summaries of one document, which share the same prefix in the cache.
+For output rules, the server compiles a JSON schema, regex or grammar into a state machine. At each decoding step it masks tokens that would break the rule. The result always matches the schema, so there is no retry loop for bad JSON.
+Calls in one program reuse the radix cache, so a later call pays little for the context of the earlier one. The runtime also batches parallel calls together on the GPU.
+used: SGLang structured outputs for tool calls and extraction; workloads with many calls over one long document.
+avoid: When a single free-text answer is enough.
+flow:
+  App [client: Python program] -> SGLang runtime [svc] : fork 3 branches | The program starts three parallel branches over one document.
+  SGLang runtime -> Radix cache [cache: shared prefix] : document prefix once | The document is prefilled once and shared by all branches.
+  SGLang runtime -> Grammar mask [svc: JSON schema] : allowed tokens | At each step, tokens that break the schema are masked.
+  Grammar mask -> GPU [model: batched decode] : sample | The three branches decode together in one batch.
+  GPU -> App : 3 valid JSON objects | The results always match the schema.
+ref: docs | SGLang documentation | SGLang project | https://docs.sglang.ai/
+
+@@ sklearn
+== Pipeline with ColumnTransformer
+kind: pipes-filters
+when: A model needs several preprocessing steps, and the same steps must run in training and in prediction.
+how: A Pipeline chains steps; each has fit and transform, and the last is an estimator. A ColumnTransformer sends numeric columns to a scaler and imputer, and text or category columns to an encoder, then joins the outputs. The whole object is one estimator with fit and predict.
+When you call fit, the steps learn their values (means, categories) only from the training data. Inside cross-validation this is done again for each fold, so no information leaks from the test fold. This is the main reason to use a Pipeline instead of manual steps.
+Handle unknown categories with handle_unknown="ignore". Version the library together with the saved pipeline.
+used: Tabular machine learning in scikit-learn; most production sklearn models are saved as one pipeline object.
+avoid: For image, audio or text deep models; use PyTorch data pipelines and feature steps in the framework.
+flow:
+  Raw table [store: DataFrame] -> ColumnTransformer [svc: split by column] : fit_transform | The table is split into numeric and category columns.
+  ColumnTransformer -> Scaler and imputer [svc: numeric] : age, income | Numeric columns are filled and scaled using training means only.
+  ColumnTransformer -> OneHotEncoder [svc: category] : country, device | Category columns become 0 and 1 columns.
+  Scaler and imputer -> Classifier [model: LogisticRegression] : joined features | The joined matrix goes to the final estimator.
+  Classifier -> Raw table : predict(new rows) | The same fitted steps run on new rows, so training and use match.
+ref: docs | Pipelines and composite estimators | scikit-learn documentation | https://scikit-learn.org/stable/modules/compose.html
+
+== Train offline, serve a saved pipeline behind an API
+kind: online-offline, horizontal-scale
+when: A fitted scikit-learn model must answer requests in a few milliseconds from a web service.
+how: A scheduled training job reads data from the warehouse, fits the pipeline, checks metrics on a held-out set and saves the model file with joblib, or with the skops format. The file goes to object storage with a version in its name, together with the library versions.
+A web service (FastAPI or similar) loads the file once at start, and not on each request. It calls predict on each request or on small batches. Because the service is stateless, add replicas behind a load balancer when traffic grows.
+Never load a pickle file from a source you do not trust, because it can run code. Pin the same scikit-learn version for training and serving. Models from other versions may fail or change results.
+used: Common for fraud scores, churn scores and ranking models in small teams; ONNX export is an option for other runtimes.
+avoid: When scores are needed only once per day; run a batch job and write results to a table.
+flow:
+  Warehouse [lake] -> Training job [svc: nightly] : training rows | The job reads the latest labelled data.
+  Training job -> Model store [store: model_v42.joblib] : save pipeline | A model that passes the metric check is saved with a version.
+  API replica [svc: FastAPI x3] -> Model store : load at start | Each replica loads the file once at start.
+  Client [client] -> API replica : POST /score | The client sends one row of features.
+  API replica -> Client : score 0.83 | The replica predicts in memory in about 1 ms.
+  Training job -x> Model store : failed metric, not saved | A model below the quality threshold is never published.
+ref: docs | Model persistence | scikit-learn documentation | https://scikit-learn.org/stable/model_persistence.html
+
+== Parallel hyperparameter search with cross-validation
+kind: scatter-gather, fork-join
+when: You must choose among many hyperparameter settings and want a fair estimate of each one.
+how: GridSearchCV or RandomizedSearchCV builds a list of settings. For each setting and each cross-validation fold it fits a copy of the pipeline. With 20 settings and 5 folds, this is 100 independent fits.
+With n_jobs, joblib runs them in parallel on local processes. With a Dask or Ray backend, they run on a cluster. Each worker returns a score. The search averages the scores per setting, picks the best, and refits it on all training data.
+Test data stays outside the search. Use it once at the end. Use random search or successive halving when the grid is large.
+used: Standard model selection in scikit-learn; Dask-ML and joblib backends spread it over clusters.
+avoid: When each fit takes hours; use fewer, smarter trials with a tool such as Optuna.
+flow:
+  Search [svc: GridSearchCV] -> Worker 1 to 8 [svc: joblib processes] : 100 fit tasks | The search turns 20 settings times 5 folds into 100 tasks.
+  Worker 1 to 8 -> Training folds [store: data] : read fold data | Each worker reads its fold.
+  Worker 1 to 8 -> Search : fold scores | Each worker returns its validation score.
+  Search -> Best pipeline [model: refit] : best setting, refit all | The best average setting is refitted on all training data.
+  Best pipeline -> Test set [store: untouched] : final score | The held-out test set is used once.
+ref: docs | Tuning the hyper-parameters of an estimator | scikit-learn documentation | https://scikit-learn.org/stable/modules/grid_search.html
+
+@@ tensorflow
+== SavedModel behind TensorFlow Serving with versioned hot swap
+kind: online-offline, blue-green
+when: A trained TensorFlow model must serve low-latency predictions, and new versions must go live without downtime.
+how: Training exports a SavedModel into a numbered folder, for example models/ranker/42. TensorFlow Serving watches the base folder. When folder 43 appears, it loads it, and only after the load it switches new requests to version 43. Version 42 is unloaded after its in-flight requests end.
+You can also pin versions with labels, such as "stable" and "canary", and send a small share of callers to the canary label. Rolling back means deleting folder 43, or moving the stable label.
+Serving can batch requests that arrive within a few milliseconds into one tensor call, which raises GPU use. Set a batch size and a maximum wait, for example 5 ms.
+used: TFX pipelines that end in TensorFlow Serving; recommendation and ranking services at companies that run TensorFlow models.
+avoid: When you need one runtime for many frameworks or for LLMs; use a general model server such as Triton or vLLM.
+flow:
+  Training job [svc: Keras] -> Model folder [store: models/ranker/43] : export SavedModel | The job writes a new numbered version folder.
+  Model folder -> TF Serving [svc: gRPC + REST] : poll finds 43 | The server notices version 43 and loads it in the background.
+  TF Serving -> Ranker app [client] : predictions from v42 | While 43 loads, v42 still answers every request.
+  * TF Serving: serving v43 | After the load, new requests switch to version 43.
+  Ranker app -> TF Serving : Predict, batched | The server batches requests that arrive within 5 ms.
+  TF Serving -x> Model folder : unload v42 | Version 42 is unloaded after its last request finishes.
+ref: docs | TensorFlow Serving configuration | TensorFlow documentation | https://www.tensorflow.org/tfx/serving/serving_config
+
+== Distributed training with tf.distribute strategies
+kind: data-parallel
+when: One GPU is too slow for the training set, and you want to scale the same Keras code over several GPUs, hosts or TPUs.
+how: You create a strategy object and build the model inside its scope. MirroredStrategy copies the model to each GPU on one machine and averages gradients with all-reduce. MultiWorkerMirroredStrategy does the same across machines, using a cluster description in the TF_CONFIG variable. TPUStrategy does it on TPU cores.
+The global batch is split into equal parts per replica, so a global batch of 1024 on 8 GPUs gives 128 per GPU. Keras model.fit needs almost no change.
+ParameterServerStrategy is another mode, where workers pull variables from parameter servers, for very large embedding tables. It is more complex and is less common today.
+used: Keras training on multi-GPU servers and on Cloud TPU; TensorFlow Recommenders models with large embeddings.
+avoid: When the model does not fit on one device; add model parallelism or use a framework with built-in sharding.
+flow:
+  TF_CONFIG and strategy [note: cluster spec] -> Workers [svc: 2 hosts x 4 GPUs] : build model in scope | Each worker builds the same model inside the strategy scope.
+  tf.data service [lake: sharded input] -> Workers : batch of 128 per GPU | Each replica gets its own part of the global batch.
+  Workers -> All-reduce [svc: NCCL] : gradients | Replicas sum their gradients.
+  All-reduce -> Workers : averaged gradient | Every replica applies the same update.
+  Workers -> Checkpoint [store: chief writes] : save | The chief worker saves checkpoints, so a restart can resume.
+ref: docs | Distributed training with TensorFlow | TensorFlow documentation | https://www.tensorflow.org/guide/distributed_training
+
+== tf.data input pipeline that keeps the accelerator busy
+kind: pipes-filters, producer-consumer
+when: Training is slow because the GPU waits for data reading and preprocessing on the CPU.
+how: tf.data builds the input as a chain of steps: read files (TFRecord), shuffle, map a preprocessing function, batch and prefetch. Each step is an operation on a dataset, so the chain is a pipeline.
+map can run on many threads (num_parallel_calls). Prefetch keeps a bounded buffer of ready batches, so the CPU prepares batch n+1 while the GPU trains on batch n. The buffer size gives backpressure: if it is full, the producers wait.
+Read files in parallel with interleave, and cache small datasets after the first pass. Check the profiler: if the GPU is idle between steps, the input is the bottleneck.
+used: TensorFlow and Keras training jobs; TFRecord data on Cloud Storage with a TPU needs this to keep up.
+avoid: For tiny datasets that fit in memory as arrays; plain tensors are fine.
+flow:
+  TFRecord files [lake: GCS] -> Reader [svc: interleave x8] : parallel reads | Eight readers open different files at once.
+  Reader -> Map [svc: decode + augment] : raw records | Threads decode images and apply augmentation.
+  Map -> Prefetch buffer [queue: 2 batches] : batch of 256 | Finished batches wait in a bounded buffer.
+  Prefetch buffer -> Training step [model: GPU] : next batch | The GPU takes a ready batch, with no wait.
+  Training step ~> Prefetch buffer : slot freed | A taken batch frees a slot, and the producers continue.
+ref: docs | Better performance with the tf.data API | TensorFlow documentation | https://www.tensorflow.org/guide/data_performance
+
+@@ vllm
+== Continuous batching with a paged KV cache
+kind: continuous-batching
+when: Many users call an LLM at once, and static batches waste GPU time and memory.
+how: Each request keeps a key-value (KV) cache for every token so far. Old systems reserved one big contiguous block per request, which wasted much memory. vLLM's PagedAttention splits the KV cache into small fixed-size blocks, kept in a block table like pages in an operating system. Memory is allocated as the text grows, so little is wasted, and more requests fit in the batch.
+At every decoding step the scheduler adds waiting requests and removes finished ones, so the batch never waits for the slowest request. Long prompts can be split into chunks (chunked prefill) so they do not block decoding.
+When memory runs out, a request can be paused and its blocks freed, and then resumed later.
+used: vLLM servers in production at many companies; it is the base of several cloud LLM services.
+avoid: For a single-user local run on a laptop; llama.cpp is lighter.
+flow:
+  Client A [client] -> Scheduler [svc: vLLM engine] : prompt 800 tokens | A request arrives while others decode.
+  Client B [client] -> Scheduler : prompt 40 tokens | A second request arrives at the same time.
+  Scheduler -> Block manager [cache: 16-token blocks] : allocate blocks | KV blocks are allocated only as tokens are produced.
+  Scheduler -> GPU [model: one step + 24 requests] : mixed prefill + decode | New and old requests share one forward pass.
+  GPU -> Client A : token | Each request gets its token after every step.
+  GPU -> Block manager : B done, free blocks | When B finishes, its blocks return to the pool.
+ref: paper | Efficient Memory Management for Large Language Model Serving with PagedAttention | Kwon et al., SOSP 2023 | https://arxiv.org/abs/2309.06180
+
+== Tensor-parallel serving of a model that exceeds one GPU
+kind: model-parallel
+when: A model's weights are larger than the memory of one GPU, or you want lower latency from several GPUs.
+how: With tensor parallelism, vLLM splits each layer's weight matrices across GPUs, for example 4 GPUs for a 70B model in 16-bit (about 140 GB of weights). Every GPU computes its slice, and an all-reduce joins the results after the attention and feed-forward blocks. This needs a fast link such as NVLink.
+For models too large for one node, pipeline parallelism puts groups of layers on different nodes, with tensor parallelism inside each node. Ray or multiprocessing starts the workers. Quantized weights such as FP8 reduce the number of GPUs needed.
+Tensor parallelism helps latency but costs communication. Use the smallest degree that fits the weights and leaves room for the KV cache.
+used: vLLM tensor-parallel and pipeline-parallel serving of 70B and larger open models on multi-GPU nodes.
+avoid: When the model fits on one GPU; run replicas of it instead, which scale more simply.
+flow:
+  API server [svc: vLLM] -> Worker 0 to 3 [model: 4 GPUs NVLink] : request + token ids | The engine sends each step to all four workers.
+  Worker 0 to 3 -> All-reduce [svc: NCCL] : partial results | Each GPU has computed a slice of the layer.
+  All-reduce -> Worker 0 to 3 : summed output | Every GPU gets the joined output for the next layer.
+  Worker 0 to 3 -> API server : next token | One GPU returns the sampled token.
+  API server -> Client [client] : stream token | The user sees text as it is produced.
+ref: docs | vLLM documentation | vLLM project | https://docs.vllm.ai/en/latest/
+
+== Replicas on Kubernetes with autoscaling and a router
+kind: horizontal-scale, autoscaling
+when: Traffic to an LLM varies through the day, and one vLLM server cannot meet latency at the peak.
+how: Run vLLM as a Deployment on GPU nodes. Each pod serves the same OpenAI-compatible API and holds its own copy of the weights. A service or gateway balances requests across pods.
+Do not scale on CPU. Scale on a signal from vLLM's metrics, such as the number of waiting requests or KV cache use, with the Horizontal Pod Autoscaler or KEDA. A new pod needs minutes to start a GPU node and load weights, so keep warm capacity and put the weights on a fast shared volume.
+Routing by prefix helps: if requests with the same system prompt go to the same pod, its prefix cache gets hits. Add a request queue limit to shed load, and return 429 when full.
+used: vLLM Kubernetes deployments, including the vLLM production stack; common for self-hosted chat and agent back ends.
+avoid: For steady load below one GPU; one server with a restart policy is simpler.
+flow:
+  Users [user] -> Gateway [svc: router] : chat requests | Requests enter through a gateway with a limit per key.
+  Gateway -> vLLM pod 1, vLLM pod 2 [svc: GPU + own cache] : route by prefix | Requests with the same prefix go to the same pod.
+  vLLM pod 1 -> Metrics [store: Prometheus] : waiting = 37 | Pods export queue length and cache use.
+  Metrics -> Autoscaler [svc: HPA or KEDA] : queue above target | The autoscaler sees a long queue.
+  Autoscaler -> vLLM pod 3 [svc: starting] : add pod | A new pod starts; it needs minutes to load weights.
+  Gateway -x> Users : 429 when queue full | If all pods are full, the gateway rejects early.
+ref: docs | vLLM Kubernetes deployment | vLLM project | https://docs.vllm.ai/en/latest/deployment/k8s.html
+
+@@ xgboost
+== Distributed gradient boosting with histogram all-reduce
+kind: data-parallel, map-reduce
+when: The training table is too large or too slow for one machine, and you want boosted trees on a cluster.
+how: XGBoost builds trees one after another. For each split it needs the sum of gradients per feature bin. With the histogram method, each worker owns a part of the rows and builds local histograms of its rows. Workers then do an all-reduce, so everyone has the global histogram and finds the same best split.
+You run this through Dask, Spark or Ray. Each worker keeps its data partition in memory, or in GPU memory. No raw rows move over the network; only histograms do, which are small (bins times features).
+Check data balance, because the slowest worker sets the speed. The model on the driver is the same as one trained on a single machine, apart from small numeric differences.
+used: XGBoost on Dask and Spark clusters; GPU training with NVIDIA RAPIDS and Dask.
+avoid: When the data fits on one big machine; single-node training is simpler and often fast enough.
+flow:
+  Driver [svc: Dask client] -> Worker 1, Worker 2, Worker 3 [svc: row partitions] : train(dtrain) | The driver starts a training task on each worker.
+  * Worker 1: local histogram | Each worker counts gradients per bin for its own rows.
+  Worker 1, Worker 2, Worker 3 -> Allreduce [svc: Rabit or NCCL] : histograms | The small histograms are summed across workers.
+  Allreduce -> Worker 1, Worker 2, Worker 3 : global histogram | All workers pick the same split and grow the same tree.
+  Worker 1 -> Model store [store: model.json] : save booster | The model is saved once after all rounds.
+ref: docs | Distributed XGBoost with Dask | XGBoost documentation | https://xgboost.readthedocs.io/en/stable/tutorials/dask.html
+
+== Ranking stage after candidate retrieval
+kind: two-tower-retrieval, online-offline
+when: A feed, search or ad system has hundreds of candidates per request and must score each one within a few milliseconds.
+how: A cheap first stage, such as an index or a two-tower model, returns about 200 candidates. A gradient-boosted tree model then scores each one with features: user history, item statistics, context and the retrieval score. XGBoost trees are fast on CPU, and a score takes microseconds, so 200 candidates fit in a few milliseconds.
+Training is offline on logged impressions and clicks, with a ranking or logistic objective. Features come from a feature store, so training and serving match. For ads, the score may be a click probability that is multiplied by the bid.
+Tune on a time-based split, and watch calibration, because auctions use the probability as a number and not only an order.
+used: Learning-to-rank and click prediction in search, recommendation and ad systems; common in tabular-feature ranking.
+avoid: When the signal is mostly raw text, images or long sequences; use a neural ranker.
+flow:
+  Request [client: user + context] -> Retriever [svc: ANN index] : user vector | The retriever finds about 200 candidates.
+  Retriever -> Ranker [svc: XGBoost + CPU] : 200 candidates | Candidate ids go to the ranking service.
+  Ranker -> Feature store [cache: online] : batch lookup | One batched call fetches features for all candidates.
+  * Ranker: scoring 200 rows | Trees score all rows in a few milliseconds.
+  Ranker -> Request : top 10 | The best ten are returned.
+  Ranker ~> Click log [log: impressions + clicks] : scores and features | The logged data becomes the next training set.
+ref: paper | XGBoost: A Scalable Tree Boosting System | Chen & Guestrin, KDD 2016 | https://arxiv.org/abs/1603.02754
+
+== Nightly batch scoring written to a serving table
+kind: precompute, online-offline
+when: Scores such as churn risk or lead quality change slowly, and many consumers need them by key.
+how: A scheduled job reads the latest features from the warehouse, loads the saved XGBoost model, and scores every row. On Spark this runs in parallel over partitions, with the model sent to each executor. The output is a table of id, score, model version and time.
+A sync job copies the table into a key-value store or the CRM, so a lookup takes one read. Online code never runs the model. This is cheap and easy to monitor, because you can compare today's score distribution with yesterday's before you publish.
+The price is staleness of up to one day. If one event should change the score at once, add an online path.
+used: Churn, credit and lead-scoring jobs on Spark or warehouse tasks; common in marketing and risk analytics.
+avoid: When the score depends on the current request, such as the live auction; score online.
+flow:
+  Warehouse [lake: features] -> Scoring job [svc: Spark] : read feature table | The nightly job reads yesterday's features.
+  Model store [store: model.json v12] -> Scoring job : load booster | Each executor gets the saved model.
+  Scoring job -> Scores table [db: id + score + version] : write scores | Scores are written with the model version.
+  Scores table -> Sync job [svc: checks drift] : compare to yesterday | A check stops the sync if the score distribution jumps.
+  Sync job -> Serving store [cache: key-value] : upsert by id | Scores are copied to a key-value store.
+  CRM app [client] -> Serving store : get score by id | The app reads one score by key.
+ref: docs | XGBoost with PySpark | XGBoost documentation | https://xgboost.readthedocs.io/en/stable/tutorials/spark_estimator.html
+
+@@ alphafold
+== Search, then structure inference pipeline
+kind: pipes-filters, offload-accelerator
+when: A prediction needs a slow CPU database search first and a fast GPU model second.
+how: The input is an amino-acid sequence. The first stage searches large sequence databases (with tools such as jackhmmer and HHblits) and builds a multiple sequence alignment (MSA). It also searches for structure templates. This stage is CPU- and disk-heavy and takes minutes to hours, depending on the databases.
+The second stage runs the neural network on a GPU. It reads the MSA, template features and the sequence, and predicts atom coordinates and a confidence score per residue (pLDDT). Several model seeds can be run and ranked by confidence. An optional relaxation step then repairs small geometry errors.
+The stages are separate programs with files between them, so each can be run on the best hardware and cached.
+used: The open AlphaFold 2 code from Google DeepMind, run in many labs and clusters; ColabFold replaces the search with a faster MMseqs2 service.
+avoid: When speed matters more than the last bit of accuracy for many sequences; use a single-sequence language-model predictor.
+flow:
+  Sequence [store: FASTA] -> MSA search [svc: CPU + databases] : jackhmmer, HHblits | Databases are searched for relatives of the sequence.
+  MSA search -> Feature files [store: MSA + templates] : alignment | The result is stored as a features file.
+  Feature files -> Network [model: GPU + Evoformer] : MSA + template features | The GPU model reads the features and the sequence.
+  Network -> Structure [store: PDB + pLDDT] : coordinates, confidence | It outputs atom positions and a confidence per residue.
+  Structure -> Relax [svc: optional] : fix geometry | A short physics step fixes small clashes.
+ref: paper | Highly accurate protein structure prediction with AlphaFold | Jumper et al., Nature, 2021 | https://www.nature.com/articles/s41586-021-03819-2
+
+== Precompute a whole proteome and serve by lookup
+kind: precompute, cdn-edge
+when: Many users want predictions for the same known sequences, and running the model for each request is wasteful.
+how: Run the pipeline once, offline, for every sequence of interest, such as all proteins in UniProt for many species. Store the structure files, confidence data and metadata in object storage, keyed by UniProt accession.
+A web front end and an API answer a lookup by key with a file read. Popular files are cached on a content delivery network. Users look up a protein in seconds and need no GPU.
+The database is as new as the last run. Mutations, complexes and new sequences are not in it, so those still need a live run.
+used: The AlphaFold Protein Structure Database at EMBL-EBI, built with Google DeepMind, which holds predictions for over 200 million proteins.
+avoid: For novel or edited sequences, or complexes; run the model for them.
+flow:
+  UniProt sequences [lake: millions] -> Batch pipeline [svc: GPU cluster] : run all | A large batch run predicts each sequence once.
+  Batch pipeline -> Object storage [store: PDB + PAE files] : files by accession | Results are stored by accession id.
+  Object storage -> CDN [cache: edge] : cache popular files | Popular entries are cached near users.
+  Researcher [user] -> Web and API [svc: lookup] : P69905 | A user asks for one protein by accession.
+  Web and API -> CDN : fetch file | The front end fetches the file from the cache or storage.
+  Web and API -x> Researcher : not in database | A new sequence is not found; the user must run the model.
+ref: docs | AlphaFold Protein Structure Database | EMBL-EBI | https://alphafold.ebi.ac.uk/about
+
+== Job queue with separate CPU and GPU worker pools
+kind: competing-consumers, load-leveling
+when: A lab or company must run thousands of predictions, and the CPU search and GPU steps have very different cost.
+how: Users submit sequences to a job queue. CPU workers take jobs from the queue and run the MSA search. They write the features file to shared storage and put a second message on a GPU queue. GPU workers take these and run the network.
+Splitting the queues lets you size each pool alone. Search is often the bottleneck, so you may run more CPU nodes than GPUs. The databases are large (hundreds of gigabytes), so put them on fast local or shared SSD.
+Cache the MSA by a hash of the sequence. Repeat requests and later model versions then skip the search. Jobs that fail go back to the queue, and after a few tries move to a dead-letter queue.
+used: Batch prediction services around AlphaFold and ColabFold on cluster schedulers such as Slurm and Kubernetes; common in biotech platforms.
+avoid: For a handful of sequences; run the pipeline by hand on one machine.
+flow:
+  Scientist [user] -> Search queue [queue: sequences] : submit 5,000 sequences | Many jobs are submitted at once, and the queue holds them.
+  Search queue -> CPU workers [svc: MSA search] : one job each | CPU workers compete for jobs.
+  CPU workers -> MSA cache [cache: by sequence hash] : features file | The result is cached by a hash of the sequence.
+  CPU workers -> GPU queue [queue: ready features] : feature path | A second message tells a GPU worker that the features are ready.
+  GPU queue -> GPU workers [svc: inference] : one job each | GPU workers run the model.
+  GPU workers -> Results store [store: structures] : PDB + confidence | Finished structures are stored for the scientist.
+  GPU workers -x> GPU queue : failed, retry | A failed job goes back; after 3 tries it moves to a dead-letter queue.
+ref: docs | AlphaFold open-source code | Google DeepMind | https://github.com/google-deepmind/alphafold
+
+@@ claude
+== Tool-use loop with the Messages API
+kind: agent-loop
+when: An app wants Claude to call your functions, such as search, SQL or ticket tools, and use the results to answer.
+how: You send a request with the user message and a list of tools, each with a name, a description and a JSON schema. If Claude decides to use a tool, the response has stop_reason "tool_use" and one or more tool_use blocks, each with an id and the arguments.
+Your code runs the function. It then sends a new request that includes the earlier messages and a tool_result block with the same id. Claude reads the result and either calls another tool or gives a final answer, with stop_reason "end_turn". The loop is yours: the API holds no state between calls.
+Set a maximum number of turns, and return clear error text in tool_result so the model can fix its call. Run side-effect tools only after checks or approval.
+used: Claude Code, agent products built on the Claude API and the Claude Agent SDK; customer support and coding assistants.
+avoid: When the steps are fixed; write a plain workflow in code with one model call at each step.
+flow:
+  App [svc: your code] -> Claude API [model: Messages API] : user msg + tools | The app sends the question and the tool schemas.
+  Claude API -> App : tool_use get_order(41) | Claude asks for a tool call with arguments.
+  App -> Orders DB [db] : run get_order(41) | The app runs the function; Claude does not run code on your side.
+  Orders DB -> App : order row | The function returns data.
+  App -> Claude API : tool_result id=toolu_1 | The app sends the result with the matching id.
+  Claude API -> App : final answer, end_turn | Claude writes the answer for the user.
+ref: docs | Tool use with Claude | Anthropic documentation | https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview
+
+== Prompt caching for a large shared context
+kind: prefix-cache
+when: Many requests start with the same large text, such as a manual, a code base or a long system prompt.
+how: You mark the end of the stable part with a cache_control breakpoint. Claude stores the processed prefix. A later request with an identical prefix reads from the cache, so it is faster and costs much less: cache reads are billed at a small part of normal input price (about one tenth), while the first write costs a little more.
+The default lifetime is 5 minutes, refreshed on each hit, and a 1-hour option exists. The match is exact, so put fixed content first (tools, system prompt, documents) and changing content last. Any change before the breakpoint breaks the cache.
+Check the usage fields in the response for cache creation and cache read tokens, to confirm hits.
+used: Coding agents that resend long histories, document question-answering, and agents with long tool lists.
+avoid: When each prompt is unique, or calls are too rare to hit within the cache lifetime.
+flow:
+  App [svc] -> Claude API [model] : manual + question 1 | The first request includes a 50k-token manual with a breakpoint.
+  Claude API -> Prefix cache [cache: 5 min TTL] : write processed prefix | The prefix is stored after processing.
+  App -> Claude API : same prefix + question 2 | A second request starts with the identical text.
+  Claude API -> Prefix cache : read prefix | The API finds the cached prefix and skips reprocessing it.
+  Claude API -> App : answer, cache_read 50k | The usage shows 50k tokens were read from the cache, at lower cost.
+  App -x> Claude API : edited manual, miss | An edit in the prefix changes it, so the cache is missed.
+ref: docs | Prompt caching | Anthropic documentation | https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+
+== Batch API for large offline jobs
+kind: async-request-reply, load-leveling
+when: You have thousands of prompts, such as labelling or summarising a dataset, and no user is waiting for each answer.
+how: You submit up to many requests in one Message Batch. Each request has a custom_id and the usual Messages parameters. The API returns a batch id at once. The work runs in the background at lower priority, with a discount of 50 percent, and most batches finish within an hour. They may take up to 24 hours.
+Your job polls the batch status, or checks it on a schedule. When it ends, you download the results file. Results can come in a different order, so match them by custom_id. Some requests may fail or expire, so collect those and send them again in a new batch.
+Combine with prompt caching for a shared prefix, and keep the batch under the size limits in the documentation.
+used: Dataset labelling, evaluation runs, bulk summaries and nightly enrichment jobs built on the Claude API.
+avoid: For interactive features that need an answer in seconds; use the normal Messages API.
+flow:
+  Pipeline [svc: nightly job] -> Batches API [model: Claude] : create batch, 10k requests | The job sends all requests with custom ids.
+  Batches API -> Pipeline : batch id, in_progress | The call returns at once with a batch id.
+  Pipeline -> Batches API : poll status | The job checks the status from time to time.
+  Batches API -> Pipeline : ended + results url | When processing is done, a results link is given.
+  Pipeline -> Results table [db: by custom_id] : write answers | The job writes answers by custom_id, not by order.
+  Pipeline -> Batches API : resubmit 12 failed | Failed requests go into a new, smaller batch.
+ref: docs | Batch processing | Anthropic documentation | https://platform.claude.com/docs/en/build-with-claude/batch-processing

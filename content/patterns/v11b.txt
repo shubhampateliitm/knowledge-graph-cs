@@ -1,0 +1,76 @@
+@@ chainrep
+== Strongly consistent store on a chain with a master
+kind: chain-replication
+when: You need linearizable reads and writes on large values or logs, and network bandwidth per server is the scarce resource.
+how: Each object group has a chain of three servers. Clients send writes to the head. The head applies the write and forwards it over a TCP stream to the next server, and so on to the tail. The tail applies it, which commits it, and replies to the client. Reads go to the tail only. The tail holds only committed writes, so a read never sees a value that could be lost.
+A small master service (a Paxos or Raft group, or ZooKeeper) watches the servers with heartbeats. When one stops answering, the master removes it and sends the new chain to everyone. A new server is added at the tail after it copies the state. Each server keeps a list of forwarded but unacknowledged writes, so the predecessor can resend the missing writes after a middle failure.
+With 3 servers the chain survives 2 failures. Each link carries one copy of each write, so no single server sends more than 1x the write volume. The cost is that write latency grows with each hop, and one slow server slows all writes until the master removes it.
+used: The model of the OSDI 2004 chain replication paper; research stores such as FAWN-KV; the Hibari key-value store; shared logs such as CORFU on flash; the HDFS block pipeline has the same forwarding shape.
+avoid: When one slow replica must not slow writes, or you cannot run a separate membership service; use Raft or Paxos quorums instead.
+flow:
+  Client [client] -> Head [svc: S1] : set x = 6 | The client sends the write to the head, which fixes the order of updates.
+  Head -> Middle [svc: S2] : forward x = 6 | The head applies the write, adds it to its Sent list and forwards it over TCP.
+  Middle -> Tail [svc: S3] : forward x = 6 | The middle server does the same and forwards the write to the tail.
+  Tail -> Client : reply: committed | The tail applies the write. It is now committed, and the tail replies.
+  Tail ~> Middle, Head : ack | The acknowledgement flows back so each server can drop the write from its Sent list.
+  Middle -x> Tail : crash before forward | A later write is lost between S2 and S3 because the middle server crashes.
+  Master [svc: Paxos group] -> Head, Tail : new chain S1 -> S3 | The master detects the failure, removes S2 and sends the new chain.
+  Head -> Tail : resend unacked write | S1 resends the write from its Sent list to S3, so no write is lost.
+ref: paper | Chain Replication for Supporting High Throughput and Availability | van Renesse & Schneider, OSDI 2004 | https://www.usenix.org/legacy/event/osdi04/tech/full_papers/renesse/renesse.pdf
+
+== CRAQ: reads from any node with clean and dirty versions
+kind: read-replicas
+when: Reads are 90% or more of the traffic, the data must stay strongly consistent, and the tail of a plain chain is the bottleneck.
+how: CRAQ keeps the chain write path. A write travels from the head to the tail as before. Each server keeps, per object, the clean version and any newer dirty versions still on their way to the tail.
+A read can go to any server. If the object is clean there, the server answers at once from local memory. If a dirty version exists, the server sends a small version query to the tail, which answers with the latest committed version number. The server then returns that version, which it still holds. This keeps reads linearizable.
+When the tail commits a write, it sends an acknowledgement back along the chain. Each server marks that version clean and removes older ones. Read capacity grows with chain length: the CRAQ authors measured about 3 times the read rate of a plain chain with few writes, and about 2 times with writes saturating it. Hot keys that are written all the time make every server dirty, and then the tail gets many version queries.
+used: Research system from Princeton (USENIX ATC 2009); ideas used in read-optimised replicated stores such as a profile or catalogue store that is read much more than written.
+avoid: When writes to the same keys are frequent (use plain chain replication or a quorum store), or when stale reads are acceptable (use an eventually consistent replica).
+flow:
+  Writer [client] -> Head [svc: v7 dirty] : write x = 7 | The write enters the head, which marks version 7 dirty.
+  Head -> Middle [svc: v7 dirty] : forward v7 | Version 7 moves down the chain and each server holds it as dirty.
+  Reader A [client] -> Middle : read x | Reader A asks the middle server, which holds a dirty version.
+  Middle -> Tail [svc: v6 committed] : version query | The middle server asks only for the committed version number, not the data.
+  Tail -> Middle : committed is v6 | The tail says version 6 is the latest committed one.
+  Middle -> Reader A : x = 6 | The middle server returns its stored version 6, so the read is still linearizable.
+  Tail ~> Middle, Head : ack v7 | When version 7 reaches the tail, the acknowledgement marks it clean everywhere.
+  * Middle: v7 clean | After the acknowledgement, the middle server answers reads locally with no tail visit.
+ref: paper | Object Storage on CRAQ: High-throughput chain replication for read-mostly workloads | Terrace & Freedman, USENIX ATC 2009 | https://www.usenix.org/legacy/event/usenix09/tech/full_papers/terrace/terrace.pdf
+
+@@ kbypass
+== Thread per core with a polled NIC queue per core
+kind: event-loop, sharding
+when: A server must give low and steady tail latency at very high request rates, and cross-core locks would limit it.
+how: The NIC splits incoming connections into many hardware queues by a hash of the connection (receive-side scaling). The server starts one pinned thread per CPU core. Each thread owns one queue and one shard of the data, with its own memory. It runs a loop that polls the queue, handles requests to completion and writes replies to the transmit queue.
+A request for data owned by another core is sent to that core as a message in a lock-free queue. No data structure is shared, so there are no locks and no cache lines bouncing between cores. In Seastar the loop is a reactor, and disk I/O is also asynchronous and direct.
+The network stack can be the normal Linux one, or Seastar's own TCP/IP stack on DPDK. Most of the gain comes from the pinned, shared-nothing design. The cost is that busy cores stay at high CPU use, hot shards cannot borrow idle cores, and the application must be written in an asynchronous style.
+used: ScyllaDB (one shard per core) and Redpanda (Kafka API, Seastar thread per core); both can use the kernel stack, and DPDK is an option in Seastar.
+avoid: When the load is small or the code is blocking and thread-based; use a normal thread pool and the kernel stack.
+flow:
+  Clients [client] -> NIC [svc: 4 RX queues] : requests | Many clients send requests. The NIC hashes each connection to one queue.
+  NIC -> Core 0 [svc: shard 0], Core 1 [svc: shard 1] : DMA into buffers | Each queue is read by exactly one core, which owns that shard.
+  * Core 0: serves own keys | A key that belongs to shard 0 is served by core 0 itself, with no lock.
+  Core 1 -> Core 0 : message: key in shard 0 | A key that belongs to another shard is sent to that core as a message.
+  Core 0 -> Core 1 : result | The owning core replies through a lock-free queue, and core 1 answers the client.
+  Core 1 -> NIC : response frame | Each core writes responses to its own transmit queue.
+  Core 0 -> Disk [store: NVMe] : direct I/O | Each core also issues its own asynchronous disk I/O with no shared page cache lock.
+ref: docs | Seastar networking | Seastar project | https://seastar.io/networking/
+ref: docs | Redpanda architecture: thread-per-core | Redpanda Data | https://docs.redpanda.com/current/get-started/architecture/
+
+== Fast-path packet filter in front of the service
+kind: load-shedding, pipes-filters
+when: A very busy edge, such as a bid-request front end or a load balancer, must drop or route millions of packets per second cheaply.
+how: A program runs at the earliest point of the receive path: an XDP program in the NIC driver, an AF_XDP socket, or a DPDK application on a dedicated core. It reads each packet from the ring and checks cheap rules. Examples are a block list of source addresses, a rate limit per source and a check of the request header.
+Bad or excess packets are dropped here, before the kernel allocates a socket buffer and before any application thread wakes up. Good packets are passed on: either to the kernel stack in the same machine, or rewritten and sent to a backend. At 10 Gb/s with small packets, the budget is about 200 CPU cycles per packet, so the rules must be simple and use tables in memory.
+The filter protects the slow, rich service behind it. Keep a path back to the kernel for traffic the filter does not understand, and export counters for drops and ring occupancy.
+used: XDP-based DDoS filters and L4 load balancers such as Katran (open source); DPDK-based routers and firewalls; high-rate ad-exchange front ends can apply the same idea before the bidder pool.
+avoid: When the kernel path is not the bottleneck (profile first), or when rules need full TCP state; use a normal reverse proxy or iptables/nftables.
+flow:
+  Internet [client] -> NIC [svc: RX ring] : 5M packets/s | Packets arrive faster than the bidder pool could process through the kernel.
+  NIC -> Filter [svc: XDP / DPDK core] : poll burst of 32 | A polling core reads the ring in batches, with no interrupt and no system call.
+  Filter -x> NIC : drop blocked sources | Packets from blocked or over-limit sources are dropped at about 100 CPU cycles each.
+  Filter -> Kernel stack [svc: TCP and sockets] : pass good traffic | Valid traffic is handed to the normal kernel stack.
+  Kernel stack -> Bidder pool [svc: 40 instances] : bid requests | The bidder only sees clean traffic, so its CPU goes to real work.
+  Filter ~> Metrics [store: counters] : drops, ring fill | Counters show drops and ring occupancy, so a stalled core is found quickly.
+ref: docs | AF_XDP | Linux kernel documentation | https://docs.kernel.org/networking/af_xdp.html
+ref: docs | DPDK about and history | DPDK project | https://www.dpdk.org/about/

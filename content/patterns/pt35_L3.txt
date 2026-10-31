@@ -1,0 +1,768 @@
+@@ locks
+== Lock striping for a shared map
+kind: sharding
+when: Many threads read and update one shared table, and a single lock around the whole table would make them wait in line.
+how: Split the table into many buckets and protect each bucket with its own lock, or its own atomic head pointer. A thread hashes the key, finds the bucket, and locks only that bucket. Two threads that touch different buckets never wait for each other.
+Java's ConcurrentHashMap works this way. Since Java 8 it uses a compare-and-swap to insert into an empty bucket, and it takes a synchronized lock on the first node of the bucket only when the bucket already has entries. Older versions used 16 segments, each with its own lock.
+The cost is that whole-table work, such as a resize or a size count, needs care. The count is kept in several cells and added up on demand. Choose the number of locks near the number of cores that really compete, not far above it.
+used: Java ConcurrentHashMap; per-bucket latches in database lock managers; Go sharded maps in cache libraries.
+avoid: When the map is touched by one thread, or the critical section is long. Then fix the long work first, or give each thread its own copy and merge later.
+flow:
+  Thread A [client: key "u17"] -> Hash map [svc: 64 buckets] : put u17 | Thread A hashes its key and picks bucket 5.
+  Thread B [client: key "u90"] -> Hash map : put u90 | Thread B hashes its key and picks bucket 41.
+  Hash map -> Bucket 5 lock [note: held by A], Bucket 41 lock [note: held by B] : lock bucket | Each thread locks only its own bucket, so both run at the same time.
+  Thread C [client: key "u17"] -x> Bucket 5 lock : lock bucket | Thread C wants the same bucket as A, so it waits until A unlocks.
+  Bucket 5 lock -> Thread C : unlock | A releases the lock and C continues.
+ref: docs | futex(7) | Linux man-pages | https://man7.org/linux/man-pages/man7/futex.7.html
+
+== Compare-and-swap retry loop
+kind: optimistic-concurrency
+when: Many threads update one small shared value, such as a counter or a head pointer, and a lock would cost more than the update.
+how: A thread reads the current value, computes the new value, and calls compare-and-swap (CAS) with the old and new values. CAS writes only if the word still holds the old value. If another thread changed it first, CAS fails, and the thread reads again and retries.
+No thread sleeps and no thread holds a lock, so a thread that is stopped by the scheduler cannot block the others. The price is cache traffic. Each CAS needs the cache line in exclusive state, so with 32 threads on one counter most CAS calls fail and the line bounces between cores.
+For hot counters, Java's LongAdder keeps several cells and adds them only when you read. Each thread usually updates its own cell, so there are fewer failed CAS calls. Reads are a little slower and not an exact snapshot.
+used: Atomic reference counts in shared pointers; id and sequence generators; lock-free stacks and queues; Java AtomicLong and LongAdder; Go sync/atomic.
+avoid: When one update must change several variables together. Use a lock, or a transaction, so the group changes as one step.
+flow:
+  Worker 1 [svc] -> Counter [cache: value 100] : read | Worker 1 reads 100 and plans to write 101.
+  Worker 2 [svc] -> Counter : read | Worker 2 also reads 100.
+  Worker 2 -> Counter : CAS(100, 101) | Worker 2 is first, so the counter becomes 101.
+  Worker 1 -x> Counter : CAS(100, 101) | The value is now 101, not 100, so the CAS of worker 1 fails.
+  Worker 1 -> Counter : read, CAS(101, 102) | Worker 1 reads again and retries. No lock was needed.
+ref: docs | futex(7) | Linux man-pages | https://man7.org/linux/man-pages/man7/futex.7.html
+
+@@ mmap
+== Memory-mapped index files for search
+kind: memory-tiering
+when: A search or key-value engine reads a large index with random access, and the hot part of it should live in RAM without a second cache.
+how: The engine opens each index file and maps it into its address space. A lookup is then a plain memory read. If the page is not in RAM, a page fault makes the kernel load the 4 KB page from disk. Pages that are already in the page cache cost no copy and no system call.
+Hot parts of the index stay in RAM and cold parts stay on disk. The operating system decides what to keep, so the engine needs no buffer pool of its own. Several processes that map the same file share the same physical pages.
+Lucene does this in its MMapDirectory, and Elasticsearch uses it for some index file types by default. The Java heap stays small, because index data lives outside the heap. Leave free RAM for the page cache, or the first queries after a restart will be slow.
+used: Apache Lucene, Elasticsearch and OpenSearch index files; Kafka offset index files; LMDB.
+avoid: When the file is far larger than RAM and reads are random on slow disks, or when you need to control I/O errors: a failed read on a mapped file arrives as a signal, not a return code.
+flow:
+  Query thread [client] -> Lucene [svc: MMapDirectory] : search "error" | A query needs the posting list of one term.
+  Lucene -> Mapped index [store: segment file] : read bytes at offset | Lucene reads memory at an address inside the mapped segment file.
+  Mapped index -> Page cache [cache: 4 KB pages] : hit | The page is already in RAM, so the read costs nothing more than a memory access.
+  Mapped index -> Disk [store: NVMe SSD] : page fault | A cold page is loaded from disk by the kernel, which takes about 100 microseconds.
+  Disk ~> Page cache : fill page | The kernel keeps the page for the next query.
+ref: docs | mmap(2) | Linux man-pages | https://man7.org/linux/man-pages/man2/mmap.2.html
+
+== Copy-on-write B-tree on one mapping
+kind: copy-on-write
+when: A small embedded database needs fast reads with no read locks, and writes can be done by one writer at a time.
+how: The whole database file is mapped read-only. A reader gets a pointer into the mapping and follows B-tree pages with no copy. A writer never changes a page in place. It copies each page on the path from leaf to root, edits the copy, and finally writes a new root pointer.
+Readers that started before the commit keep using the old root, so they see a stable snapshot. Old pages are reused only after no reader needs them. There is no write-ahead log, because a crash leaves the old root intact.
+LMDB is built like this. It allows many readers and one writer at a time. Reads are very cheap, but writes copy several pages, and one long-running reader can stop old pages from being reused, so the file grows.
+used: LMDB; OpenLDAP back end; boltdb and bbolt (used by etcd) use the same idea.
+avoid: When there are many concurrent writers or heavy write volume. Use an LSM tree or a server database with a write-ahead log.
+flow:
+  Reader [client] -> Mapped DB file [store: LMDB mmap] : begin read txn | The reader takes the current root page and sees a fixed snapshot.
+  Writer [client] -> Mapped DB file : copy pages on path | The writer copies the leaf and its parents, and edits only the copies.
+  Writer -> Mapped DB file : write new root | The writer writes the new root pointer, then calls fsync. This is the commit.
+  * Mapped DB file: root v2 | The database now has a new version of the tree.
+  Reader -> Mapped DB file : read old pages | The first reader still reads version 1. It is not blocked and sees no change.
+  Mapped DB file ~> Free list [note: pages of v1] : reuse after readers end | Old pages go to a free list when no reader uses them.
+ref: docs | LMDB documentation | Symas |
+
+@@ nscgroups
+== Pod limits enforced by cgroups
+kind: bulkhead, control-loop
+when: Many teams share one cluster, and one noisy service must not take all CPU or memory from the others.
+how: A Kubernetes pod spec gives each container a CPU and memory request and limit. The scheduler places the pod using the requests. The kubelet asks the container runtime to create a cgroup for the pod and writes the limits into it.
+On cgroup v2 the memory limit becomes memory.max, and the CPU limit becomes cpu.max, for example "50000 100000" for half a core (50 ms of CPU in each 100 ms period). If a container goes over its memory limit, the kernel kills a process in it (OOM kill). If it goes over its CPU limit, the kernel throttles it until the next period. It is not killed.
+The limit is a hard wall for one pod, so a memory leak harms only that pod. The cost is that tight CPU limits can add latency spikes from throttling, so many teams set memory limits but loose CPU limits.
+used: Kubernetes on every major cloud; Docker --memory and --cpus flags; systemd services with MemoryMax and CPUQuota.
+avoid: When the workload is a single trusted job on a whole machine. Cgroup limits add little there.
+flow:
+  Pod spec [note: 0.5 CPU 256Mi] -> Scheduler [svc] : create pod | The pod asks for 0.5 CPU and 256 MiB of memory.
+  Scheduler -> Kubelet [svc: node 7] : bind to node 7 | The scheduler picks a node that has enough unrequested capacity.
+  Kubelet -> Container runtime [svc: containerd] : create container | The kubelet asks the runtime to start the container with its limits.
+  Container runtime -> Pod cgroup [store: memory.max] : write limits | The runtime writes the limits into the cgroup files in the kernel.
+  App process [svc: leaks memory] -x> Pod cgroup : allocate over 256 MiB | The process passes memory.max, and the kernel OOM-kills it.
+  Kubelet ~> Pod spec : restart container | The kubelet sees the exit and restarts the container; other pods are not harmed.
+ref: docs | Resource Management for Pods and Containers | Kubernetes documentation | https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+ref: docs | Control Group v2 | Linux kernel documentation | https://docs.kernel.org/admin-guide/cgroup-v2.html
+
+== Shared namespaces in a pod sidecar
+kind: sidecar
+when: A helper process, such as a proxy or log shipper, must sit next to an app and talk to it as if it were on the same machine.
+how: A pod is a group of containers started with some namespaces shared. All containers in the pod join one network namespace, so they have the same IP address and can reach each other on localhost. Each container keeps its own mount namespace, so each has its own root file system. A shared volume can be mounted into both to pass files.
+A service mesh proxy such as Envoy runs as a sidecar. Rules redirect the pod's traffic through it. The app is not changed. The app and the proxy still have separate cgroup limits, so a busy proxy cannot use the memory of the app.
+The pod is the unit of scheduling: the containers start, stop and move together. The risk is that a sidecar adds memory and start-up cost to every pod.
+used: Envoy in Istio sidecar mode; Fluent Bit log shippers; Vault agent; Kubernetes pods in general.
+avoid: When the helper can run once per node, such as a log agent as a DaemonSet, or in a shared gateway. Then you pay its cost once.
+flow:
+  Client [client] -> Pod IP [svc: one network namespace] : request to port 8080 | A request arrives at the pod IP address.
+  Pod IP -> Envoy sidecar [svc: container 2] : redirected | Network rules send inbound traffic to the proxy container first.
+  Envoy sidecar -> App container [svc: container 1] : localhost:8081 | The proxy forwards to the app over localhost, inside the same network namespace.
+  App container -> Shared volume [store: emptyDir] : write log file | The app writes logs to a volume that both containers can see.
+  Log shipper [svc: container 3] ~> Shared volume : tail file | A third container reads the same files and ships them away.
+ref: docs | namespaces(7) | Linux man-pages | https://man7.org/linux/man-pages/man7/namespaces.7.html
+
+@@ pagecache
+== Broker log that relies on the page cache
+kind: memory-tiering
+when: A log or queue server appends data in order and reads recent data soon after. You want high speed without a large cache inside the process.
+how: The server appends each record to a segment file with write(). The kernel copies the data to the page cache and returns at once, and later writes dirty pages to disk in the background. A consumer that reads near the tail finds the same pages still in RAM, so the read never touches the disk.
+Kafka is designed this way. It does not keep its own cache of messages. The brokers use sequential disk access and sendfile to send pages from the cache to the network without copying them into the process. Kafka does not call fsync for every message by default. Durability comes from replication to other brokers, so a broker crash loses no acknowledged data if enough replicas are in sync.
+A consumer that lags by hours reads cold segments from disk. That read also pushes hot pages out of the cache, so one slow consumer can slow the others. Leave plenty of RAM free for the cache and keep the Java heap small.
+used: Apache Kafka brokers; Redpanda and other log stores that depend on the OS for caching; many file-based log stores.
+avoid: When each message must be on disk before you reply, for example a single node with no replicas. Then use fsync, and accept the cost.
+flow:
+  Producer [client] -> Broker [svc: Kafka / small heap] : append record | The producer sends a batch to the partition leader.
+  Broker -> Page cache [cache: dirty pages] : write() to segment | The kernel copies the bytes into RAM and returns in microseconds.
+  Page cache ~> Disk [store: segment files] : background flush | The kernel writes dirty pages later, in big sequential runs.
+  Broker ~> Follower broker [svc: replica] : replicate | The follower copies the data, which gives durability without fsync.
+  Consumer [client: near tail] -> Broker : fetch | A caught-up consumer asks for recent offsets.
+  Broker -> Page cache : sendfile | Pages go from the cache to the socket, with no read from disk and no copy into the process.
+ref: docs | Kafka design: persistence | Apache Kafka documentation | https://kafka.apache.org/documentation/#persistence
+
+== Group commit with fsync on a write-ahead log
+kind: wal, batching
+when: A database must not lose a committed transaction after a crash, but one disk flush for each commit would be too slow.
+how: A write to the log file first lands in the page cache, where a power loss would erase it. The database calls fsync, which forces dirty pages of that file to the device, and only then tells the client that the commit is done. An fsync on a datacenter SSD takes from 50 microseconds to a few milliseconds, so the rate of fsync calls limits the commit rate.
+Group commit lowers the cost. While one fsync runs, other transactions append their log records. The next fsync covers all of them with one flush, and all of them are acknowledged together. PostgreSQL does this with its WAL and the commit_delay setting.
+Data files are different: the database writes them lazily into the page cache and flushes them at checkpoints. After a crash, the log is replayed from the last checkpoint.
+used: PostgreSQL WAL; MySQL InnoDB redo log; SQLite in WAL mode; etcd and other Raft logs.
+avoid: When losing the last fraction of a second is fine. Turn off synchronous commit, as with PostgreSQL synchronous_commit = off, and gain speed.
+flow:
+  Txn 1 [client] -> Database [svc: WAL writer] : COMMIT | Transaction 1 asks to commit.
+  Txn 2 [client] -> Database : COMMIT | Transaction 2 arrives a moment later.
+  Database -> Page cache [cache: WAL pages] : write both records | The database appends both log records to the log file in the page cache.
+  Database -> WAL file [log: on SSD] : one fsync | One fsync makes both records durable on the device.
+  WAL file -> Database : fsync done | The device confirms, which takes about 1 ms.
+  Database -> Txn 1, Txn 2 : commit OK | Both clients get their answer after one flush.
+  Database ~> Data files [store: heap pages] : lazy write at checkpoint | Table pages are written later and need no fsync per commit.
+ref: docs | WAL configuration | PostgreSQL documentation | https://www.postgresql.org/docs/current/wal-configuration.html
+
+@@ pagereplace
+== Size memory to the working set
+kind: memory-tiering
+when: A service runs on a machine with less RAM than its data, and you must decide how much memory it needs so that it does not thrash.
+how: Demand paging keeps only pages that were touched. The kernel evicts the least recently used pages, so the pages touched in the last few seconds or minutes, the working set, stay in RAM. If RAM is larger than the working set, almost every access is a hit and misses are rare.
+If RAM is smaller, the same pages are evicted and loaded again and again. Each miss costs about 100 microseconds on an SSD, roughly 1,000 times a RAM access. Throughput falls sharply, and the machine is busy with I/O instead of work. This is thrashing.
+Watch major page faults, swap-in rate and the pressure stall information in /proc/pressure/memory. Size the instance so the hot set fits, for example a 20 GB hot index needs more than 20 GB of free RAM. Pages that are never touched, like old code paths, cost nothing.
+used: Capacity planning for Elasticsearch, Redis with swap, and database servers; Linux PSI used by Facebook's oomd and systemd-oomd.
+avoid: When the access pattern is a one-time scan of all data. Then the working set is the whole file, and more RAM does not help; use streaming reads.
+flow:
+  App [svc: touches 12 GB] -> Page table [store: virtual to physical] : access page | The app reads an address, and the hardware checks the page table.
+  Page table -> RAM [cache: 16 GB / 90% full] : hit | The page is present, so the access takes about 100 nanoseconds.
+  Page table -x> RAM : page fault | The page is not present, so the CPU traps to the kernel.
+  RAM -> Disk [store: SSD or swap] : read page, evict LRU page | The kernel loads the page and evicts a cold page, written first if it is dirty.
+  * RAM: working set exceeds RAM | When the hot set grows over RAM, every access evicts a page needed soon.
+  Disk -> App : stall 100 us | Each miss stalls the thread, and the service becomes slow. This is thrashing.
+ref: docs | Pressure Stall Information | Linux kernel documentation | https://docs.kernel.org/accounting/psi.html
+
+== Clock sweep with a scan ring buffer
+kind: none
+when: A cache of pages must evict cheaply and must not be wiped out by one big sequential scan.
+how: True LRU needs a list update on every hit, which is costly. The clock algorithm keeps pages in a circle with a use mark. A hit sets the mark. To evict, a hand moves round the circle: it clears a set mark and skips the page, and it evicts the first page with a clear mark.
+PostgreSQL's buffer manager adds a small counter per buffer, up to 5, so popular pages survive more passes of the hand. A hit raises the count, and the hand lowers it.
+A large sequential scan would still push out the whole hot set. So PostgreSQL gives such a scan a small ring of 256 KB and reuses only those buffers. The scan reads its pages through the ring and the hot pages stay. The Linux kernel uses a related idea with active and inactive lists.
+used: PostgreSQL shared buffers; the Linux page reclaim lists; many database buffer pools.
+avoid: When the workload is a fixed set of very hot keys and a frequency-based policy such as LFU or TinyLFU fits better.
+flow:
+  Seq scan query [client] -> Buffer manager [svc: PostgreSQL] : scan big table | A query reads a table larger than a quarter of the buffer pool.
+  Buffer manager -> Ring buffer [cache: 256 KB] : use small ring | The scan gets a private ring of 32 pages of 8 KB.
+  Ring buffer -> Disk [store: table file] : read next page | The scan reuses ring slots, so the shared pool is not flooded.
+  Index query [client] -> Buffer manager : get hot page | An index query asks for a popular page at the same time.
+  Buffer manager -> Shared buffers [cache: clock sweep] : hit, count + 1 | The page is still cached because the scan did not evict it.
+  Buffer manager ~> Shared buffers : hand lowers count | Later, the hand lowers counts and evicts only pages with count 0.
+ref: docs | Buffer manager README | PostgreSQL source | https://raw.githubusercontent.com/postgres/postgres/master/src/backend/storage/buffer/README
+
+@@ permissions
+== Least-privilege container
+kind: zero-trust
+when: A service handles untrusted input, and a bug in it must not give the attacker the power of root on the host.
+how: Linux decides each action from the user id, the group id, the file mode bits and a set of capabilities. Root is split into about 40 capabilities, such as binding ports under 1024 or changing the clock. A process needs only the few that its job requires.
+In Kubernetes, the securityContext of a pod sets this. Run as a non-root user id, drop all capabilities, add back only what is needed, forbid privilege escalation through setuid programs, and mount the root file system read-only. A write goes only to a volume you named.
+If an attacker takes over the process, the attacker can read only what that user id can read and cannot load kernel modules or change the network. Combine this with a seccomp profile that blocks system calls the service never uses. Test it: an image that wrote to its own directory will fail when the file system is read-only.
+used: Kubernetes Pod Security Standards (restricted profile); Docker default capability set; distroless and non-root base images.
+avoid: When the workload really needs the host, such as a node agent that loads eBPF programs. Give it only the exact capability it needs, and isolate it.
+flow:
+  Attacker [user] -> Web service [svc: runs as uid 10001] : crafted request | A bug lets the attacker run code inside the service.
+  Web service -> App files [store: read-only root fs] : write backdoor | The attacker tries to write a tool into the image.
+  App files -x> Web service : EROFS | The file system is read-only, so the write is refused.
+  Web service -> Kernel [svc: capabilities none] : mount, ptrace, bind 80 | The attacker tries actions that need root powers.
+  Kernel -x> Web service : EPERM | The process has no capabilities, so the kernel refuses each call.
+  Web service -> Tmp volume [store: emptyDir] : write temp data | Only the named volume is writable, so normal work still runs.
+ref: docs | Pod Security Standards | Kubernetes documentation | https://kubernetes.io/docs/concepts/security/pod-security-standards/
+ref: docs | capabilities(7) | Linux man-pages | https://man7.org/linux/man-pages/man7/capabilities.7.html
+
+== Privilege separation: root master, plain workers
+kind: least-privilege
+when: A server must do one action that needs root, such as binding port 443, but then runs code that parses untrusted data.
+how: A small master process starts as root. It opens the listening sockets, reads the private key files and starts workers. Each worker then drops to an unprivileged user, using setgid and setuid, and serves the clients. Only the master keeps root, and it does little work and parses no client data.
+nginx works like this. The master process reads the configuration and binds ports, and worker processes run as the user named in the user directive. The sshd program also keeps the network-facing code in an unprivileged child process, and a small privileged part does only the few jobs that need root.
+A bug in a worker gives the attacker a plain account, not root. The cost is a little more design work: sockets and file descriptors must be passed from the master to the workers before the drop.
+used: nginx master and workers; OpenSSH privilege separation; Postfix with its small separate daemons; Apache httpd parent and children.
+avoid: When capabilities are enough: grant the single capability, for example CAP_NET_BIND_SERVICE, and never start as root.
+flow:
+  Master [svc: root] -> Port 443 [queue: listening socket] : bind and listen | Only root may bind a port below 1024, so the master does it first.
+  Master -> Worker 1, Worker 2 [svc: user nginx] : fork, setuid | Each child process drops to an unprivileged user before it serves any request.
+  Client [client] -> Port 443 : HTTPS request | A client connects to the shared socket.
+  Port 443 -> Worker 1 : accept | One worker accepts the connection and parses the untrusted bytes.
+  Worker 1 -x> Master : read private key | The worker cannot open files that only root can read.
+  Master ~> Worker 2 : reload config signal | Admin actions go through the master, which keeps root.
+ref: docs | nginx beginner's guide | nginx documentation | https://nginx.org/en/docs/beginners_guide.html
+
+@@ process
+== Pre-fork worker pool under a supervisor
+kind: thread-pool
+when: A server runs code that is not thread safe or can crash, and you want to use all CPU cores with simple, isolated workers.
+how: A master process opens the listening socket and calls fork() several times. Each child is a separate process with its own memory and shares the socket. Each child accepts connections and handles requests alone, so there is no shared state and no locks between workers.
+The master does not serve requests. It watches the children. If one exits or is killed, for example by the out-of-memory killer, the master starts a new one. It can also restart workers after N requests to hide slow memory leaks, and it can roll a new code version by replacing workers one at a time.
+Gunicorn for Python does this, usually with about two to four workers per core. A fork is cheap because the kernel shares pages copy-on-write. Memory per worker is still real, so 32 workers of 300 MB use about 10 GB.
+used: Gunicorn, uWSGI, Unicorn for Ruby, nginx workers, Apache prefork MPM.
+avoid: When requests wait on slow I/O for a long time. Use an async server or threads, because idle processes waste memory.
+flow:
+  Master [svc: gunicorn] -> Worker 1, Worker 2, Worker 3 [svc: own memory] : fork x 3 | The master starts three child processes that share one listening socket.
+  Client [client] -> Worker 2 : HTTP request | The kernel gives each new connection to one worker that is waiting in accept.
+  Worker 2 -> App code [svc: Python] : handle | The worker runs the request alone, with no locks against its siblings.
+  Worker 3 -x> Master : crashes (SIGKILL) | One worker dies, perhaps killed for using too much memory.
+  Master -> Worker 3 : fork replacement | The master sees the exit through SIGCHLD and starts a new worker.
+  * Worker 3: new process | The pool is back to three workers, and clients saw errors only on requests that were in flight.
+ref: docs | Gunicorn design | Gunicorn documentation | https://gunicorn.org/design/
+
+== Process per site isolation
+kind: bulkhead
+when: A program runs code from many sources that may be buggy or hostile, and one failure must not take down the rest.
+how: Put each risky unit in its own process. The processes have separate address spaces, so one cannot read the memory of another, and a crash of one is seen by the others only as a closed pipe. A small trusted parent process creates the children and passes messages between them.
+Chrome gives each site its own renderer process. This is called site isolation. A tab that crashes shows a sad face, and other tabs continue. A renderer runs in a sandbox with few rights, so a bug in the page code cannot read files or other sites' data directly. The browser process holds the powers.
+The cost is memory: each process has its own copy of heap and runtime. Processes talk through inter-process messages, which are slower than a function call. Design the message interface to be small and check every message.
+used: Google Chrome and other Chromium browsers; PostgreSQL, which runs one backend process per connection; Android apps, one process each by default.
+avoid: When units share a lot of data and talk often. A thread pool in one process is cheaper, if you can trust the code.
+flow:
+  Browser process [svc: trusted parent] -> Renderer A [svc: site a.com] : spawn sandboxed | The parent starts one renderer process per site.
+  Browser process -> Renderer B [svc: site b.com] : spawn sandboxed | A second site gets a second process and its own memory.
+  User [user] -> Browser process : open tab | The user opens two tabs.
+  Renderer A -x> Renderer B : read memory | A page in A tries to read the memory of B, and the MMU blocks it.
+  Renderer A -x> Browser process : crash | A bug crashes renderer A.
+  Browser process -> User : tab crashed | Only the first tab shows an error; renderer B keeps running.
+ref: docs | Site Isolation | Chromium project | https://www.chromium.org/Home/chromium-security/site-isolation/
+
+@@ rtsched
+== Priority inheritance on a shared lock
+kind: priority-inheritance
+when: A high-priority task and a low-priority task share a lock, and medium tasks could keep the low one from running.
+how: Priority inversion happens like this. A low-priority task holds a lock. A high-priority task needs the lock and waits. A medium-priority task that does not need the lock becomes ready and takes the CPU from the low task. The low task cannot finish, so the lock stays held and the high task is blocked by a task of lower rank.
+Priority inheritance fixes it. While the high task waits, the lock holder runs at the priority of the highest waiter. The medium task can no longer preempt it. When the holder releases the lock it returns to its own priority.
+In 1997 the Mars Pathfinder lander reset itself because of this fault. The VxWorks mutex was created without the inheritance option, and the engineers fixed it by changing the flag from the ground. Linux offers it through PTHREAD_PRIO_INHERIT mutexes and the rt-mutex in the kernel.
+used: Mars Pathfinder fix; VxWorks mutexes; Linux PI futexes and PREEMPT_RT; AUTOSAR and other real-time operating systems.
+avoid: When a design can avoid sharing the lock. Pass data by message or use a lock-free queue, so the high task never waits for a low one.
+flow:
+  Low task [svc: priority 1] -> Mutex [note: free] : lock | The low-priority task takes the lock and starts its work.
+  High task [svc: priority 10] -x> Mutex : lock | The high task needs the lock and blocks.
+  Medium task [svc: priority 5] -> Low task : preempts it | Without inheritance, the medium task takes the CPU and the low task makes no progress.
+  * High task: blocked too long | The high task misses its deadline. This is priority inversion.
+  Mutex -> Low task : boost to priority 10 | With inheritance, the lock holder now runs at the priority of the waiter.
+  Low task -> Mutex : unlock | The low task finishes fast, unlocks, and drops back to priority 1.
+  Mutex -> High task : acquired | The high task runs at once.
+ref: docs | RT-mutex implementation design | Linux kernel documentation | https://docs.kernel.org/locking/rt-mutex-design.html
+
+== Periodic real-time loop with a deadline
+kind: none
+when: A control or audio task must run every few milliseconds and finish before its deadline, every time and not just on average.
+how: Give the task a real-time scheduling class, for example SCHED_FIFO on Linux, with a fixed priority above normal work. A timer wakes it every period, for example every 1 ms. It reads sensors, computes, writes outputs and sleeps until the next period. The scheduler always runs the highest-priority ready task.
+To keep the worst-case time low, the task locks its memory with mlockall so that page faults cannot occur, allocates all buffers before the loop, avoids calls that may block, and is pinned to a reserved CPU core. A kernel with PREEMPT_RT, which is part of mainline Linux since version 6.12, lets even kernel code be preempted, which cuts the worst-case delay.
+Measure the worst-case wake-up latency with cyclictest under load. The number to watch is the maximum, not the average. If the maximum is above the period, the design fails.
+used: JACK and PipeWire audio threads; robot control loops, including ROS 2 real-time setups; industrial PLC software on Linux; AUTOSAR ECUs.
+avoid: When occasional misses are fine, such as video playback. Normal scheduling is simpler and does not risk starving the rest of the machine.
+flow:
+  Timer [svc: 1 ms period] -> Control task [svc: SCHED_FIFO 80] : wake up | A timer interrupt makes the real-time task ready at the start of each period.
+  Control task -> Sensor [client: IMU] : read, then compute | The task reads its input and computes within about 200 microseconds. No page fault can occur because memory is locked.
+  Control task -> Actuator [svc: motor driver] : write command | It writes the result before its deadline.
+  Batch job [svc: normal class] -x> Control task : tries to preempt | A normal task cannot preempt a higher real-time priority.
+  Control task ~> Timer : sleep until next period | The task sleeps, and other work can use the CPU.
+ref: docs | Real-Time Linux wiki | Linux Foundation |
+
+@@ scheduling
+== Priority classes with preemption in a cluster
+kind: priority-queue
+when: Latency-critical services and batch jobs share the same machines, and the services must win when capacity is short.
+how: Give each job a priority. The scheduler places high-priority work first. If no node has room, it may preempt: it evicts lower-priority work from a node to make space. The evicted batch job goes back to the queue and runs again later.
+Google's Borg did this at large scale with production and non-production priority bands. Kubernetes has PriorityClass objects, and its scheduler can preempt lower-priority pods. On each node, the same idea appears in the kernel: CPU weights and real-time classes decide who runs next.
+Batch work should be restartable, because it can be killed at any time. In return, the machines run busier. Running only services leaves large idle gaps. Filling the gaps with batch work raises machine use, and the Borg paper found that keeping them in separate clusters would need about 20 to 30 percent more machines.
+used: Google Borg; Kubernetes PriorityClass and preemption; Apache YARN queues with preemption; Slurm job preemption on HPC clusters.
+avoid: When all jobs are equal and cannot be restarted. Preemption would waste work; use plain queues and capacity limits.
+flow:
+  Batch job [svc: priority 100] -> Scheduler [svc: cluster] : submit | A batch job is submitted with low priority.
+  Scheduler -> Node 1 [svc: 90% used] : place batch pods | The scheduler fills spare room with batch pods.
+  Web service [svc: priority 1000] -> Scheduler : scale up, 4 pods | A traffic spike makes the web service ask for more pods.
+  Scheduler -x> Node 1 : no room | No node has free capacity for the high-priority pods.
+  Scheduler -> Node 1 : preempt batch pods | The scheduler evicts batch pods with the lowest priority to make space.
+  Node 1 -> Web service : pods running | The web pods start. The evicted batch pods wait in the queue.
+  Scheduler ~> Batch job : reschedule later | When capacity returns, the batch job is placed again.
+ref: paper | Large-scale cluster management at Google with Borg | Verma et al., EuroSys 2015 | https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/
+ref: docs | Pod Priority and Preemption | Kubernetes documentation | https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/
+
+== Weighted fair share of CPU
+kind: fair-share
+when: Many tenants share the same CPU cores, and each should get a fair part of it, with spare time still being used.
+how: Each task or group gets a weight. When all are busy, each gets CPU time in proportion to its weight. When one is idle, the others use its share. This keeps the machine fully used, and a busy tenant cannot hold more than its share while others wait.
+Since Linux 6.6 the default scheduler for normal tasks is EEVDF, which replaced CFS. With cgroups v2, the cpu.weight file sets the weight of a group. Kubernetes turns a container's CPU request into this weight, so a pod that requests 2 CPUs gets twice the share of a pod that requests 1 when the node is full.
+Weights set only the share under contention. A hard cap is a different tool: cpu.max, which Kubernetes sets from the limit. Use weights for fairness and caps only where you must stop a tenant from using idle CPU.
+used: Kubernetes CPU requests; systemd CPUWeight; Linux EEVDF and CFS; hypervisors such as KVM that give each VM a CPU share.
+avoid: When a task has a hard deadline. Shares give an average, not a bound; use a real-time class or a reserved core.
+flow:
+  Pod A [svc: request 2 CPU] -> Node CPU [svc: 4 cores] : runs, weight 200 | Pod A has twice the weight of pod B.
+  Pod B [svc: request 1 CPU] -> Node CPU : runs, weight 100 | Pod B has weight 100.
+  Node CPU -> Pod A : 2.7 cores when busy | When both are busy, A gets two thirds of the cores in use.
+  Node CPU -> Pod B : 1.3 cores when busy | Pod B gets one third. Neither one starves.
+  * Pod A: idle | Pod A has no work for a while.
+  Node CPU -> Pod B : all 4 cores | Pod B can use the idle time. The weights bind only when there is contention.
+ref: docs | Control Group v2: CPU | Linux kernel documentation | https://docs.kernel.org/admin-guide/cgroup-v2.html
+
+@@ semaphores
+== Bounded buffer between producer and consumer
+kind: producer-consumer
+when: A fast producer feeds a slower consumer, and you need to cap memory and slow the producer down instead of dropping data.
+how: A buffer of fixed size N sits between the two sides. Two semaphores guard it: "empty slots", which starts at N, and "full slots", which starts at 0. A producer waits on empty slots, writes an item, and then signals full slots. A consumer waits on full slots, takes an item, and signals empty slots. A mutex protects the buffer's indexes.
+When the buffer is full, the producer sleeps, which is backpressure with no extra code. When it is empty, the consumer sleeps and uses no CPU. Java's ArrayBlockingQueue and Go's buffered channels are this pattern. Unix pipes work the same way, with a 64 KB buffer on Linux.
+Pick N from the burst size you want to absorb. A big N hides slowness but adds delay and memory. A small N makes the producer slow down early.
+used: Unix pipes between shell commands; Java BlockingQueue in thread pools; Go channels; logging libraries that pass messages to a writer thread.
+avoid: When data may be dropped under load, such as metrics samples. Use a lossy queue, or drop the oldest item, rather than block the producer.
+flow:
+  Producer [svc: fast] -> Buffer [queue: N = 4] : put item | The producer first waits on the empty-slots semaphore, then adds an item.
+  Buffer -> Consumer [svc: slow] : take item | The consumer waits on the full-slots semaphore, then removes the oldest item.
+  * Buffer: 4 of 4 full | The consumer is slower, so the buffer fills.
+  Producer -x> Buffer : put blocked | No empty slot is left, so the producer sleeps. This slows the whole pipeline to the consumer speed.
+  Consumer -> Buffer : signal empty slot | The consumer frees a slot and signals the semaphore.
+  Buffer -> Producer : wake up | The producer wakes and adds its next item.
+ref: book | Operating Systems: Three Easy Pieces, Semaphores | Arpaci-Dusseau, 2018 | https://pages.cs.wisc.edu/~remzi/OSTEP/threads-sema.pdf
+
+== Counting semaphore as a concurrency limit
+kind: bulkhead, load-shedding
+when: A downstream resource can serve only N requests at once, and extra callers should wait or be turned away.
+how: Create a counting semaphore with N permits. Before each call to the resource, a worker acquires a permit. When the call ends, it releases the permit, even on error. If all N permits are taken, a caller waits, or tries for a short time and fails fast.
+A connection pool is this, with N connections as permits. Resilience4j has a semaphore bulkhead with the same idea, and Go has the semaphore package in golang.org/x/sync. A different limit can be set for each downstream service, so a slow payment service cannot use all the threads and starve the product pages.
+Choose N from capacity: if a database handles 50 queries at once, give it 50 permits across all callers. A short wait time keeps callers from piling up. Always release in a finally block, or permits leak and the limit slowly closes to zero.
+used: Database connection pools such as HikariCP; Resilience4j SemaphoreBulkhead; Go x/sync/semaphore; nginx limit_conn.
+avoid: When the limit should be a rate (requests per second) and not a count of concurrent calls. Use a token bucket.
+flow:
+  Request 1 [client] -> Limiter [svc: 2 permits] : acquire | The first request takes a permit; one is left.
+  Request 2 [client] -> Limiter : acquire | The second request takes the last permit.
+  Limiter -> Payment API [svc: max 2 at once] : 2 calls | Only two calls reach the slow service at the same time.
+  Request 3 [client] -x> Limiter : acquire, wait 50 ms | No permit is free, so request 3 waits briefly and then fails fast.
+  Payment API -> Limiter : response, release | When a call ends, its permit is released.
+  Limiter -> Request 3 : retry gets permit | A later try succeeds. Other endpoints still have their own permits.
+ref: docs | Bulkhead | Resilience4j documentation | https://resilience4j.readme.io/docs/bulkhead
+
+@@ signals
+== Graceful shutdown on SIGTERM
+kind: graceful-shutdown
+when: A service is stopped for a deploy or a scale-down, and it must finish current requests and not drop work.
+how: The orchestrator sends SIGTERM first. Kubernetes does this to each container, then waits terminationGracePeriodSeconds, which is 30 seconds by default, and then sends SIGKILL. SIGKILL cannot be caught, so everything must end before it.
+The signal handler only sets a flag. The main loop sees the flag and starts the drain: it fails the readiness check so the load balancer stops sending new requests, stops accepting connections, waits for requests in flight, flushes buffers and closes database connections, and then exits with code 0. Do real work in the main thread, not inside the handler, because only a few calls are safe in a handler.
+Set the grace period longer than your longest normal request. In containers, make sure the app is process 1 or that a small init passes the signal on; a shell script wrapper that does not forward SIGTERM causes a hard kill after 30 seconds.
+used: Kubernetes pod termination; Docker stop; systemd stop; gunicorn, nginx and Go http.Server Shutdown.
+avoid: When work cannot be interrupted and takes much longer than the grace period. Use a checkpoint and a job queue so another worker can resume.
+flow:
+  Kubelet [svc: node agent] -> App [svc: PID 1] : SIGTERM | The kubelet asks the container to stop, and a 30 second timer starts.
+  App -> Readiness probe [svc: health check] : report not ready | The app fails readiness, so the endpoint is removed from the service.
+  Load balancer [svc] -x> App : no new requests | New traffic goes to other pods. Requests already running continue.
+  App -> Database [db] : finish and flush | The app completes in-flight work, flushes buffers and closes connections.
+  App -> Kubelet : exit 0 | The app exits cleanly before the timer ends.
+  Kubelet ~> App : SIGKILL after 30 s | If the app is still alive at 30 seconds, it is killed without cleanup.
+ref: docs | Pod Lifecycle: termination of pods | Kubernetes documentation | https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination
+ref: docs | signal(7) | Linux man-pages | https://man7.org/linux/man-pages/man7/signal.7.html
+
+== Signals turned into events in a loop
+kind: event-loop
+when: An event-driven server must react to signals, but a handler may run at any moment and can do almost nothing safely.
+how: A handler runs between two instructions of the main code, so it may not call malloc, take locks or print. The safe design keeps the handler tiny. Either it writes one byte to a pipe (the self-pipe trick), or the program does not use handlers at all and reads signals from a file descriptor made by signalfd.
+That descriptor is added to the same epoll set as the sockets. The event loop wakes up for a signal like any other event and runs normal code: reload the config on SIGHUP, start the drain on SIGTERM, reopen log files on SIGUSR1, or reap children on SIGCHLD.
+All logic stays in one place and in one thread, so no data race with a handler is possible. In a multi-threaded program, block the signals in all threads and let one thread read them.
+used: nginx and HAProxy master processes; Redis; libuv and Node.js signal handles; systemd.
+avoid: When a program is simple and only needs to exit on Ctrl-C. A plain default action is enough.
+flow:
+  Admin [user] -> Server [svc: event loop] : kill -HUP pid | An admin asks the server to reload its configuration.
+  Server -> Signal fd [queue: signalfd] : kernel queues signal | The kernel makes the signal readable on a file descriptor, with no handler.
+  Signal fd -> Event loop [svc: epoll_wait] : readable | The loop wakes up and sees a readable descriptor.
+  Client [client] -> Event loop : request on socket | Sockets and the signal share one loop, so both are handled in order.
+  Event loop -> Config store [store: nginx.conf] : reload | The loop reads the new config in normal code. It is safe to use locks and memory here.
+  Event loop -> Admin : reload done | The loop logs the result. No request was dropped.
+ref: docs | signalfd(2) | Linux man-pages | https://man7.org/linux/man-pages/man2/signalfd.2.html
+
+@@ syscalls
+== Batched submission with io_uring
+kind: batching
+when: A server does very many small I/O calls, and the cost of each system call is a large part of the CPU time.
+how: A normal read or write is a system call. Each one switches into the kernel and back, which costs from about 100 nanoseconds to over a microsecond, and more after security mitigations. With a million operations per second this adds up to real CPU.
+io_uring uses two ring buffers that the process and the kernel share in memory. The program writes many submission entries into the first ring, then makes one io_uring_enter call to submit them all. Completions appear in the second ring, and the program reads them with no system call. In SQPOLL mode a kernel thread polls the submission ring, and the program may need no calls at all while busy.
+One call can carry dozens of reads, writes, accepts and sends. The program must handle completions out of order. Kernel support differs by version, and some container runtimes block io_uring by default because of past security bugs.
+used: Seastar and ScyllaDB I/O; RocksDB and some Rust runtimes such as tokio-uring; high-speed proxies and storage servers on Linux.
+avoid: When the load is small or the code must run on old kernels and other systems. Plain epoll is simpler and fast enough.
+flow:
+  App [svc: server loop] -> Submission ring [queue: shared memory] : write 32 entries | The app fills the ring with 32 read and write requests, with no system call yet.
+  App -> Kernel [svc: io_uring_enter] : one syscall | A single call tells the kernel to start all 32.
+  Kernel -> NVMe drive [store: SSD] : 32 reads in flight | The kernel issues the I/O to the device in parallel.
+  NVMe drive ~> Completion ring [queue: shared memory] : results arrive | As each I/O finishes, the kernel writes a result entry to the second ring.
+  Completion ring -> App : read results | The app reads completions directly from memory, in any order.
+ref: docs | Efficient IO with io_uring | Jens Axboe, 2019 | https://kernel.dk/io_uring.pdf
+
+== System call filter for a sandbox
+kind: zero-trust
+when: A process runs untrusted or exposed code, and you want to cut the kernel attack surface to the calls it really needs.
+how: The kernel has more than 300 system calls, and each one is code that an attacker can try to exploit. A filter using seccomp-bpf is installed in a process before it handles untrusted data. For every system call, a small program checks the call number and the arguments and returns allow, deny with an error, or kill.
+Docker applies a default profile that blocks tens of rarely needed calls. Chrome's renderer sandbox allows only a short list. systemd can set a filter per service with SystemCallFilter. The filter cannot be removed once set, and children inherit it.
+gVisor goes further. Its user-space kernel receives the application's calls, implements them itself and passes only a small set of calls to the real kernel. The price is slower system calls, so I/O-heavy programs can lose speed.
+used: Docker and containerd default seccomp profile; Chrome and Firefox sandboxes; systemd services; gVisor in Google Cloud Run and similar services; OpenSSH.
+avoid: When the program is trusted and uses many different calls. A filter that is too strict breaks it in rare paths. Start in log-only mode and look at what is used.
+flow:
+  Container runtime [svc: runc] -> Seccomp filter [note: allowlist] : install before exec | The runtime installs the filter, and from then on it cannot be removed.
+  Container runtime -> App [svc: untrusted code] : exec | The app starts, with the filter in place.
+  App -> Seccomp filter : read(), write() | Common calls are checked and allowed.
+  Seccomp filter -> Kernel [svc: Linux] : allowed | The call goes on to the real kernel.
+  App -x> Seccomp filter : keyctl(), mount() | The attacker tries a call that the app never needs.
+  Seccomp filter -x> App : EPERM or kill | The kernel code behind that call is never reached.
+ref: docs | Seccomp BPF | Linux kernel documentation | https://docs.kernel.org/userspace-api/seccomp_filter.html
+ref: docs | gVisor: What is gVisor? | gVisor project | https://gvisor.dev/docs/
+
+@@ thread
+== Bounded thread pool with a queue
+kind: thread-pool, load-shedding
+when: A server must handle many requests at once, and creating one thread per request would risk running out of memory or CPU.
+how: Create N worker threads once. Requests go into a queue, and each idle worker takes the next one. Each thread has its own stack, about 1 MB by default on 64-bit Linux for Java, so 10,000 threads need about 10 GB of address space and a lot of scheduling work.
+The pool has three limits: the number of threads, the queue length and a rejection rule. When the queue is full, new requests are refused at once with an error such as HTTP 503, or the caller runs the task itself to slow down. Tomcat's default maximum is 200 request threads.
+Size N from the work. For CPU-bound tasks use about one thread per core. For tasks that wait on I/O, use more, up to cores times (1 + wait time / compute time). Separate pools for separate downstream services give isolation.
+used: Tomcat and Jetty request threads; Java ThreadPoolExecutor; Go servers use goroutines instead; Nginx thread pools for blocking file I/O.
+avoid: When there are very many idle connections. Use an event loop or lightweight threads such as Java virtual threads or goroutines.
+flow:
+  Client [client] -> Acceptor [svc: listener] : HTTP request | The acceptor takes the connection from the socket.
+  Acceptor -> Work queue [queue: max 100] : enqueue task | The task waits in a bounded queue.
+  Work queue -> Worker 1, Worker 2 [svc: pool of 200] : take next | Idle workers take tasks in order.
+  Worker 1 -> Database [db] : query | A worker blocks on I/O, and that thread cannot do other work meanwhile.
+  Acceptor -x> Client : 503 queue full | When the queue is full, the server sheds load at once, and memory use stays bounded.
+  Worker 2 ~> Client : response | The worker returns its result and picks up the next task.
+ref: docs | Executors and thread pools | Oracle Java Tutorials | https://docs.oracle.com/javase/tutorial/essential/concurrency/pools.html
+
+== Thread per core, shared nothing
+kind: sharding, event-loop
+when: A data server wants high throughput on many cores, and locks and cache misses between threads are the main cost.
+how: Start one thread per core and pin each thread to its core. Give each thread its own part of the data and its own part of the memory. A key belongs to the thread chosen by a hash of the key, so only that thread reads or writes it. There are no locks on the data.
+A request that arrives on the wrong core is passed to the owner by a message queue, a fast lock-free ring between two cores. Each thread runs its own event loop with asynchronous I/O, so it never blocks.
+Seastar is the framework that does this, and ScyllaDB is built on it. It avoids cache-line sharing and cross-core lock waits, which is why such systems reach millions of operations per second per node. The cost is hard programming: work must be split by key, and a hot key keeps one core busy while others are idle.
+used: ScyllaDB and Seastar; Redpanda; DPDK-based packet processors.
+avoid: When requests need data from many shards at once, or the team cannot adopt an async programming style. Use a normal thread pool with locks.
+flow:
+  Client [client] -> Node [svc: ScyllaDB] : GET user 42 | A request arrives on one core's network queue.
+  Node -> Core 0 [svc: owns hash 0-3] : hash(42) is shard 2 | Core 0 hashes the key and finds that core 2 owns it.
+  Core 0 -> Core 2 [svc: owns hash 8-11] : message over ring | Core 0 sends the request through a lock-free queue, with no lock on the data.
+  Core 2 -> Memtable [cache: core 2 data] : read | Core 2 reads data that no other thread ever touches.
+  Core 2 -> Core 0 : value | Core 2 returns the answer by message.
+  Core 0 -> Client : response | The first core replies to the client.
+ref: docs | Seastar: shared-nothing design | Seastar project | https://seastar.io/shared-nothing/
+
+@@ vmem
+== Fork snapshot with copy-on-write pages
+kind: copy-on-write
+when: A process must save a consistent point-in-time copy of a large memory state without stopping the service.
+how: Calling fork() creates a child with a copy of the parent's page tables, not of the memory. Parent and child point to the same physical pages, which are marked read-only. When either one writes a page, the CPU faults, the kernel copies that one 4 KB page, and the writer gets its private copy.
+Redis uses this for its RDB snapshot. BGSAVE forks, and the child walks the frozen view of memory and writes the file, while the parent goes on with commands. The child sees the data exactly as it was at the fork instant.
+Extra memory equals the pages written during the snapshot. A write-heavy 20 GB instance can need close to double memory in the worst case, so leave headroom. Redis advises turning off Transparent Huge Pages, because a write to a 2 MB page copies the whole 2 MB. The fork call itself takes longer for larger page tables and can stall the parent for a short time.
+used: Redis RDB snapshots and AOF rewrite; some database checkpoints; Android zygote process that forks apps and shares pages.
+avoid: When the dataset is huge and the write rate is high. Use a replica to take the snapshot, or a storage engine with its own snapshot support.
+flow:
+  Redis parent [svc: 20 GB in RAM] -> Kernel [svc: fork] : BGSAVE | The parent asks to save a snapshot.
+  Kernel -> Redis child [svc: shares all pages] : copy page tables only | The child starts in milliseconds and shares every page with the parent.
+  Client [client] -> Redis parent : SET key value | A client writes while the snapshot is running.
+  Redis parent -> Kernel : write to shared page | The page is read-only, so the CPU faults into the kernel.
+  Kernel -> Redis parent : copy one page | The kernel gives the parent a private copy. The child still sees the old page.
+  Redis child -> Disk [store: dump.rdb] : write snapshot | The child writes a consistent file and exits.
+ref: docs | Redis persistence | Redis documentation | https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/
+
+== Huge pages for large heaps
+kind: memory-tiering
+when: A process uses tens of gigabytes with random access, and address translation misses slow it down.
+how: Each memory access needs a translation from virtual to physical address. The CPU caches recent translations in the TLB, which holds roughly a thousand to a few thousand entries. With 4 KB pages this covers only a few megabytes. A random access into a 64 GB heap misses the TLB often, and each miss walks the page tables, which costs several more memory reads.
+Huge pages are 2 MB on x86-64. Each TLB entry then covers 512 times more memory, so the same TLB reaches several gigabytes. Fewer misses means a few percent to tens of percent more speed on large random workloads.
+Use them through explicit hugepages, as with PostgreSQL's huge_pages setting, or through Transparent Huge Pages, as in the JVM option -XX:+UseTransparentHugePages. The trade-off: explicit pages must be reserved in advance, and THP can add latency spikes from memory compaction, so databases often advise testing it.
+used: PostgreSQL huge_pages; JVM large heaps; Oracle Database SGA; DPDK packet buffers; in-memory analytics engines.
+avoid: When the heap is small, or access is sequential. The TLB already works well, and huge pages can waste memory.
+flow:
+  App [svc: 64 GB heap] -> TLB [cache: translations] : access address | Each access first looks for the page translation in the TLB.
+  TLB -x> Page table [store: 4 level tree] : miss, walk tables | With 4 KB pages, random access misses often, and a walk costs several memory reads.
+  Page table -> TLB : fill entry | The entry is cached for later accesses to the same 4 KB.
+  * TLB: 2 MB entries | The kernel now backs the heap with 2 MB huge pages.
+  App -> TLB : access address | The same TLB now covers 512 times more memory.
+  TLB -> RAM [cache: physical memory] : hit, direct access | Most accesses hit, and the page-table walks mostly go away.
+ref: docs | Transparent Hugepage Support | Linux kernel documentation | https://docs.kernel.org/admin-guide/mm/transhuge.html
+
+@@ callstack
+== Continuous sampling profiler
+kind: observability-pipeline
+when: You want to find which functions burn CPU in production, all the time, with overhead too small to notice.
+how: A profiler agent interrupts each process about 19 to 100 times per second, using a timer or CPU performance counters. At each sample it reads the call stack, which is the chain of return addresses from the stack frames, and turns it into function names. Frames with the same stack are counted together.
+Every minute or so the agent uploads these counts to a backend. The backend stores them by service, version and time. A flame graph shows each function as a box whose width is the share of samples that contain it. A wide box deep in the graph is a hot spot.
+At 100 samples per second the overhead is usually below 1 percent. Compiled code needs frame pointers or debug info to unwind the stack. Many Linux distributions now build packages with frame pointers for this reason.
+used: Google-Wide Profiling; Grafana Pyroscope; Parca; Datadog and Elastic continuous profilers; Linux perf with flame graphs.
+avoid: When you need exact call counts or short events. Use tracing or counters. A sample misses a function that runs very briefly.
+flow:
+  Service [svc: Go or Java] -> Profiler agent [svc: eBPF or perf] : stack samples at 99 Hz | The agent captures a stack trace from each CPU about 99 times each second.
+  Profiler agent -> Symbol resolver [svc: debug info] : addresses to names | Raw addresses become function names and line numbers.
+  Profiler agent -> Profile backend [store: Pyroscope] : upload counts per minute | Identical stacks are merged and sent in small batches.
+  Engineer [user] -> Profile backend : compare v41 and v42 | The engineer opens a flame graph and compares two versions.
+  Profile backend -> Engineer : json.Marshal is 18% | A wide box shows one function using 18 percent of CPU.
+ref: docs | Flame Graphs | Brendan Gregg | https://www.brendangregg.com/flamegraphs.html
+
+== Crash report with symbolicated stack
+kind: observability-pipeline
+when: Programs run on users' devices or many servers, and each crash must show the exact function and line that failed.
+how: When a program crashes, a handler writes a small dump with the call stack of each thread, as raw addresses, plus the loaded modules and their build ids. It cannot use nice names, because release builds are stripped to save size.
+The report is sent to a collector. The collector looks up the build id in a store of debug symbols, uploaded by the build system for each release, and turns addresses into function names and line numbers. Reports with the same top frames are grouped into one issue with a count.
+This gives a ranked list of crashes by users affected. Breakpad and Crashpad do this for native apps, and Sentry does it for many languages. Keep the symbol files for every released version for as long as that version is in use, and keep them private, since they reveal your code structure.
+used: Chrome and Firefox crash reporting with Crashpad and Breakpad; Sentry; Firebase Crashlytics; Android and iOS crash services.
+avoid: When logs already carry full stack traces, as in a Java service. Then log the exception and send it to the log pipeline.
+flow:
+  App [client: stripped binary] -> Crash handler [svc: in process] : fatal signal | A crash raises a signal, and the handler wakes up in the dying process.
+  Crash handler -> Minidump [store: stack and modules] : write dump | It saves raw return addresses for every thread and the build id.
+  Minidump ~> Collector [svc: crash server] : upload on next start | The dump is sent when the app runs again or when the network works.
+  Build system [svc: CI] -> Symbol store [store: debug symbols] : upload per build id | Each release uploads its symbol file.
+  Collector -> Symbol store : look up build id | The collector finds the matching symbols for the dump.
+  Collector -> Issue tracker [svc: groups crashes] : parse_config at line 88 | Crashes with the same stack are grouped and counted.
+ref: docs | Crashpad overview | Chromium project | https://chromium.googlesource.com/crashpad/crashpad/+/HEAD/doc/overview_design.md
+
+@@ closures
+== Middleware chain built from closures
+kind: pipes-filters
+when: Every request must pass through shared steps such as logging, authentication and rate limiting, and each route should pick its own steps.
+how: A middleware is a function that takes the next handler and returns a new handler. The new handler is a closure: it remembers next, plus its own settings like a key or a limit, in the environment where it was made. When called, it does its work, then calls next, or stops and answers itself.
+Wrapping handlers one inside another gives a chain: logging(auth(rateLimit(route))). Express, Go net/http wrappers, Koa and Python ASGI middleware all work like this. The setup code runs once, and the closures are reused for every request.
+A closure keeps its captured variables alive on the heap for as long as the closure lives. A captured database handle or a growing map therefore stays in memory. In Go and JavaScript, watch for closures that capture a loop variable or a large object by accident.
+used: Express and Koa middleware; Go http.Handler wrappers; Python ASGI and WSGI middleware; Rust tower layers.
+avoid: When steps need to be reordered or inspected at run time. A declared list of named steps is easier to debug than nested closures.
+flow:
+  Client [client] -> Logging [svc: closure / has logger] : GET /orders | The outer closure starts a timer and calls the next handler.
+  Logging -> Auth [svc: closure / has key set] : next(req) | The auth closure uses the key set that it captured when it was created.
+  Auth -x> Client : 401 no token | If the token is bad, the chain stops here, and inner handlers never run.
+  Auth -> Rate limit [svc: closure / has counters] : next(req) | A valid request goes on to the next closure.
+  Rate limit -> Orders handler [svc: route] : next(req) | The last closure calls the route function.
+  Orders handler -> Client : 200 JSON | The response goes back out through each layer, and logging records the time.
+ref: docs | Using middleware | Express documentation | https://expressjs.com/en/guide/using-middleware.html
+
+== Ship a closure to the data
+kind: data-locality, map-reduce
+when: A computation should run on the machines that hold the data, and the code must carry a few values with it.
+how: In Spark the driver program writes a function such as rows.filter(r => r.score > threshold). The function captures the local variable threshold. Spark serializes the closure, with its captured values, and sends a copy to every executor. Each executor applies it to its own partitions.
+The copy is made at send time. If the closure changes a captured counter, only the executor's copy changes, and the driver does not see it. Use an accumulator for counters, and a broadcast variable for a big read-only table, so it is sent once per executor and not once per task.
+Everything the closure captures must be serializable. A common failure is capturing the whole enclosing object, for example a class with a database connection, which gives a "Task not serializable" error. Copy only the needed fields into local variables first.
+used: Apache Spark RDD and DataFrame user functions; Apache Flink and Beam user functions; Dask delayed functions; Ray remote functions.
+avoid: When the captured state is large or changes during the job. Put it in a shared store and read it from the task.
+flow:
+  Driver [svc: Spark driver] -> Executor 1, Executor 2 [svc: JVM] : serialized closure | The driver sends the function and the captured threshold to each executor.
+  Executor 1 -> Partition 1 [store: HDFS block] : read local rows | Each executor reads the blocks that are on its own machine.
+  Executor 2 -> Partition 2 [store: HDFS block] : read local rows | The second executor does the same on its own data.
+  Executor 1 -> Driver : count of rows | Only small results travel back, not the data.
+  Executor 2 -x> Driver : task not serializable | A closure that captured a database connection fails to serialize and the job stops.
+  Driver -> Executor 1, Executor 2 : broadcast lookup table | A large table is sent once per executor with a broadcast variable.
+ref: docs | RDD programming guide: understanding closures | Apache Spark documentation | https://spark.apache.org/docs/latest/rdd-programming-guide.html
+
+@@ concmodels
+== Actor per entity with mailbox
+kind: actor-model
+when: Millions of independent things, like users, devices or game rooms, each have state that must change one step at a time.
+how: Each entity is an actor with private state and a mailbox. Other code never touches the state. It sends a message, and the actor handles one message at a time. So there are no locks and no data races inside an actor, even if thousands of messages arrive from many threads.
+A runtime maps actors to a small pool of threads. Actors are cheap: an Erlang process starts at a few kilobytes. Frameworks such as Akka and Microsoft Orleans can also place actors on many machines and find them by id, so the caller sends a message to "user 42" and does not know the node.
+If an actor fails, a supervisor restarts it with a clean state. This is the "let it crash" style of Erlang. The cost is that a message may be lost or slow, there is no global order between actors, and a slow actor lets its mailbox grow without bound unless you set a limit.
+used: Erlang and Elixir systems, including WhatsApp's servers; Akka in many JVM services; Orleans, which Microsoft used for Halo game services.
+avoid: When one operation must change many entities atomically. Use a database transaction or a saga instead.
+flow:
+  Client [client] -> Gateway [svc: finds actor by id] : update user 42 | A request arrives for one user.
+  Gateway -> Node B [svc: actor runtime] : route by id | The runtime knows that user 42 lives on node B.
+  Node B -> User 42 mailbox [queue: FIFO] : message | The message waits in the mailbox of the actor.
+  User 42 mailbox -> User 42 actor [svc: private state] : one at a time | The actor handles one message at a time, so its state needs no lock.
+  User 42 actor -x> Supervisor [svc: restarts] : crash | A bug crashes this actor only.
+  Supervisor -> User 42 actor : restart, fresh state | The supervisor starts a new actor, and other actors are not affected.
+ref: paper | A Universal Modular Actor Formalism for Artificial Intelligence | Hewitt, Bishop & Steiger, IJCAI 1973 |
+ref: docs | Orleans overview | Microsoft documentation | https://learn.microsoft.com/en-us/dotnet/orleans/overview
+
+== Single-threaded event loop for shared state
+kind: event-loop
+when: Many clients read and update small shared data, and the work per request is short, so locks would cost more than they save.
+how: One thread owns all the data. It uses epoll or a similar call to wait on many sockets, reads a ready request, runs it to the end, and writes the reply. Because only one thread runs commands, each command is atomic with no lock, and no race between commands is possible.
+Redis uses this model for command execution. A simple command takes about a microsecond, so one thread can serve more than 100,000 requests per second. Newer Redis versions add I/O threads for network reads and writes, but commands still run on one thread.
+The weakness is blocking. One slow command, such as KEYS on a big database or a long Lua script, stops every other client. To use more cores, run one process per core with its own data, and shard the keys among them.
+used: Redis command execution; Node.js servers; nginx workers; HAProxy.
+avoid: When requests run heavy CPU work. They block the loop. Use a thread pool, or send the work to another process.
+flow:
+  Client 1 [client] -> Event loop [svc: Redis main thread] : INCR hits | The request arrives, and the loop reads it from a ready socket.
+  Client 2 [client] -> Event loop : GET user:7 | A second request waits in its socket until the loop is free.
+  Event loop -> Dataset [cache: in memory] : run to completion | The loop runs the command alone, with no lock, in about a microsecond.
+  Event loop -> Client 1, Client 2 : replies | Each reply is written in turn.
+  Client 3 [client] -> Event loop : KEYS * on 50M keys | One slow command takes seconds.
+  * Event loop: blocked 3 s | While it is blocked, every other client waits. This is the main risk of the model.
+ref: docs | Redis benchmarks and the single thread | Redis documentation | https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/
+
+@@ coroutines
+== Many concurrent calls on one event loop
+kind: event-loop, scatter-gather
+when: A request must call many slow services or files, and threads waiting on each call would waste memory.
+how: A coroutine is a function that can pause at an await point and resume later. When it awaits a network call, it gives control back to the event loop, which runs another coroutine. When the reply arrives, the loop resumes the first one where it stopped. One thread can run tens of thousands of waiting coroutines.
+Python's asyncio.gather starts 50 calls at once and waits for all of them. With a 100 ms call each, the total is about 100 ms, not 5 seconds. The same shape exists in JavaScript Promise.all, Rust with tokio, and Kotlin coroutines.
+The rule is: never block the loop. A normal blocking call, such as time.sleep or a CPU loop of 200 ms, stops all coroutines. Put such work in a thread or process pool. Limit the number of calls in flight with a semaphore, so you do not overload the target.
+used: FastAPI and aiohttp services; Node.js servers; Rust tokio services; API gateways that fan out to many back ends.
+avoid: When the work is CPU-bound. Coroutines do not add cores. Use processes or threads.
+flow:
+  Request [client] -> API handler [svc: async def] : GET /dashboard | The handler is a coroutine on the event loop.
+  API handler -> Event loop [svc: one thread] : gather 3 calls | The handler starts three child coroutines and pauses at await.
+  Event loop -> Profile API [svc], Orders API [svc], Ads API [svc] : 3 requests in flight | The loop sends all three requests without waiting for any reply.
+  Orders API -> Event loop : reply after 40 ms | The reply wakes one coroutine, and the others still wait.
+  Profile API -> Event loop : reply after 90 ms | The handler resumes only when all three are done.
+  Event loop -> Request : merged JSON in 90 ms | The total time is the slowest call, not the sum, and no thread waited.
+ref: docs | Coroutines and Tasks | Python documentation | https://docs.python.org/3/library/asyncio-task.html
+
+== Structured concurrency with cancellation
+kind: timeout-deadline, fork-join
+when: A request starts several child tasks, and when it fails or times out, all its children must stop and no work must leak.
+how: Child coroutines live inside a scope that the parent opens. The scope ends only when all children have ended. If one child fails, the scope cancels its siblings and passes the error to the parent. If the parent has a deadline, it is delivered to all children by cancellation, which wakes each coroutine at its next await point.
+Python 3.11 added asyncio.TaskGroup and asyncio.timeout for this. Kotlin has coroutineScope, and Java 21 has virtual threads, with structured concurrency available as a preview feature. Trio in Python and Swift task groups use the same design.
+Without a scope, a forgotten child task can run on after the request has been answered. It holds connections and memory and can write stale data. With a scope, the lifetime of work is the lifetime of the block of code, so leaks are far less likely. Cleanup code must be written so that it can run on cancellation.
+used: Python TaskGroup in asyncio services; Kotlin coroutines on Android and in Ktor; Swift concurrency; Trio.
+avoid: When a task must outlive its request on purpose, such as sending an email afterwards. Hand it to a durable queue instead.
+flow:
+  Handler [svc: timeout 200 ms] -> Task group [svc: scope] : open scope | The handler opens a scope with a 200 ms deadline.
+  Task group -> Search call [svc], Price call [svc], Stock call [svc] : start 3 children | Three child tasks start inside the scope.
+  Stock call -x> Task group : raises error at 50 ms | One child fails early.
+  Task group -> Search call, Price call : cancel | The scope cancels the other two children at their next await.
+  Task group -> Handler : error, no leaked tasks | The scope waits until all children stop, then it raises the error to the parent.
+  Handler -> Client [client] : 503 | The handler answers, and nothing keeps running in the background.
+ref: docs | Coroutines and Tasks: Task Groups | Python documentation | https://docs.python.org/3/library/asyncio-task.html#task-groups
+
+@@ dataflowan
+== Optimizing compiler pass pipeline
+kind: interpreter-compiler
+when: A compiler must make code faster without changing what it does, using facts that hold on every possible run.
+how: The compiler turns the code into a control-flow graph in an intermediate form such as LLVM IR in SSA form. Each analysis is a dataflow problem: it attaches a fact to each program point and repeats the update rules over the graph until nothing changes (a fixed point).
+Constant propagation finds that x is always 4 here. Liveness finds that a value is never read again, so its store can be removed (dead-code elimination). Available-expression analysis finds that a + b was already computed, so the second computation is replaced by the first result.
+LLVM runs dozens of such passes in sequence, and each pass feeds the next: after constants are propagated, branches become known and more code is found dead. Analyses must be safe: when unsure, they assume the worst. The compile time grows with the number of passes, which is why -O0 is quick and -O3 is slower.
+used: LLVM and GCC optimizers; the JVM's C2 and Graal JIT compilers; V8 TurboFan; Rust compiler MIR optimizations.
+avoid: When the program cannot be analyzed, for example because of heavy dynamic code. A JIT that uses run-time profile data may help more.
+flow:
+  Source code [client] -> Front end [svc: parser] : parse to IR | The front end builds a control-flow graph in SSA form.
+  Front end -> Constant propagation [svc: pass 1] : IR | The pass finds that x = 4 on every path to this use.
+  Constant propagation -> Dead code removal [svc: pass 2] : IR with if(false) | A branch whose condition is now constant false is known to be dead.
+  Dead code removal -> Liveness pass [svc: pass 3] : smaller IR | The pass finds stores that no later code reads, and removes them.
+  Liveness pass -> Code generator [svc: back end] : optimized IR | The back end picks registers and emits machine code.
+ref: docs | LLVM Analysis and Transform Passes | LLVM project | https://llvm.org/docs/Passes.html
+
+== Static analysis gate in CI
+kind: quality-gate
+when: A team wants to find bugs, such as null dereference or injection, before merge, across code paths that tests never run.
+how: A static analyzer parses the code, builds a control-flow graph and call graph, and runs dataflow analyses. A taint analysis marks data from sources, like an HTTP parameter, as tainted, and follows it through assignments and calls. If tainted data reaches a sink, like an SQL query, without a sanitizer on the path, it reports a bug with the full path.
+The analysis runs in CI on each pull request, often only on changed code to stay fast. Findings appear as comments on the diff, and a severe finding can block the merge. CodeQL stores the program as a database that you query. Facebook's Infer and Google's Error Prone are other tools.
+Static analysis is conservative, so it gives false alarms. Tune it: suppress with a reason, and track the false-positive rate. Keep run time under a few minutes, or developers will skip it.
+used: GitHub CodeQL code scanning; Infer at Meta; Semgrep and SonarQube in CI; Linux kernel's Coccinelle and Smatch.
+avoid: When the main risk is in configuration or runtime behavior. Use tests, fuzzing or runtime monitoring.
+flow:
+  Developer [user] -> CI pipeline [svc: pull request] : push change | A developer opens a pull request.
+  CI pipeline -> Analyzer [svc: CodeQL] : analyze changed files | The analyzer builds a graph of the code.
+  Analyzer -> Taint solver [svc: dataflow] : sources, sinks, sanitizers | The solver follows tainted data along graph edges until a fixed point.
+  Taint solver -> Analyzer : path from param to SQL | It found an unsanitized path from an HTTP parameter to a query.
+  Analyzer -x> CI pipeline : fail check | The check fails and the merge is blocked.
+  CI pipeline -> Developer : comment on diff line | The developer sees the path in the review and fixes it.
+ref: docs | About code scanning with CodeQL | GitHub documentation | https://docs.github.com/en/code-security/code-scanning/introduction-to-code-scanning/about-code-scanning-with-codeql
+
+@@ dispatch
+== Function-pointer table as a plugin interface
+kind: plugin-arch
+when: A core system must call many different implementations through one stable interface, and new ones must be added without changing the core.
+how: The core defines a table of function pointers, the same idea as a C++ vtable. Each implementation fills in the table with its own functions, and registers it. The core calls through the table: one load of the pointer and one indirect jump. It never names the implementation.
+The Linux virtual file system does this. Each file system provides a table, struct file_operations, with read, write and others. A read() on a file calls the read function in that file's table, so the same call works on ext4, NFS or a device. Go's database/sql does it with drivers and an interface, and Java uses interfaces with invokeinterface.
+The call costs a few nanoseconds more than a direct call and blocks inlining. That is acceptable at an I/O boundary, but harmful in a hot inner loop. Keep the interface small and stable, since all implementations depend on it.
+used: Linux VFS and device drivers; Go database/sql drivers; JDBC; C++ virtual functions in game engines and browsers.
+avoid: When there is only one implementation and the call is hot. Call it directly, and add the interface when a second one appears.
+flow:
+  App [client] -> VFS layer [svc: kernel core] : read(fd, buf, 4096) | The application makes one generic call.
+  VFS layer -> File ops table [store: function pointers] : look up read | The core loads the read pointer from the file's table.
+  File ops table -> ext4 [svc: filesystem A] : indirect call | For an ext4 file the pointer leads to ext4's read function.
+  File ops table -> NFS client [svc: filesystem B] : indirect call | For an NFS file the same call reaches NFS code instead.
+  NFS client -> App : bytes | Either way, the app sees the same result and the VFS core is unchanged.
+ref: docs | Overview of the Linux Virtual File System | Linux kernel documentation | https://docs.kernel.org/filesystems/vfs.html
+
+== Inline cache with guard and deoptimization
+kind: interpreter-compiler
+when: A dynamic language must call methods or read properties on values whose type is not known when the code is compiled, and it must be fast.
+how: The first time a call site runs, the runtime does the full lookup: it finds the object's hidden class (shape), then the method in it. It stores the shape and the result in the call site. This is an inline cache.
+Next time, the call site checks the shape with one compare. If it matches, it jumps straight to the stored target. Most call sites see only one shape (monomorphic), so this is fast. If a site sees two to four shapes, it keeps a short list. More than that is megamorphic, and the runtime falls back to a slow shared lookup.
+The optimizing compiler of V8 and the HotSpot JIT go further. They inline the target and put a guard in front. If the guard fails because a new type appears, the code is thrown away (deoptimization), and execution returns to the interpreter. So keep object shapes stable: create fields in the same order, and avoid mixing types at one call site.
+used: V8 inline caches and TurboFan; HotSpot JVM inline caching and class hierarchy analysis; PyPy and LuaJIT guards; Python 3.11 specializing interpreter.
+avoid: When the code is rarely run or is ahead-of-time compiled. A plain vtable call is enough.
+flow:
+  Call site [svc: obj.area()] -> Runtime [svc: slow lookup] : first call, Circle | The first call does a full lookup of the hidden class and method.
+  Runtime -> Inline cache [cache: shape Circle] : store target | The shape and target are saved at the call site.
+  Call site -> Inline cache : shape check passes | Later calls with a Circle cost one compare and a jump.
+  Inline cache -> Compiled code [svc: inlined area] : guarded inline | The JIT inlines the target behind the guard.
+  Call site -x> Inline cache : a Square arrives | The guard fails, because the shape differs.
+  Inline cache -> Runtime : deoptimize, relookup | The runtime drops the compiled code, runs the interpreter and builds a two-shape cache.
+ref: docs | Fast properties in V8 | V8 blog | https://v8.dev/blog/fast-properties
+
+@@ fp
+== Pure, idempotent pipeline steps for replay
+kind: backfill-replay, map-reduce
+when: A data job must be re-run after a bug or late data, and the second run must give the same result with no duplicates.
+how: Write each step as a pure function of its input partition: the same input gives the same output, and nothing else is read or changed. Avoid the wall clock and random values inside the step. Pass the date as a parameter.
+Each task writes its output for one partition, for example one day, to a new location, and then swaps it in atomically, or overwrites the whole partition. Running the task twice replaces the partition with the same data, so there are no duplicates. This is what makes a backfill of 90 days safe: run 90 independent tasks in any order and in parallel.
+Spark transformations work this way. Because they are deterministic, Spark can recompute a lost partition from its lineage. Airflow and dbt rely on the same rule: a task for one date overwrites that date only. Impure parts, such as API calls, live at the edges, and their results are saved first.
+used: Spark lineage-based recovery; dbt incremental models with partition overwrite; Airflow backfills; Beam and Flink batch jobs.
+avoid: When the step has to change an external system that cannot be undone, such as sending email. Add an idempotency key or a dedup table.
+flow:
+  Scheduler [svc: Airflow] -> Task 2026-10-01 [svc: pure function], Task 2026-10-02 [svc: pure function] : run for date | The scheduler starts one task per date, with the date as a parameter.
+  Task 2026-10-01 -> Raw events [lake: day partitions] : read one day | Each task reads only its own partition.
+  Task 2026-10-01 -> Daily table [lake: Parquet by day] : overwrite partition | The task replaces that day with its result in one atomic step.
+  Scheduler -> Task 2026-10-01 : backfill, run again | After a bug fix, the scheduler runs the same task again.
+  Task 2026-10-01 -> Daily table : overwrite, same bytes | The new result replaces the old one. No duplicate rows appear.
+ref: docs | Resilient Distributed Datasets | Zaharia et al., NSDI 2012 | https://www.usenix.org/conference/nsdi12/technical-sessions/presentation/zaharia
+
+== State as a fold over immutable events
+kind: event-sourcing
+when: You need a full history of changes, easy undo or replay, and state that is simple to test.
+how: Model state changes as immutable event values. The current state is a pure function: state = fold(apply, initial, events). The function apply takes the old state and one event and returns a new state. It changes nothing in place, and it does no I/O.
+Redux in front-end apps uses this shape with a reducer. Event-sourced services store events in a log such as Kafka and rebuild the state by reading it. To fix a bug in apply, replay the log and get the corrected state. For speed, save a snapshot every N events and replay only the events after it.
+Persistent immutable data structures make this cheap. A new version of a map shares most of its nodes with the old one, so an update copies only a path of about log32(n) nodes. Old versions remain valid for readers with no lock, which also helps with threads.
+used: Redux reducers; Clojure and Scala persistent collections; event-sourced services on Kafka or EventStoreDB; Git, which stores immutable snapshots.
+avoid: When history has no value, or the data must be erased on request, as with some privacy rules. A plain table with updates is simpler.
+flow:
+  Client [client] -> Command handler [svc: validates] : place order | A command arrives and is checked against the current state.
+  Command handler -> Event log [log: immutable events] : OrderPlaced #7 | The handler appends an event. Nothing is changed in place.
+  Event log -> Reducer [svc: pure apply] : events after snapshot | The reducer reads the events after the last snapshot.
+  Reducer -> State [cache: order view] : new state | It returns a new state value, and the old value remains valid for readers.
+  Event log ~> Snapshot [store: every 1000 events] : save state | A snapshot is saved from time to time, to cut replay time.
+  Dev [user] -> Reducer : replay all after bug fix | After a bug fix, replaying all events gives the corrected state.
+ref: docs | Redux fundamentals: reducers | Redux documentation | https://redux.js.org/tutorials/fundamentals/part-3-state-actions-reducers
+
+@@ gc
+== Keep the managed heap small with off-heap data
+kind: memory-tiering
+when: A Java or Go service holds many gigabytes of cache or buffer data, and garbage collection pauses or cost grow with that data.
+how: A tracing collector must visit live objects, so its work grows with the number of live objects and references. A 64 GB heap full of small cache entries makes each full collection slow. Put the bulk data outside the managed heap: in native memory, in memory-mapped files, or in the OS page cache.
+Cassandra can keep memtables off the heap, Kafka relies on the page cache, and Spark's Tungsten uses off-heap binary buffers. Apache Flink keeps its managed memory off-heap. Libraries such as Caffeine keep the cache on the heap, while Chronicle Map and Ehcache offer off-heap stores.
+Store data as large byte arrays or buffers, not as millions of small objects. The collector then sees a few big objects. The cost is manual work: you must serialize data, size the native memory, and free it. Leave room for it. A container limit counts heap plus native memory, so a heap of 8 GB in a 10 GB limit can still be killed.
+used: Apache Kafka and Elasticsearch on the OS page cache; Cassandra off-heap memtables; Flink managed memory; Spark Tungsten.
+avoid: When the heap is small and pauses are already short. Tuning the collector or the heap size is easier than off-heap code.
+flow:
+  App [svc: JVM heap 8 GB] -> Heap [cache: small objects] : hot metadata | Only small, short-lived objects stay on the managed heap.
+  App -> Off-heap store [store: native memory 40 GB] : put value bytes | Large values are written as bytes to native memory.
+  Heap -> GC [svc: collector] : mark live objects | The collector scans only the small live set on the heap.
+  GC -> App : pause 5 ms | Pauses stay short because the heap holds few objects.
+  App -> Off-heap store : get value bytes | A read copies bytes back and deserializes them on demand.
+  * Off-heap store: counts in container limit | Native memory is not collected, and it counts toward the container memory limit.
+ref: docs | Garbage Collection Tuning Guide | Oracle, JDK documentation | https://docs.oracle.com/en/java/javase/21/gctuning/
+
+== Pause budget with a concurrent collector
+kind: none
+when: A latency-sensitive service has a p99 target of tens of milliseconds, and stop-the-world pauses must stay far below it.
+how: A stop-the-world pause freezes every application thread while the collector works. Concurrent collectors do most work while the application runs and stop it only for short steps. G1 is the default collector in the JVM. It splits the heap into regions, and it tries to meet a pause goal, 200 ms by default, by choosing how many regions to collect each time.
+ZGC and Shenandoah do almost all work concurrently. ZGC's pauses are usually well under a millisecond and do not grow with heap size. Generational ZGC became the default mode of ZGC in JDK 23. The price is more CPU use and some extra memory, and a lower peak throughput.
+Measure before choosing. Turn on GC logs, read pause times and the allocation rate, and compare with the latency target. If allocation is faster than the collector can keep up, even ZGC will stall the application. The first fix is usually to allocate less.
+used: JVM services on G1 or ZGC; Go's concurrent collector with a GOMEMLIMIT setting; .NET background GC.
+avoid: When the job is batch and only total time matters. The default parallel collector gives higher throughput.
+flow:
+  Service [svc: JVM / p99 target 30 ms] -> Heap [cache: 16 GB regions] : allocate objects | The service allocates objects at a high rate.
+  Heap -> Collector [svc: ZGC] : heap 60 percent full | The collector starts a cycle while the application runs.
+  Collector -> Heap : mark and relocate | Most of the work is done in parallel threads, without stopping the app.
+  Collector -> Service : pause 0.5 ms | Only short root scans stop the application threads.
+  * Service: allocation outruns collector | If the app allocates faster than the collector can free memory, the app must wait.
+  Service -x> Heap : allocation stall | A thread waits for memory. The p99 grows. Reduce allocation or add heap.
+ref: docs | The Z Garbage Collector | OpenJDK project | https://openjdk.org/projects/zgc/

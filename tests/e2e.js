@@ -56,6 +56,9 @@ const shots = process.argv[3] || null;
   await page.click('[data-view="courses"]'); await page.waitForSelector('#v-courses .tcard');
   await page.click('#v-courses [data-course="CS244B"]'); await page.waitForTimeout(100);
   ok((await page.textContent('#v-courses .tsteps h2')).includes('Distributed Systems'), 'course view shows CS 244B');
+  ok(await page.locator('#v-courses .sch-row').count() >= 3 && await page.locator('#v-courses .sch-row:has-text("MIT") [data-program="mit-63"]').count() === 1, 'program buttons are grouped by school (Stanford, MIT, Caltech)');
+  await page.click('[data-program="mit-63"]'); await page.waitForTimeout(100);
+  ok(/MIT 6\.1210/.test(await page.textContent('#v-courses .tlist')), 'MIT 6-3 lists MIT subjects');
   await page.click('[data-program="ms"]'); await page.waitForTimeout(100);
   ok(await page.locator('#v-courses .tcard').count() > 10, 'MS program lists course groups');
   await page.click('#v-courses [data-rcourse]'); await page.waitForSelector('#reader:not([hidden]) .seqnav');
@@ -502,7 +505,28 @@ const shots = process.argv[3] || null;
   // problem map (a build with content/problemmap/map.json, or DTS_PROBLEMMAP=tests/fixtures/problemmap_sample.json)
   const hasPM = await page.evaluate(() => { const D = window.__dts.DATA; return !!(D.pm_summary || (D.problemmap && D.problemmap.concepts)); });
   if (hasPM) {
-    await page.goto(base + '#problems'); await page.waitForSelector('#pm-svg .pm-n', { timeout: 20000 });
+    await page.goto(base + '#problems'); await page.waitForSelector('#pm-road .pm-fcard .pm-ir', { timeout: 20000 });
+    // roadmap (default): progress card with a next problem, families in dependency order, ideas in stages with a status
+    const rm = await page.evaluate(() => { const I = window.DTSPM._I(); const fams = [...document.querySelectorAll('#pm-road .pm-fcard')];
+      const firstStage = document.querySelector('#pm-road .pm-fcard.open .pm-stage-l .pm-ir'); const d = firstStage && I.byId[firstStage.dataset.pmidea];
+      return { fams: fams.length, nf: I.fams.length, open: document.querySelectorAll('#pm-road .pm-fcard.open').length, next: !!document.querySelector('#pm-road .pm-nextbig[data-pmprob]'), lvl0: d ? d.l : -1,
+        locked: [...document.querySelectorAll('#pm-road .pm-ideas .pm-ir.locked')].every(b => b.querySelector('.pm-need')), mapHidden: document.getElementById('pm-mapw').hidden }; });
+    ok(rm.fams === rm.nf && rm.open >= 1 && rm.next && rm.lvl0 === 0 && rm.locked && rm.mapHidden, `problem map opens as a roadmap: ${rm.fams} family cards, a next problem, stage 1 = level 0, locked ideas say what they need`);
+    const fid = await page.getAttribute('#pm-road .pm-fcard:not(.open) [data-pmopen]', 'data-pmopen');
+    await page.click(`#pm-road [data-pmopen="${fid}"]`); await page.waitForTimeout(100);
+    ok(await page.locator(`#pm-road .pm-fcard.open [data-pmopen="${fid}"]`).count() === 1, 'roadmap: a family card opens on tap');
+    const rid = await page.getAttribute('#pm-road .pm-fcard.open .pm-ir', 'data-pmidea');
+    await page.click(`#pm-road .pm-ir[data-pmidea="${rid}"]`); await page.waitForSelector('#panel .pm-ladder .pm-row');
+    ok(await page.locator(`#pm-road .pm-ir.sel[data-pmidea="${rid}"]`).count() === 1, 'roadmap: an idea opens its ladder and stays marked');
+    await page.click('#panel [data-pmclose]'); await page.waitForTimeout(100);
+    // lesson: an idea's panel starts with "Learn it first" (what, signals, Python template, walk-through, bugs, cost)
+    const lesIdea = await page.evaluate(() => { const L = window.DTSPM._raw && window.DTSPM._raw().lessons; return L ? Object.keys(L)[0] : null; });
+    if (lesIdea) {
+      await page.evaluate(id => location.hash = '#problems/idea/' + id, lesIdea); await page.waitForSelector('#panel .pm-lesson');
+      ok(await page.locator('#panel .pm-lesson[open] .codeblock').count() === 1 && await page.locator('#panel .pm-lesson .pm-walk li').count() >= 3 && await page.locator('#panel .pm-lesson .pm-sig li').count() >= 3, 'idea panel: "Learn it first" lesson with signals, a Python template and a walk-through (' + lesIdea + ')');
+      await page.click('#panel [data-pmclose]'); await page.waitForTimeout(100);
+    }
+    await page.click('[data-pmmode="map"]'); await page.waitForSelector('#pm-svg .pm-n');
     const pm = await page.evaluate(() => { const I = window.DTSPM._I(); return { ideas: I.ideas.length, probs: I.P.length, nodes: document.querySelectorAll('#pm-svg .pm-n').length, allG: document.querySelectorAll('#pm-svg g').length }; });
     ok(pm.nodes === pm.ideas && pm.allG < pm.ideas + 40, `problem map draws its ${pm.ideas} ideas as SVG nodes, not its ${pm.probs} problems (${pm.allG} groups)`);
     const lv = await page.evaluate(() => { const y = id => +document.querySelector(`.pm-n[data-pmidea="${id}"] rect`).getAttribute('y'); const I = window.DTSPM._I(); const lo = I.ideas.find(d => d.l === 0), hi = I.ideas.find(d => d.l === I.maxL); return y(lo.id) > y(hi.id); });
@@ -538,12 +562,14 @@ const shots = process.argv[3] || null;
     ok((await page.getAttribute('#panel .btnrow [data-pmdone="1"]', 'aria-pressed')) === 'true', 'mark a problem as solved');
     await page.reload(); await page.waitForSelector('#panel .btnrow [data-pmdone="1"]', { timeout: 20000 });
     ok((await page.getAttribute('#panel .btnrow [data-pmdone="1"]', 'aria-pressed')) === 'true', 'solved mark survives a reload (deep link #problems/1)');
+    ok(/^1 of /.test((await page.textContent('#pm-road .pm-yt')).trim()) && (await page.locator('#pm-road .pm-nextbig').textContent()).includes('Your next problem'), 'roadmap: progress counts the solved problem and suggests the next one');
     await page.click('[data-view="you"]'); await page.waitForSelector('#pm-next .pm-row');
     const nx = await page.evaluate(() => { const I = window.DTSPM._I(), done = window.DTSPM.done(); return [...document.querySelectorAll('#pm-next .pm-pt')].map(b => +b.dataset.pmprob).filter(n => I.byN[n].p.length).every(n => I.byN[n].p.every(m => done.has(m))); });
     ok(nx, 'You: next problems have all their prerequisites solved');
     await page.click('[data-view="problems"]'); await page.waitForSelector('#panel .btnrow [data-pmdone="1"]');
     await page.click('#panel .btnrow [data-pmdone="1"]'); await page.waitForTimeout(200);
-    // keyboard: arrow keys move between ideas, Enter opens one
+    // keyboard: arrow keys move between ideas, Enter opens one (full map)
+    await page.click('[data-pmmode="map"]'); await page.waitForSelector('#pm-svg .pm-n');
     await page.locator('.pm-n[tabindex="0"]').focus(); const before = await page.evaluate(() => document.activeElement.dataset.pmidea);
     await page.keyboard.press('ArrowUp'); const after = await page.evaluate(() => document.activeElement.dataset.pmidea);
     await page.keyboard.press('Enter'); await page.waitForTimeout(150);
@@ -565,7 +591,10 @@ const shots = process.argv[3] || null;
     // reduced motion: picking an idea does not animate the scroll
     const pctx = await browser.newContext({ viewport: { width: 390, height: 844 }, reducedMotion: 'reduce', colorScheme: 'dark' });
     const pp = await pctx.newPage(); pp.on('pageerror', e => errors.push('pageerror: ' + e.message));
-    await pp.goto(base + '#problems'); await pp.waitForSelector('#pm-svg .pm-n', { timeout: 20000 });
+    await pp.goto(base + '#problems'); await pp.waitForSelector('#pm-road .pm-ir', { timeout: 20000 });
+    const tb = await pp.evaluate(() => { const t = document.querySelector('.tabs'), r = t.getBoundingClientRect(), b = t.querySelector('[aria-pressed="true"]').getBoundingClientRect(); return [getComputedStyle(t).position, Math.round(innerHeight - r.bottom), b.left >= r.left - 1 && b.right <= r.right + 1, Math.round(b.height)]; });
+    ok(tb[0] === 'fixed' && tb[1] <= 1 && tb[2] && tb[3] >= 44, 'phone: view tabs are a bottom bar, the current tab is in view and 44 px tall (' + tb.join(',') + ')');
+    await pp.click('[data-pmmode="map"]'); await pp.waitForSelector('#pm-svg .pm-n');
     const ph = await pp.evaluate(() => { const f = document.getElementById('pm-frame'); return [document.documentElement.scrollWidth, f.scrollWidth > f.clientWidth, f.scrollTop > 0]; });
     ok(ph[0] <= 392 && ph[1], 'phone: the map scrolls inside its frame, no horizontal page scroll (' + ph[0] + ')');
     ok(ph[2], 'phone: the map opens at the foundations (scrolled to the bottom)');
@@ -582,6 +611,40 @@ const shots = process.argv[3] || null;
   await vp.fill('[data-alin="key"]', '42'); await vp.press('[data-alin="key"]', 'Enter');
   ok(/^insert 42: start at the root/.test(await vp.textContent('#av-msg')) && (await vp.getAttribute('[data-aact="play"]', 'aria-pressed')) === 'false', 'reduced motion: Insert (Enter) jumps to the new key without playing');
   await vctx.close();
+  // hands-on practice links: a section near the end of a read, each link opens in a new tab
+  await page.goto(base + '#read/dimmodel'); await page.waitForSelector('#reader #rs-handson .ho');
+  const ho = await page.evaluate(() => [...document.querySelectorAll('#rs-handson a.ho')].map(a => [a.target, a.rel, /^https?:/.test(a.href), !!a.querySelector('.ho-a')]));
+  ok(ho.length >= 2 && ho.every(x => x[0] === '_blank' && /noopener/.test(x[1]) && x[2] && x[3]) && await page.locator('#reader .toc a[data-jump="rs-handson"]').count() === 1, 'read: "Practice it yourself" lists ' + ho.length + ' links (new tab, access label) with a TOC entry');
+  // "Taught in" names each school: Raft is taught at Stanford and at MIT (6.5840)
+  await page.goto(base + '#read/raft'); await page.waitForSelector('#reader .ladder-cap');
+  const taught = await page.$$eval('#reader .ladder-cap', ps => ps.map(p => p.textContent).find(t => /^Taught in/.test(t)) || '');
+  ok(/Stanford/.test(taught) && /MIT 6\.5840/.test(taught), 'read: "Taught in" groups courses by school (' + taught.slice(0, 80) + ')');
+  await page.click('#reader [data-course="MIT 6.5840"]'); await page.waitForTimeout(200);
+  ok(await page.locator('#v-courses [data-program="mit-meng"][aria-pressed="true"]').count() === 1 && /Distributed Computer Systems Engineering/.test(await page.textContent('#v-courses .tsteps h2')), 'a course link opens its own school\'s program');
+  // architecture patterns: a read section with one tab and one animated diagram per pattern, and the catalog view
+  await page.goto(base + '#pattern/kafka/2'); await page.waitForSelector('#reader #rs-apat .ap-panel:not([hidden]) svg');
+  const npat = await page.evaluate(() => window.__dts.DATA.patterns.filter(x => x.concept === 'kafka').length);
+  ok(npat >= 3 && await page.locator('#rs-apat .ap-tab').count() === npat && await page.locator('#rs-apat .ap-panel').count() === npat, 'kafka read: one tab and one panel per pattern (' + npat + ')');
+  ok(await page.locator('#rs-apat .ap-panel:not([hidden])').count() === 1 && (await page.getAttribute('#rs-apat .ap-tab[data-aptab="1"]', 'aria-selected')) === 'true', 'deep link #pattern/kafka/2 opens the second pattern');
+  ok(await page.locator('#reader .toc a[data-jump="rs-apat"]').count() === 1, 'contents list has "Architecture patterns"');
+  ok(await page.locator('#rs-apat .ap-panel:not([hidden]) .ap-scene .scene').count() === 1 && await page.locator('#rs-apat .ap-scene .scene').count() === 1, 'only the open pattern mounts a scene player');
+  await page.focus('#rs-apat .ap-tab[data-aptab="1"]'); await page.keyboard.press('ArrowRight'); await page.waitForTimeout(150);
+  ok((await page.getAttribute('#rs-apat .ap-tab[data-aptab="2"]', 'aria-selected')) === 'true' && /#pattern\/kafka\/3$/.test(page.url()), 'arrow keys move between pattern tabs and update the address');
+  await page.click('#rs-apat .ap-panel:not([hidden]) .ap-scene [data-sc="next"]'); await page.waitForTimeout(100);
+  ok(/step 2 of/.test(await page.textContent('#rs-apat .ap-panel:not([hidden]) .sc-k')), 'pattern diagram steps with Next');
+  const kind = await page.getAttribute('#rs-apat .ap-panel:not([hidden]) .ap-kind', 'data-pkind');
+  await page.click('#rs-apat .ap-panel:not([hidden]) .ap-kind'); await page.waitForSelector('#v-architecture .ap-cat.on');
+  ok(await page.locator('#reader').isHidden() && (await page.getAttribute('#v-architecture .ap-cat.on', 'id')) === 'apc-' + kind && page.url().endsWith('#architecture/' + kind), 'pattern chip opens the catalog at ' + kind);
+  const ncat = await page.evaluate(() => window.__dts.DATA.pcatalog.length);
+  ok(await page.locator('#v-architecture .ap-cat').count() === ncat && await page.locator('.tabs [data-view="architecture"][aria-pressed="true"]').count() === 1, 'Patterns view lists the whole catalog (' + ncat + ')');
+  await page.click('#v-architecture [data-pfam="Resilience & reliability"]');
+  const fams = await page.$$eval('#v-architecture .ysec', h => h.map(x => x.textContent));
+  ok(fams.length === 1 && /resilience/i.test(fams[0]), 'family filter shows one family');
+  await page.click('#v-architecture [data-pfam=""]');
+  await page.click('#apc-' + kind + ' [data-patopen^="kafka/"]'); await page.waitForSelector('#reader #rs-apat .ap-panel:not([hidden]) svg');
+  ok(/#pattern\/kafka\/\d$/.test(page.url()), 'a concept in the catalog opens its read at that pattern');
+  await page.click('#reader [data-rclose]');
+  if (shots) await page.screenshot({ path: shots + '/9-patterns.png' });
   // mobile
   await page.setViewportSize({ width: 390, height: 844 }); await page.goto(base + '#explore'); await page.waitForSelector('.col .item');
   const sw = await page.evaluate(() => document.documentElement.scrollWidth);
@@ -589,11 +652,23 @@ const shots = process.argv[3] || null;
   if (shots) await page.screenshot({ path: shots + '/5-mobile.png' });
   const sceneHashes = (await page.evaluate(() => (window.__dts.SCENES || []).some(s => s.id === 'sample-tcp-handshake'))) ? ['#animations', '#scene/sample-tcp-handshake', '#scene/sample-lru-eviction'] : [];
   for (const h of ['#design', '#algo/merge', '#algo/dijkstra', '#algo/btree', '#algo/raft', '#practice/list', '#design/url-shortener',
-                   '#algo/monostack', '#algo/window2', '#algo/backtrack', '#algo/treedfs', '#algo/dp1d', '#algo/prefix', '#algo/segtree', '#algo/fastslow', '#algo/bsanswer', '#algo/mst', '#algo/dp2d', '#algo/sweep', '#algo/kmp', '#algo/topk', '#algo/sieve', '#patterns', '#practice/two-sum'].concat(sceneHashes)) {
+                   '#algo/monostack', '#algo/window2', '#algo/backtrack', '#algo/treedfs', '#algo/dp1d', '#algo/prefix', '#algo/segtree', '#algo/fastslow', '#algo/bsanswer', '#algo/mst', '#algo/dp2d', '#algo/sweep', '#algo/kmp', '#algo/topk', '#algo/sieve', '#patterns', '#practice/two-sum', '#architecture', '#pattern/kafka/1'].concat(sceneHashes)) {
     await page.goto(base + h); await page.waitForTimeout(350);
     const w = await page.evaluate(() => Math.max(document.documentElement.scrollWidth, document.getElementById('reader').hidden ? 0 : document.getElementById('reader').scrollWidth));
     ok(w <= 392, 'no horizontal page scroll on phone width at ' + h + ' (' + w + ')');
   }
+  // touch: a horizontal swipe on a drawing steps it forward, a swipe the other way steps back
+  const tctx = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, reducedMotion: 'reduce' });
+  const tp = await tctx.newPage(); tp.on('pageerror', e => errors.push('pageerror: ' + e.message));
+  await tp.goto(base + '#algo/merge'); await tp.waitForSelector('#av-stage');
+  const swipe = (sel, dx) => tp.evaluate(([sel, dx]) => { const el = document.querySelector(sel), r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + Math.min(80, r.height / 2);
+    const t = (x) => new Touch({ identifier: 1, target: el, clientX: x, clientY: y });
+    el.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, touches: [t(x)], changedTouches: [t(x)] }));
+    el.dispatchEvent(new TouchEvent('touchend', { bubbles: true, touches: [], changedTouches: [t(x + dx)] })); }, [sel, dx]);
+  const k0 = await tp.textContent('.av-k'); await swipe('#av-stage', -120); await tp.waitForTimeout(150); const k1 = await tp.textContent('.av-k');
+  await swipe('#av-stage', 120); await tp.waitForTimeout(150); const k2 = await tp.textContent('.av-k');
+  ok(k1 !== k0 && k2 === k0, 'touch: swipe left steps a visualizer forward, swipe right steps back (' + [k0, k1, k2].join(' / ') + ')');
+  await tctx.close();
   if (sceneHashes.length) {
     await page.goto(base + '#scene/sample-tcp-handshake'); await page.waitForSelector('#rs-watch .scene .sc-a');
     const z = page.locator('#rs-watch .scene .sc-zoom');

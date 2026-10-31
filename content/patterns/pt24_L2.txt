@@ -1,0 +1,839 @@
+@@ backupdr
+== Base backup plus WAL archive for point-in-time recovery
+kind: wal
+when: A database must be restorable to any second, for example just before a bad deploy or an accidental DROP TABLE.
+how: Take a full base backup once a day (pg_basebackup or pgBackRest). At the same time, the server ships every finished WAL segment (16 MB by default) to object storage in another failure domain, using archive_command.
+To recover, the operator restores the newest base backup taken before the target time. Then the server replays archived WAL up to recovery_target_time and stops. The data loss window is the time since the last archived segment, so RPO is minutes, or seconds if you also stream WAL.
+The restore time (RTO) grows with the size of the base backup and the amount of WAL to replay. A 2 TB database can need hours, so measure it. Compress and encrypt the archive, and store checksums so a bad file is found early.
+used: PostgreSQL continuous archiving with pgBackRest or WAL-G; the same idea in MySQL with binlog replay; managed services such as Amazon RDS and Cloud SQL offer point-in-time restore.
+avoid: When RTO must be seconds; keep a hot standby (replication and failover) and use PITR only as the last line of defence.
+flow:
+  Postgres [db: primary] -> WAL archive [store: object storage] : finished WAL segment | The server copies each completed WAL segment to a bucket in another zone or region.
+  pgBackRest [svc: daily job] -> Postgres : base backup | Once a day a job copies the data files while the server keeps running.
+  pgBackRest -> WAL archive : base backup files | The base backup lands in the same bucket, with checksums.
+  Developer [user] -x> Postgres : DROP TABLE at 14:03 | A mistake at 14:03 is also written to the WAL, so replication would copy it too.
+  Restore host [svc: new server] -> WAL archive : fetch base and WAL | The operator restores the 02:00 base backup and replays WAL.
+  * Restore host: stopped at 14:02:59 | Recovery stops at recovery_target_time, one second before the mistake.
+ref: docs | Continuous Archiving and Point-in-Time Recovery | PostgreSQL documentation | https://www.postgresql.org/docs/current/continuous-archiving.html
+
+== Cross-region copy with versioning and object lock
+kind: multi-region, copy-on-write
+when: You must survive the loss of a whole region, and also survive a bad delete or a ransomware attack.
+how: The primary bucket has versioning on, so an overwrite or delete keeps the old version. A replication rule copies new objects to a bucket in a second region and often a second account. S3 Replication Time Control aims to copy 99.99% of objects within 15 minutes, so that is your RPO.
+Replication alone copies mistakes: a corrupted object is replicated too. Versioning lets you step back to the last good version. Object Lock (write once, read many) in the backup bucket stops anyone, even an admin, from deleting versions before the retention date.
+Recovery means pointing the application to the second region. Run restore drills, because a backup that was never restored is only a hope. Cost is storage in two regions plus cross-region transfer.
+used: Amazon S3 Cross-Region Replication with Object Lock; Google Cloud Storage dual-region buckets; backup vaults with immutable copies in a separate account.
+avoid: When data changes too fast for async copy to keep up with the RPO; use synchronous or quorum replication within a region and accept the latency.
+flow:
+  App [svc] -> Primary bucket [store: A versioned] : PUT object v2 | The app writes; versioning keeps v1 next to v2.
+  Primary bucket ~> DR bucket [store: B locked] : async replication | A rule copies each new version to region B in the background.
+  * DR bucket: lag 4 min | Replication lag is the real RPO, and it should be monitored.
+  Operator [user] -x> DR bucket : delete version | Object Lock rejects the delete until the retention date.
+  Primary bucket -x> App : region outage | Region A fails and the app can no longer read.
+  App -> DR bucket : read in region B | After failover the app reads from the copy in region B.
+ref: docs | Replicating objects within and across Regions | Amazon S3 User Guide | https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication.html
+
+== Automated restore drill
+kind: scheduler-agent, health-check
+when: You have backups, but nobody has proven that they restore, or how long a restore takes.
+how: A scheduler starts a job every night or every week. The job picks the newest backup, restores it into a throw-away instance, and replays the archived log to a known time.
+Then it runs checks. It compares row counts with a recent figure, runs checksum verification on the data files, and runs a few business queries. It records the elapsed time as the measured RTO and the age of the last log record as the measured RPO.
+The result goes to a dashboard, and a failure pages the on-call engineer. The scratch instance is deleted at the end. This finds silent problems early: an expired key, a missing WAL segment, a corrupt backup, or a restore that has grown from 1 hour to 6 hours.
+used: Site reliability teams that run scheduled restore tests; pgBackRest verify and restore commands in a CI job; disaster-recovery game days.
+avoid: When the data is too large to restore often; then restore a sample or one shard and test the full path less often.
+flow:
+  Scheduler [svc: weekly] -> Restore job [svc: runs in CI] : start drill | The scheduler starts the drill on a fixed day.
+  Restore job -> Backup store [store: object storage] : fetch newest backup | The job downloads the latest base backup and log.
+  Restore job -> Scratch DB [db: temporary] : restore and replay | It restores into a new instance and replays the log to a target time.
+  Restore job -> Scratch DB : checksums and row counts | It verifies data files and runs business queries.
+  Restore job -x> On-call [user] : restore failed | A missing segment or bad checksum pages a human at once.
+  Restore job -> Dashboard [client: RTO and RPO] : elapsed 52 min | The measured restore time is stored, so growth is visible.
+ref: book | Site Reliability Engineering: Data Integrity | Beyer et al., Google, 2016 | https://sre.google/sre-book/data-integrity/
+
+@@ batching
+== Producer linger and batch buffer
+kind: batching
+when: Many small writes go to a broker or a database over the network, and per-request cost dominates.
+how: The client does not send each record at once. It appends records to a per-partition buffer and sends the buffer when it is full or when a timer fires. In Kafka these are batch.size (16 KB by default) and linger.ms.
+One request then carries hundreds of records. The broker writes one contiguous chunk, compression works on the whole batch, and the network and system call cost is paid once. Throughput can rise by 5 to 10 times.
+The price is latency: a record may wait up to linger.ms before it leaves. Choose a small wait for interactive paths and a larger one for pipelines. Always bound the buffer, so a slow broker causes backpressure and not an out-of-memory crash.
+used: Kafka producers; the Elasticsearch bulk API; log shippers such as Fluent Bit and Vector; ad-event collectors that batch impressions before writing to a topic.
+avoid: When one event must be durable and visible within a few milliseconds; send it alone or use a tiny linger.
+flow:
+  App threads [client: 500 events/s] -> Batch buffer [queue: per partition] : append record | Each thread only appends to memory, which takes microseconds.
+  * Batch buffer: full at 16 KB | The buffer closes when it reaches 16 KB or when linger.ms ends.
+  Batch buffer -> Compressor [svc: lz4] : 200 records | The whole batch is compressed together, which compresses better than single records.
+  Compressor -> Broker [log: partition 3] : one produce request | One network round trip carries all 200 records.
+  Broker -> App threads : ack | The ack completes all 200 send futures at once.
+ref: docs | Kafka producer configs | Apache Kafka documentation | https://kafka.apache.org/documentation/#producerconfigs
+
+== Group commit
+kind: wal, batching
+when: Every transaction must be on disk before it is acknowledged, but one fsync per transaction would limit throughput.
+how: Each transaction writes its commit record into the in-memory log buffer. One transaction becomes the leader and calls fsync. While that fsync runs (0.1 to 5 ms), other transactions join the buffer and wait.
+When the fsync returns, it makes all of their records durable at once, and all of them are acknowledged. So 50 concurrent commits can cost one disk flush, not 50.
+This is why a database on a disk with a 1 ms flush can still commit tens of thousands of transactions per second under load. Latency per commit stays near one flush time. Under light load there is nothing to group, and each commit pays its own fsync.
+used: PostgreSQL (commit_delay and commit_siblings tune it), MySQL InnoDB binlog group commit, Kafka brokers that flush after many records, Raft implementations that batch log appends.
+avoid: When you accept losing the last moments of data; relax durability (for example synchronous_commit off) instead.
+flow:
+  Txn A [client] -> Log buffer [log: in memory] : commit record | Transaction A appends its commit record and becomes the flush leader.
+  Txn B, Txn C [client] -> Log buffer : commit records | While A flushes, B and C add their records to the same buffer.
+  Log buffer -> Disk [store: NVMe] : one fsync | A single flush writes the records of A, B and C.
+  Disk -> Log buffer : durable | The flush returns, and all three records are safe.
+  Log buffer -> Txn A, Txn B, Txn C : commit ok | All three transactions are acknowledged together.
+ref: docs | WAL configuration | PostgreSQL documentation | https://www.postgresql.org/docs/current/wal-configuration.html
+
+== Request coalescing with a per-tick loader
+kind: batching
+when: One page or API call triggers many small lookups of the same kind, the classic N+1 query problem.
+how: Instead of querying inside each resolver, the code asks a loader for key 17. The loader collects keys during one tick of the event loop and then runs a single query, such as SELECT ... WHERE id IN (...), for all keys. It also removes duplicates and caches results for this request.
+A GraphQL query for 100 posts with their authors makes 1 query for posts and 1 for all authors, not 101 queries. The same idea works for calls to other services: one batch endpoint, one round trip.
+Batch size needs a cap, for example 1,000 keys, to keep queries small. The loader adds almost no delay, because it waits only for the current tick, not for a timer.
+used: DataLoader in GraphQL servers; Go singleflight for identical calls; Facebook's Haxl; batch endpoints in microservice APIs.
+avoid: When lookups depend on each other and cannot be issued together, or when the backend has no batch form.
+flow:
+  GraphQL resolver [svc: 100 posts] -> Loader [svc: DataLoader] : load author 7 | Each resolver asks for one author and gets a promise.
+  * Loader: 12 distinct keys | The loader waits until the end of the tick and removes duplicate keys.
+  Loader -> Users DB [db] : WHERE id IN (...) | One query fetches all 12 distinct authors.
+  Users DB -> Loader : 12 rows | The rows come back in one reply.
+  Loader -> GraphQL resolver : resolve promises | Every waiting resolver gets its author, so 101 queries became 2.
+ref: docs | DataLoader | GraphQL Foundation | https://github.com/graphql/dataloader
+
+@@ concgc
+== Young generation with a remembered set
+kind: none
+when: A service allocates many short-lived objects (requests, buffers) and cannot pay for scanning the whole heap on every collection.
+how: Most objects die young. The heap is split into a young area and an old area. New objects go to the young area. A young collection copies the few live objects to a survivor area or promotes them to the old area, and then frees the rest in one step.
+To avoid scanning the old area, the collector keeps a remembered set (G1 uses cards). A write barrier records when an old object starts to point to a young object. Those cards are the extra roots for the young collection.
+Young pauses stay at a few milliseconds if the live young data is small. G1 also splits the heap into regions and picks the regions with most garbage for mixed collections, to meet a pause goal such as 200 ms (the default).
+used: G1 (the default collector in the JVM), Parallel GC, the .NET GC, and V8 for JavaScript.
+avoid: When most objects live long, for example a huge cache; then old-generation tuning or off-heap storage matters more.
+flow:
+  App threads [svc: allocate] -> Young area [store: eden regions] : new objects | Allocation is a pointer bump, so it is very cheap.
+  App threads -> Card table [store: dirty cards] : write barrier | Storing an old-to-young pointer marks a card dirty.
+  Young area -> Survivor area [store: copied] : young GC | Live objects are copied out; dead ones cost nothing.
+  Card table -> Young area : extra roots | The collector scans only dirty cards in the old area.
+  Survivor area -> Old area [store: promoted] : age over threshold | Objects that survive several collections are promoted.
+  Old area ~> App threads : mixed GC | Later, regions with much garbage are cleaned together with the young regions.
+ref: book | The Garbage Collection Handbook | Jones, Hosking & Moss, CRC Press, 2011 |
+
+== Concurrent relocation with load barriers
+kind: none
+when: Latency matters more than throughput, the heap is large (many GB), and pauses must stay around one millisecond.
+how: ZGC marks live objects and then moves them while the application keeps running. A moved object leaves a forwarding entry. Pointers carry colour bits, and a load barrier checks them each time the program reads a reference from the heap.
+If the pointer is stale, the barrier follows the forwarding table and fixes the pointer (self-healing). So the program never sees an old address, and no long stop-the-world copy is needed. The pauses only start and end phases and do not grow with heap size.
+Since JDK 24 ZGC is generational only (JEP 490): young objects are collected often and old ones rarely. This cuts the cost of the barriers and the memory overhead. The price is some CPU for barriers and headroom in the heap: if allocation outruns collection, threads stall.
+used: ZGC in JDK 21 and later; generational Shenandoah in JDK 25; low-latency Java services such as trading systems and big search nodes.
+avoid: When the job is a batch with no latency goal; Parallel or G1 gives more throughput for less memory.
+flow:
+  App threads [svc: running] -> Heap [store: 64 GB] : allocate | The application keeps allocating during all GC phases.
+  GC threads [svc: concurrent] -> Heap : mark live objects | Marking runs beside the application and needs only short pauses.
+  GC threads -> Forwarding table [store: old to new] : relocate objects | Live objects move to new pages, and the old address is recorded.
+  App threads -> Load barrier [svc: pointer check] : read reference | Every reference read goes through a small check.
+  Load barrier -> App threads : healed pointer | A stale pointer is fixed using the forwarding table.
+  * App threads: pause 0.4 ms | Pauses stay below a millisecond even on a large heap.
+ref: spec | JEP 490: ZGC: Remove the Non-Generational Mode | OpenJDK, 2024 | https://openjdk.org/jeps/490
+
+@@ connpool
+== Transaction-mode pooler in front of PostgreSQL
+kind: connection-pool
+when: Hundreds of application instances need to talk to PostgreSQL, but the server can only handle a few hundred connections.
+how: Each PostgreSQL connection is a separate OS process with several MB of memory, and too many of them slow the server. A pooler such as PgBouncer sits between the applications and the database. The applications open, say, 2,000 cheap client connections to the pooler.
+In transaction mode, the pooler gives a client a real server connection only for the length of one transaction. Then it returns the connection to the pool. So 2,000 clients can share about 40 server connections, a size close to what the CPU cores can actually run.
+Limits: session features break in transaction mode, for example session-level SET, advisory locks, and in older versions prepared statements. Clients also wait in a queue when all server connections are busy, so watch the queue time.
+used: PgBouncer and Odyssey in front of PostgreSQL; pgcat; RDS Proxy; many Postgres-based services use a pooler by default.
+avoid: When the database is already thread-based and handles thousands of connections well; a pool inside the app is then enough.
+flow:
+  App pods [client: 2000 conns] -> PgBouncer [svc: transaction mode] : BEGIN ... COMMIT | Many applications connect to the pooler, which is cheap to hold open.
+  PgBouncer -> Postgres [db: 40 backends] : borrowed connection | The pooler lends one server connection for the length of one transaction.
+  Postgres -> PgBouncer : result | The result returns, and the server connection goes back to the pool at COMMIT.
+  * PgBouncer: queue 30 waiting | When all 40 are busy, new transactions wait in the pooler queue.
+  PgBouncer -x> App pods : query_wait_timeout | A client that waits too long gets an error, which is better than overloading the database.
+ref: docs | PgBouncer features | PgBouncer documentation | https://www.pgbouncer.org/features.html
+
+== In-process pool with a small fixed size
+kind: bulkhead, load-shedding
+when: One service talks to one database, and requests must not open a new connection each time or flood the database.
+how: The application holds a pool of open connections created at start-up. A request thread borrows one, runs its queries, and gives it back. The pool is small on purpose.
+Little's law gives the size: connections in use = queries per second times seconds per query. At 500 queries per second and 4 ms each, only 2 are busy on average. The HikariCP guide suggests starting near (cores times 2) plus the number of disks and then measuring. A pool of 10 often beats a pool of 100.
+When the pool is empty, the request waits, up to a timeout (30 seconds by default in HikariCP). Set a much lower timeout, such as 1 second, and fail fast. Otherwise, a slow query makes threads pile up and the whole service stops.
+used: HikariCP in Java; SQLAlchemy QueuePool in Python; pgx pool in Go; database/sql in Go.
+avoid: Function-as-a-service workloads where many short-lived processes each own a pool; use a shared proxy instead.
+flow:
+  Request threads [client: 200 threads] -> Pool [svc: HikariCP size 10] : borrow connection | A thread asks for a connection and does not open a new one.
+  Pool -> Postgres [db] : query on pooled conn | The query uses an already open and authenticated connection.
+  Postgres -> Pool : rows | The thread returns the connection after the query.
+  * Pool: 10 of 10 in use | A slow query holds connections, so new threads must wait.
+  Pool -x> Request threads : timeout after 1 s | The pool fails fast, so one slow dependency cannot hold all threads.
+ref: docs | About Pool Sizing | HikariCP wiki | https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing
+
+== Managed proxy for serverless functions
+kind: bulkhead
+when: Many short-lived functions or containers scale out fast, and each would otherwise open its own database connection.
+how: A function instance cannot keep a pool for long, and 1,000 concurrent instances would open 1,000 connections. A managed proxy, such as RDS Proxy, keeps a warm pool of database connections and multiplexes the function requests over them.
+The functions connect to the proxy with IAM or secrets, and the proxy handles TLS and authentication to the database. During a database failover the proxy keeps client connections open and reconnects to the new primary, which shortens the visible outage.
+The proxy adds about one network hop, so a few milliseconds of latency. It can also pin a client to one server connection when the session uses state, and this removes the benefit. Keep session state out of the code.
+used: Amazon RDS Proxy with AWS Lambda; Cloud SQL managed connection pooling; PgBouncer on Kubernetes for bursty workers.
+avoid: When there are few long-lived services that already use a local pool; the extra hop gives little.
+flow:
+  Lambda instances [client: 1000 concurrent] -> RDS Proxy [svc: warm pool] : connect and query | Functions open short connections to the proxy.
+  RDS Proxy -> Aurora primary [db: 100 conns] : multiplexed queries | The proxy shares about 100 database connections between all functions.
+  * RDS Proxy: pinned 8 | A session that sets state is pinned to one connection and cannot be shared.
+  Aurora primary -x> RDS Proxy : failover | The primary fails and a replica is promoted.
+  RDS Proxy -> Aurora replica [db: new primary] : reconnect | The proxy reconnects, and functions keep their client connections.
+ref: docs | Amazon RDS Proxy | AWS documentation | https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.html
+
+@@ eventloop
+== Reactor server with epoll
+kind: event-loop
+when: One process must hold tens of thousands of mostly idle connections with low memory and low latency.
+how: Sockets are set to non-blocking. The loop thread calls epoll_wait (kqueue on BSD and macOS, or io_uring) and gets the list of ready sockets. For each ready socket it runs a small handler: read bytes, parse, write the reply, then go back to waiting.
+There is no thread per connection, so there are no thread stacks and no context switches. A single Redis thread can serve 100,000 or more simple commands per second. NGINX runs one such loop per worker process, with workers set to the number of cores.
+The rule is simple: never block the loop. A handler that takes 50 ms delays every other connection by 50 ms. Slow CPU work and blocking calls must move elsewhere.
+used: NGINX, Redis, Memcached (with libevent), Node.js (libuv), HAProxy, Netty in Java.
+avoid: When handlers are long CPU jobs; use a thread pool or separate processes.
+flow:
+  Clients [client: 10000 sockets] -> Listener [svc: epoll loop] : requests | Many connections send small requests at random times.
+  Listener -> Handler [svc: parse and reply] : ready socket 412 | epoll_wait returns the ready sockets, and the loop calls the handler for each.
+  Handler -> Cache [cache: in memory] : GET key | The handler does only fast in-memory work.
+  Cache -> Handler : value | The answer comes back in microseconds.
+  Handler -> Clients : response | The loop writes the reply and goes back to epoll_wait.
+  * Listener: blocked 50 ms | One slow handler would stall all 10,000 sockets, so it must be avoided.
+ref: docs | epoll(7) | Linux man-pages | https://man7.org/linux/man-pages/man7/epoll.7.html
+
+== Event loop with a worker pool for blocking work
+kind: event-loop, thread-pool
+when: The loop serves requests, but some steps block: file reads, DNS lookups, hashing or compression.
+how: The loop thread stays free for network events. When a handler needs blocking or CPU-heavy work, it submits the job to a small pool of worker threads and registers a callback. The worker runs the job and posts the result back to the loop, which runs the callback.
+Node.js does this with libuv: file system calls, DNS lookups and crypto use a pool of 4 threads by default (UV_THREADPOOL_SIZE). Network sockets stay on the loop. NGINX can offload file reads to a thread pool with the aio threads option.
+Size the pool for the job. If 8 hashing jobs wait on 4 threads, the 8th waits for two job times. Watch the loop lag (the delay between a timer and when it really runs); it is the main health signal.
+used: Node.js with libuv; NGINX with thread pools for aio; Python asyncio run_in_executor; Netty with a separate executor group for business logic.
+avoid: When the work is pure I/O that the OS can do without blocking (use async I/O); or when it is very heavy CPU, where separate worker processes are better.
+flow:
+  Client [client] -> Event loop [svc: one thread] : request | The request arrives on the loop thread.
+  Event loop -> Worker pool [svc: 4 threads] : hash password | The loop hands the slow job to the pool and returns at once.
+  * Event loop: free, serving others | While the job runs, the loop keeps handling other sockets.
+  Worker pool -> Event loop : job done | The worker posts the result, which wakes the loop.
+  Event loop -> Client : response | The loop runs the callback and writes the reply.
+ref: docs | Design overview | libuv documentation | https://docs.libuv.org/en/v1.x/design.html
+
+== WebSocket gateway with pub/sub behind it
+kind: event-loop, pubsub
+when: Millions of browsers or phones keep a connection open for live updates such as scores, chat or prices.
+how: A fleet of gateway servers each runs event loops and holds, for example, 100,000 idle WebSocket connections. A connection costs a few KB of memory, so this is possible only without a thread per connection.
+A load balancer spreads new connections. A backend publishes an event to a pub/sub system (Redis pub/sub, Kafka or NATS). Each gateway subscribes to the topics of its connected users, and writes the event to the sockets that match.
+The hard parts are not in the loop: reconnect storms after a deploy, slow clients whose send buffers fill (drop or disconnect them), and heartbeats to find dead connections. Users are often hashed to a gateway so that a topic needs few subscribers.
+used: Slack and Discord style gateways; Phoenix Channels on the Erlang VM; socket.io with a Redis adapter; Netty-based push servers.
+avoid: When updates are rare and one-way; Server-Sent Events or plain polling is simpler.
+flow:
+  Browsers [client: 100k sockets] -> Gateway A [svc: event loop] : WebSocket connect | Each browser holds one long connection to a gateway.
+  Gateway A -> Pub/sub [topic: Redis or Kafka] : subscribe room 9 | The gateway subscribes once per room, not once per user.
+  Backend [svc: score service] -> Pub/sub : publish goal event | The backend publishes one event to the room topic.
+  Pub/sub -> Gateway A : event | Every gateway with listeners in room 9 receives the event.
+  Gateway A -> Browsers : push to 3,000 sockets | The loop writes the frame to each matching socket.
+  Gateway A -x> Browsers : drop slow client | A client whose send buffer is full is disconnected to protect memory.
+ref: docs | Node.js event loop, timers and nextTick | Node.js documentation | https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick
+
+@@ eviction
+== Cache-aside with a bounded LRU cache
+kind: cache-aside, memory-tiering
+when: A database serves skewed reads, and a cache of fixed memory should keep the most useful keys.
+how: The application reads the cache first. On a miss it reads the database and writes the value into the cache. When the cache reaches its memory limit, it must drop something to make room.
+LRU drops the key unused for the longest time. The classic form is a hash map plus a doubly linked list, so get and evict are both O(1). Redis does not keep an exact list. With maxmemory-policy allkeys-lru it samples a few keys (5 by default) and evicts the oldest of the sample. This is cheaper and close to exact LRU.
+Because access is skewed (Zipf), a cache holding 10 percent of the keys can serve 80 to 90 percent of reads. Measure the hit ratio; if it is below your target, the cache is too small or the policy is wrong. Set a TTL as well, to bound stale data.
+used: Redis and Memcached as database caches; the Linux page cache; database buffer pools use LRU-like policies.
+avoid: When a large scan reads everything once; plain LRU would flush the useful keys. Use LFU, 2Q or TinyLFU.
+flow:
+  App [svc] -> Redis [cache: maxmemory 8 GB] : GET user 42 | The app asks the cache first.
+  Redis -x> App : miss | The key is not in the cache.
+  App -> Postgres [db] : SELECT user 42 | The app reads the source of truth.
+  App -> Redis : SET user 42 TTL 300 | The app stores the value with a TTL.
+  * Redis: memory full | The cache hits its limit and must evict before the next write.
+  Redis -> Sample [note: 5 random keys] : pick oldest | Redis samples 5 keys and removes the least recently used one.
+ref: docs | Key eviction | Redis documentation | https://redis.io/docs/latest/develop/reference/eviction/
+
+== Frequency-based admission (TinyLFU)
+kind: memory-tiering
+when: The workload mixes hot keys with scans or one-time reads, and plain LRU keeps losing the hot keys.
+how: Caffeine, the Java cache, uses Window TinyLFU. A new key first enters a small window (about 1 percent of space) managed by LRU. When the window is full, the evicted candidate competes with the victim from the main area.
+The cache compares their estimated frequencies, kept in a compact count-min sketch with periodic aging (halving the counters). The key with the higher count stays; the other is dropped. A one-time scan key has a low count and does not push out a popular key.
+This gives a better hit ratio than LRU on many real traces, for little memory: a few bits per entry. The cost is more complex code and a small CPU cost per access, not a concern for most services.
+used: Caffeine (in Spring and many JVM services); Ristretto in Go; the idea appears in other caches as TinyLFU admission.
+avoid: When the cache is tiny or access is strictly recency-based; plain LRU is simpler and as good.
+flow:
+  Reader [client] -> Caffeine cache [cache: in process] : get key | Reads go to an in-process cache with no network hop.
+  Caffeine cache -> Window [cache: 1 percent LRU] : new key | A new key enters a small window first.
+  Window -> Frequency sketch [store: count-min] : estimate candidate | The window evicts a candidate, and its count is read from the sketch.
+  Frequency sketch -> Main area [cache: 99 percent] : compare with victim | The candidate is admitted only if its count beats the victim.
+  Window -x> Main area : scan key rejected | A key seen once has a low count, so it is dropped and the hot set stays.
+ref: paper | TinyLFU: A Highly Efficient Cache Admission Policy | Einziger, Friedman & Manes, ACM TOS, 2017 |
+
+== Edge cache with a shield tier
+kind: cdn-edge, memory-tiering
+when: A CDN serves global traffic, and the origin must see very few requests for the same object.
+how: Each edge server keeps the most requested objects in RAM and on SSD, and evicts by LRU or a similar policy when the disk is full. A request that misses at the edge goes to a regional shield cache, and only a miss there goes to the origin.
+Because many edges share one shield, a popular object reaches the origin once, not once per edge. The long tail of rarely requested files is evicted first from the edge but may stay longer in the shield, which is bigger.
+Big objects and small objects compete for space. Some CDNs use size-aware admission, so one huge video file does not remove thousands of small images. Cache hit ratio (often above 90 percent for static assets) is the number to watch.
+used: Common in CDNs such as Cloudflare, Fastly and CloudFront (origin shield); Varnish and NGINX caches in front of an origin.
+avoid: When content is personalised or changes at every request; the hit ratio is too low to repay the hop.
+flow:
+  Viewer [user] -> Edge cache [cache: SSD and RAM] : GET segment 17 | A viewer asks the nearest edge.
+  Edge cache -x> Viewer : miss | This edge does not have the object.
+  Edge cache -> Shield cache [cache: regional] : fetch | The edge asks the regional shield.
+  Shield cache -> Origin [svc: origin store] : fetch once | Only a shield miss reaches the origin.
+  Origin -> Shield cache : object | The origin returns the object, and the shield stores it.
+  Shield cache -> Edge cache : object | The edge stores the object, evicting its least recently used entry.
+  Edge cache -> Viewer : hit next time | Later viewers get it from the edge.
+ref: docs | Origin Shield | Amazon CloudFront documentation | https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/origin-shield.html
+
+
+@@ latencynums
+== Capacity estimate before design
+kind: capacity-estimate
+when: Before choosing databases and server counts, you need to know if the system is 100 QPS or 100,000 QPS.
+how: Start from users and actions: 50 million daily users times 10 requests each is 500 million requests per day. Divide by 86,400 seconds to get about 6,000 QPS on average, and multiply by 2 to 3 for the peak.
+Do the same for storage and bandwidth. 500 million posts per day at 1 KB is 500 GB per day, or about 180 TB per year, before replication. Then check each result against known costs: a RAM read is about 100 ns, an SSD read about 100 microseconds, a same-zone round trip about 0.5 ms.
+The numbers choose the design. 6,000 QPS of reads fits one cache node. 180 TB per year does not fit one database server, so you need sharding or cheap object storage. Write all assumptions down so others can correct them. The goal is the right order of magnitude, not the exact value.
+used: Common in capacity planning, design reviews and system design interviews; Jeff Dean's "Numbers Everyone Should Know" is the usual reference.
+avoid: As a replacement for load tests; use the estimate to find the shape, then measure the real system.
+flow:
+  Product brief [note: 50M daily users] -> Estimate sheet [svc: QPS and GB] : users times actions | The team turns users and actions into requests per day.
+  Estimate sheet -> Peak load [note: 6k avg and 15k peak] : divide by 86400 | Requests per day become average QPS, and a peak factor gives the design target.
+  Estimate sheet -> Storage need [note: 180 TB per year] : rows times bytes | Writes times row size give storage, before replicas.
+  Peak load -> Design choice [svc: cache and shards] : fits one node? | One cache node handles the reads, so no read shards are needed.
+  Storage need -> Design choice : too big for one disk | 180 TB needs sharding or object storage, so the database design changes.
+ref: blog | Latency Numbers Every Programmer Should Know | Colin Scott, Berkeley, interactive | https://colin-scott.github.io/personal_website/research/interactive_latency.html
+
+== Latency budget across a call chain
+kind: timeout-deadline
+when: A user-facing request calls several services, and the total must stay under a target such as 200 ms at p99.
+how: Write a budget first. Network hop in one zone: about 0.5 ms. Cache read: about 1 ms. Database read: 2 to 10 ms. Cross-region call: 70 to 150 ms. Add the steps on the critical path and compare the sum with the target.
+Then pass the remaining budget as a deadline with each call. If the gateway has 200 ms and spends 20 ms, it sends the next hop a 180 ms deadline. A service that sees an expired deadline stops work at once and does not waste capacity.
+The estimate shows what to change. Calls that can run in parallel go in parallel, so the cost is the maximum and not the sum. One cross-region call can use the whole budget, so move that data nearer to the user or cache it.
+used: gRPC deadlines; Google's SRE practice of latency budgets; any design review that costs each hop before the build.
+avoid: Treating averages as the budget; the tail adds up faster than the mean, so budget with p99.
+flow:
+  Client [user: 200 ms budget] -> Gateway [svc: spends 20 ms] : request | The gateway starts the clock with a 200 ms budget.
+  Gateway -> Order service [svc: 180 ms left] : deadline 180 ms | The remaining budget travels with the call.
+  Order service -> Cache [cache: 1 ms] : get cart | A cache read costs about a millisecond.
+  Order service -> Pricing DB [db: 8 ms] : read prices | A database read costs a few milliseconds, and it runs in parallel.
+  Order service -x> EU replica [db: 120 ms] : cross-region read | A cross-region read would use most of the budget, so the design avoids it.
+  Order service -> Gateway : response in 41 ms | The critical path is the maximum of the parallel calls, plus hops.
+ref: docs | gRPC and Deadlines | gRPC documentation | https://grpc.io/docs/guides/deadlines/
+
+== Place data by latency class
+kind: read-replicas, cdn-edge
+when: Users in many regions need fast reads, and a cross-continent round trip of 100 ms or more would be felt on every page.
+how: The latency table says physics sets a floor: light in fibre needs about 5 ms per 1,000 km one way, so Europe to the US west coast cannot be below roughly 70 ms round trip. No tuning removes this.
+So put the data near the user. Static files go to a CDN edge. Hot reads go to a cache in the user region. Database reads go to a read replica in the same region, with writes sent to the primary in one home region.
+Each step trades something. Replicas lag the primary by milliseconds to seconds, so a user who just wrote may read old data; route that user to the primary for a short time. Keep the write path on one home region unless you accept multi-leader conflicts.
+used: Common in global web and streaming services; read replicas in each region with writes to one primary (for example Aurora Global Database).
+avoid: When all users are in one region; the extra copies cost money and add lag with no latency benefit.
+flow:
+  User EU [user: Frankfurt] -> CDN edge [cache: in region] : GET image | Static files come from a nearby edge in a few milliseconds.
+  User EU -> Cache EU [cache: 1 ms] : GET profile | Hot reads are served from a cache in the same region.
+  User EU -> Replica EU [db: read replica] : SELECT feed | Reads use a local replica instead of crossing the ocean.
+  User EU -> Primary US [db: home region] : POST comment | Writes cross the ocean once, at about 90 ms.
+  Primary US ~> Replica EU : replication stream | The replica gets changes after a short lag.
+  * Replica EU: lag 300 ms | A user may see old data for a moment, so read-your-writes needs care.
+
+@@ lockfree
+== Single-producer single-consumer ring buffer between stages
+kind: producer-consumer, pipeline-stages
+when: Two threads must pass many small messages with very low latency and no lock.
+how: A fixed array is used as a ring. One producer thread owns the head index and one consumer thread owns the tail index. The producer writes the item, then publishes the new head with a release store. The consumer reads the head with an acquire load, takes the item, and advances the tail.
+There is no lock and no compare-and-swap, because each index has one writer. The capacity is a power of two, so wrap-around is a bit mask. Head and tail sit on different cache lines (padding) to avoid false sharing.
+Throughput can reach tens of millions of messages per second, with latency under a microsecond. A full ring is backpressure: the producer spins, yields or drops. Batch reads help, because the consumer can take all available items with one index update.
+used: LMAX Disruptor in trading systems; Aeron's log buffers; the per-core message queues in shard-per-core databases; Linux io_uring rings between kernel and user space.
+avoid: When there are many producers or consumers, or when the average rate is low; a plain queue with a lock is simpler.
+flow:
+  Network thread [svc: producer] -> Ring buffer [queue: 1024 slots] : write slot, publish head | The producer fills a slot, then moves the head with a release store.
+  Ring buffer -> Parser thread [svc: consumer] : acquire head, read slot | The consumer sees the new head and reads the slot.
+  Parser thread -> Ring buffer : advance tail | The consumer frees the slot by moving the tail.
+  Ring buffer -x> Network thread : full, backpressure | When head catches the tail, the producer must wait or drop.
+  Parser thread -> Matching engine [svc: next stage] : parsed order | The next stage uses another ring in the same way.
+ref: paper | Disruptor: High performance alternative to bounded queues | Thompson et al., LMAX, 2011 |
+
+== Copy-on-write snapshot swapped with CAS
+kind: copy-on-write
+when: Many threads read a shared structure all the time (routing table, config, feature flags), and updates are rare.
+how: The structure is immutable and held behind one atomic reference. A reader loads the reference once and reads the snapshot with no lock and no wait. It can never see a half-written state.
+A writer copies the structure, changes the copy, and publishes it with compare-and-swap: if the reference still points to the old version, set it to the new one. If the CAS fails, another writer won; the writer reloads and retries. This is a lock-free retry loop.
+Old versions are freed when no reader uses them. A garbage-collected language does this for free. In C++ you need epochs, hazard pointers or RCU for safe reclamation, and this also avoids the ABA problem. The cost is a full copy per write, so keep the structure small or use persistent trees.
+used: Java AtomicReference with immutable maps; the Linux kernel's RCU for routing and file tables; Envoy and gRPC clients that swap config snapshots; Go atomic.Pointer.
+avoid: When writes are frequent or the structure is huge; use sharded locks or a concurrent map.
+flow:
+  Reader threads [client: 32 threads] -> Config ref [store: atomic pointer] : load pointer | Each reader loads the pointer once and uses that snapshot.
+  Config ref -> Snapshot v7 [store: immutable] : read | Readers read v7 without locks.
+  Writer [svc: config updater] -> Snapshot v8 [store: copy plus change] : copy and edit | The writer builds a new version off to the side.
+  Writer -> Config ref : CAS v7 to v8 | If the pointer is still v7, it flips to v8 in one atomic step.
+  Writer -x> Config ref : CAS failed, retry | If another writer won, this writer reloads and tries again.
+  * Snapshot v7: freed after readers leave | The old version is reclaimed only when no reader holds it.
+ref: docs | What is RCU, Fundamentally? | Paul McKenney, LWN.net, 2007 | https://lwn.net/Articles/262464/
+
+== Striped counters to avoid a hot cache line
+kind: sharding
+when: Many threads increment one shared counter (requests, bytes), and the atomic add becomes the bottleneck.
+how: A single atomic counter is correct but slow under contention: every increment moves the cache line between cores, and CAS retries pile up. With 32 threads, throughput can fall below one thread.
+The fix is to stripe. Keep an array of cells, and let each thread add to its own cell, chosen by a thread hash. A read sums all cells. The sum is not an exact instant snapshot, but for metrics that is fine.
+Java's LongAdder does this: it starts with one cell and grows the cell array only when it sees CAS failures. Each cell is padded to its own cache line. Writes scale almost linearly with cores, and the cost moves to reads, which are rare.
+used: Java LongAdder and ConcurrentHashMap's size counter; Linux per-CPU counters; metrics libraries such as Micrometer and Prometheus client libraries.
+avoid: When you need an exact value at every moment (for example a limit check); use one atomic or a lock.
+flow:
+  Thread 1, Thread 2, Thread 3 [client] -> LongAdder [svc: cell array] : increment | All threads call increment on the same object.
+  LongAdder -> Cell 0 [store: padded line], Cell 1, Cell 2 : add by thread hash | Each thread adds to its own cell, so cache lines do not bounce.
+  LongAdder -x> Cell 0 : CAS failed | A failed CAS means contention, so the array grows.
+  Metrics reader [svc: scrape] -> LongAdder : sum() | A reader adds up all cells when needed.
+  LongAdder -> Metrics reader : total 9,812,331 | The total is approximate during writes but exact once writers stop.
+ref: docs | LongAdder | Java SE API documentation | https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/atomic/LongAdder.html
+
+@@ profiling
+== Continuous profiling in production
+kind: observability-pipeline
+when: A performance problem appears only in production, and you want to see where CPU time goes without a special test run.
+how: A small agent in each process or on each host samples call stacks about 100 times per second, using perf, eBPF or a runtime profiler such as async-profiler. This costs about 1 percent of CPU. It tags each profile with service, version and region, and uploads it every 10 to 60 seconds.
+A backend merges identical stacks into flame graphs and stores them like time series. An engineer can open the flame graph for one service, compare this week with last week, or compare the new version against the old one right after a deploy.
+Profiles answer where the time goes, which metrics and traces cannot. Keep the sample rate low and the agent safe: it must never crash the service. Cost control: keep only aggregated stacks, and drop old data after about 30 days.
+used: Grafana Pyroscope, Parca, Google Cloud Profiler, Datadog Continuous Profiler; Google-Wide Profiling (the internal system behind the idea).
+avoid: When the service is tiny or runs for seconds; a one-time local profile is enough.
+flow:
+  Service pod [svc: Java app] -> Agent [svc: async-profiler] : stack samples 100 Hz | The agent samples where each thread is running.
+  Agent -> Collector [svc: profile ingester] : profile every 30 s | Merged stacks with labels are uploaded every 30 seconds.
+  Collector -> Profile store [store: object storage] : stacks with version tag | Profiles are stored like time series, with labels.
+  Engineer [user] -> Profile store : compare v41 and v42 | The engineer diffs two versions after a deploy.
+  Profile store -> Engineer : flame graph | The graph shows that JSON parsing grew from 8 to 21 percent of CPU.
+ref: paper | Google-Wide Profiling: A Continuous Profiling Infrastructure for Data Centers | Ren et al., IEEE Micro, 2010 |
+
+== USE method then profile, fix, verify
+kind: profile-loop
+when: A service is slow and the team does not know whether the cause is CPU, memory, disk, network or a lock.
+how: First check each resource for Utilization, Saturation and Errors (the USE method by Brendan Gregg). CPU at 95 percent with a long run queue points to CPU. Disk at 100 percent busy with a long queue points to disk. This takes minutes and finds the right resource.
+Only then profile that resource. For CPU, record stacks with perf for 30 seconds and draw a flame graph. For lock waits, use an off-CPU profile. The widest box on top is the first thing to look at.
+Change one thing, run the same load test, and compare the numbers. If p99 does not improve, revert. Without this loop, teams tune guesses. Always profile the real workload: a benchmark with other data can show a different hot path.
+used: Linux performance work with perf, bpftrace and flame graphs; Netflix performance engineering teams; any on-call guide that starts with USE.
+avoid: When the system is not yet working correctly; fix bugs first, then measure speed.
+flow:
+  On-call [user] -> Dashboard [client: USE checks] : check CPU, disk, net | The engineer checks utilization, saturation and errors for each resource.
+  Dashboard -> On-call : CPU 95 and queue 12 | One resource is saturated, so CPU is the suspect.
+  On-call -> perf [svc: record 30 s] : perf record -g | The engineer samples stacks on the busy host.
+  perf -> Flame graph [note: top box 31 percent] : fold stacks | Identical stacks are merged, and one function is widest.
+  On-call -> Service [svc: patched] : fix and redeploy | The engineer changes that one function.
+  Load test [client: same workload] -> Service : replay load | The same test shows whether p99 improved.
+ref: blog | The USE Method | Brendan Gregg | https://www.brendangregg.com/usemethod.html
+
+== Profile-guided optimization
+kind: interpreter-compiler, feedback-loop
+when: A hot service is already tuned, and you want 2 to 15 percent more speed from the compiler without changing the code.
+how: Build the binary, run it in production or a realistic test, and collect a CPU profile. Feed the profile back into the next build. The compiler now knows which functions are hot, which branches are taken and which calls are common.
+It uses this to inline hot calls, lay out hot code together, and move cold code away. Go 1.21 made PGO generally available: a default.pgo file in the main package is picked up by go build. Clang and GCC offer the same with instrumented builds or sampled profiles (AutoFDO).
+Profiles go stale when the code changes, so refresh them regularly. Merge profiles from several instances, so the data does not favour one request type. Measure the gain; it is workload dependent.
+used: Go PGO; Clang and GCC PGO and AutoFDO; Chrome and Firefox builds; Google fleet-wide AutoFDO.
+avoid: When the workload changes a lot between runs or the build cannot get a representative profile.
+flow:
+  Binary v1 [svc: prod build] -> Profiler [svc: pprof] : CPU samples | Production instances give CPU profiles of real traffic.
+  Profiler -> Profile store [store: merged profile] : merge many instances | Profiles from many pods are merged into one.
+  Profile store -> Compiler [svc: go build] : default.pgo | The next build reads the merged profile.
+  Compiler -> Binary v2 [svc: optimized] : inline hot calls | The compiler inlines hot calls and orders hot code together.
+  Binary v2 -> Profiler : new samples | The new version is profiled again, which closes the loop.
+ref: docs | Profile-guided optimization | The Go Authors | https://go.dev/doc/pgo
+
+@@ sepstorage
+== Stateless compute clusters over object storage
+kind: open-table-format
+when: Analytics load is bursty, and you want to pay for compute only when queries run while the data stays in one place.
+how: Data lives as Parquet files in object storage (S3, GCS, Azure Blob), described by a table format such as Iceberg or Delta. Query engines are stateless clusters that start, read the files over HTTP, and stop. Several engines can read the same tables at once.
+Storage costs about 2 cents per GB per month and is very durable. Compute scales from zero to hundreds of nodes in minutes, and different teams get their own cluster so one heavy query does not slow another. Each node keeps a local SSD cache for hot files, because S3 has first-byte latency of tens of milliseconds.
+The price: network reads are slower than local disk, so engines use column pruning, predicate pushdown and caching. Small files hurt, so a compaction job merges them. Egress and request costs need watching.
+used: Snowflake and BigQuery separate storage and compute; Trino, Spark and Athena over Iceberg tables; Databricks lakehouse.
+avoid: When latency of a few milliseconds per random read is needed (OLTP); local disks or a database fit better.
+flow:
+  Analyst [user] -> Query engine [svc: Trino cluster] : SELECT sum(...) | A query starts on a cluster that holds no data of its own.
+  Query engine -> Catalog [svc: Iceberg metadata] : list data files | The engine reads the table metadata to find the needed files.
+  Query engine -> Object store [lake: Parquet files] : range reads | Workers read only the needed columns and row groups over HTTP.
+  * Query engine: SSD cache warm | Hot files stay on local SSD, so repeat queries are faster.
+  ETL job [svc: Spark] -> Object store : write new files | A second engine writes to the same store without touching the first cluster.
+  Query engine -x> Analyst : cluster idle, scaled to 0 | When idle, compute stops and only storage is billed.
+ref: paper | The Snowflake Elastic Data Warehouse | Dageville et al., SIGMOD, 2016 |
+
+== Log-only storage layer behind the compute node
+kind: wal, quorum
+when: A relational database needs fast crash recovery, cheap replicas and storage that grows by itself.
+how: Aurora keeps the SQL engine in a compute node and moves storage to a separate service. The compute node does not write data pages to storage. It sends only redo log records.
+The storage layer is spread over 3 availability zones, with 6 copies of each 10 GB segment. A write needs 4 of 6 copies to acknowledge, and a read quorum is 3 of 6. Storage nodes apply redo records to pages in the background and rebuild pages on demand.
+Because pages are materialised in storage, a crashed compute node restarts without replaying a long log. Read replicas share the same storage, so adding one copies no data. The limits are the network round trip per commit and the need for compute nodes to cache hot pages.
+used: Amazon Aurora (MySQL and PostgreSQL compatible); the same idea in Google AlloyDB and Neon, which also ship the log to a storage service.
+avoid: When the workload is small and a single instance with local NVMe is cheaper and faster.
+flow:
+  Writer node [svc: SQL engine] -> Storage node 1 [store: AZ a], Storage node 2 [store: AZ b], Storage node 3 [store: AZ c] : redo records | The writer sends only log records, not full pages, to 6 copies.
+  Storage node 1, Storage node 2, Storage node 3 -> Writer node : ack | Four of six acknowledgements make the commit durable.
+  * Storage node 1: applying redo | Each storage node builds data pages from redo records in the background.
+  Reader node [svc: read replica] -> Storage node 2 : read page | Replicas read pages from the same shared storage.
+  Writer node -x> Storage node 3 : node lost | Losing one copy is harmless because 4 of 6 still agree.
+ref: paper | Amazon Aurora: Design Considerations for High Throughput Cloud-Native Relational Databases | Verbitski et al., SIGMOD, 2017 |
+
+== Scale-to-zero compute with shared state
+kind: autoscaling, horizontal-scale
+when: Traffic is spiky or idle most of the day, and you do not want to pay for servers that hold state.
+how: The compute is stateless: functions or containers keep no durable data. Sessions go to a cache, files to object storage and records to a database, all outside the compute. Because any instance can serve any request, the platform can add or remove instances freely.
+An autoscaler watches request rate or queue depth and starts instances. When there is no traffic, it stops them all. A cold start costs from 100 ms to a few seconds, so keep a minimum of one or two warm instances for latency-critical paths.
+The state services now carry the load and need their own scaling and connection limits (see connection pooling). Local disk is only a cache that may disappear at any time.
+used: AWS Lambda with S3 and DynamoDB; Cloud Run with Cloud Storage; Kubernetes deployments with KEDA scaling from queue depth.
+avoid: When the workload is steady and heavy all day; reserved servers cost less than per-request billing.
+flow:
+  Users [user: spiky traffic] -> Load balancer [svc] : requests | Traffic arrives in bursts, with long idle periods.
+  Load balancer -> Function pool [svc: stateless] : route to any instance | Any instance can serve any request because none holds state.
+  Function pool -> Session cache [cache: Redis] : session lookup | Session data is shared outside the instance.
+  Function pool -> Object store [lake: S3] : read and write files | Durable data lives in shared storage, so scaling is free of data movement.
+  * Function pool: 0 instances | With no traffic, compute scales to zero and only storage is billed.
+  Autoscaler [svc: KEDA] -> Function pool : scale to 40 | A burst of requests starts new instances within seconds.
+ref: docs | Autoscaling with KEDA | KEDA project documentation | https://keda.sh/docs/
+
+@@ shardpercore
+== Shard-per-core database
+kind: sharding, event-loop
+when: A database on a 64-core server must keep all cores busy with low tail latency, and lock contention between threads is the limit.
+how: The node is split into one shard per core. Each shard owns a slice of the data (by hash of the partition key), its own memtable, cache and event loop, and memory from its local NUMA node. Threads are pinned to cores, so the OS rarely moves them.
+A request arrives on any core. That core hashes the key and finds the owner core. If it is the owner, it handles the request at once. If not, it sends the request through a lock-free queue to the owner core, and the owner replies the same way. No data structure is shared, so there are no locks and few cache misses caused by other cores.
+The price is load imbalance: one hot partition can overload one core while others idle. The code must also be fully asynchronous, because a blocking call stalls its whole shard. Seastar, the C++ framework under ScyllaDB, enforces this style.
+used: ScyllaDB (built on Seastar); Redpanda runs one thread per core for its partitions.
+avoid: When the workload is small, or the code needs blocking libraries; a normal thread pool is simpler.
+flow:
+  Client [client] -> Core 3 [svc: shard 3] : GET key K | The request arrives on core 3, picked by the network layer.
+  * Core 3: owner is core 5 | Core 3 hashes the key and learns that core 5 owns it.
+  Core 3 -> Core 5 [svc: shard 5] : message via SPSC queue | A lock-free queue carries the request to the owner, with no lock.
+  Core 5 -> Memtable 5 [store: core-local data] : read key K | The owner reads its private data, with no sharing and no atomics.
+  Core 5 -> Core 3 : result | The result returns through the reverse queue.
+  Core 3 -> Client : response | The first core answers the client.
+ref: docs | Seastar: shared-nothing design | Seastar project | https://seastar.io/shared-nothing/
+
+== NIC queue per core, connection owned by one core
+kind: sharding
+when: A network server must handle millions of packets per second, and a shared socket or connection table becomes a bottleneck.
+how: A modern network card has several receive queues. It hashes each packet's 4-tuple (addresses and ports) and puts packets of one connection always in the same queue (receive-side scaling). Each queue triggers interrupts, or is polled, on one fixed core.
+One thread per core runs its own event loop with its own connection table, buffers and timers. A connection lives on one core for its whole life, so its state is never touched by another core. Alternatively, the kernel feature SO_REUSEPORT lets each thread have its own listening socket on the same port.
+There are no locks on the hot path, and the packet data stays in that core's cache. The cost is that long-lived heavy connections can make a core hot. Operators check per-core CPU and may rebalance the queue map.
+used: Seastar with DPDK or the Linux stack; NGINX and HAProxy with reuseport and one process per core; high-speed packet processors and load balancers.
+avoid: When one connection needs data owned by many cores often; the cross-core messages then erase the gain.
+flow:
+  Clients [client: many flows] -> NIC [svc: RSS hash] : packets | The card hashes each packet's addresses and ports.
+  NIC -> Queue 0 [queue: core 0], Queue 1 [queue: core 1] : same flow, same queue | All packets of one connection reach the same receive queue.
+  Queue 0 -> Loop 0 [svc: core 0 loop] : poll batch | A pinned thread on core 0 takes packets from queue 0.
+  Queue 1 -> Loop 1 [svc: core 1 loop] : poll batch | Core 1 does the same with its own queue.
+  Loop 0 -> Conn table 0 [store: core-local] : update connection | State of its connections is private to core 0.
+  * Loop 0: no locks held | No other core touches this state, so no locks are needed.
+ref: docs | Scaling in the Linux Networking Stack | Linux kernel documentation | https://www.kernel.org/doc/html/latest/networking/scaling.html
+
+@@ taillatency
+== Hedged requests after the p95
+kind: hedged-requests
+when: A read goes to replicated servers, and a few slow responses (GC pause, noisy neighbour, compaction) ruin the p99.
+how: The client sends the request to one replica. If no reply arrives within the p95 latency of that call (for example 10 ms), it sends a second copy to another replica. It uses the first answer and cancels the other request.
+Only about 5 percent of requests get a duplicate, so the extra load is small. In the Tail at Scale paper, a hedge after 10 ms for a BigTable read of 1,000 keys cut the 99.9th percentile from 1,800 ms to 74 ms, for 2 percent more requests.
+Rules: only hedge idempotent reads, cap the share of hedged requests (for example 5 percent), and cancel the loser to free its resources. If the whole system is overloaded, hedging adds load and makes it worse, so turn it off when errors rise.
+used: Google BigTable and Spanner clients; gRPC hedging policy; Cassandra speculative retry; Envoy hedging on per-try timeouts.
+avoid: For non-idempotent writes, or when slow replies come from overload and not from random slow nodes.
+flow:
+  Client [client: p95 = 10 ms] -> Replica A [svc: slow node] : request | The client sends the request to the first replica.
+  * Client: 10 ms passed | The p95 time passes with no answer, so the client hedges.
+  Client -> Replica B [svc: healthy] : same request | A second copy goes to a different replica.
+  Replica B -> Client : answer at 14 ms | The faster replica answers first.
+  Client -x> Replica A : cancel | The client cancels the slow request to free its work.
+ref: paper | The Tail at Scale | Dean & Barroso, Communications of the ACM, 2013 | https://research.google/pubs/the-tail-at-scale/
+
+== Fan-out with a deadline and partial results
+kind: scatter-gather, timeout-deadline
+when: One query goes to many shards, and the answer is as slow as the slowest shard.
+how: If 1 percent of calls to a shard are slow and a query touches 100 shards, then 1 minus 0.99 to the power of 100, about 63 percent of queries, see at least one slow shard. Fan-out turns a rare event into a common one.
+The aggregator sends the query to all shards with a deadline, for example 150 ms. When the deadline ends, it merges what it has and returns it, with a flag that says some shards were missing. Results from 98 of 100 shards are usually good enough for search.
+The aggregator can also send the query to the two least busy replicas of each shard and take the first reply. Monitor how often results are partial, and alert if it grows. For exact answers (money), do not use partial results; use a smaller fan-out instead.
+used: Web search engines and Elasticsearch (timeout and allow_partial_search_results); ad servers that stop waiting for slow bidders at the auction deadline.
+avoid: When every shard must answer for correctness; reduce shards per query or route by key.
+flow:
+  Client [client] -> Aggregator [svc: deadline 150 ms] : query | The aggregator starts the clock when the query arrives.
+  Aggregator -> Shard 1 [svc], Shard 2 [svc], Shard 3 [svc: slow GC] : query | The query goes to all shards in parallel.
+  Shard 1, Shard 2 -> Aggregator : results at 40 ms | Fast shards answer early.
+  Shard 3 -x> Aggregator : no answer by 150 ms | The slow shard misses the deadline.
+  * Aggregator: merge 2 of 3 | At the deadline the aggregator stops waiting.
+  Aggregator -> Client : partial results flag | The client gets a good answer on time, and a flag shows it is partial.
+ref: paper | The Tail at Scale | Dean & Barroso, Communications of the ACM, 2013 | https://research.google/pubs/the-tail-at-scale/
+
+== Load-aware replica selection
+kind: load-aware-routing
+when: Replicas have different speeds at different moments, and round robin sends work to a node that is already busy.
+how: The coordinator remembers, for each replica, the recent response time, the queue length it reported and the number of its own requests in flight. It ranks the replicas with a formula that punishes queue length strongly (cubic in Elasticsearch) and sends the request to the best one.
+Servers add their queue size and service time to each reply, so the client always has fresh data. A node in a GC pause or with a busy disk quickly gets less traffic, and it gets traffic back when its numbers recover.
+This lowers tail latency without extra requests, unlike hedging. A risk is herd behaviour: many coordinators pick the same best node at once, so the formula needs randomness or per-client in-flight counts.
+used: Elasticsearch adaptive replica selection (on by default since version 7); Cassandra dynamic snitch; Envoy least-request and peak EWMA balancing; Linkerd.
+avoid: When replicas are identical and load is low; round robin is enough.
+flow:
+  Coordinator [svc: ARS ranking] -> Node A [svc: queue 2] : search shard 4 | The coordinator picks the replica with the best rank.
+  Node A -> Coordinator : result with queue 2 | Each reply carries the node's queue size and service time.
+  * Coordinator: rank updated | The coordinator updates its moving averages for node A.
+  Coordinator -> Node B [svc: queue 31, GC] : fewer requests | Node B reported a long queue, so its rank is poor.
+  Node B ~> Coordinator : queue 3 | After the GC pause ends, node B reports a short queue.
+  Coordinator -> Node B : traffic returns | The rank recovers, and node B gets requests again.
+ref: docs | Search shard routing: adaptive replica selection | Elasticsearch documentation | https://www.elastic.co/guide/en/elasticsearch/reference/current/search-shard-routing.html
+
+@@ threadpool
+== Bounded pool with a bounded queue and a rejection policy
+kind: thread-pool, load-shedding
+when: A service gets bursts of tasks, and an unbounded number of threads or an unbounded queue would exhaust memory.
+how: A fixed number of worker threads takes tasks from a queue. Java's ThreadPoolExecutor has a core size, a maximum size, a queue and a rejection policy. A common setup is 16 threads, a queue of 200 tasks, and a policy for a full queue.
+The size comes from the work. For CPU-bound tasks, use about the number of cores. For tasks that wait on I/O, use cores times (1 plus wait time divided by compute time). Little's law checks the queue: 200 queued tasks at 1,000 tasks per second means 200 ms of waiting.
+When the queue is full, the pool must say no. AbortPolicy throws an error, so the caller can return 503. CallerRunsPolicy makes the submitting thread do the work, which slows down the producer. Never use an unbounded queue: it hides overload until memory runs out.
+used: Java ExecutorService and Tomcat's request thread pool; .NET ThreadPool; Python concurrent.futures; Go worker pools built from channels.
+avoid: For very many blocked tasks (100,000 waiting on network); use async I/O, an event loop or virtual threads.
+flow:
+  Request handler [client: 1000 tasks/s] -> Task queue [queue: capacity 200] : submit task | Each incoming request becomes a task in a bounded queue.
+  Task queue -> Worker pool [svc: 16 threads] : take task | Idle workers take tasks in order, and reuse their threads.
+  Worker pool -> Database [db] : query | Workers do the real work and are limited to 16 at a time.
+  * Task queue: 200 of 200 | A slow database makes the queue fill.
+  Request handler -x> Task queue : rejected | The pool rejects the new task.
+  Request handler -> Client [user] : 503 retry later | The caller gets a clear error, so the system stays alive.
+ref: docs | ThreadPoolExecutor | Java SE API documentation | https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html
+
+== Separate pools per dependency
+kind: bulkhead, thread-pool
+when: One service calls several backends, and a slow one must not use all the threads and block the rest.
+how: Give each dependency its own small pool, for example 20 threads for payments, 10 for recommendations and 10 for search. A call to a backend runs on that pool only.
+If recommendations become slow, its 10 threads fill and its queue fills. New recommendation calls fail fast or use a fallback (a default list). The other pools and the request threads stay free, so checkout still works. This is the bulkhead idea from ship design: a leak floods one compartment only.
+It costs memory and some idle threads, and the sizes need care. Combine with a timeout and a circuit breaker, so the stuck threads are released and the failing backend gets time to recover.
+used: Resilience4j bulkheads; Netflix Hystrix thread pool isolation (now in maintenance); Envoy circuit breakers per cluster; Istio connection pool limits.
+avoid: When all calls go to one backend; a single pool with a timeout is enough.
+flow:
+  Checkout API [svc: request threads] -> Payments pool [svc: 20 threads] : charge card | Payment calls use their own pool.
+  Checkout API -> Reco pool [svc: 10 threads] : get recommendations | Recommendation calls use another pool.
+  Reco pool -> Reco service [svc: slow] : request | The recommendation backend slows down, and calls take 5 s.
+  * Reco pool: 10 of 10 busy | The pool is full, but only this pool.
+  Checkout API -x> Reco pool : rejected, use fallback | New calls fail fast, and the page uses a default list.
+  Payments pool -> Payment gateway [svc: healthy] : charge OK | Payments still work, because their threads are untouched.
+ref: docs | Resilience4j Bulkhead | Resilience4j documentation | https://resilience4j.readme.io/docs/bulkhead
+
+== Staged pipeline with a pool per stage
+kind: pipeline-stages, thread-pool
+when: A request needs several steps with different costs (parse, enrich, write), and one pool for all steps is hard to tune.
+how: Split the work into stages. Each stage has a queue and its own thread pool. A stage takes a task from its queue, does its step and puts the result in the next queue. This is the SEDA design (staged event-driven architecture).
+Each pool is sized for its step: 4 threads for CPU parsing, 32 for slow enrichment calls, 8 for writes. The queue lengths show the bottleneck: the queue before the slowest stage grows. A controller can adjust pool sizes from these lengths.
+Bounded queues between stages give backpressure, so a slow last stage slows the first. The cost is more hops, more queueing delay and harder debugging, because one request crosses many threads.
+used: Cassandra's internal SEDA stages (read, mutation, gossip) with separate thread pools; Netty pipelines with separate executors; ingestion services.
+avoid: When one step is simple and short; the queue hops cost more than they give.
+flow:
+  Ingress [client] -> Parse queue [queue: 100] : event | Raw events enter the first queue.
+  Parse queue -> Parse pool [svc: 4 threads] : take event | A small CPU pool parses events.
+  Parse pool -> Enrich queue [queue: 500] : parsed event | Results go to the next stage's queue.
+  Enrich queue -> Enrich pool [svc: 32 threads] : take event | A larger pool handles slow lookups.
+  Enrich pool -> Write pool [svc: 8 threads] : enriched event | The last stage writes in small batches.
+  * Enrich queue: length 480 | A long queue shows that enrichment is the bottleneck.
+ref: paper | SEDA: An Architecture for Well-Conditioned, Scalable Internet Services | Welsh, Culler & Brewer, SOSP, 2001 |
+
+@@ workstealing
+== Fork-join divide and conquer
+kind: fork-join
+when: A big job (sort, sum, tree walk, image tiles) can be split into independent parts, and parts have uneven cost.
+how: A task splits itself into two subtasks. It forks one (pushes it on its own deque) and works on the other. When both are done, it joins and combines the results. The splitting stops at a threshold, for example 10,000 elements, where a sequential loop is faster.
+Each worker thread owns a double-ended queue. The owner pushes and pops at one end (LIFO), which keeps data hot in cache. An idle worker picks a random victim and steals from the other end, where the oldest, biggest tasks wait. One steal then moves a lot of work.
+The theory (Blumofe and Leiserson) shows that the time is about work divided by workers plus the critical path. The cost is some overhead per task, so tasks must be big enough.
+used: Java ForkJoinPool (behind parallel streams and CompletableFuture default executor); Rust Rayon; Intel oneTBB; Cilk; .NET Task Parallel Library.
+avoid: For blocking I/O tasks or tasks that need locks on shared data; they stall workers, so use a thread pool with more threads or async.
+flow:
+  Root task [svc: sort 1M items] -> Worker 1 [svc: deque] : fork into halves | The root splits the array and keeps one half in its own deque.
+  Worker 1 -> Worker 1 deque [queue: 2 tasks] : push other half | The second half waits at the bottom of the deque.
+  Worker 2 [svc: idle] -> Worker 1 deque : steal oldest task | An idle worker takes the biggest task from the far end.
+  Worker 1 -> Join [svc: merge] : sorted left half | Worker 1 finishes its half.
+  Worker 2 -> Join : sorted right half | Worker 2 finishes the stolen half.
+  Join -> Root task : merged result | The two sorted halves are merged into the result.
+ref: paper | Scheduling Multithreaded Computations by Work Stealing | Blumofe & Leiserson, JACM, 1999 |
+
+== Per-core run queues in a language runtime scheduler
+kind: thread-pool, fork-join
+when: A runtime runs millions of small tasks (goroutines, async tasks) on a few OS threads, and a single shared queue would be a lock hot spot.
+how: Go gives each processor (P) its own local run queue of up to 256 goroutines, plus one global queue. A thread (M) running a P takes the next goroutine from its local queue with no lock. A new goroutine goes to the local queue of the P that created it.
+When a local queue is empty, the P checks the global queue, then the network poller, and then steals half of the goroutines from another P's queue. Once in a while it checks the global queue first, so tasks there do not starve.
+Result: good cache locality, little lock contention and automatic balance. Tokio's multi-thread runtime follows the same plan with a local queue per worker thread and a shared injection queue. A task that blocks the thread for long still hurts, so use spawn_blocking or a separate pool.
+used: Go runtime scheduler; Tokio multi-thread runtime; Java virtual threads run on a ForkJoinPool scheduler.
+avoid: When tasks block the OS thread (long CPU loops, blocking calls) without yielding; the stealing cannot help.
+flow:
+  Goroutine A [svc: running on P0] -> P0 run queue [queue: local] : spawn goroutine B | New work goes to the local queue, with no lock.
+  P1 [svc: idle] -> P0 run queue : steal half | P1 has no work, so it takes half of P0's queue.
+  P1 -> Global queue [queue: shared] : check now and then | Sometimes P1 looks at the shared queue first, so it is not starved.
+  P0 run queue -> P0 [svc: thread M0] : next goroutine | P0 takes its next goroutine from its own queue.
+  P1 -> Network poller [svc: epoll] : ready sockets | An idle P also takes goroutines that were waiting for I/O.
+  * P1: running stolen work | Load balances itself, with no central scheduler.
+ref: blog | Go scheduler design document | Dmitry Vyukov, 2012 | https://golang.org/s/go11sched
+
+@@ zerocopy
+== Serving files with sendfile
+kind: none
+when: A server sends large static files or log segments to many clients, and copying them through user space wastes CPU and memory bandwidth.
+how: The classic path reads a file into a user buffer and then writes it to the socket. That is four copies and two system calls: disk to page cache, page cache to user buffer, user buffer to socket buffer, socket buffer to the network card.
+With sendfile (or Java FileChannel.transferTo) the kernel moves data from the page cache to the socket without going through user space. The network card can read the data by DMA, so the CPU copies almost nothing. A file already in the page cache costs no disk read at all.
+Kafka serves consumer fetches this way: a consumer that is close to the head of the log reads from the page cache straight to the socket. The limit is that the data cannot be changed on the way. With TLS in user space the data must be encrypted, so zero copy is lost unless the kernel does TLS (kTLS).
+used: NGINX with sendfile on; Apache Kafka broker fetch path; Varnish; static file servers and CDN edges.
+avoid: When data must be transformed in user space (compress, encrypt, parse) before sending; then copy is needed.
+flow:
+  Client [client] -> Server [svc: NGINX] : GET /video.mp4 | A client asks for a large static file.
+  Server -> Kernel [svc: sendfile syscall] : sendfile(socket, file) | The server makes one call and does not read the data itself.
+  Kernel -> Page cache [cache: file pages] : look up pages | The kernel finds the file's pages in memory, or reads them from disk once.
+  Page cache -> NIC [svc: DMA read] : pages to network card | The card reads the pages by DMA, with no copy into user space.
+  NIC -> Client : packets | The data reaches the client, with almost no CPU work.
+  * Server: CPU 3 percent | The CPU saved goes to more connections.
+ref: docs | sendfile(2) | Linux man-pages | https://man7.org/linux/man-pages/man2/sendfile.2.html
+
+== Memory-mapped index files
+kind: memory-tiering
+when: A search or storage engine reads big immutable files at random, and you want the OS to manage caching.
+how: The file is mapped into the process address space with mmap. Reading a byte is an ordinary memory read. On the first access the CPU takes a page fault, and the kernel loads the page into the page cache and maps it. There is no read call and no copy into a user buffer.
+Later reads of hot pages run at memory speed. The OS decides what to keep and evicts cold pages when memory is short. Several processes can map the same file and share one copy of the pages.
+Risks: a page fault on a cold page blocks the thread for a disk read (about 100 microseconds on SSD), and errors show up as signals, not return codes. Performance drops if the file is much larger than RAM and access is random. Many engines use mmap for immutable read-only data and normal I/O for writes.
+used: Lucene MMapDirectory (Elasticsearch and Solr); LMDB; the Linux loader for shared libraries; Kafka index files.
+avoid: For databases that need exact control of writes and eviction; a buffer pool avoids surprises (some engines moved away from mmap for this reason).
+flow:
+  Search thread [svc: Lucene] -> Mapped index [store: mmap of 40 GB] : read posting list | The thread reads an address in the mapped file as normal memory.
+  Mapped index -x> Search thread : page fault | The page is not in memory yet, so the thread pauses.
+  Mapped index -> Page cache [cache: shared pages] : load 4 KB page | The kernel reads the page from disk into the page cache.
+  Page cache -> Search thread : mapped page | The page is mapped and the read continues, without any copy.
+  * Page cache: 38 GB hot | Hot index pages stay in RAM, and later reads take nanoseconds.
+  Page cache ~> Disk [store: NVMe] : evict cold pages | When memory is short the kernel drops cold pages.
+ref: docs | mmap(2) | Linux man-pages | https://man7.org/linux/man-pages/man2/mmap.2.html
+
+@@ bloom
+== Bloom filter per SSTable in an LSM read path
+kind: lsm-compaction
+when: A key-value store keeps data in many immutable files, and a read for a missing key must not touch every file.
+how: Each SSTable has a Bloom filter built when the file is written, holding all its keys. It is kept in memory. A read first checks the memtable, then, for each file from newest to oldest, asks the file's filter whether the key could be there.
+If the filter says "definitely absent", the file is skipped with no disk read. If it says "maybe", the store reads the index and data block. At 10 bits per key, the false-positive rate is about 1 percent, so a read for a missing key touches about 0.01 files per level instead of one.
+The cost is memory: 10 bits per key is 1.25 bytes, so 1 billion keys need about 1.2 GB. The filter cannot delete keys, but that does not matter, because files are immutable and compaction builds new filters. Range scans cannot use it unless prefix filters are added.
+used: RocksDB and LevelDB; Apache Cassandra (per SSTable filter); HBase and Bigtable; ScyllaDB.
+avoid: When most reads are for keys that exist; the filter only adds a check. Also when all data fits in memory.
+flow:
+  Client [client] -> Memtable [store: in memory] : GET user:991 | The read starts in the memtable.
+  Memtable -x> Client : not found | The key is not in the newest data.
+  Client -> Bloom L0 [cache: file 1 filter] : might contain? | The store asks the filter of the newest SSTable.
+  Bloom L0 -x> Client : definitely absent | The file is skipped, with no disk read.
+  Client -> Bloom L1 [cache: file 2 filter] : might contain? | The next file's filter is checked.
+  Bloom L1 -> SSTable 2 [store: on SSD] : maybe, read block | Only a "maybe" costs one disk read.
+  * SSTable 2: key found | About 1 percent of the "maybe" answers are false, and then the block read finds nothing.
+ref: paper | Space/Time Trade-offs in Hash Coding with Allowable Errors | Burton Bloom, CACM, 1970 |
+
+== Negative-lookup guard in front of a database
+kind: cache-aside
+when: Many requests ask for keys that do not exist (random IDs, attacks, deleted items), and each one reaches the database.
+how: A cache stores only keys that exist, so a miss for a missing key always goes to the database. This is called cache penetration. A Bloom filter holding all valid keys sits before the cache.
+The application checks the filter first. If the answer is "definitely absent", it returns "not found" at once, without touching the cache or the database. If "maybe", it continues with cache-aside as normal. New keys are added to the filter when they are created.
+At 1 percent false positives, 99 percent of invalid lookups stop at the filter. Because a Bloom filter cannot remove keys, deleted items stay "maybe" until the filter is rebuilt, for example nightly. Use a counting or cuckoo filter if you need deletes.
+used: Common in large web services against cache-penetration attacks; Redis Stack and RedisBloom provide the filter; early Chrome used a Bloom filter for its safe-browsing URL check.
+avoid: When the key set is small enough to keep as an exact set in memory.
+flow:
+  Client [client] -> API [svc: lookup] : GET item 7731 | A request arrives for an item ID.
+  API -> Bloom filter [cache: all valid IDs] : contains? | The API checks the filter before anything else.
+  Bloom filter -x> API : definitely absent | The ID was never created, so there is no need to look further.
+  API -> Client : 404 not found | The API answers without a database call.
+  API -> Redis [cache: values] : maybe, GET item 5120 | A "maybe" goes to the normal cache-aside path.
+  Redis -x> API : miss | The cache has no value yet.
+  API -> Postgres [db: source of truth] : SELECT item 5120 | Only possible keys reach the database.
+ref: docs | Bloom filter | Redis documentation | https://redis.io/docs/latest/develop/data-types/probabilistic/bloom-filter/
+
+== Bloom filter pushed to the other side of a join
+kind: data-locality
+when: A big table is joined with a small filtered table, and most big-table rows have no match, so shuffling them is wasted work.
+how: The engine first builds the small side (for example 2 million customer IDs after a filter). It builds a Bloom filter of the join keys and sends it to every worker that scans the big table. This is called a runtime filter.
+Each scan worker tests every row against the filter and drops rows that are definitely absent, before the shuffle or even before reading the rest of the columns. If only 1 percent of rows match, the data moved over the network falls by about 99 percent, plus false positives.
+The false positives are not a problem, because the real join still runs and removes them. The filter only has to be small and fast to ship. Build time and size need a limit, so the engine skips it when the small side is too big.
+used: Apache Spark (Bloom filter join, since version 3.3); Apache Impala runtime filters; Trino dynamic filtering (uses other filter types); Apache Doris.
+avoid: When the join keys of both tables overlap strongly; the filter removes few rows and costs time.
+flow:
+  Planner [svc: query engine] -> Dim scan [svc: small side] : scan filtered customers | The engine reads the small side first.
+  Dim scan -> Bloom builder [svc: build filter] : 2M customer IDs | It adds each join key to a Bloom filter of about 2 MB.
+  Bloom builder -> Fact scan 1 [svc: worker 1], Fact scan 2 [svc: worker 2] : broadcast filter | The filter is sent to all workers that scan the big table.
+  Fact scan 1 -x> Shuffle [queue: network] : 99 percent of rows dropped | Rows that cannot match never leave the worker.
+  Fact scan 1, Fact scan 2 -> Shuffle : surviving rows | Only the few matching rows and a few false positives are shuffled.
+  Shuffle -> Join [svc: hash join] : small input | The real join runs on a much smaller input.
+ref: docs | Runtime filtering | Apache Impala documentation | https://impala.apache.org/docs/build/html/topics/impala_runtime_filtering.html
+
+@@ cms
+== Heavy hitters in a stream with a count-min sketch
+kind: windowed-agg
+when: You need the top items (IPs, URLs, search terms) in a very large stream, and a full counter per item will not fit in memory.
+how: A count-min sketch is a table of d rows and w columns of counters. For each item, d hash functions pick one cell per row, and each of those cells is increased by 1. To estimate a count, read the d cells and take the minimum. The estimate is never too low, and only too high when other items collide.
+With width w = e / epsilon and depth d = ln(1 / delta), the error is at most epsilon times the stream size with probability 1 minus delta. For example 2,000 columns and 5 rows use about 40 KB of memory with 32-bit counters, even for billions of items.
+To find the top K, keep a small min-heap next to the sketch. After each update, if the item's estimate is above the heap minimum, push it. Sketches from many nodes are merged by adding their tables cell by cell, and a window is made by keeping one sketch per minute.
+used: Network and security monitoring for heavy hitters; stream processors (for example Flink and Spark approximate top-K); Redis Stack Count-Min Sketch and Top-K.
+avoid: When you need exact counts, or the counts are small and few; use a hash map.
+flow:
+  Event stream [log: 50k events/s] -> Sketch updater [svc: per node] : item "/search" | Each event updates the sketch on one node.
+  Sketch updater -> CMS table [store: 5 rows x 2000] : +1 in 5 cells | Five hash functions pick five cells, and each gets plus one.
+  Sketch updater -> Top-K heap [store: 100 items] : estimate over min? | The updater keeps the 100 items with the highest estimates.
+  * CMS table: estimate 91,204 | Read the minimum of the five cells; it is never below the true count.
+  CMS table -> Merger [svc: central] : table every minute | Each node sends its table every minute.
+  Merger -> Dashboard [client: top URLs] : merged top 100 | Tables are added cell by cell, then the top list is shown.
+ref: paper | An Improved Data Stream Summary: The Count-Min Sketch and its Applications | Cormode & Muthukrishnan, J. Algorithms, 2005 |
+
+== TinyLFU admission counter for a cache
+kind: memory-tiering
+when: A cache needs to know how often each key was used lately, but cannot keep a counter for every key ever seen.
+how: A cache with 1 million entries may see 100 million different keys. TinyLFU keeps their recent frequency in a small count-min sketch with 4-bit counters, and uses a few bits per cached entry.
+When a new key wants to enter a full cache, the cache compares the sketch estimate of the new key with that of the eviction victim. The new key is admitted only if its estimate is higher. A key that was seen once, for example in a scan, does not push out a popular key.
+To forget old history, the counters are halved after the number of events reaches a sample size (about 10 times the cache size). A small doorkeeper Bloom filter can catch keys seen only once before they reach the sketch.
+used: Caffeine for Java; Ristretto for Go; the same design appears in other admission policies.
+avoid: When the workload has strong recency and no scans; plain LRU gives a similar hit ratio with less code.
+flow:
+  Request [client] -> Cache [cache: 1M entries] : GET key X | A read arrives at the cache.
+  Cache -> Sketch [store: 4-bit counters] : count access of X | Every access adds one in the sketch cells for X.
+  Cache -x> Request : miss on X | X is not cached, so the app loads it from the database.
+  Cache -> Sketch : estimate X vs victim V | Before storing X, the cache compares X with the victim.
+  Sketch -> Cache : X 1, V 17 | The new key was seen once and the victim 17 times.
+  Cache -x> Cache keys [note: reject X] : X not admitted | The cache keeps V, and the scan key is dropped.
+  * Sketch: halve all counters | After the sample size, counters are halved so old history fades.
+ref: paper | TinyLFU: A Highly Efficient Cache Admission Policy | Einziger, Friedman & Manes, ACM TOS, 2017 |
+
+== Hot-key detection in a cache proxy
+kind: load-shedding
+when: A few keys in a sharded cache get so much traffic that one node is overloaded while others are idle.
+how: The proxy or client library counts requests per key in a count-min sketch over a short window, such as 10 seconds. A key above a threshold (for example 1 percent of the traffic) is marked hot.
+For hot keys the system can change its routing. It can keep a local copy in each client or proxy for a second, spread reads over several replicas of that key, or add a random suffix to the key to spread it over shards. The sketch uses a fixed few KB of memory, however many keys exist.
+Sketch counts can only be too high, so some cold keys may be marked hot by mistake. This costs little, because the action is a short local cache. The window must reset so that a key that cools down loses the mark.
+used: Common in large cache and key-value services; the idea is used in hot-key handling; Redis can report hot keys with its LFU counters.
+avoid: When the key space is small enough for exact counters, or traffic is flat.
+flow:
+  Clients [client: many] -> Cache proxy [svc: sketch per window] : GET banner:home | Every read passes through the proxy.
+  Cache proxy -> CMS [store: few KB] : count key | The proxy adds one for the key in the sketch.
+  * CMS: banner:home 38k per 10 s | The estimate passes the hot threshold.
+  Cache proxy -> Local cache [cache: TTL 1 s] : keep copy of hot key | Hot values are kept locally for one second.
+  Cache proxy -> Shard A [cache: owner of key] : cold keys only | Only the cold traffic still goes to the owning shard.
+  Shard A -x> Cache proxy : overload avoided | The owner shard no longer sees thousands of reads per second for one key.
+ref: paper | An Improved Data Stream Summary: The Count-Min Sketch and its Applications | Cormode & Muthukrishnan, J. Algorithms, 2005 |
+
+@@ hll
+== Unique visitors with Redis HyperLogLog
+kind: precompute
+when: A page, campaign or API needs a live count of distinct users, and a set of all user IDs would take too much memory.
+how: Redis stores a HyperLogLog in at most 12 KB per key, with a standard error of 0.81 percent. PFADD adds an item: Redis hashes it, uses the first bits to pick one of 16,384 registers, and stores the longest run of leading zeros seen in the rest of the hash. PFCOUNT estimates the distinct count from all registers.
+A key per page per day, such as uv:page42:2026-10-28, tracks the unique visitors in 12 KB, whether there are 1,000 or 100 million. An exact set of 100 million 8-byte IDs needs near 1 GB.
+PFMERGE joins several keys into one, so weekly uniques are the union of seven daily keys, and a user who came on three days counts once. The limits: you cannot list the items or remove one, and the answer is an estimate, not an exact count.
+used: Redis HyperLogLog (PFADD, PFCOUNT, PFMERGE); unique-visitor counters in analytics products; ad systems for unique reach per campaign.
+avoid: When you need exact counts (billing) or the item list; use a set or a database query.
+flow:
+  Web server [svc: page view] -> Redis [cache: 12 KB per key] : PFADD uv:page42 user991 | Each view adds the user ID to the daily sketch.
+  * Redis: 16384 registers | The ID is hashed, and one register keeps its longest run of leading zeros.
+  Dashboard [client] -> Redis : PFCOUNT uv:page42:day | The dashboard asks for today's unique visitors.
+  Redis -> Dashboard : about 1,204,300 | The estimate is within about 1 percent of the truth.
+  Dashboard -> Redis : PFMERGE week d1..d7 | Seven daily sketches are merged to count each user once per week.
+  Redis -> Dashboard : weekly uniques | The union count is returned from a new 12 KB key.
+ref: docs | HyperLogLog | Redis documentation | https://redis.io/docs/latest/develop/data-types/probabilistic/hyperloglogs/
+
+== Mergeable sketches in distributed rollups
+kind: pre-aggregation, map-reduce
+when: A warehouse or stream job must report distinct users per day, country and campaign, and exact distinct counts cannot be added across groups.
+how: Distinct counts do not add up: 10 users on Monday and 10 on Tuesday may be 12 users in total. So the pipeline stores a HyperLogLog sketch per group, not a number. Each worker builds a sketch for its data partition (map step).
+Sketches merge by taking the maximum of each register, so the merge is cheap, order does not matter, and it can run in a tree. A rollup table holds one sketch per day, campaign and country. A query for a week or for all countries merges the stored sketches and then estimates.
+This makes distinct counts as cheap as sums, at about 1 percent error and a few KB per sketch. Choose the precision (for example 2 to the power 14 registers) by the needed error. Intersections are not accurate with HLL, so use other sketches for overlap.
+used: Spark approx_count_distinct; Presto and Trino approx_distinct; BigQuery HLL_COUNT functions; Apache Druid and Pinot sketch columns; Apache DataSketches.
+avoid: When the number of distinct values is small (under a few thousand); an exact count is cheap. Also for billing.
+flow:
+  Events [lake: impressions] -> Worker 1 [svc: partition 1], Worker 2 [svc: partition 2] : user IDs | Each worker reads part of the data.
+  Worker 1, Worker 2 -> Sketch rollup [db: day, campaign] : one HLL per group | Workers write a sketch per day and campaign, not a count.
+  Analyst [user] -> Query engine [svc: sketch merge] : unique users this week | The analyst asks for a wider time range than the stored groups.
+  Query engine -> Sketch rollup : read 7 sketches | The engine reads the seven daily sketches.
+  * Query engine: max of registers | The merge keeps the larger value in each register.
+  Query engine -> Analyst : 3.1M with 1 percent error | The answer comes at the cost of reading a few KB, not billions of rows.
+ref: paper | HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm | Flajolet, Fusy, Gandouet & Meunier, AofA, 2007 |

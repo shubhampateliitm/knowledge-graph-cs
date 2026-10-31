@@ -1,0 +1,50 @@
+# Gold example: the model for depth, tone and format of architecture patterns. Spec: content/patterns/README.md
+
+@@ kafka
+== Fan-out to independent consumer groups
+kind: pubsub, event-driven
+when: Several teams need the same events, and each must read at its own speed without slowing the others.
+how: The producer appends each event once to a topic partition. Each consumer group stores its own committed offset per partition, so the billing service, the search indexer and the lake loader read the same bytes independently.
+A slow group does not slow the others: it only falls behind in offset (this gap is called consumer lag). Adding a new group later costs nothing on the write path; it starts from the earliest retained offset and catches up.
+The cost is retention: the broker must keep data on disk for as long as the slowest useful reader needs it, for example 7 days times the daily volume times the replication factor.
+used: LinkedIn activity tracking (the original Kafka use); Uber and Netflix event buses; ad-event pipelines that feed billing, pacing and reporting from one impression topic.
+avoid: When each message must be handled by exactly one worker and then deleted; use a queue (SQS, or Kafka share groups) instead.
+flow:
+  Order service [svc] -> orders topic [log: 12 partitions] : OrderPlaced #41 | The order service appends event 41 once, to one partition chosen by the hash of the order id.
+  orders topic -> Billing group [svc: offset 40], Search indexer [svc: offset 38], Lake loader [svc: offset 12] : poll | Three consumer groups pull the same partition, each from its own committed offset.
+  * Lake loader: offset 12, lag 29 | The lake loader is slow, so its lag grows; the other two groups are not affected at all.
+  Billing group -> Billing DB [db] : charge order 41 | Billing processes event 41 and then commits offset 42 for its group.
+  Lake loader -> S3 lake [lake: Parquet files] : batch of 10,000 | The lake loader writes large batches, which is cheaper on S3, and commits after each batch.
+ref: paper | Kafka: a Distributed Messaging System for Log Processing | Kreps, Narkhede & Rao, NetDB 2011 |
+ref: docs | Kafka design: consumer position | Apache Kafka documentation | https://kafka.apache.org/43/design/design/
+
+== Transactional outbox with change data capture
+kind: outbox, cdc
+when: A service must update its database and publish an event, and the two must never disagree.
+how: Writing to the database and then to Kafka is a dual write: a crash between the two loses the event, or publishes an event for a rolled-back change. The outbox pattern removes the second write from the request path.
+The service writes the business row and an outbox row in one local ACID transaction. A CDC connector (Debezium on Kafka Connect) reads the database's write-ahead log, sees the committed outbox row and publishes it to Kafka. Because the log only contains committed transactions, the event exists if and only if the change committed.
+Delivery is at least once (the connector can resend after a restart), so consumers must be idempotent, for example by keeping the last applied event id per entity.
+used: Debezium outbox event router; payment and order systems that must not lose events; keeping search indexes and caches in sync with an OLTP database.
+avoid: When a few lost or duplicated events are acceptable and simplicity matters more; or when the database has no readable change log.
+flow:
+  API [svc] -> Postgres [db: orders + outbox] : one transaction | The API writes the order row and an outbox row in one transaction; both commit or neither does.
+  Postgres -> Debezium [svc: Kafka Connect] : WAL record | Debezium reads the committed outbox insert from the write-ahead log, not from the table.
+  Debezium -> orders topic [log] : OrderPlaced | The connector publishes the event and stores its log position in Kafka.
+  Debezium -x> orders topic : resend after crash | After a crash the connector may resend the last events, so duplicates can appear.
+  orders topic -> Email service [svc: dedup by id] : OrderPlaced | The consumer ignores an event id it has already processed, so the duplicate is harmless.
+ref: docs | Outbox Event Router | Debezium documentation | https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html
+
+== Kappa reprocessing by replay
+kind: kappa-arch, backfill-replay
+when: A streaming job has a bug or a new version, and its past output must be recomputed without a separate batch pipeline.
+how: Keep the input topic for long enough (or use tiered storage to keep it cheaply on object storage). Start version 2 of the job as a new consumer group from offset 0, writing to a new output table.
+When version 2 has caught up to the head of the log, switch readers from the old table to the new one and stop version 1. One code path serves both real-time and history, which removes the classic Lambda problem of two implementations that drift apart.
+The limit is cost and time: replaying 30 days of a 1 TB per day topic reads 30 TB, and the job must process faster than real time to ever catch up.
+used: Jay Kreps' original Kappa proposal at LinkedIn; Flink and Kafka Streams jobs that are redeployed with a new consumer group.
+flow:
+  Events topic [log: 30 days kept] -> Job v1 [svc: live] : head of log | Job version 1 serves live results from the head of the topic.
+  Events topic -> Job v2 [svc: replaying] : from offset 0 | Version 2 starts a new consumer group at offset 0 and replays all retained history.
+  Job v2 -> Table v2 [db] : rebuilt results | Version 2 writes to a new table, so readers are not disturbed during the rebuild.
+  * Job v2: caught up | Version 2 reaches the head of the log and is now as fresh as version 1.
+  Dashboard [client] -> Table v2 : switch reads | Readers switch to the new table and version 1 is stopped.
+ref: blog | Questioning the Lambda Architecture | Jay Kreps, O'Reilly Radar, 2014 | https://www.oreilly.com/radar/questioning-the-lambda-architecture/

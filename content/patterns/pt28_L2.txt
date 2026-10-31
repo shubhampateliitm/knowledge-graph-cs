@@ -1,0 +1,703 @@
+@@ schemaevol
+== Compatibility gate in a schema registry
+kind: event-driven, pubsub
+when: Many teams produce and consume the same events, and a producer must change a field without breaking readers it does not know.
+how: The producer team changes the Avro schema, for example adds a field with a default value. Before the first record is sent, the serializer registers the new schema in a schema registry under the topic's subject. The registry checks the new schema against the old versions with the subject's rule. Confluent's default rule is BACKWARD: a reader with the new schema can still read data written with the old one.
+If the check fails, the registry rejects the schema (HTTP 409) and the deploy stops in CI, before bad data exists. If it passes, each record carries a small schema id. Consumers fetch the writer schema by id and resolve it against their own schema.
+With BACKWARD, upgrade consumers first, then producers. Removing a field or adding one without a default is the usual breaking change; use a new topic version for that.
+used: Confluent Schema Registry with Avro, Protobuf or JSON Schema on Kafka; Apicurio Registry; common in data-contract setups between event teams.
+avoid: When one team owns both sides and deploys them together; plain versioned code may be enough. Also not for breaking changes, which need a new topic.
+flow:
+  Producer CI [svc: new schema v2] -> Schema registry [svc: subject orders-value] : register v2 | The pipeline sends the new schema to the registry before deploy.
+  * Schema registry: checks BACKWARD vs v1 | The registry tests whether a v2 reader can read v1 data.
+  Schema registry -x> Producer CI : 409 incompatible | A removed required field fails the check, so the deploy stops here.
+  Producer CI -> Schema registry : v2 with default field | The corrected schema adds the new field with a default and passes.
+  Producer [svc: schema id 7] -> orders topic [log] : record + schema id | Each record holds the schema id, not the full schema.
+  orders topic -> Consumer [svc: reads v1 and v2] : record | The consumer fetches schema 7 once, caches it, and fills the default for old records.
+ref: docs | Schema Evolution and Compatibility | Confluent documentation | https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html
+ref: spec | Apache Avro specification: schema resolution | Apache Avro | https://avro.apache.org/docs/current/specification/
+
+== Lakehouse columns tracked by id
+kind: open-table-format
+when: A big table on object storage must add, rename or reorder columns without rewriting terabytes of files.
+how: An Apache Iceberg table gives each column a unique numeric id, stored in table metadata. Parquet data files record these ids. A query maps names to ids at read time.
+Add column is a metadata commit: a new metadata file lists the new column with a fresh id. Old files do not have it, so the engine returns null for them. Rename changes only the name for the same id, so old files still match. Drop removes the id from the schema. Widening a type, such as int to long, is also allowed.
+Each change is one atomic swap of the metadata pointer in the catalog. Readers on an older snapshot still see the old schema, which keeps time travel correct. A dropped name is never reused for a different id, which prevents old data showing under the wrong column.
+used: Apache Iceberg; Delta Lake and Hudi have similar rules with different mechanics (Delta can use column mapping by name or id).
+avoid: For a change that needs new values in old rows, such as a computed column; run a backfill job on top.
+flow:
+  Data engineer [user] -> Catalog [svc: Iceberg REST] : ALTER ADD COLUMN | The engineer adds a column through a SQL engine.
+  Catalog -> Metadata file [store: schema v3] : new column, id 12 | A new metadata file gets the new column with id 12.
+  Catalog -> Metadata file : RENAME id 5 | A rename changes the name for column id 5, not the data files.
+  Reader [svc: Trino or Spark] -> Metadata file : read schema | The reader loads the current schema and its ids.
+  Reader -> Parquet files [lake: written under v1] : project by column id | Old files lack id 12, so the reader returns null for it.
+ref: spec | Apache Iceberg table spec: schema evolution | Apache Iceberg | https://iceberg.apache.org/spec/
+
+@@ secindex
+== Local index with scatter-gather reads
+kind: scatter-gather, sharding
+when: Writes must stay fast and local, and queries by a non-key column are less common than writes.
+how: Data is partitioned by the primary key. Each partition keeps its own index over its own rows, for example a MongoDB index on a sharded collection, or a Cassandra SAI index on each node. A write updates the row and the index in the same partition, with no network hop.
+A query on the indexed column does not know which partition holds the matches. A router (mongos in MongoDB, the coordinator node in Cassandra) sends the query to every partition. Each partition looks up its own index and returns matches. The router merges the answers.
+Read cost grows with the partition count, and the slowest partition sets the latency. With 100 shards, one query makes 100 sub-queries. If the query also contains the partition key, the router can send it to one partition only.
+used: MongoDB sharded collections (without the shard key, the query goes to all shards); Cassandra secondary indexes; Elasticsearch shard-level indexes.
+avoid: When non-key queries are frequent and the partition count is large; use a global index or a second table keyed by the query column.
+flow:
+  App [client] -> Router [svc: mongos] : find email = a@x.com | The query has no shard key, so the router cannot pick one shard.
+  Router -> Shard 1 [db: local index], Shard 2 [db: local index], Shard 3 [db: local index] : same query | The router sends the query to all shards in parallel.
+  Shard 1 -> Router : 0 rows | Each shard checks only its own local index.
+  Shard 3 -> Router : 1 row | One shard holds the match.
+  Router -> App : 1 row merged | The router merges partial results; latency equals the slowest shard.
+ref: docs | Sharded cluster query router | MongoDB documentation | https://www.mongodb.com/docs/manual/core/sharded-cluster-query-router/
+
+== Global index updated asynchronously
+kind: index-table, sharding
+when: Reads by a non-key attribute are frequent and must hit one partition, and slightly stale index results are acceptable.
+how: The index is itself partitioned, but by the indexed value, not by the base key. In DynamoDB this is a global secondary index (GSI) with its own partition key and its own capacity. A read by the indexed value goes to one index partition.
+A write to the base table is acknowledged first. DynamoDB then copies the change to each GSI in the background. The GSI is therefore eventually consistent, and you cannot ask for a strongly consistent read from it. The write to the index partition happens on another node, so each base write costs extra write capacity per index.
+Keep index entries small by projecting only the attributes you need. If the GSI throttles, DynamoDB can throttle writes to the base table too, so size both together.
+used: Amazon DynamoDB global secondary indexes; Cassandra materialized views and manual index tables follow the same idea.
+avoid: When a read must see its own write at once; use a local index in the same partition (a DynamoDB LSI, which allows strongly consistent reads) or read the base table.
+flow:
+  App [client] -> Orders table [db: key order_id] : PutItem order 41 | The write goes to the partition chosen by the order id.
+  Orders table -> App : OK | The write is acknowledged before the index is updated.
+  Orders table ~> Email GSI [db: key email] : copy item | A background process writes the item into the index partition for that email.
+  App -> Email GSI : Query email = a@x | A read by email hits exactly one index partition.
+  * Email GSI: lag under 1 s | The index may be a little behind, so a read just after the write can miss the item.
+  App -x> Email GSI : consistent read | Strongly consistent reads are not supported on a global index.
+ref: docs | Using global secondary indexes in DynamoDB | AWS documentation | https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html
+
+@@ segments
+== Retention by deleting whole segment files
+kind: none
+when: A log grows forever and old data must expire cheaply, without rewriting files.
+how: The log of one Kafka partition is split into segment files. A new segment starts when the active one reaches segment.bytes (1 GiB by default) or its age limit. Each segment is named by the first offset it holds, for example 00000000000000368769.log.
+A background task checks closed segments. If the newest record in a segment is older than retention.ms (7 days by default), or the log is larger than retention.bytes, the whole file is deleted. Deleting a file is one cheap file-system call; no record is rewritten. The active segment is never deleted, so data can live longer than the limit.
+The segment size is a trade-off. Small segments expire data closer to the limit but create many files and open handles. Large segments give fewer files but keep data longer than needed.
+used: Apache Kafka log retention; Apache Pulsar (BookKeeper ledgers) and Redpanda use the same segment idea.
+avoid: When you must delete single records at once (for example privacy erasure); use log compaction with tombstones, or store the data in a database.
+flow:
+  Producer [client] -> Active segment [log: 00000000370000.log] : append | New records are appended to the end of the active segment only.
+  Active segment -> Closed segment [log: 00000000368769.log] : roll at 1 GiB | When the file reaches the size limit, Kafka closes it and opens a new one.
+  Retention task [svc: every 5 min] -> Closed segment : older than 7 days? | A background task checks the newest timestamp in each closed segment.
+  Retention task -> Closed segment : delete segment files | The whole segment and its index files are removed at once.
+  Retention task -x> Active segment : never deleted | The active segment is skipped even if it is old.
+ref: docs | Kafka log design and retention | Apache Kafka documentation | https://kafka.apache.org/documentation/
+
+== Fetch by offset with a sparse index
+kind: data-skipping
+when: Consumers read from any offset in a huge log and each lookup must cost a few disk reads, with a small index.
+how: A consumer asks a broker for offset 1,000,042. The broker holds the segments in a sorted map keyed by base offset, and picks the segment with the largest base offset not above the target.
+Each segment has an offset index file that is sparse: it holds one entry about every 4 KB of log (index.interval.bytes), mapping an offset to a byte position. The broker binary-searches the index for the closest entry below the target, then scans forward in the log file a few records. The index is memory-mapped, so the search usually touches no disk.
+The broker then sends the bytes to the consumer. On Linux it can use sendfile, so data goes from the page cache to the network card without a copy through user space. A separate time index maps timestamps to offsets for time-based seeks.
+used: Apache Kafka (.index and .timeindex files); the same sparse-index idea appears in LSM-tree SSTables and ClickHouse primary indexes.
+avoid: When you need lookups by an arbitrary attribute; a sparse offset index only serves the log order. Use a database index for that.
+flow:
+  Consumer [client] -> Broker [svc: partition leader] : fetch offset 1000042 | The consumer asks for records starting at one offset.
+  Broker -> Segment map [store: base offsets] : floor(1000042) | The broker picks the segment whose base offset is the largest one not above the target.
+  Broker -> Offset index [store: sparse] : binary search | A binary search finds the nearest earlier entry: offset 1000020 at byte 81920.
+  Broker -> Segment file [log: .log] : scan from byte 81920 | The broker reads forward a few records to reach offset 1000042.
+  Broker -> Consumer : batch of records | The broker returns a batch, often by zero-copy sendfile.
+ref: docs | Kafka design: log, segments and offset index | Apache Kafka documentation | https://kafka.apache.org/documentation/
+
+@@ tieredstorage
+== Kafka local tier plus object storage tier
+kind: tiered-storage
+when: A topic must keep weeks or months of history for replay, but broker disks are too costly to size for it.
+how: With Kafka tiered storage (KIP-405, production-ready since Kafka 3.9), a topic has two retention limits. local.retention.ms says how long segments stay on broker disks, for example 1 day. retention.ms says how long they live in total, for example 90 days.
+When a segment closes and is older than the active segment, the RemoteLogManager on the leader copies it to object storage such as S3 through a plugin. After the copy, brokers delete the local file once local retention passes. Replicas do not copy the history, so adding a broker moves only the hot data and is fast.
+Consumers near the head read from local disk as before. A consumer that reads an old offset makes the broker fetch the segment from object storage. This is slower and costs per request, so replays should run at a planned time.
+used: Confluent Cloud and Confluent Platform; Redpanda, Aiven and AWS MSK offer tiered storage for Kafka-style logs (check each vendor for plugin and version).
+avoid: When most reads hit old data at low latency, or compacted topics, which tiered storage does not support in Kafka.
+flow:
+  Producer [client] -> Leader broker [svc: local disk 1 day] : append | New records are written to the active segment on local disk.
+  * Leader broker: segment rolled | A full segment is closed and becomes ready to copy.
+  Leader broker ~> S3 bucket [lake: remote segments] : copy segment | The RemoteLogManager uploads the closed segment in the background.
+  * Leader broker: local copy deleted after 1 day | After local retention, the broker removes the disk copy.
+  Live consumer [client] -> Leader broker : fetch head offset | Fresh reads come from local disk or page cache.
+  Replay job [client] -> Leader broker : fetch offset 90 days old | The broker finds the offset in remote metadata.
+  Leader broker -> S3 bucket : range read | The broker reads the needed bytes from S3, which adds latency.
+ref: spec | KIP-405: Kafka Tiered Storage | Apache Kafka community | https://cwiki.apache.org/confluence/display/KAFKA/KIP-405%3A+Kafka+Tiered+Storage
+
+== Hot, warm and cold lifecycle for event indexes
+kind: tiered-storage
+when: Log or ad-event data is searched often for a few days, rarely for months, and must be kept for a year.
+how: Elasticsearch index lifecycle management (ILM) moves each index through phases. In the hot phase the index takes writes on fast NVMe nodes. After a rollover, for example at 50 GB or 1 day, it moves to warm nodes with cheaper disks and is made read-only.
+In the cold or frozen phase the index is turned into a searchable snapshot: the data lives in an object store such as S3, and nodes keep only a cache. Queries still work but take seconds instead of milliseconds. A delete phase removes the index at the retention limit.
+Object storage costs a small fraction of NVMe per GB, so most of the bytes sit on the cheapest tier. The price is query latency and a limit on shard-level features on frozen data. Pick phase ages from real query logs: how often are 30-day-old events read?
+used: Elasticsearch and OpenSearch with ILM or ISM policies; S3 lifecycle rules (Standard to Infrequent Access to Glacier) for lake files; common in observability and ad-reporting stacks.
+avoid: When the data is queried evenly across all ages, or when every query must have the same low latency.
+flow:
+  Ingest [svc: Logstash or Beats] -> Hot index [db: NVMe, writable] : bulk writes | New events go to the hot index on fast disks.
+  Hot index -> Warm index [db: read-only] : rollover at 50 GB | ILM rolls the index over and moves it to cheaper nodes.
+  Warm index -> Frozen snapshot [lake: S3] : after 30 days | The index becomes a searchable snapshot in object storage.
+  Dashboard [client] -> Hot index : last 24 hours | Common queries hit hot data and are fast.
+  Dashboard -> Frozen snapshot : last year | Old queries read from S3 and take seconds.
+  * Frozen snapshot: deleted at 365 days | The delete phase removes the index after retention ends.
+ref: docs | Index lifecycle management | Elastic documentation | https://www.elastic.co/guide/en/elasticsearch/reference/current/index-lifecycle-management.html
+
+@@ wal
+== Crash recovery with log before data
+kind: wal
+when: A database must acknowledge a commit fast and still never lose it, even if power fails a moment later.
+how: A change to a data page is first described in a log record and appended to the write-ahead log (WAL). The data page itself stays in memory and is written to disk later. A commit is acknowledged only after its log record is flushed with fsync.
+One sequential append is much cheaper than many random page writes, so commits are fast. The log gets a log sequence number (LSN). Each page stores the LSN of its last change, so recovery knows what is already applied.
+After a crash, the database starts from the last checkpoint and replays the log. It redoes changes the pages do not have yet, and undoes changes from transactions that never committed. A checkpoint periodically flushes dirty pages, so the log before it can be recycled and replay stays short.
+used: PostgreSQL, MySQL InnoDB (redo log), SQLite WAL mode, RocksDB and every major OLTP database.
+avoid: For data you can rebuild cheaply, such as a cache; fsync on every commit costs latency, so skip it there.
+flow:
+  Client [client] -> Database [svc: Postgres] : COMMIT tx 7 | A client commits a transaction that changed a row.
+  Database -> WAL [log: sequential file] : append record, LSN 900 | The change is described in the log first.
+  WAL -> Disk [store: fsync] : flush | The database flushes the log to stable storage before replying.
+  Database -> Client : committed | Only now is the commit acknowledged; the data page is still dirty in memory.
+  * Database: crashed, data page lost | Power fails before the data page is written.
+  Database -> WAL : replay from checkpoint | On restart the database reads the log and redoes LSN 900, so the row is back.
+ref: docs | Write-Ahead Logging (WAL) | PostgreSQL documentation | https://www.postgresql.org/docs/current/wal-intro.html
+
+== WAL shipping to replicas and CDC
+kind: wal, leader-follower, cdc
+when: The same ordered change history must feed a standby database, point-in-time recovery and downstream systems.
+how: The primary already writes every change to its WAL, so the WAL is reused as a replication stream. In PostgreSQL, a standby connects, receives WAL records and replays them. Because replay is in log order, the standby ends up byte-identical to the primary.
+The same WAL can be archived to object storage after each segment. A base backup plus the archived WAL lets you restore to any second (point-in-time recovery), for example just before a bad DELETE.
+With logical decoding, the server also turns WAL records into row changes. Debezium reads them and publishes to Kafka, so search indexes and caches follow the database without dual writes. A replication slot keeps WAL on disk until the reader has consumed it. A stuck reader can fill the primary's disk, so alert on slot lag.
+used: PostgreSQL streaming replication and archive_command; Debezium on Postgres, MySQL binlog and similar logs; MySQL replicas use the binary log in the same way.
+avoid: Cross-version or cross-engine replication through the physical WAL; use logical replication or CDC instead.
+flow:
+  Primary [db: Postgres] -> Standby [db: hot standby] : stream WAL | The standby replays the same log records in order.
+  Primary -> WAL archive [lake: S3] : archive segment | Each completed WAL segment is copied to object storage.
+  Primary -> Debezium [svc: logical decoding] : row changes via slot | A replication slot sends decoded row changes to Debezium.
+  Debezium -> orders topic [log] : change events | Row changes become events for search and cache updates.
+  Operator [user] -> WAL archive : restore to 10:41:59 | After a bad delete, restore a base backup and replay WAL to the chosen time.
+  * Primary: slot lag 40 GB | A stalled reader makes the primary keep WAL; watch the lag.
+ref: docs | Continuous archiving and point-in-time recovery | PostgreSQL documentation | https://www.postgresql.org/docs/current/continuous-archiving.html
+
+== Group commit
+kind: wal, batching
+when: Many transactions commit at the same time and each fsync is the slowest part of a commit.
+how: An fsync on an SSD can take around 0.1 to 1 ms, and much more on a network disk. If each commit did its own fsync, throughput would be capped near the number of fsyncs per second.
+With group commit, the first committing transaction becomes the leader and flushes the log. Transactions that arrive while the flush runs wait in a queue. When the flush ends, the next leader writes all queued log records with one fsync, then wakes every waiting transaction.
+Fifty commits may share one fsync, so throughput rises while latency stays about one flush time. Some systems add a short delay (PostgreSQL has commit_delay) to gather more commits, which only helps under high concurrency. Setting synchronous_commit off removes the wait but can lose the last moments of commits.
+used: PostgreSQL, MySQL InnoDB, and most databases with a WAL; Kafka batches records in a similar way when it flushes or replicates.
+avoid: Low-concurrency workloads, where there is nothing to group and a delay only adds latency.
+flow:
+  Tx A [client] -> WAL buffer [queue: log records] : commit record | Transaction A adds its record and becomes the flush leader.
+  Tx B [client], Tx C [client] -> WAL buffer : commit records | B and C arrive during A's flush and wait in the queue.
+  WAL buffer -> Disk [store: fsync 0.5 ms] : fsync A | The leader flushes its own record to disk.
+  WAL buffer -> Disk : one fsync for B and C | The next flush covers both queued records at once.
+  Disk -> Tx B, Tx C : durable | Both transactions are woken and acknowledged after one fsync.
+ref: docs | WAL configuration: commit_delay | PostgreSQL documentation | https://www.postgresql.org/docs/current/wal-configuration.html
+
+@@ zonemaps
+== File skipping from table metadata
+kind: open-table-format
+when: A selective query reads a huge table on object storage, and most files cannot contain a matching row.
+how: When a writer creates a data file, it also records min and max values per column. Delta Lake stores these in the transaction log (by default for the first 32 columns). Iceberg stores lower and upper bounds per file in manifest files.
+A query such as WHERE event_date = '2026-10-01' is planned against this metadata first. The engine drops every file whose range does not contain the value, without opening it. Only the surviving files are read from S3. Tens of thousands of files can drop to a few hundred.
+This works only if values are clustered. A random column has a wide min-max range in every file, so nothing is skipped. A date column in an append-only table works very well. For other columns, sort or cluster the table.
+used: Delta Lake data skipping; Apache Iceberg manifest pruning; Databricks, Trino and Spark all use file statistics for planning.
+avoid: For high-cardinality columns that are not clustered; add Bloom filters or cluster the data first.
+flow:
+  Analyst [user] -> Query engine [svc: Spark or Trino] : WHERE event_date = Oct 1 | A selective query arrives.
+  Query engine -> Table log [store: min/max per file] : read file stats | The planner reads statistics, not data.
+  Table log -> Query engine : 40 of 12,000 files match | Files whose range excludes the date are dropped.
+  Query engine -> Data files [lake: Parquet on S3] : read 40 files | Only matching files are fetched from object storage.
+  Data files -> Query engine : rows | The engine filters rows inside the surviving files.
+  * Query engine: skipped 99.7% of files | Skipping saves S3 reads, time and cost.
+ref: docs | Data skipping in Delta Lake | Delta Lake documentation | https://docs.delta.io/latest/optimizations-oss.html
+
+== Micro-partition pruning in a warehouse
+kind: data-skipping
+when: Interactive dashboards run filtered queries over a very large table, and indexes would cost too much to keep.
+how: A cloud warehouse such as Snowflake stores a table as immutable micro-partitions, each holding about 50 to 500 MB of data before compression. On load, it records the min and max of every column per micro-partition in a metadata service.
+At query time, the optimizer reads only this metadata. It prunes micro-partitions whose range cannot match the filter, so the compute cluster scans a small part of the table. No user-managed index exists.
+The data stays in load order unless you define a clustering key. A table loaded by time prunes well on time filters and badly on others. Periodic reclustering sorts data by the key, which costs compute, so use it only for large tables with a stable filter column.
+used: Snowflake micro-partitions; BigQuery clustered tables and ClickHouse sparse primary indexes use similar block-level ranges.
+avoid: Small tables, where a full scan is cheap, and filters on columns that are not clustered.
+flow:
+  BI tool [client] -> Warehouse [svc: query compiler] : WHERE campaign_id = 77 | A dashboard asks for one campaign.
+  Warehouse -> Metadata service [store: min/max per partition] : find candidate partitions | The compiler checks column ranges only.
+  Metadata service -> Warehouse : 120 of 9,000 partitions | Most partitions are pruned.
+  Warehouse -> Virtual warehouse [svc: compute cluster] : scan 120 partitions | Compute reads only the candidates from remote storage.
+  Virtual warehouse -> BI tool : result | The query finishes with a fraction of the I/O.
+ref: docs | Micro-partitions and data clustering | Snowflake documentation | https://docs.snowflake.com/en/user-guide/tables-clustering-micropartitions
+
+@@ zorder
+== Clustering compaction job on a lakehouse table
+kind: open-table-format, precompute
+when: Queries filter on two or three columns, and data skipping is weak because each file holds a wide range of values.
+how: A scheduled maintenance job rewrites small, unsorted files into larger files sorted by a clustering key. In Delta Lake this is OPTIMIZE ... ZORDER BY (user_id, event_date). Iceberg offers a rewrite_data_files procedure with a sort or zorder strategy.
+Z-order interleaves the bits of the chosen columns into one number and sorts by it. Rows that are close in all columns end up in the same file. Each file then has a narrow min/max range on every clustered column, so zone maps skip far more files. A filter on either column benefits, which a plain sort on the first column cannot give.
+The rewrite is a normal table transaction: new files are added, old ones are removed in the log, and readers keep a consistent view. It costs compute and I/O, so run it on cold partitions, not on data still being written. Newer features, such as Delta liquid clustering, aim to do this incrementally.
+used: Delta Lake OPTIMIZE ZORDER and liquid clustering; Iceberg sort-order and z-order rewrites; common in ad-event and clickstream lakehouses.
+avoid: For columns with few values, where plain partitioning is simpler, and for tables with fewer than a few hundred files.
+flow:
+  Streaming ingest [svc: Spark] -> Events table [lake: many small files] : append files | Ingest writes small files in arrival order; each spans many users and dates.
+  Scheduler [svc: Airflow] -> Optimize job [svc: Spark] : nightly run | A nightly job picks yesterday's partition.
+  Optimize job -> Events table : read, sort by z-order key | The job sorts rows by the interleaved key of user_id and event_date.
+  Optimize job -> Table log [store: min/max per file] : commit new files | New large files replace old ones in one commit; ranges are narrow now.
+  Analyst [user] -> Table log : WHERE user_id = 9 | The planner checks file ranges for the filter.
+  Table log -> Analyst : read 3 of 400 files | Most files are skipped.
+ref: docs | Data skipping and Z-ordering | Delta Lake documentation | https://docs.delta.io/latest/optimizations-oss.html
+
+== Z-order key for geo and multi-column ranges
+kind: index-table
+when: A key-value or sorted store must answer rectangle or multi-column range queries, but it only supports one-dimensional range scans.
+how: At write time, the app turns two coordinates, for example latitude and longitude, into one number by interleaving their bits. Geohash is a base-32 form of this Z-order curve. The number becomes the row key or an indexed column in an ordinary B-tree or sorted store.
+Points that are near in space usually have keys with a long common prefix. A rectangle query is split into a small set of key ranges, and each range is one cheap scan. The app then filters the results exactly, because a range can include points outside the rectangle.
+The curve has jumps, so one rectangle may need many ranges. Hilbert curves and S2 or H3 cells have better locality at a higher cost of computing. Keep the precision (key length) matched to the query size.
+used: Geohash keys in Redis, Elasticsearch and DynamoDB or Cassandra tables for nearby search; Z-order sorting in Delta and Iceberg.
+avoid: When a spatial database (PostGIS with GiST) is available; it handles shapes and distances directly.
+flow:
+  App [client] -> Key encoder [svc: interleave bits] : lat, lon | The writer converts a point into one Z-order key.
+  Key encoder -> Sorted store [db: B-tree on key] : put key u4pru... | The store keeps points ordered by that key.
+  App -> Range planner [svc: split rectangle] : bbox query | A reader sends a bounding box.
+  Range planner -> Sorted store : 6 key ranges | The box becomes a few range scans.
+  Sorted store -> App : candidate points | Ranges return candidates, some outside the box.
+  * App: exact filter applied | The app removes points outside the exact box.
+ref: paper | A computer oriented geodetic data base and a new technique in file sequencing | G. M. Morton, IBM, 1966 |
+
+@@ backpressure
+== Credit-based flow control in a dataflow job
+kind: load-shedding, producer-consumer
+when: One operator in a streaming job is slower than the rest, and memory must stay bounded without losing data.
+how: Between two Flink tasks, data moves through small network buffers. The receiver tells the sender how many free buffers it has, called credits. The sender may send only as many buffers as it has credits.
+If a downstream operator is slow, its input buffers fill and it stops returning credits. The upstream task then has no credit, so its output buffers fill too. This stalls task by task until it reaches the source. The source then reads less from Kafka. Lag grows in the topic, which is safe because Kafka stores data on disk, and memory use stays flat.
+The Flink UI marks tasks as busy, backpressured or idle. The slow operator is the first busy task after a backpressured one. Fix it with more parallelism or a faster sink, not with bigger buffers, which only hide the problem for a short time.
+used: Apache Flink (credit-based since 1.5); Spark Structured Streaming rate limits; Reactive Streams libraries such as Akka Streams and Reactor.
+avoid: When data is lost safely by design, such as sampled metrics; there, shed load at the edge instead.
+flow:
+  Kafka source [svc: reads topic] -> Parser [svc: map] : buffers | The source sends buffers while the parser has credits.
+  Parser -> Enricher [svc: lookup] : buffers | The parser feeds the enricher.
+  Enricher -> Sink [db: slow warehouse] : write batch | The sink is slow, so its input buffers fill up.
+  * Enricher: no credits, backpressured | The sink stops returning credits, so the enricher has to wait.
+  Sink -x> Enricher : credit 0 | No free buffers, so the enricher cannot send more.
+  Enricher -x> Parser : credit 0 | The pause travels upstream one task at a time.
+  * Kafka source: reads slower, lag grows | The source slows down; the backlog waits safely in Kafka.
+ref: docs | Monitoring back pressure | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/monitoring/back_pressure/
+
+== Pull with bounded prefetch and pause
+kind: producer-consumer, load-leveling
+when: A consumer calls a slow downstream service, and the pulled records must never exceed what it can handle.
+how: The consumer pulls records itself, so it controls the rate. With a Kafka consumer, poll() returns at most max.poll.records (500 by default). The app hands each batch to a bounded worker pool.
+If the pool queue is full, the app calls pause() on the assigned partitions. The consumer keeps calling poll() so heartbeats continue and the group does not rebalance, but it receives no records. When the queue drains, it calls resume(). Offsets are committed only after work finishes.
+The same idea is request(n) in Reactive Streams, where the subscriber states how many items it can take. And in message queues like SQS or RabbitMQ the prefetch limit plays this role. The key rule is that every buffer between producer and consumer has a bound, and a full buffer blocks or rejects, never grows without limit.
+used: Kafka consumers with pause and resume; RabbitMQ prefetch count; Reactive Streams in Akka, Reactor and RxJava.
+avoid: Push protocols where the sender cannot be slowed, such as UDP telemetry; there, drop or sample.
+flow:
+  orders topic [log] -> Consumer [svc: poll 500] : poll | The consumer pulls up to 500 records per call.
+  Consumer -> Work queue [queue: bound 1000] : submit | Records go into a bounded in-memory queue.
+  Work queue -> Worker pool [svc: 16 threads] : tasks | Workers call the slow payment API.
+  * Work queue: full at 1000 | The workers cannot keep up, so the queue is full.
+  Consumer -x> orders topic : pause partitions | The consumer pauses fetching but keeps polling, so it stays in the group.
+  Worker pool -> Consumer : done, commit offsets | After the queue drains, the consumer resumes and commits.
+ref: docs | Reactive Streams | Reactive Streams initiative | https://www.reactive-streams.org/
+ref: docs | Kafka consumer: pause and resume | Apache Kafka documentation | https://kafka.apache.org/documentation/
+
+@@ checkpoint
+== Barrier checkpoint of a streaming job
+kind: checkpoint-restart
+when: A long-running job holds state, and after a crash it must resume without losing or double counting events.
+how: In Flink, the JobManager starts a checkpoint every interval, for example 1 minute. It tells the sources to inject a barrier, a special marker, into each stream. A source records its offset, for example Kafka offset 5,200, and sends the barrier on.
+Each operator waits until the barrier arrives on all its inputs. It then snapshots its keyed state to durable storage such as S3 and forwards the barrier. Events before the barrier are in the snapshot; events after it are not. This is the Chandy-Lamport idea with barriers in place of channel recording. Uploads run in the background, so processing continues. With RocksDB, checkpoints can be incremental.
+When every operator confirms, the checkpoint is complete. After a failure, Flink restarts the tasks, loads the last complete snapshot and rewinds Kafka to the saved offsets. Results between that checkpoint and the crash are recomputed.
+used: Apache Flink; Spark Structured Streaming keeps offsets and state in a checkpoint location; Kafka Streams uses changelog topics for a similar goal.
+avoid: Tiny stateless jobs, where restarting from the last committed offset is enough. Under heavy backpressure, aligned barriers get slow; use unaligned checkpoints.
+flow:
+  JobManager [svc: coordinator] -> Kafka source [svc: offset 5200] : trigger checkpoint 17 | The coordinator asks sources to start checkpoint 17.
+  Kafka source -> Window operator [svc: keyed state] : barrier 17 | The source emits a barrier and saves its offset.
+  Window operator -> State store [lake: S3] : snapshot state | After the barrier arrives on all inputs the operator uploads its state.
+  Window operator -> JobManager : ack 17 | The operator confirms its part.
+  * JobManager: checkpoint 17 complete | All parts are in; checkpoint 17 becomes the restore point.
+  Window operator -x> JobManager : task failed | A task crashes after the checkpoint.
+  JobManager -> Kafka source : restore 17, seek 5200 | The job restores state and rewinds the offsets, then recomputes.
+ref: paper | Distributed Snapshots: Determining Global States of Distributed Systems | Chandy & Lamport, 1985 |
+ref: docs | Checkpointing | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/
+
+== Savepoint for a planned upgrade
+kind: checkpoint-restart, blue-green
+when: A stateful job needs new code, a new parallelism or a cluster move, and its state must carry over.
+how: A savepoint is a checkpoint that an operator triggers by hand. It is stored in a self-contained directory and is not deleted automatically. A normal checkpoint is owned by Flink and can be removed when a newer one exists.
+To upgrade, run stop-with-savepoint. Flink takes a savepoint at a clean point, drains sources and stops the job. The team deploys the new jar and starts it from the savepoint path. State is matched to operators by stable operator ids (uid), so always set them. Parallelism can change because keyed state is split into key groups.
+For a safer rollout, start the new version from the same savepoint beside the old one, with output to a separate sink, compare results, then switch. Keep the savepoint until the new version has its own good checkpoints.
+used: Apache Flink savepoints for upgrades, A/B tests of job logic and region migration; Kafka Streams achieves a similar result through its changelog topics.
+avoid: Changing state types without a migration plan; incompatible serializers make the restore fail.
+flow:
+  Operator [user] -> JobManager [svc: Flink v1] : stop with savepoint | The operator asks for a clean stop.
+  JobManager -> Savepoint dir [lake: S3 savepoint-42] : write full state | State of every operator is written to one directory.
+  Operator -> Savepoint dir : deploy v2 from sp-42 | The new jar starts from the saved state.
+  Savepoint dir -> Flink v2 [svc: new code] : restore by operator uid | State is matched to operators by uid and split by key group.
+  Flink v2 -> Kafka source [svc: topic] : resume at saved offsets | The new job continues from the saved offsets with no gap and no repeat.
+ref: docs | Savepoints | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/state/savepoints/
+
+@@ consumergroups
+== Partition-per-consumer scaling
+kind: competing-consumers, heartbeat
+when: One topic has too much traffic for one worker, and per-key order must still hold.
+how: All consumers with the same group.id form a group. A broker acts as group coordinator. Each partition is assigned to exactly one member, so one consumer sees all events of a key in order. A topic with 12 partitions can use up to 12 active consumers; more members sit idle.
+Members send heartbeats. If one stops for longer than the session timeout, the coordinator removes it and reassigns its partitions. In the classic protocol, a rebalance makes members give up partitions and rejoin, which can pause the whole group. In the KIP-848 protocol (GA in Kafka 4.0, opt in with group.protocol=consumer) the broker computes assignments and only moved partitions change owner.
+Each member commits offsets per partition. The new owner starts from the last committed offset, so some events may be processed again.
+used: Almost every Kafka application, including ad-event processors, order services and Kafka Streams jobs; Kinesis and Pulsar have similar shared-subscription ideas.
+avoid: When work per message varies a lot or you need more workers than partitions; use Kafka share groups or a queue.
+flow:
+  Consumer A [svc: owns P0-P5] -> Coordinator [svc: group broker] : JoinGroup | Each member joins the group and sends heartbeats.
+  Consumer B [svc: owns P6-P11] -> Coordinator : JoinGroup | The second member joins; the coordinator splits 12 partitions.
+  Coordinator -> Consumer A, Consumer B : assignment | Each member learns which partitions it owns.
+  Consumer A -> orders topic [log: 12 partitions] : fetch P0-P5 | A reads only its partitions, in order.
+  Consumer B -x> Coordinator : heartbeat missed | B crashes and its heartbeats stop.
+  Coordinator -> Consumer A : reassign P6-P11 | After the session timeout A also takes B's partitions and resumes at the committed offsets.
+ref: spec | KIP-848: The Next Generation of the Consumer Rebalance Protocol | Apache Kafka community | https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
+ref: docs | Kafka design: consumers and consumer groups | Apache Kafka documentation | https://kafka.apache.org/documentation/
+
+== Static membership for rolling deploys
+kind: lease, heartbeat
+when: A rolling restart of a stateful consumer fleet triggers a rebalance for every pod, and each rebalance pauses processing.
+how: Each consumer gets a fixed group.instance.id, for example the Kubernetes StatefulSet pod name orders-consumer-2. The coordinator remembers that id and its partitions.
+When the pod restarts and rejoins within session.timeout.ms (set it above the restart time, for example 60 seconds), the coordinator gives it the same partitions back. No rebalance happens, and other members keep working. Stateful consumers, such as Kafka Streams with local RocksDB state, avoid moving and rebuilding state.
+The cost is slower failure handling. If a pod dies for good, its partitions wait unprocessed until the session timeout ends. Choose the timeout as a trade-off between restart time and the delay you accept on real failure. Combine this with cooperative rebalancing so that normal membership changes move few partitions.
+used: Kafka consumers with group.instance.id on Kubernetes StatefulSets; Kafka Streams applications with large local state.
+avoid: Fleets of stateless workers with fast restarts, where an ordinary rebalance is cheap.
+flow:
+  Deployer [svc: Kubernetes] -> Consumer 2 [svc: instance id c-2] : restart pod | A rolling update restarts one pod at a time.
+  Consumer 2 -x> Coordinator [svc: group broker] : no LeaveGroup | A static member does not leave the group on shutdown.
+  * Coordinator: P4-P5 reserved for c-2 | The coordinator keeps the partitions of c-2 for up to the session timeout.
+  Consumer 2 -> Coordinator : JoinGroup, same id | The pod comes back after 20 seconds with the same id.
+  Coordinator -> Consumer 2 : same partitions P4-P5 | The partitions return to the same member, so no rebalance happens.
+  Consumer 1 [svc: unaffected] -> orders topic [log] : fetch continues | Other members never stopped reading.
+ref: spec | KIP-345: Static membership | Apache Kafka community | https://cwiki.apache.org/confluence/display/KAFKA/KIP-345%3A+Introduce+static+membership+protocol+to+reduce+consumer+rebalances
+
+@@ deliverysem
+== At-least-once with an idempotent consumer
+kind: idempotent-consumer, event-driven
+when: Losing an event is not acceptable, and the effect of processing it twice can be made harmless.
+how: The consumer processes a message first and acknowledges or commits its offset afterwards. If it crashes between the two steps, the broker sends the message again after restart. This is at-least-once delivery: no loss, but possible duplicates.
+To make duplicates harmless, each event carries a unique id. The consumer writes the effect and the processed id in one database transaction, or uses an insert with a unique key. If the id is already stored, it skips the work. A payment charge can also pass the id as an idempotency key to the payment provider.
+Exactly-once delivery over a network is not possible, because a sender cannot tell a lost message from a lost acknowledgement. Exactly-once effects come from at-least-once plus idempotent handling. Keep the dedup records at least as long as the longest possible redelivery delay.
+used: Order, billing and ad-billing consumers on Kafka, SQS and RabbitMQ; Stripe-style idempotency keys on payment APIs.
+avoid: For work with irreversible effects that cannot take an idempotency key; add a transaction or manual review. For lossy telemetry, at-most-once is cheaper.
+flow:
+  orders topic [log] -> Billing consumer [svc: process then commit] : OrderPlaced id e-41 | The consumer receives event e-41.
+  Billing consumer -> Billing DB [db: processed_ids] : insert e-41 + charge | One transaction writes the charge and the id e-41.
+  Billing consumer -x> orders topic : crash before commit | The consumer dies before the offset commit reaches the broker.
+  orders topic -> Billing consumer : OrderPlaced e-41 again | After restart the broker redelivers the event.
+  Billing consumer -> Billing DB : insert e-41 fails | The unique key rejects the id, so no second charge is made.
+  Billing consumer -> orders topic : commit offset | The consumer skips the work and commits.
+ref: docs | Patterns of Distributed Systems: Idempotent Receiver | Unmesh Joshi, martinfowler.com | https://martinfowler.com/articles/patterns-of-distributed-systems/idempotent-receiver.html
+
+== Retry and dead-letter queue for failing messages
+kind: dead-letter, retry-backoff
+when: Some messages fail again and again, for example bad data, and must not block the healthy ones.
+how: With Amazon SQS, a consumer receives a message and it becomes invisible for the visibility timeout (30 seconds by default). If the consumer deletes the message in time, it is done. If it crashes or fails, the message becomes visible again and is delivered again, which is at-least-once delivery.
+Each delivery increases the receive count. A redrive policy sets maxReceiveCount, for example 5. After the fifth failed receive, SQS moves the message to a dead-letter queue (DLQ). The main queue keeps flowing.
+Engineers look at the DLQ, fix the bug or the data, then redrive the messages back to the source queue. Add exponential backoff with jitter between retries for transient errors, and set an alarm on DLQ depth. A DLQ must have a longer retention than the source queue, or old messages vanish.
+used: Amazon SQS dead-letter queues; RabbitMQ dead-letter exchanges; Kafka consumers with retry topics and a DLQ topic; Azure Service Bus.
+avoid: When order matters strictly; a skipped message breaks order, so stop the partition or park the whole key.
+flow:
+  Order queue [queue: SQS] -> Worker [svc: handler] : receive, count 1 | The worker receives a message; it is hidden for 30 seconds.
+  Worker -x> Order queue : fails, no delete | The handler throws on bad data, so the message is not deleted.
+  Order queue -> Worker : receive again, count 2 | The message becomes visible and is delivered again.
+  * Worker: retry with backoff | The worker waits longer after each failure to avoid a retry storm.
+  Order queue -> Dead-letter queue [queue: kept 14 days] : count 5 reached | After 5 receives the message moves to the DLQ.
+  Engineer [user] -> Dead-letter queue : inspect, fix, redrive | The team fixes the cause and sends messages back to the source queue.
+ref: docs | Amazon SQS dead-letter queues | AWS documentation | https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html
+
+@@ exactlyonce
+== Transactional consume-transform-produce
+kind: two-phase-commit, idempotent-consumer
+when: A Kafka job reads a topic, writes results to another topic, and must not lose or repeat output after a crash.
+how: The job sets a transactional.id, which also enables the idempotent producer, so retries do not write duplicates. For each batch it calls beginTransaction, writes output records, then calls sendOffsetsToTransaction with the input offsets, then commitTransaction.
+Output records and the input offset commit become visible together or not at all. A transaction coordinator on the brokers writes commit or abort markers into every partition involved, in a two-phase style. If the job dies, a new instance with the same transactional.id fences the old one with an epoch number and aborts its open transaction.
+Downstream consumers set isolation.level=read_committed, so they skip records of open or aborted transactions. The scope is Kafka only: side effects such as an HTTP call or a database write are outside the transaction. Latency rises by the commit interval, so use batches of tens to hundreds of milliseconds.
+used: Kafka Streams with processing.guarantee=exactly_once_v2; hand-written consume-transform-produce services on Kafka.
+avoid: When the sink is not Kafka; then use an idempotent sink or a two-phase commit sink. Also avoid it for very low latency needs.
+flow:
+  orders topic [log] -> Stream app [svc: transactional.id t-1] : batch, offsets 100-199 | The app reads a batch from the input topic.
+  Stream app -> Coordinator [svc: txn coordinator] : begin, add partitions | The app opens a transaction.
+  Stream app -> totals topic [log] : write results | Results are written but still hidden from read_committed readers.
+  Stream app -> Coordinator : offsets 200 and commit | The input offsets join the same transaction, then commit starts.
+  Coordinator -> totals topic : commit marker | A marker makes the results visible; the offset commit is recorded too.
+  Stream app -x> Coordinator : crash mid-transaction | If the app dies earlier, the transaction is aborted and the batch runs again.
+  Reader [client: read_committed] -> totals topic : fetch | Readers see only committed results.
+ref: spec | KIP-98: Exactly Once Delivery and Transactional Messaging | Apache Kafka community | https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging
+
+== Two-phase commit sink tied to checkpoints
+kind: two-phase-commit, checkpoint-restart
+when: A stream job writes to an external system such as Kafka or a lakehouse table, and output must appear once even after restarts.
+how: A Flink sink writes new records into an open transaction, for example a Kafka transaction or a set of staged Iceberg files. When a checkpoint barrier reaches the sink, the sink flushes and pre-commits: the data is durable but still invisible.
+Only after the JobManager reports that the whole checkpoint is complete does the sink commit the transaction. If a crash happens before that, Flink restores the last checkpoint, rewinds the sources, and aborts the open transaction. The records are written again in a new transaction, so the output has no duplicates.
+If a crash happens after the checkpoint completes but before the commit, the pre-committed transaction id is in the checkpoint, so recovery commits it again. Output is delayed until the checkpoint ends, so results appear every checkpoint interval, for example every 30 seconds.
+used: Apache Flink Kafka sink in exactly-once mode; Flink file and Iceberg sinks; Flink's TwoPhaseCommitSinkFunction idea.
+avoid: When a sink can upsert by key; an idempotent write is simpler and has no checkpoint delay.
+flow:
+  Kafka source [svc: offsets] -> Aggregator [svc: counts] : events | The job processes events as usual.
+  Aggregator -> Sink [svc: open transaction] : results | The sink writes into an open transaction.
+  Aggregator -> Sink : barrier 17 | The checkpoint barrier reaches the sink.
+  Sink -> Kafka out [log: txn pre-committed] : flush and pre-commit | Data is durable but hidden from readers.
+  JobManager [svc: coordinator] -> Sink : checkpoint 17 complete | The coordinator tells the sink the checkpoint is done.
+  Sink -> Kafka out : commit | The transaction is committed and results become visible.
+  Sink -x> Kafka out : crash before commit | After a crash, recovery commits or aborts by the saved transaction id.
+ref: docs | An overview of end-to-end exactly-once processing in Flink | Apache Flink blog, 2018 | https://flink.apache.org/2018/02/28/an-overview-of-end-to-end-exactly-once-processing-in-apache-flink-with-apache-kafka-too/
+
+== Idempotent upsert sink
+kind: idempotent-consumer
+when: Output goes to a database or key-value store, and replayed events must overwrite, not add to, earlier results.
+how: The job computes a result that has a natural key, for example campaign id plus minute. It writes with an upsert: INSERT ... ON CONFLICT DO UPDATE in Postgres, or a put in a key-value store. Writing the same result twice leaves the same row.
+This gives effectively-once results with only at-least-once delivery, and needs no transactions across systems. A replay after a crash recomputes the same value for the same key, so the table converges to the right answer. The sink must write the full value, not an increment such as count + 1, because an increment applied twice gives a wrong count.
+For safety against old data overwriting new, keep a version or event-time column and update only when the new version is higher. Readers can see a value twice or see a briefly older value during replay, which is fine for dashboards but not for money.
+used: Flink and Spark jobs writing to Postgres, Cassandra, Elasticsearch or ClickHouse (ReplacingMergeTree); common in ad-reporting aggregates.
+avoid: For append-only sinks without keys or for increments; use a transactional sink.
+flow:
+  Kafka source [svc: at-least-once] -> Aggregator [svc: per minute totals] : click events | The job reads events and may see some twice after a restart.
+  Aggregator -> Reports DB [db: key campaign+minute] : UPSERT total = 1250 | The job writes the full total for the key, not an increment.
+  Aggregator -x> Kafka source : crash and restore | The job restores from its last checkpoint and reads some events again.
+  Kafka source -> Aggregator : replayed events | The same events are processed a second time.
+  Aggregator -> Reports DB : UPSERT total = 1250 | The same key gets the same value, so the row does not change.
+  Dashboard [client] -> Reports DB : read totals | Readers see the correct total, with no double count.
+ref: book | Designing Data-Intensive Applications, ch. 11 | Martin Kleppmann, O'Reilly, 2017 |
+
+@@ logcompaction
+== Changelog topic that rebuilds state
+kind: materialized-view, lsm-compaction
+when: A stream job keeps local state per key, and a new or failed instance must rebuild that state fast.
+how: A Kafka Streams state store (RocksDB) sends every update to a changelog topic, keyed by the store key. The topic uses cleanup.policy=compact: a background cleaner thread keeps only the latest record per key and drops older ones, but only in closed segments.
+The topic's size then grows with the number of keys, not with the number of updates. When an instance moves to another machine, it reads the changelog from the start and replays it into a fresh RocksDB. With compaction, this replay reads one record per key, so restore takes minutes instead of days.
+A record with a null value is a tombstone. It marks the key as deleted and is itself removed after delete.retention.ms (24 hours by default). Compaction is not immediate: the min.cleanable.dirty.ratio and segment size control how late old values stay.
+used: Kafka Streams changelog topics; Kafka's own __consumer_offsets topic; Kafka Connect offset and config topics.
+avoid: When history matters for audit or replay of every change; use delete retention or tiered storage instead.
+flow:
+  Stream task [svc: updates counts] -> RocksDB [store: local state] : put user 7 = 12 | The task updates local state first.
+  Stream task -> changelog topic [log: compacted] : user 7 = 12 | The same update is sent to the changelog topic.
+  Stream task -> changelog topic : user 7 = 13 | A newer update for the same key is appended.
+  Cleaner [svc: log cleaner] -> changelog topic : keep latest per key | The cleaner removes the older record for user 7.
+  Stream task -x> RocksDB : machine lost | The machine and its local disk are gone.
+  New task [svc: other node] -> changelog topic : read from start | A new instance replays the compacted log.
+  New task -> RocksDB : restore state | It rebuilds the state with one record per key.
+ref: docs | Kafka log compaction | Apache Kafka documentation | https://kafka.apache.org/documentation/#compaction
+
+== Compacted topic as a shared latest-state table
+kind: cdc, materialized-view
+when: Many services need the current state of a reference entity, such as user profiles, and new services must bootstrap it quickly.
+how: A CDC connector, for example Debezium, writes each row change of a table into a Kafka topic. The record key is the primary key and the value is the full new row. The topic is compacted, so it holds at least the latest row of every key, not the whole history.
+A new service starts a consumer from the earliest offset and reads the topic once. It ends with the current profile of every user, and it keeps receiving live changes. It can load the data into a local cache or a Kafka Streams KTable for joins.
+When a row is deleted, the connector writes a tombstone with a null value. After delete.retention.ms, compaction removes the key. Note that compaction may keep old values for a while, so a reader must treat the last record for a key as the truth and handle duplicates. For erasure rules such as GDPR, check that the tombstone and compaction timing meet your deadline.
+used: Debezium into compacted topics; Kafka Streams GlobalKTable and KTable sources; common for profile, catalog and configuration data.
+avoid: For large data that changes rarely and is read by lookup; a database or cache with an API is simpler.
+flow:
+  Users DB [db: Postgres] -> Debezium [svc: Kafka Connect] : row change | Debezium reads changes from the database log.
+  Debezium -> users topic [log: compacted] : key user 7, full row | Each change becomes a keyed record.
+  users topic -> Search service [svc: bootstrap from 0] : read all keys | A new service reads the topic from the beginning.
+  users topic -> Ads service [svc: KTable] : live updates | An existing service follows new changes.
+  Debezium -> users topic : tombstone user 9 | A deleted row becomes a record with a null value.
+  * users topic: user 9 removed after compaction | The cleaner later drops the key and the tombstone.
+ref: docs | Debezium: Kafka topic creation and compaction | Debezium documentation |
+ref: docs | Kafka log compaction | Apache Kafka documentation | https://kafka.apache.org/documentation/#compaction
+
+@@ sharegroups
+== Work queue on a Kafka topic
+kind: competing-consumers
+when: Jobs of uneven length must be spread across more workers than there are partitions, and each job needs its own retry.
+how: In a share group (KIP-932, production-ready in Kafka 4.2), many consumers read the same partitions at once. A fetch makes the broker acquire a batch of records for that consumer. These records are locked for the acquisition lock timeout, for example 30 seconds, and other members do not see them.
+The consumer processes each record and replies with accept, release or reject. Accept finishes the record. Release makes it available again for another worker, with its delivery count raised. Reject marks the record as bad and archives it. If the lock expires with no reply, the record is released too.
+Each record has a delivery count. After the group's limit (5 by default) the broker archives the record, so poison messages do not loop forever; the app should move such records to its own dead-letter topic. There is no per-key ordering guarantee, and the topic keeps its normal retention.
+used: Kafka 4.2 share groups; the same record-lock model is used by SQS and Pulsar shared subscriptions (different details).
+avoid: When events of one key must be processed in order, or for high-throughput stream processing; use consumer groups.
+flow:
+  jobs topic [log: 3 partitions] -> Broker [svc: share coordinator] : records 1-30 | The topic holds jobs; all workers use one share group.
+  Broker -> Worker 1 [svc: locks 1-10], Worker 2 [svc: locks 11-20], Worker 3 [svc: locks 21-30] : acquire, 30 s lock | Each worker gets its own locked batch, even though there are only 3 partitions.
+  Worker 1 -> Broker : accept 1-9 | Finished jobs are acknowledged one by one.
+  Worker 1 -> Broker : release 10 | A failed job is released and its delivery count becomes 2.
+  Broker -> Worker 3 : record 10 again | Another worker now gets record 10.
+  Worker 2 -x> Broker : crash, no reply | Worker 2 dies; its lock expires after 30 seconds.
+  Broker -> Worker 1 : records 11-20 | The expired records are released and go to a live worker.
+ref: spec | KIP-932: Queues for Kafka | Apache Kafka community | https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka
+
+== One topic, an ordered stream and a work queue
+kind: pubsub, competing-consumers
+when: The same events feed an ordered analytics job and a pool of independent workers, and you want one copy of the data.
+how: Producers write to one topic. A normal consumer group reads it for jobs that need per-key order, such as a stream processor that builds balances. A share group reads the same topic for slow, independent tasks such as sending emails or calling an external API.
+The two groups are independent, like consumer groups in the gold fan-out pattern. The consumer group keeps one committed offset per partition. The share group keeps per-record state, so a single slow email does not block the records after it. The share group can scale to hundreds of workers.
+This removes the need to copy events into a separate queue system such as RabbitMQ or SQS for task work. The trade-off is that the share group gives no key order, and its features, such as an automatic dead-letter queue, are still younger than in classic queue brokers. Check the client support of your language before choosing it.
+used: Kafka 4.2 deployments that need both stream and queue semantics; teams that now run Kafka plus a separate queue.
+avoid: When the queue needs mature features such as priorities, delayed delivery or per-message TTL; use a dedicated queue broker.
+flow:
+  Checkout service [svc] -> orders topic [log: 12 partitions] : OrderPlaced | The service writes each order event once.
+  orders topic -> Balance job [svc: consumer group] : ordered by key | The consumer group reads each partition in order.
+  orders topic -> Email workers [svc: share group] : locked per record | The share group gives each record to one free worker.
+  Balance job -> Balances DB [db] : update by key | The ordered job keeps correct totals per customer.
+  Email workers -> Mail API [svc: slow external] : send email | A slow call blocks only that one worker's record.
+  Email workers -x> orders topic : release on error | A failed send is released and retried by another worker.
+ref: docs | Kafka share groups | Apache Kafka documentation | https://kafka.apache.org/documentation/
+
+@@ statefulops
+== Keyed state partitioned by hash
+kind: sharding, checkpoint-restart
+when: A streaming job must keep a count, a model or a session per key, and the state is too large for one machine.
+how: The job routes every event by a hash of its key, using keyBy in Flink or a repartition topic in Kafka Streams. Each parallel task owns a range of keys and keeps their state locally, in memory or in an embedded RocksDB on local disk. Reads and writes of state are local calls, so a lookup costs microseconds, not a network round trip.
+Because one key always goes to one task, there are no locks and no races. State can be much bigger than memory, since RocksDB spills to disk. The cost is that a hot key overloads one task.
+State is backed up by checkpoints to object storage. Flink splits keyed state into key groups, so after a restart or a rescale, groups are redistributed over the new task count. Set a time-to-live on state so old keys do not grow it forever.
+used: Apache Flink keyed state with RocksDB; Kafka Streams state stores with changelog topics; Spark Structured Streaming state store.
+avoid: When the state is small and shared by all keys; a broadcast value is simpler. For a hot key, pre-aggregate in two stages.
+flow:
+  Kafka source [svc: events] -> Task 1 [svc: keys A-M], Task 2 [svc: keys N-Z] : keyBy user id | Events are routed by key hash, so one key always reaches one task.
+  Task 1 -> RocksDB 1 [store: local disk] : get and put count | State is read and written locally.
+  Task 2 -> RocksDB 2 [store: local disk] : get and put count | Each task has its own state, so there are no locks.
+  Task 1 -> Output topic [log] : user 7 count = 12 | The task emits the updated result.
+  Task 1 ~> Checkpoint store [lake: S3] : async snapshot | State is backed up in the background at each checkpoint.
+  Task 1 -x> Checkpoint store : machine lost | The disk is lost; state returns from the last snapshot on another machine.
+ref: docs | Stateful stream processing | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/
+
+== Deduplication with state and a time-to-live
+kind: idempotent-consumer, windowed-agg
+when: A source delivers duplicate events, for example after producer retries, and each event id should count once.
+how: Key the stream by event id (or by user id plus event id). For each key, the operator keeps a flag in state. On the first event it sets the flag and passes the event on. On a repeat it finds the flag and drops the event.
+Without a limit, the state grows with every id ever seen. A state time-to-live fixes this: the flag expires after, for example, 24 hours. That window must be longer than the longest delay between a duplicate and its original. A duplicate that comes later than the TTL passes through.
+Size matters: 500 million ids per day at 50 bytes each is about 25 GB of state, so RocksDB on local disk is needed rather than heap memory. Checkpoints back up the flags, so after a restart the operator still remembers what it has seen.
+used: Flink deduplication (SQL ROW_NUMBER by id) and keyed state with TTL; Kafka Streams dedup with a window store; used for ad impression and click logs.
+avoid: When the sink can dedupe by primary key; an upsert is cheaper than holding state.
+flow:
+  Impressions topic [log: at-least-once] -> Dedup operator [svc: keyed by id] : impression i-90 | An event with id i-90 arrives.
+  Dedup operator -> State [store: id flags with TTL] : seen i-90? | The operator checks the flag for this id.
+  Dedup operator -> Billing topic [log] : emit i-90 | It is the first time, so the event passes.
+  Impressions topic -> Dedup operator : impression i-90 again | A producer retry sends the same id again.
+  Dedup operator -x> Billing topic : dropped | The flag exists, so the event is dropped.
+  * State: 25 GB for 24 h of ids | The TTL expires old flags and keeps state bounded.
+ref: docs | State TTL | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/fault-tolerance/state/#state-time-to-live-ttl
+
+@@ streamjoin
+== Stream enrichment with a changelog table
+kind: stream-table-join
+when: Each event needs the latest attributes of an entity, such as user or campaign data, attached before it goes on.
+how: Reference data is a table kept as a compacted changelog topic, for example campaigns keyed by campaign id. The stream job loads it into local state as a KTable. Both inputs are partitioned by the same key with the same partition count (co-partitioned), so one task sees all rows and events of a key.
+For each event, the job does a local lookup of the key and emits the event joined with the current row. There is no network call per event, so throughput stays high. The table updates as new changelog records arrive.
+A stream-table join is not time-travel. It uses the table state at processing time, so a late event gets the newest row, not the row from event time. If you need the old version, use a temporal join. A GlobalKTable copies the whole table to every task and avoids co-partitioning for small tables.
+used: Kafka Streams KStream-KTable and GlobalKTable joins; Flink with lookup joins; ad servers adding campaign and creative metadata to impressions.
+avoid: When the table is huge and rarely used, or when results must use the row as of event time; use a temporal join.
+flow:
+  Impressions topic [log: key campaign id] -> Join task [svc: KStream-KTable] : impression c-7 | Events arrive keyed by campaign id.
+  Campaigns changelog [log: compacted] -> Join task : c-7 budget = 500 | The table side updates a local store.
+  Join task -> Local store [store: RocksDB] : get c-7 | The task looks up the row locally.
+  Join task -> Enriched topic [log] : impression + budget | The output holds the event with its campaign fields.
+  Campaigns changelog -> Join task : c-7 budget = 450 | A later update changes the row.
+  * Join task: later events see 450 | Only events processed after the update use the new row.
+ref: docs | Kafka Streams DSL: joins | Apache Kafka documentation | https://kafka.apache.org/documentation/streams/developer-guide/dsl-api.html
+
+== Interval join for click attribution
+kind: windowed-agg, event-driven
+when: Two event streams must be matched by key within a time bound, such as a click within 30 minutes after an impression.
+how: Both streams are keyed by the same id, for example impression id. Each side keeps its recent events in keyed state. When a click arrives, the job looks for impressions with the same key whose event time lies in the allowed range, here 0 to 30 minutes before the click. For each match it emits one joined record. A new impression is also checked against clicks already seen.
+Because streams are out of order, either side can arrive first. State must be held until no match is possible. The watermark gives that moment: once the watermark passes impression time plus 30 minutes, the entry is removed. Without this, state grows without limit.
+Left or outer variants emit unmatched impressions after the bound ends, which gives the count of impressions without a click. Keep the bound as short as the business rule allows, because state size grows with the bound times the event rate.
+used: Flink interval join; Spark Structured Streaming stream-stream join with watermarks; attribution of conversions to ad exposures.
+avoid: When the match has no clear time bound; use a batch join or a session-style model.
+flow:
+  Impressions topic [log] -> Join operator [svc: interval join] : impression i-5 at 10:00 | The impression is stored in state under its key.
+  Clicks topic [log] -> Join operator : click i-5 at 10:12 | A click with the same key arrives.
+  Join operator -> Attributed topic [log] : i-5 click after 12 min | The click is within 30 minutes, so a match is emitted.
+  Join operator -> State [store: keyed buffers] : keep i-5 until 10:30 | The impression stays until the match window ends.
+  * Join operator: watermark 10:31 | The watermark passes 10:30, so state for i-5 can be removed.
+  Join operator -x> State : expire i-5 | State is cleaned and memory stays bounded.
+ref: docs | Joins | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/joining/
+
+== Temporal join for point-in-time correctness
+kind: stream-table-join, feature-store
+when: Each event must be joined with the version of a changing table that was valid at the event's own time.
+how: The table side is a versioned table: every row has a key and a validity time, such as a currency rate or a user tier that changes over time. The job keeps recent versions in state. For an order at 10:05, it joins the rate version valid at 10:05, not the newest one.
+In Flink SQL this is written FOR SYSTEM_TIME AS OF order_time. The join needs watermarks on both sides. The job waits until the table watermark passes the event time, so late table updates are included. Then old versions that no event can need are removed.
+This gives results that do not change when you replay history. That is why feature stores use point-in-time joins to build training sets: a label must only see features known at that moment, or the model sees the future.
+used: Flink temporal table joins; feature store training-set builders (Feast and similar); finance rate conversion.
+avoid: When the latest value is what you want; a simple stream-table join is cheaper. Also avoid it when the table has no reliable update times.
+flow:
+  Orders topic [log: event time] -> Temporal join [svc: Flink SQL] : order at 10:05 | The order carries its own event time.
+  Rates changelog [log: versioned] -> Temporal join : EUR 1.10 at 10:00 | Rate versions flow into keyed state.
+  Rates changelog -> Temporal join : EUR 1.12 at 10:20 | A newer rate arrives with a later valid time.
+  Temporal join -> Priced orders [log] : order uses 1.10 | The job picks the version valid at 10:05, not the newest.
+  * Temporal join: watermark 10:25 | The watermark passes 10:20, so versions older than needed can be dropped.
+ref: docs | Temporal joins | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/sql/queries/joins/
+
+@@ watermarks
+== Event-time windows closed by a watermark
+kind: windowed-agg
+when: Events arrive late and out of order, but a window result must reflect event time and still be emitted in bounded delay.
+how: Each event carries its event time, for example the time of the click on the device. The job computes a watermark, often max event time seen minus a bound. With a 5 second bound, after seeing an event at 10:00:20 the watermark is 10:00:15. It says: no more events older than 10:00:15 are expected.
+A window for 10:00:00 to 10:00:10 closes when the watermark passes its end. The job emits the result then and drops the window state. An event that arrives after its window closed is late. Flink can keep the window for an allowed lateness and re-emit an updated result, or send the late event to a side output for later correction.
+A small bound gives low delay but more late events. A large bound gives complete results but slower output. Choose the bound from the measured delay distribution, for example the 99th percentile, and count late events as a metric.
+used: Apache Flink, Apache Beam and Google Dataflow (the Dataflow model), Spark Structured Streaming withWatermark.
+avoid: When processing-time results are enough, such as a live rate for monitoring; they are simpler and have no late data.
+flow:
+  Mobile app [client] -> Events topic [log] : click at 10:00:18 | Events carry the time they happened, but arrive out of order.
+  Events topic -> Window operator [svc: 10 s windows] : clicks 10:00:18 and :20 | The operator assigns each event to a window by event time.
+  * Window operator: watermark 10:00:15 | The watermark is max event time minus 5 seconds.
+  Window operator -> Counts topic [log] : window 10:00:00 = 412 | The watermark passed the window end, so the window closes and emits.
+  Events topic -x> Window operator : click at 10:00:07 | This event is late: its window is already closed.
+  Window operator ~> Late side output [log] : late click | The late event goes to a side output for correction, instead of being lost.
+ref: paper | The Dataflow Model | Akidau et al., VLDB 2015 | https://www.vldb.org/pvldb/vol8/p1792-Akidau.pdf
+ref: docs | Generating watermarks | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/event-time/generating_watermarks/
+
+== Per-partition watermarks and idle sources
+kind: windowed-agg
+when: A job reads many partitions at different speeds, and one slow or empty partition must not give wrong results or block progress.
+how: Each source partition tracks its own watermark. A downstream operator with several inputs uses the minimum of them. This is safe: the operator never claims a time that any input has not passed. With partitions at 10:00:40, 10:00:35 and 10:00:12, the operator watermark is 10:00:12.
+One slow partition holds back every window. A partition with no traffic holds the minimum forever, and windows never close. The fix is to mark idle sources: in Flink, withIdleness(1 minute) tells the job to ignore a partition that sent nothing for a minute. When data returns, it joins the minimum again.
+Idle marking can make events late, so pick the timeout with care. Reading each partition with watermarks inside the Kafka source (per-partition) is better than one watermark after the source, because the partition order is kept.
+used: Apache Flink Kafka source watermark strategies with withIdleness; Spark and Beam have similar handling of idle input.
+avoid: When all partitions have steady traffic and similar speed; the default settings are enough.
+flow:
+  Partition 0 [log: 10:00:40] -> Kafka source [svc: per-partition marks] : events and watermark | Partition 0 is fast; its watermark is 10:00:40.
+  Partition 1 [log: 10:00:35] -> Kafka source : events and watermark | Partition 1 is a little slower.
+  Partition 2 [log: no traffic] -> Kafka source : nothing | Partition 2 has no events at all.
+  Kafka source -> Window operator [svc: min of inputs] : watermark 10:00:12 | The operator takes the minimum, so windows cannot close yet.
+  Kafka source -x> Window operator : stuck for minutes | The silent partition blocks all windows.
+  * Kafka source: partition 2 idle after 1 min | withIdleness ignores the silent partition.
+  Kafka source -> Window operator : watermark 10:00:35 | The minimum moves on and windows close.
+ref: docs | Dealing with idle sources | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/event-time/generating_watermarks/
+
+@@ windowing
+== Tumbling windows into a reporting store
+kind: windowed-agg, pre-aggregation
+when: Dashboards need counts and sums per minute from billions of raw events, and raw events cost too much to query live.
+how: A streaming job reads ad events and groups them by campaign id and by a fixed one-minute window of event time. Windows do not overlap, so each event belongs to exactly one window. The job keeps one counter per key and window in state.
+When the watermark passes the end of a window, the job emits one row such as campaign 7, 10:01, impressions 52,000, clicks 410. A row replaces millions of events. The rows go to a store built for queries, for example Druid, ClickHouse or Pinot, and the dashboard queries only the rows.
+Late events either update the row (upsert with the same key) or are logged for the nightly batch to fix. Pick window size by the finest grain users query: coarser grains can be rolled up from the minute rows later, but finer ones cannot be recovered.
+used: Flink or Kafka Streams into Druid, ClickHouse or Pinot for ad reporting; Spark Structured Streaming window aggregations.
+avoid: When users need ad hoc drill-down on raw events; keep raw data too, in a lake.
+flow:
+  Events topic [log: impressions and clicks] -> Window job [svc: 1 min tumbling] : events by campaign | The job assigns each event to one minute window.
+  Window job -> Window state [store: counters per key] : count + 1 | Each event updates a counter for its key and window.
+  * Window job: watermark passes 10:01:00 | The window 10:00 to 10:01 is complete.
+  Window job -> Metrics store [db: ClickHouse] : campaign 7, 10:00, 52000 | One row per key and window is written, replacing millions of events.
+  Dashboard [client] -> Metrics store : last 6 hours | The dashboard reads small pre-aggregated rows.
+  Window job ~> Raw lake [lake: Parquet] : raw events | Raw events also go to the lake for later drill-down.
+ref: docs | Windows | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/windows/
+
+== Session windows for viewing sessions
+kind: windowed-agg
+when: Activity comes in bursts with idle gaps, such as a viewer watching TV, and a session has no fixed length.
+how: A session window groups events of one key that are closer together than a gap, for example 30 minutes. Each event starts its own window of event time plus the gap. If another event of the same key falls into that window, the two windows merge into one longer window.
+The window closes when the watermark passes the last event time plus the gap. Then the job emits the session: start, end, event count and watch time. State is held per key and per open session, so a long idle gap lets state be freed.
+Sessions are hard to size for memory, because a session can last hours. Late events can merge two already closed sessions, so allowed lateness must be set with care. The result is the true unit of viewing, which fixed windows cut in the wrong places.
+used: Flink and Beam session windows; Spark Structured Streaming session_window; connected TV and web analytics for sessions and watch time.
+avoid: When you only need rates per fixed period; tumbling windows use less state.
+flow:
+  Player events [log: key viewer id] -> Session job [svc: gap 30 min] : play at 20:00 | The first event opens a window 20:00 to 20:30.
+  Player events -> Session job : pause at 20:20 | A second event falls inside, so the window grows to 20:50.
+  * Session job: window 20:00-20:50 | Windows of one key merge when they overlap.
+  Player events -> Session job : play at 22:00 | A new event after a long gap opens a separate session.
+  * Session job: watermark 20:51 | The watermark passes 20:50, so the first session closes.
+  Session job -> Sessions table [db] : viewer 5, 50 min, 2 events | The job writes one row per finished session.
+ref: docs | Session windows | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/windows/
+
+== Sliding windows for fraud and rate alerts
+kind: windowed-agg
+when: A rule needs a moving total over the last N minutes, updated often, such as clicks per device in the last 5 minutes.
+how: A sliding window has a size and a slide, for example size 5 minutes and slide 1 minute. Windows overlap, so each event is in five windows. The job counts per key in every window and emits a result each minute.
+The cost is higher than for tumbling windows: state and updates grow by size divided by slide. Choose the slide as large as the alert delay allows. For very large windows with small slides, an incremental function keeps only one aggregate per window instead of all events.
+A rule engine reads the counts. If clicks per device exceed a limit, such as 100 in 5 minutes, it raises a fraud flag or blocks the traffic. If a rolling value is needed on every event, with no slide, use a per-key state with expiry instead of windows.
+used: Flink sliding windows and Kafka Streams hopping windows; fraud and invalid traffic checks in ad platforms; rate monitoring.
+avoid: When the slide is tiny compared with the size; keep per-key state with expiring buckets instead.
+flow:
+  Clicks topic [log] -> Sliding job [svc: size 5m slide 1m] : click device d-9 | Each click is added to five overlapping windows.
+  Sliding job -> Window state [store: counts per window] : count + 1 in 5 windows | State holds one counter per key and window.
+  * Sliding job: watermark passes 10:05 | The window 10:00 to 10:05 closes and emits.
+  Sliding job -> Rules engine [svc: threshold 100] : d-9 has 140 clicks | The count goes to a rule check each minute.
+  Rules engine -> Block list [store: Redis] : block d-9 | The device is blocked for the next hour.
+  Ad server [svc] -> Block list : check device | The ad server checks the list before it bids.
+ref: docs | Windows | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/windows/

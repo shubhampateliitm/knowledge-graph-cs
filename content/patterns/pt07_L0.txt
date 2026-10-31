@@ -1,0 +1,808 @@
+@@ golang
+== Bounded worker pool with channels
+kind: thread-pool, producer-consumer
+when: A service must run many independent jobs, such as image resizes or API calls, without starting unlimited work.
+how: A producer goroutine sends jobs into a buffered channel, for example with capacity 100. A fixed number of worker goroutines, say 16, loop over the channel and take one job each. The channel is the queue, and its buffer is the bound.
+When the buffer is full, the send blocks. This is backpressure: the producer slows down instead of using all memory. A sync.WaitGroup waits for the workers to finish, and closing the channel tells them to stop.
+Goroutines start with a stack of about 2 KB and are scheduled by the Go runtime onto OS threads, so a pool of 16 is cheap. Pools are still useful, because the limit protects the downstream database or API, not the CPU.
+used: Common in Go services, crawlers and batch tools; the pattern is described in the Go blog on pipelines and cancellation.
+avoid: When one goroutine per request is fine and downstream limits are not a problem; use a semaphore (buffered channel or x/sync/semaphore) for a simple cap.
+flow:
+  Producer [svc: goroutine] -> jobs channel [queue: buffer 100] : send job | The producer sends each job into the buffered channel.
+  jobs channel -> Worker 1 [svc: goroutine], Worker 2 [svc: goroutine] : receive job | Idle workers receive jobs; each job goes to exactly one worker.
+  Worker 1 -> Downstream API [svc: limit 16 calls] : call | Only 16 workers exist, so the API never sees more than 16 parallel calls.
+  Producer -x> jobs channel : send blocks, buffer full | When the buffer is full the send blocks, so the producer slows down.
+  Worker 2 -> results channel [queue] : result | Workers send results to a second channel that a collector reads.
+ref: blog | Go Concurrency Patterns: Pipelines and cancellation | Sameer Ajmani, The Go Blog, 2014 | https://go.dev/blog/pipelines
+
+== Controller reconcile loop with informers
+kind: control-loop, event-driven
+when: You must keep a real system equal to a declared desired state, and recover by itself after crashes or missed events.
+how: Kubernetes controllers are written in Go with client-go. An informer opens a watch on the API server, keeps a local cache of objects, and calls handlers on add, update and delete events. The handler does not do work. It puts the object key into a rate-limited work queue.
+Worker goroutines take a key, read the current object from the local cache, compare it with the real world, and make the missing changes. This is the reconcile function. If it fails, the key is put back with exponential delay.
+The loop is level-triggered: it looks at the full state, not at one event. So a lost or duplicated event does not matter, because the next reconcile fixes the difference. The informer also resyncs from time to time.
+used: Kubernetes built-in controllers (Deployment, Job); operators built with controller-runtime and Kubebuilder; Argo CD and Crossplane.
+avoid: For a one-off task with no long-lived desired state; use a plain job or a workflow engine instead.
+flow:
+  API server [svc: Kubernetes] -> Informer [svc: client-go cache] : watch event | The informer receives a change event over a long-lived watch and updates its local cache.
+  Informer -> Work queue [queue: dedup by key] : enqueue key | The handler only stores the object key; many events for one object collapse into one key.
+  Work queue -> Reconciler [svc: goroutine] : next key | A worker goroutine takes one key at a time.
+  Reconciler -> Informer : read cache | The reconciler reads the current object from the cache, not from the API server.
+  Reconciler -> Cloud API [svc: real world] : create or fix | It makes the missing changes so the real world matches the spec.
+  Reconciler -x> Work queue : error, requeue with delay | On error the key returns to the queue with a growing delay.
+ref: docs | Kubernetes Controllers | Kubernetes documentation | https://kubernetes.io/docs/concepts/architecture/controller/
+
+== Deadline propagation with context
+kind: timeout-deadline, circuit-breaker
+when: A request fans out into many downstream calls, and work must stop when the caller has given up.
+how: Go passes a context.Context as the first argument of every function that does I/O. The edge handler creates a context with a deadline, for example 800 ms from the user request. Each call to a database or another service receives the same context.
+gRPC sends the remaining time to the next service as a header, so the deadline shrinks at every hop. When the deadline passes or the client disconnects, ctx.Done() closes. All goroutines that select on it stop, and database drivers cancel their queries.
+Without this, a slow dependency leaves thousands of goroutines waiting and holding connections long after nobody needs the answer. Pair it with a circuit breaker so that calls to a failing service return at once.
+used: Standard in Go gRPC and net/http services; Kubernetes client-go and most Go cloud SDKs take a context.
+avoid: Do not store business data in the context. For work that must finish even if the caller leaves, use a detached context with its own timeout.
+flow:
+  Client [client] -> API handler [svc: ctx deadline 800ms] : HTTP request | The handler creates a context with an 800 ms deadline.
+  API handler -> Orders service [svc: 640ms left] : gRPC with deadline | The deadline travels in the gRPC header; the remaining time is about 640 ms.
+  Orders service -> Postgres [db] : query with ctx | The driver ties the query to the context.
+  * Orders service: deadline passed | The deadline passes before the query returns.
+  Orders service -x> Postgres : cancel query | The context closes and the driver cancels the running query.
+  Orders service -x> API handler : DeadlineExceeded | The caller gets a clear error and frees its goroutines at once.
+ref: blog | Go Concurrency Patterns: Context | Sameer Ajmani, The Go Blog, 2014 | https://go.dev/blog/context
+
+@@ jvm
+== Tiered JIT with deoptimization
+kind: interpreter-compiler, feedback-loop
+when: A long-running server must start fast, but reach near native speed on its hot code.
+how: HotSpot first runs bytecode in an interpreter and counts method calls and loop back-edges. After a few hundred to a few thousand invocations, the C1 compiler produces fast but simple code with profiling counters. A method that stays hot (about 10,000 calls or more) is compiled again by C2 with the collected profile.
+The profile tells C2 which branch is taken, which class is the real receiver at a virtual call, and which values are never null. C2 uses this to inline across calls and to remove checks. The assumptions can be wrong. If a new class appears, the code deoptimizes: execution goes back to the interpreter and the method is compiled again.
+The price is warm-up. Peak speed arrives after seconds or minutes, and the compiler threads use CPU while the application runs.
+used: All HotSpot-based servers: Kafka brokers, Cassandra, Elasticsearch, Spark executors; GraalVM Enterprise and OpenJ9 follow a similar idea.
+avoid: For short-lived command-line tools or functions with cold start limits; use ahead-of-time compilation (GraalVM Native Image) or class data sharing.
+flow:
+  Bytecode [note: .class files] -> Interpreter [svc: counts calls] : run | New code starts in the interpreter, which also counts calls and branches.
+  Interpreter -> C1 compiler [svc: tier 3] : hot method | After about a thousand calls the method is compiled by C1 with profiling.
+  C1 compiler -> C2 compiler [svc: profile guided] : profile data | A method that stays hot is compiled again by C2 using the profile.
+  C2 compiler -> Code cache [cache: machine code] : install | Optimized machine code is stored in the code cache and called directly.
+  Code cache -x> Interpreter : deopt, new class seen | A guess fails, so the method falls back to the interpreter and is profiled again.
+ref: docs | HotSpot Virtual Machine Garbage Collection Tuning Guide | Oracle, OpenJDK documentation | https://docs.oracle.com/en/java/javase/21/gctuning/
+
+== Virtual threads for thread-per-request servers
+kind: thread-pool, event-loop
+when: A blocking-style server must handle tens of thousands of waiting connections without callback code.
+how: Before Java 21, one request used one OS thread, with about 1 MB of stack reserved, so a server stopped at a few thousand threads. Virtual threads (JEP 444, final in Java 21) are objects on the heap, scheduled by the JVM onto a small pool of carrier threads, about one per CPU core.
+When code calls a blocking operation such as a socket read, the virtual thread unmounts from its carrier and its stack is saved on the heap. The carrier takes another virtual thread. When the data arrives, the thread is mounted again. The code stays simple and sequential.
+Create a new virtual thread for each request. Do not pool them. Limit access to scarce resources, like a database with 50 connections, with a semaphore instead.
+used: Spring Boot, Tomcat, Jetty and Helidon can run requests on virtual threads; Helidon Nima is built around them.
+avoid: For CPU-bound work, where more threads than cores do not help; and be careful with code that pins the carrier, such as long synchronized blocks around I/O in older Java versions.
+flow:
+  Client [client] -> HTTP server [svc: Tomcat or Jetty] : request | The server starts one virtual thread for the request.
+  HTTP server -> Carrier pool [svc: 8 OS threads] : run virtual thread | The virtual thread is mounted on one of 8 carrier threads.
+  Carrier pool -> Postgres [db] : blocking query | The code calls a blocking JDBC query in plain sequential style.
+  * Carrier pool: unmounted, waiting | The virtual thread unmounts, so its carrier thread is free for other requests.
+  Postgres -> Carrier pool : rows | The reply arrives and the virtual thread is mounted again, possibly on another carrier.
+  Carrier pool -> Client : response | The handler finishes and the virtual thread ends.
+ref: spec | JEP 444: Virtual Threads | OpenJDK, 2023 | https://openjdk.org/jeps/444
+
+== Fast restart with CRaC or class data sharing
+kind: checkpoint-restart, immutable-infra
+when: Java services scale out or start often, and a 20 to 60 second start with cold code is too slow or too costly.
+how: Warm-up has two costs: loading and verifying classes, and compiling hot code. Application Class Data Sharing (AppCDS) writes loaded classes into an archive file at build time. The next JVM maps the file, and startup can drop by a third or more.
+CRaC (Coordinated Restore at Checkpoint) goes further. You run the application, warm it with test traffic, and ask the JVM to checkpoint. The process memory, including compiled code, is saved to disk with CRIU on Linux. New instances restore from this image in tens of milliseconds. Open files and sockets must be closed before the checkpoint and opened again after restore, through a Resource callback.
+The image is built in the CI pipeline and shipped inside the container image, so every instance starts from the same warm state.
+used: AppCDS is in standard OpenJDK. CRaC is supported by Azul Zulu builds, Spring Boot 3.2 and later, Micronaut and Quarkus; AWS Lambda SnapStart uses a similar snapshot idea for Java.
+avoid: When start time does not matter. Also avoid snapshots if the app keeps secrets or random seeds in memory; refresh them after restore.
+flow:
+  CI build [svc: pipeline] -> Warm JVM [svc: runs test traffic] : start and warm up | CI starts the application and sends test requests so the code is compiled.
+  Warm JVM -> Snapshot image [store: memory + code] : checkpoint | The JVM closes its sockets and saves the process memory to disk.
+  Snapshot image -> Container registry [store] : push image | The snapshot ships inside the container image.
+  Autoscaler [svc: scale out] -> New pod [svc: restored JVM] : start pod | A new instance is requested when load grows.
+  Container registry -> New pod : restore | The pod restores the warm process in tens of milliseconds.
+  New pod -> Postgres [db] : reopen connections | The app opens its database connections again in the restore callback.
+ref: docs | CRaC project | OpenJDK | https://openjdk.org/projects/crac/
+
+@@ llvm
+== One IR shared by many languages and targets
+kind: interpreter-compiler, plugin-arch
+when: You build several languages or several CPU targets and do not want to write an optimizer for each pair.
+how: A front end parses source code and emits LLVM IR, a typed, low-level form in static single assignment (SSA) style. Clang does this for C and C++, rustc for Rust, Swift and Zig have their own front ends. The middle end runs a pipeline of optimization passes on the IR, such as inlining, loop unrolling and vectorization.
+A back end then lowers the IR for one target: x86-64, AArch64, RISC-V, WebAssembly or a GPU. With M languages and N targets you write M plus N pieces, not M times N. A new target gets all existing front ends, and a new language gets all existing targets.
+Passes are modules with a standard interface, so teams add their own analyses and transforms. The cost is long compile time for big programs and IR that changes between releases.
+used: Clang, rustc, Swift, Julia, Zig and Mojo use LLVM; Android and Apple toolchains build on it.
+avoid: For a small language where a simple interpreter or a transpiler to C is enough, or when compile speed matters more than code speed.
+flow:
+  C++ source [note: main.cpp] -> Clang [svc: front end] : parse | Clang checks the types and builds an abstract syntax tree.
+  Rust source [note: lib.rs] -> rustc [svc: front end] : parse | A second language uses its own front end.
+  Clang, rustc -> LLVM IR [store: SSA form] : emit IR | Both front ends produce the same kind of IR.
+  LLVM IR -> Optimizer [svc: pass pipeline] : run passes | The passes inline calls, remove dead code and vectorize loops.
+  Optimizer -> x86-64 backend [svc: codegen], AArch64 backend [svc: codegen] : lower | Each target back end chooses instructions and registers.
+  x86-64 backend, AArch64 backend -> Object files [store: .o] : machine code | A linker then builds the final binary.
+ref: paper | LLVM: A Compilation Framework for Lifelong Program Analysis & Transformation | Lattner & Adve, CGO 2004 |
+
+== Profile-guided optimization and ThinLTO
+kind: feedback-loop, interpreter-compiler
+when: A hot native binary, such as a browser or a database, needs more speed and the team can run a realistic workload at build time.
+how: First build an instrumented binary with Clang using -fprofile-generate. Run it on a typical workload. It writes raw profile data, and llvm-profdata merges the runs into one profile. Then rebuild with -fprofile-use. The optimizer now knows which branches are hot, so it lays out code to improve cache use and inlines the right calls.
+ThinLTO adds whole-program optimization at link time without one giant step. Each file keeps a small summary of its functions. The linker decides imports across files, and then it compiles files in parallel with the imported functions.
+Together they often give a 10 to 20 percent speed gain on large C++ programs, at the price of a longer, two-step build. The profile must match current code, so rebuild it with each release.
+used: Chrome and Firefox builds use PGO and LTO; Linux kernel and Android builds support ThinLTO; Rust offers the same through cargo-pgo.
+avoid: When the workload is unpredictable or the build time budget is small. A stale profile can make code slower for the real workload.
+flow:
+  Source code [note: C++ repo] -> Instrumented build [svc: clang -fprofile-generate] : compile | The first build adds counters to branches and calls.
+  Instrumented build -> Training run [svc: typical workload] : run | The team runs a realistic workload; counters record which code is hot.
+  Training run -> Profile data [store: .profdata] : merge | llvm-profdata merges the raw files into one profile.
+  Profile data -> Optimized build [svc: -fprofile-use + ThinLTO] : feed profile | The optimizer uses the profile to inline hot paths and place cold code away.
+  Optimized build -> Release binary [store] : link | ThinLTO imports hot functions across files and builds in parallel.
+ref: docs | ThinLTO design | LLVM documentation | https://clang.llvm.org/docs/ThinLTO.html
+
+== JIT code generation for hot query expressions
+kind: interpreter-compiler, offload-accelerator
+when: A database or numeric library spends most time in an interpreter loop over generic expressions, and compiled code would cut it.
+how: A query engine normally walks an expression tree for every row, with a function call per operator. With LLVM JIT the engine builds LLVM IR for the whole expression, such as a filter with three comparisons. It compiles the IR into machine code in memory, using the ORC JIT, and calls that code in a tight loop.
+PostgreSQL does this when jit is on and the planner cost is above a limit (jit_above_cost, 100000 by default). Python's Numba uses llvmlite to compile numeric functions the same way.
+Compilation takes tens to hundreds of milliseconds. So the engine decides by estimated cost: cheap queries stay interpreted, large scans pay the compile cost once and gain on millions of rows.
+used: PostgreSQL JIT for expressions and tuple decoding; Numba for Python numeric code; Julia compiles every function through LLVM.
+avoid: For short OLTP queries, where compile time exceeds query time; keep JIT off or raise the cost threshold.
+flow:
+  Client [client] -> Query planner [svc: Postgres] : SQL query | The planner estimates a cost of 400,000 for a large scan.
+  Query planner -> JIT compiler [svc: LLVM ORC] : cost above limit | The cost is above jit_above_cost, so the planner asks the JIT to compile.
+  JIT compiler -> Machine code [cache: in memory] : IR to native code | The expression is compiled into native code; this takes tens of milliseconds.
+  Query planner -> Executor [svc: row loop] : run plan | The executor calls the compiled function for each row.
+  Executor -> Machine code : call per row | A tight native loop replaces the generic interpreter for 50 million rows.
+  Executor -> Client : result | The saved time on a large scan is greater than the compile cost.
+ref: docs | Just-in-Time Compilation | PostgreSQL documentation | https://www.postgresql.org/docs/current/jit.html
+
+@@ python
+== ASGI app behind a reverse proxy with worker processes
+kind: horizontal-scale, event-loop
+when: You serve a Python web API and need more throughput than one process, because of the GIL, and clean restarts.
+how: A reverse proxy such as nginx or a cloud load balancer terminates TLS and sends requests to several application servers. On each machine, Gunicorn starts a master process that forks N worker processes, often about one per CPU core. With Uvicorn workers, each worker runs one asyncio event loop that serves an ASGI app such as FastAPI or Starlette.
+Inside one worker, async handlers wait for the database or other APIs without blocking the loop, so one process handles hundreds of connections. CPU-heavy code still blocks the loop and the GIL, so it goes to a thread pool or another service.
+The workers share nothing. Session state lives in Redis or a database. Because the app is stateless, you add machines when load grows and replace workers one at a time for rolling restarts.
+used: Common in Instagram's Django serving, FastAPI services, and most Python APIs on Kubernetes.
+avoid: For heavy CPU work per request. Move it to a worker queue or use a compiled extension.
+flow:
+  Browser [client] -> Load balancer [svc: nginx] : HTTPS request | The proxy ends TLS and picks a healthy server.
+  Load balancer -> Gunicorn master [svc: 4 workers] : proxy request | Gunicorn hands the request to one of its worker processes.
+  Gunicorn master -> Uvicorn worker [svc: asyncio loop] : dispatch | One worker runs an event loop for many connections.
+  Uvicorn worker -> Redis [cache: sessions] : await GET | The handler awaits Redis, and the loop serves other requests meanwhile.
+  Uvicorn worker -> Postgres [db] : await query | The database call is also non-blocking through an async driver.
+  Uvicorn worker -> Browser : JSON response | The reply returns through the proxy.
+ref: docs | ASGI specification | ASGI documentation | https://asgi.readthedocs.io/en/latest/specs/main.html
+
+== Python as control layer over native kernels
+kind: offload-accelerator, data-locality
+when: You want Python's speed of development, but the numeric work must run at C, C++ or GPU speed.
+how: In NumPy, pandas, Polars and PyTorch, Python code only describes the operations. The real work runs in compiled kernels written in C, C++, Rust or CUDA. One call such as a matrix multiply or a Polars group-by loops over millions of values in native code.
+The extensions release the Global Interpreter Lock (GIL) while they compute, so threads can run in parallel. Data stays in native buffers (NumPy arrays, Arrow memory), and Python objects are not created per value. Many libraries share these buffers without copying, through the buffer protocol or Arrow.
+For GPUs, PyTorch queues kernels asynchronously on a CUDA stream, so Python moves on to the next line while the GPU computes. The rule is to avoid Python loops over single elements; use whole-array operations.
+used: NumPy, pandas, Polars, PyTorch and JAX; most machine learning training code.
+avoid: For logic that cannot be vectorized and runs per element; use Numba, Cython, Rust through PyO3, or rewrite that part.
+flow:
+  Python script [svc: orchestration] -> NumPy or Polars [svc: C and Rust kernels] : one call per array | Python sends one call for a large array, not one per value.
+  NumPy or Polars -> Native buffer [store: columnar memory] : read and write | The kernel works on contiguous memory without Python objects.
+  Python script -> PyTorch [svc: dispatcher] : model(x) | PyTorch chooses a kernel for the device.
+  PyTorch -> GPU [svc: CUDA stream] : launch kernel | The launch is asynchronous, so Python continues right away.
+  GPU -> Python script : result tensor | Python waits only when it needs a value on the CPU.
+ref: docs | NumPy internals and the buffer protocol | NumPy documentation | https://numpy.org/doc/stable/dev/internals.html
+
+== Task queue with Celery workers
+kind: competing-consumers, load-leveling, dead-letter
+when: Web requests must start slow work, like sending email or building a report, without making the user wait.
+how: The web app puts a task message on a broker such as RabbitMQ or Redis and returns at once. A pool of Celery worker processes, on separate machines, consume from the queue. Each message goes to one worker, so adding workers raises throughput.
+The queue also absorbs bursts: if 5,000 tasks arrive in a minute, they wait their turn. Workers acknowledge a message after the task finishes (acks_late), so a crashed worker's task is delivered again. This means tasks must be idempotent.
+Failed tasks retry with a delay, and after a few tries they go to a failed state or a dead-letter queue. Results can be stored in a backend such as Redis for the web app to poll. Separate queues for slow and fast tasks stop one kind from starving the other.
+used: Celery is common in Django and Flask systems; RQ, Dramatiq and Apache Airflow's CeleryExecutor use the same idea.
+avoid: When you need to chain complex multi-step workflows with state and audit; use a workflow engine like Temporal or Airflow.
+flow:
+  Web app [svc: Django] -> Broker [queue: Redis or RabbitMQ] : send_invoice task | The web app enqueues the task and answers the user with 202.
+  Broker -> Worker A [svc: Celery], Worker B [svc: Celery] : deliver task | Each task goes to one idle worker.
+  Worker A -> Email API [svc: external] : send email | The worker does the slow work outside the request.
+  Worker A -> Broker : ack | The worker acknowledges after success, so the task is not repeated.
+  Worker B -x> Broker : crash before ack | A crashed worker never acks, so the broker redelivers the task.
+  Broker ~> Dead-letter queue [queue] : after 5 retries | A task that keeps failing is parked for a person to inspect.
+ref: docs | Celery: Task guide, retrying and acks_late | Celery project | https://docs.celeryq.dev/en/stable/userguide/tasks.html
+
+@@ rust
+== Async service on a work-stealing runtime
+kind: event-loop, thread-pool
+when: A network service must hold many connections with predictable latency and no garbage collector pauses.
+how: Tokio runs async tasks on a pool of worker threads, by default one per CPU core. Each task is a Rust future, a state machine compiled to a small object. When a task waits for a socket, it returns control and the thread takes the next ready task. The reactor uses epoll or io_uring-style APIs of the OS to wake tasks when data arrives.
+Each worker has its own run queue. An idle worker steals half of the tasks from a busy one, which balances load without a global lock. Blocking calls and heavy CPU work are moved to spawn_blocking, a separate thread pool, so they do not stall the workers.
+Memory is freed by ownership rules at compile time, so there are no GC pauses. A hyper or axum server often serves tens of thousands of connections on a few cores, with stable p99 latency.
+used: Cloudflare Pingora, Linkerd's proxy, Discord services, and the AWS Firecracker and Lambda runtime pieces are written in Rust.
+avoid: For quick glue code where team speed matters more than latency; a Go or Python service is cheaper to write.
+flow:
+  Clients [client] -> TCP listener [svc: Tokio reactor] : accept connections | The reactor accepts thousands of connections on a few threads.
+  TCP listener -> Worker thread 1 [svc: run queue], Worker thread 2 [svc: run queue] : spawn task | Each connection becomes a lightweight task on a worker's run queue.
+  Worker thread 1 -> Upstream DB [db] : await query | The task waits without blocking its thread; the thread runs other tasks.
+  Worker thread 2 -> Worker thread 1 : steal tasks | An idle worker steals tasks from the busy worker's queue.
+  Worker thread 1 -> Blocking pool [svc: spawn_blocking] : CPU-heavy job | Hashing or file work moves to a separate pool so the async workers stay free.
+ref: docs | Tokio tutorial and runtime scheduler | Tokio project | https://tokio.rs/tokio/tutorial
+
+== Rust data plane under a managed control plane
+kind: control-data-plane, sidecar
+when: A proxy or storage engine on the hot path needs high speed and safe memory, while the rules change often.
+how: A control plane, often written in Go or Java, holds the routes, policies and certificates. It pushes changes to data-plane proxies over a streaming API, such as xDS. The data plane is written in Rust. It only reads the current configuration from memory and moves bytes.
+Rust fits the data plane for two reasons. There is no GC, so latency stays flat at the 99th percentile. The compiler prevents use-after-free and data races, which are the classic causes of security bugs in C and C++ proxies.
+The data plane can run as a sidecar next to each service, or as an edge fleet. If the control plane fails, the proxies keep serving with the last good configuration. This is why the two planes are kept separate.
+used: Linkerd2-proxy (service mesh sidecar); Cloudflare's Pingora replaced NGINX for its CDN; Amazon Firecracker and Fastly's Compute runtime also use Rust.
+avoid: For rules or logic that product teams change daily; put that in the control plane or in sandboxed plugins instead.
+flow:
+  Operator [user] -> Control plane [svc: Go or Java] : new routing policy | An engineer changes a policy; the control plane validates it.
+  Control plane -> Rust proxy A [svc: data plane], Rust proxy B [svc: data plane] : push config | Config is streamed to all proxies, and each applies it atomically.
+  Client [client] -> Rust proxy A : request | Requests are served from in-memory config, with no call to the control plane.
+  Rust proxy A -> Backend service [svc] : forward | The proxy forwards the request with zero-copy buffers.
+  Control plane -x> Rust proxy B : connection lost | A control-plane outage stops config updates only.
+  * Rust proxy B: last good config | The proxy keeps serving traffic with its last configuration.
+ref: docs | Pingora: how we built it | Cloudflare, 2022 | https://blog.cloudflare.com/how-we-built-pingora-the-proxy-that-connects-cloudflare-to-the-internet/
+
+== Replace a hot path in place through a native extension
+kind: strangler-fig, offload-accelerator
+when: A Python, Node or Ruby service has one slow, CPU-bound function, and a full rewrite is too risky.
+how: Find the hot function with a profiler. Write it as a Rust library, and expose it with a binding layer: PyO3 and maturin for Python, napi-rs for Node. The package is built as a normal wheel or native module, so callers import it and do not know it is Rust.
+The old code stays in place at first. A flag or a shadow run compares both results on real traffic. When the outputs match, traffic moves to Rust. Then you repeat with the next hot function. This is a strangler approach inside one process.
+The Rust code uses buffers from the host, such as Arrow or bytes, to avoid copying. It can release the host's lock (the GIL in Python) while it works, so threads run in parallel.
+used: Pydantic v2 (pydantic-core), Polars, Ruff, cryptography and orjson in Python; SWC and Rolldown in the JavaScript tooling world.
+avoid: When the slow part is I/O or the database. A native extension will not fix that; fix queries or caching first.
+flow:
+  Python service [svc: Flask or FastAPI] -> Profiler [svc: py-spy] : find hot function | The profile shows that 70 percent of CPU is in one parser.
+  Python service -> Old parser [svc: pure Python] : parse (current) | Production still uses the old code.
+  Python service ~> Rust parser [svc: PyO3 module] : shadow call | The same input also goes to Rust, in shadow, and results are compared.
+  Rust parser -> Python service : same output, 12x faster | When results match, the team has proof it is safe.
+  * Python service: uses Rust parser | A flag switches traffic to the Rust module, and the old code is removed.
+ref: docs | PyO3 user guide | PyO3 project | https://pyo3.rs/
+
+@@ scala
+== Spark job written in Scala
+kind: map-reduce, data-locality
+when: You must process terabytes in parallel on a cluster with typed, readable transformation code.
+how: Spark is written in Scala, and its Dataset API is natural in Scala. The driver program builds a plan of lazy transformations, such as filter, join and groupBy. Nothing runs until an action, for example write, is called. Then the Catalyst optimizer rewrites the plan and splits it into stages at each shuffle.
+Executors on the cluster each run tasks over one partition of the data, ideally on the node that holds the HDFS block or the nearby object store split. A shuffle moves rows by key across the network, as in the old map and reduce steps. If an executor dies, Spark recomputes the lost partitions from the plan.
+Typed case classes catch many mistakes at compile time, such as a missing field. The cost is JVM memory use: tune partition size, often 128 MB to 256 MB, and avoid skewed keys.
+used: Databricks, Netflix, Uber and many lakehouse ETL platforms run Spark; Scala is the main language for the Spark core and many internal jobs.
+avoid: For small data that fits in one machine; use DuckDB or Polars. For low-latency streaming per event, consider Flink.
+flow:
+  Scala driver [svc: builds plan] -> Cluster manager [svc: YARN or Kubernetes] : request executors | The driver asks for 50 executors with 4 cores each.
+  Cluster manager -> Executor 1 [svc: JVM], Executor 2 [svc: JVM] : launch | Executors start and register with the driver.
+  Scala driver -> Executor 1, Executor 2 : tasks per partition | Each task reads one partition, near its data when possible.
+  Executor 1 -> Executor 2 : shuffle by key | A groupBy sends rows with the same key to one executor.
+  Executor 2 -> Parquet lake [lake: S3 or HDFS] : write result | The final stage writes Parquet files.
+  Executor 2 -x> Scala driver : executor lost | The driver reruns only the lost tasks from the plan.
+ref: docs | Spark RDD Programming Guide and Dataset API | Apache Spark documentation | https://spark.apache.org/docs/latest/rdd-programming-guide.html
+
+== Actor cluster with sharded entities
+kind: actor-model, sharding
+when: You need many stateful, independent entities, such as carts or devices, with low latency and no shared locks.
+how: Akka, and its Apache fork Pekko, run actors on the JVM. An actor holds private state and handles one message at a time, so it needs no locks. Cluster Sharding assigns each entity id, for example a device id, to a shard by hash. A shard coordinator decides which node owns each shard, and a router sends each message to the right actor, even across machines.
+If a node leaves, its shards move to other nodes and the actors restart there. With event-sourced persistence, the actor replays its stored events to get its state back. Remember entities keeps a list of active ones.
+Messages are asynchronous, so a slow entity does not block others. Mailboxes have no natural limit, so use bounded mailboxes or streams with backpressure for heavy flows.
+used: Lightbend Akka systems in banking and logistics; Apache Pekko as the open fork; Scala-based game and IoT backends. Note that Akka moved to the Business Source License in 2022.
+avoid: For simple stateless CRUD services, where an ordinary web framework and a database are simpler.
+flow:
+  Client [client] -> API node 1 [svc: Pekko HTTP] : update device 9042 | The request arrives on any node of the cluster.
+  API node 1 -> Shard region [svc: router] : message for entity 9042 | The shard region hashes the id to shard 17.
+  Shard region -> Node 2 [svc: owns shard 17] : forward message | The coordinator says node 2 owns shard 17, so the message is sent there.
+  Node 2 -> Device actor 9042 [svc: private state] : handle one message | The actor updates its state, one message at a time.
+  Device actor 9042 -> Journal [log: Cassandra or Postgres] : persist event | The actor stores the event, so state survives a crash.
+  Node 2 -x> Shard region : node leaves cluster | Shard 17 moves to node 3, and the actor replays its events.
+ref: docs | Apache Pekko Cluster Sharding | Apache Pekko documentation | https://pekko.apache.org/docs/pekko/current/typed/cluster-sharding.html
+
+== Functional effects with fibers
+kind: thread-pool, fork-join
+when: A service has much concurrent I/O, and you want safe cancellation and retries in readable code.
+how: Libraries such as Cats Effect and ZIO describe programs as values: an IO or ZIO is a recipe, not a running job. A runtime runs these recipes on fibers, which are very light green threads, scheduled on a small work-stealing pool, about one thread per core. Millions of fibers can exist.
+Because a program is a value, you can compose it. You can run two calls in parallel and race them, set a timeout, retry with backoff, or cancel the loser. Resources such as connections are opened with bracket or Resource, and are closed even if a fiber is cancelled.
+Blocking calls go to a separate blocking pool. The same code style serves http4s and fs2 streams, where backpressure is part of the design.
+used: The Typelevel stack (http4s, fs2, Doobie) and ZIO-based services; common in Scala teams in fintech and data platforms.
+avoid: When the team is new to functional style and the service is a simple CRUD API; plain Future or virtual threads may be simpler.
+flow:
+  Request [client] -> http4s server [svc: Cats Effect] : GET /profile | The server starts a fiber for the request.
+  http4s server -> Fiber pool [svc: work-stealing] : fork 2 fibers | The handler forks two calls to run in parallel.
+  Fiber pool -> User service [svc: remote], Billing service [svc: remote] : parallel calls | Both calls run at once on non-blocking I/O.
+  User service -> Fiber pool : reply 40 ms | One call finishes quickly.
+  Billing service -x> Fiber pool : timeout after 200 ms | The slow call hits its timeout, and its fiber is cancelled.
+  Fiber pool -> http4s server : partial result | The handler returns what it has, and resources are released.
+ref: docs | Cats Effect concurrency model | Typelevel | https://typelevel.org/cats-effect/docs/concepts
+
+@@ v8
+== Event loop in Node.js and Deno
+kind: event-loop, thread-pool
+when: A server does mostly network and file I/O, and you want one simple thread with high concurrency.
+how: V8 runs JavaScript on one thread. Node.js and Deno wrap V8 with an event loop (libuv in Node, Tokio in Deno). When your code calls a socket or file API, the runtime starts the I/O in the OS or in a small thread pool, and JavaScript continues. When the I/O completes, the loop queues the callback or resolves the promise, and V8 runs it to completion.
+A handler that takes 5 ms blocks all other requests for 5 ms. So CPU-heavy work, such as image processing or big JSON parsing, must move out: to worker_threads, each with its own V8 isolate, or to another service.
+To use all cores, run one Node process per core with the cluster module or one container per core behind a load balancer. Processes share nothing, so state lives in Redis or a database.
+used: Node.js servers at Netflix, PayPal and LinkedIn; Deno and Bun for similar workloads.
+avoid: For CPU-bound services. Use worker threads for small jobs or choose Go, Rust or Java.
+flow:
+  Clients [client] -> Node process [svc: V8 + libuv] : HTTP request | The request arrives; V8 runs the handler on the single JavaScript thread.
+  Node process -> Postgres [db] : async query | The driver sends the query and returns to the loop at once.
+  * Node process: waiting, serves others | While the query waits, the loop runs other callbacks, so one thread serves many clients.
+  Postgres -> Node process : rows ready | The promise resolves, and V8 continues the handler.
+  Node process -> Worker thread [svc: own V8 isolate] : image resize job | CPU-heavy work is moved off the main thread.
+  Worker thread -> Node process : result message | The result returns as a message, and the main thread stays responsive.
+ref: docs | The Node.js Event Loop | Node.js documentation | https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick
+
+== Tiered JIT with inline caches and deoptimization
+kind: interpreter-compiler, feedback-loop
+when: A dynamic language must start at once on a page, yet run hot loops at near native speed.
+how: V8 first parses the source and runs it in the Ignition interpreter, which also gathers type feedback. Hot functions are compiled by Sparkplug, a fast baseline compiler, then by Maglev, a mid-tier optimizer, and finally by TurboFan, which produces optimized machine code.
+Objects with the same property order share a hidden class (called a map). An inline cache at each property access remembers which maps it has seen. TurboFan assumes the same maps in the future and emits a few instructions in place of a dictionary lookup.
+If the assumption fails, for example an object with a new shape appears, the code deoptimizes and goes back to the interpreter. So keep object shapes and number types stable in hot code. Compile work runs on background threads to protect the main thread.
+used: Chrome, Node.js, Deno and Electron all use V8; Cloudflare Workers also run V8.
+avoid: Do not try to micro-tune this by hand before you profile. For tight numeric kernels, use WebAssembly or typed arrays.
+flow:
+  JS source [note: app.js] -> Ignition [svc: interpreter] : parse and run | Code starts in the interpreter, which collects type feedback.
+  Ignition -> Sparkplug [svc: baseline] : warm function | A warm function is compiled by the fast baseline compiler.
+  Sparkplug -> TurboFan [svc: optimizing] : hot, stable types | A hot function is compiled on a background thread using the feedback.
+  TurboFan -> Optimized code [cache: machine code] : install | The optimized code runs with checks on object shapes.
+  Optimized code -x> Ignition : deopt, new shape seen | A new object shape breaks the guess, so execution falls back and collects feedback again.
+ref: blog | Launching Ignition and TurboFan | V8 team, 2017 | https://v8.dev/blog/launching-ignition-and-turbofan
+
+== V8 isolates for multi-tenant edge compute
+kind: bulkhead, cdn-edge
+when: You run untrusted customer code in hundreds of cities and need start times of a few milliseconds, with strong cost control.
+how: A V8 isolate is a separate heap and JavaScript context inside one process. Creating one takes milliseconds and uses a few MB, much less than a container or a VM. An edge platform loads many tenants' isolates into one runtime process on each server.
+A request is routed to the nearest data center. If the tenant's isolate is not loaded, the runtime creates it from the cached script; this is a cold start of about 5 ms. Each isolate gets limits for CPU time, memory and subrequests, so one tenant cannot starve the others. This is a bulkhead.
+The price is a weaker boundary than a hardware VM. Platforms add extra layers such as process sandboxes, no access to the file system, and regular patching of V8.
+used: Cloudflare Workers; Deno Deploy and Vercel Edge Functions use similar isolate models.
+avoid: For code that needs native libraries, long CPU jobs or full OS access; use containers or VMs.
+flow:
+  User [user] -> Edge location [svc: nearest city] : HTTPS request | Anycast routing sends the user to a close data center.
+  Edge location -> Runtime process [svc: many isolates] : find isolate | The runtime looks for the tenant's isolate.
+  Runtime process -> Isolate A [svc: tenant code] : start if needed | A missing isolate starts in a few milliseconds from cached code.
+  Isolate A -> Origin API [svc: customer origin] : fetch | The tenant code calls its origin or a KV store.
+  Isolate A -x> Runtime process : CPU limit exceeded | A tenant that uses too much CPU is stopped, and other isolates are not harmed.
+  Runtime process -> User : response | The response returns from the edge, often in under 50 ms.
+ref: blog | Cloud Computing without Containers | Cloudflare, 2018 | https://blog.cloudflare.com/cloud-computing-without-containers/
+
+@@ wasm
+== Sandboxed plugins inside a host
+kind: plugin-arch, sidecar
+when: A platform wants customers or partners to extend it with their own code without risking crashes or data leaks.
+how: The host embeds a WebAssembly runtime such as Wasmtime or V8. A plugin is a .wasm module. It has its own linear memory and cannot touch the host's memory or the OS. It can only call functions that the host chooses to import, such as "log" or "get header".
+This is capability-based security: no network, no file, no clock unless granted. The host also sets a limit for memory and for execution steps (fuel), so a loop cannot run forever. Plugins can be written in Rust, Go, C++ or AssemblyScript and compiled to the same format.
+Proxy-Wasm defines this for proxies. An Envoy filter in Wasm can read headers and reject requests. The module is loaded and updated at run time, without recompiling the proxy.
+used: Envoy and Istio Wasm filters; Redpanda data transforms; Shopify Functions; extension points in Zed and Extism-based apps.
+avoid: When plugins need heavy native access, such as GPUs or arbitrary sockets, or when a simple config file is enough.
+flow:
+  Developer [user] -> Plugin module [store: .wasm file] : compile Rust to Wasm | The partner compiles plugin code to a small .wasm module.
+  Plugin module -> Control plane [svc: config server] : upload module | The platform stores the module and pushes it to hosts.
+  Control plane -> Envoy proxy [svc: Wasm runtime] : load module | Envoy loads the module without a restart.
+  Client [client] -> Envoy proxy : request | A request arrives at the proxy.
+  Envoy proxy -> Plugin module : on_request_headers | The host calls the plugin; it can read only what the host passes in.
+  Plugin module -x> Envoy proxy : 403, reject request | The plugin decides to block the request, or it hits its fuel limit and is stopped.
+ref: spec | Proxy-Wasm ABI specification | proxy-wasm community | https://github.com/proxy-wasm/spec
+
+== Heavy library in the browser through Wasm
+kind: offload-accelerator, cdn-edge
+when: A web app needs desktop-level compute, such as image editing, CAD or video, and should run on the user's device.
+how: The team compiles a C++ or Rust engine to WebAssembly, using Emscripten or wasm-pack. The .wasm file is served from a CDN with long cache headers and is compressed with Brotli. The browser compiles it as it streams in, with WebAssembly.instantiateStreaming, and caches the compiled code.
+JavaScript owns the page and the user interface. It passes typed arrays to the Wasm module, which does the heavy loop at close to native speed. For more speed, Wasm threads use a SharedArrayBuffer and Web Workers, and SIMD instructions work on 128-bit vectors. This needs cross-origin isolation headers.
+Running on the client removes server cost and network delay for each edit. The cost is a download of several MB and no direct access to the DOM; every call crosses a JS and Wasm boundary.
+used: Figma's rendering engine; Google Earth on the web; AutoCAD web; ffmpeg.wasm and SQLite Wasm; Photoshop on the web.
+avoid: For small logic where plain JavaScript is fast enough, or when users have slow networks and cannot afford a large download.
+flow:
+  Browser [client] -> CDN [cache: edge cache] : GET engine.wasm | The browser requests the module from a CDN; it is cached for a year.
+  CDN -> Browser : Brotli, 3 MB | The module is downloaded and compiled while it streams.
+  Browser -> JS UI [svc: page code] : page loads | JavaScript starts the interface and creates the Wasm instance.
+  JS UI -> Wasm engine [svc: C++ compiled] : pass typed array | Large data goes into Wasm memory without copying each value.
+  Wasm engine -> Worker threads [svc: Web Workers] : parallel tiles | Heavy work is split across workers that share memory.
+  Wasm engine -> JS UI : pixels back | Results return to the page for drawing on a canvas.
+ref: docs | WebAssembly concepts | MDN Web Docs | https://developer.mozilla.org/en-US/docs/WebAssembly/Guides/Concepts
+
+@@ acr
+== Fingerprint on the TV, match in the cloud
+kind: precompute, batching
+when: A TV maker wants to know what is on screen, whatever the source, without sending video off the device.
+how: Software on the TV samples a small, downscaled grab of the screen, and often a short audio snippet, a few times per second. It turns each sample into a compact fingerprint, a hash of 64 bits or a few hundred bytes. The raw frames never leave the TV.
+The TV batches fingerprints, for example every 10 to 30 seconds, and sends them over HTTPS to the ACR service. The service looks up each hash in a reference index of known channels, programmes and ad creatives. The index is built in advance, so the online step is only a key lookup.
+A match returns a content id and a time offset: "channel 23, programme X, at 20:14:02". Several matches in a row confirm the result and reject false hits. The service stores the viewing event with a device id.
+used: Smart-TV platforms from Samsung, LG and Vizio, with partners such as Samba TV and Gracenote; Shazam uses the same idea for audio on phones.
+avoid: Where privacy rules or user consent do not allow screen sampling. Use set-top box or app-level data with consent instead.
+flow:
+  TV screen [note: frames and audio] -> ACR agent [client: on the TV] : sample, make hash | The agent samples the screen a few times a second and computes a small fingerprint.
+  ACR agent -> ACR service [svc: match API] : batch of hashes | Every 10 to 30 seconds, the TV sends a batch, not single hashes.
+  ACR service -> Reference index [store: hash to content] : lookup | The service looks up each hash in a precomputed index.
+  Reference index -> ACR service : channel 23, 20:14:02 | The index returns a content id and time offset.
+  ACR service -> Viewing events [log: per device] : append event | The confirmed match is stored with the device id and a timestamp.
+  ACR service -x> ACR agent : no match | A sample without a match, like a game console menu, is simply dropped.
+ref: paper | An Industrial-Strength Audio Search Algorithm | Avery Wang (Shazam), ISMIR 2003 |
+
+== Live reference index from broadcast capture
+kind: pipes-filters, sharding
+when: ACR must recognise live TV within seconds, so the reference index has to be built as the broadcast happens.
+how: Capture farms receive hundreds of channels from satellite, cable or streams. Each channel goes through an encoder that makes the same kind of fingerprints as the TV does. Fingerprints are stamped with channel id and broadcast time, and are pushed into a stream.
+An indexer writes them into a time-windowed store. The index is split (sharded) by channel group, and keeps only a short window, such as the last 2 to 6 hours, in memory. Older fingerprints move to cheaper storage for catch-up and time-shifted viewing.
+Ad creatives and programmes that are known in advance are fingerprinted from the files and added at once. A lookup then checks the live window first and the library second. The total delay from broadcast to searchable should be a few seconds, or the TV match arrives too late for live use cases.
+used: Gracenote and other content recognition vendors; smart-TV ACR vendors operate similar capture farms. Details of each company are not public.
+avoid: For on-demand content only, where a static library index is enough and no live capture is needed.
+flow:
+  Broadcast feeds [client: 300 channels] -> Capture farm [svc: decode and hash] : live signal | Each channel is decoded and fingerprinted as it airs.
+  Capture farm -> Fingerprint stream [log: channel + time] : stamped hashes | Hashes get a channel id and broadcast time.
+  Fingerprint stream -> Live index shard 1 [store: last 4 hours], Live index shard 2 [store: last 4 hours] : index by channel group | Indexers write each shard in memory for fast lookup.
+  Live index shard 1 ~> Cold archive [lake: older hashes] : age out | Hashes older than the window move to cheap storage.
+  Ad library [lake: creative files] -> Live index shard 2 : pre-fingerprinted ads | Known ads are indexed before they air.
+  ACR service [svc] -> Live index shard 1, Live index shard 2 : lookup | Lookups hit the shard that owns the channel group.
+ref: docs | Gracenote: Automatic Content Recognition | Nielsen Gracenote |
+
+== From viewing events to household audiences and attribution
+kind: identity-graph, medallion, etl-elt
+when: An advertiser wants to know which households saw an ad on TV, and whether they later bought or visited the site.
+how: Raw ACR events (device id, content id, time) land in a lake as the bronze layer. A job cleans them: it removes duplicates, merges short gaps into viewing sessions, and joins them to programme and ad metadata. This is the silver layer.
+The device id is then linked to a household through an identity graph, built from IP address, TV account and partner data, under the consent rules. Gold tables hold audiences, such as "households that saw ad X at least twice", and reach and frequency per campaign.
+For attribution, the household id is matched to later events, such as web visits or purchases, from a measurement partner, often in a clean room. A control group of households that did not see the ad shows what would have happened anyway, which is the incremental lift.
+used: Samba TV, Vizio Ads, LG Ad Solutions, and measurement firms like iSpot and Nielsen use ACR-based audiences; vendor details differ.
+avoid: When consent is missing for a region. Use contextual targeting or aggregated panel data instead.
+flow:
+  ACR service [svc: collector] -> Bronze lake [lake: raw events] : events per device | Raw events are stored as received, so they can be replayed.
+  Bronze lake -> Sessionizer [svc: Spark job] : clean and join | The job merges events into viewing sessions and adds programme and ad ids.
+  Sessionizer -> Silver table [lake: sessions] : write sessions | Clean sessions are stored as a table.
+  Identity graph [svc: device to household] -> Gold audiences [lake: household segments] : map device to household | Sessions are grouped by household under consent rules.
+  Silver table -> Gold audiences : build exposure segments | The job builds segments such as "saw ad X twice".
+  Gold audiences -> Clean room [svc: privacy match] : match with sales data | An advertiser's customer data is matched in a clean room; only aggregates leave.
+ref: docs | IAB Tech Lab Data Clean Room Guidance | IAB Tech Lab, 2023 |
+
+@@ codecs
+== Per-title encoding ladder with chunked parallel encode
+kind: map-reduce, fork-join
+when: A streaming service must encode a large catalogue efficiently, and each title needs its own best bitrate ladder.
+how: A probe encode estimates how hard the title is. Animation needs far fewer bits than a fast action film at the same quality. From the probe the system picks a ladder: a set of resolution and bitrate pairs, for example 1080p at 3 Mbps for a simple cartoon, or at 6 Mbps for sports.
+The source is cut into chunks of a few seconds, at scene cuts. Each chunk is encoded as a separate task on a fleet of machines, for each rung of the ladder. Because chunks are independent, a two hour film finishes in minutes, not hours. A final step joins the chunks and checks the result.
+The trade-off is some loss of rate control across chunk edges, and a probe cost. Per-title encoding often saves 20 percent or more of bitrate at equal quality.
+used: Netflix per-title and per-shot encoding; many VOD platforms use chunked encoding with ffmpeg, x264, x265 or SVT-AV1.
+avoid: For live streams, where there is no time for probes and chunk joins; use fixed ladders and a real-time encoder.
+flow:
+  Source master [store: ProRes file] -> Probe and planner [svc: picks rungs] : analyse title | A fast probe measures how hard the title is to compress, and the planner picks bitrates per resolution.
+  Probe and planner -> Chunk splitter [svc: scene cuts] : plan | The splitter cuts the source at scene boundaries into 5 to 10 second chunks.
+  Chunk splitter -> Encode worker 1 [svc: x265 or AV1], Encode worker 2 [svc: x265 or AV1] : chunk x rung | Each chunk and rung is one independent task.
+  Encode worker 1, Encode worker 2 -> Stitcher [svc: join and check] : encoded chunks | Results are joined back in order and checked for gaps.
+  Stitcher -> Origin storage [store: S3] : final renditions | The finished ladder is stored for packaging into HLS and DASH.
+ref: blog | Per-Title Encode Optimization | Netflix Technology Blog, 2015 | https://netflixtechblog.com/per-title-encode-optimization-7e99442b62a2
+
+== Codec fallback by device capability
+kind: offload-accelerator, api-gateway
+when: One catalogue must play on devices with very different decoders, from new TVs to old phones.
+how: The service encodes each title in several codecs: H.264 (AVC) for everything, HEVC for many TVs and Apple devices, and AV1 for newer hardware. AV1 saves about 30 percent bitrate over HEVC in many tests, but only helps if the device can decode it well.
+The player asks the platform what it supports. In browsers, the MediaCapabilities API reports if a codec is supported, smooth and power efficient. On TVs, apps read the device model and a capability table. Hardware decoders are preferred, because software decoding of 4K drains battery and can drop frames.
+The playback service uses this to return a manifest that lists only the usable codecs. If playback fails or frames drop, the player reports an error, and the service falls back to the next codec, down to H.264, which every device plays.
+used: YouTube, Netflix and Disney+ serve AV1 to devices with hardware support and H.264 elsewhere; this follows public statements by these companies.
+avoid: For a small service with a single audience. Encoding in H.264 only is cheaper and simpler.
+flow:
+  Player [client: TV or phone] -> Playback service [svc: manifest API] : request, device caps | The player sends its model and decoder capabilities.
+  Playback service -> Capability table [db: device to codecs] : look up device | The service checks which codecs this device decodes in hardware.
+  Capability table -> Playback service : AV1 yes, HEVC yes | The table says AV1 hardware decode is available.
+  Playback service -> Player : manifest with AV1 first | The manifest lists AV1, then HEVC, then H.264.
+  Player -> Hardware decoder [svc: AV1 chip] : decode stream | The player feeds segments to the hardware decoder.
+  Hardware decoder -x> Player : decode error | A failure makes the player report and switch to the H.264 rendition.
+ref: docs | Media Capabilities API | MDN Web Docs | https://developer.mozilla.org/en-US/docs/Web/API/Media_Capabilities_API
+
+== Quality metric loop for encoder tuning
+kind: feedback-loop, shadow-ab
+when: You want to lower bitrate without hurting what viewers see, and need numbers, not guesses.
+how: Encode a test set with the current and a new encoder setting. For each pair, compute a perceptual quality score such as VMAF, which compares the decoded video with the source and gives a score from 0 to 100. Plot quality against bitrate for each setting. This is a rate-distortion curve.
+A summary like BD-rate says how many percent of bitrate the new setting saves at equal quality. If it saves bits without a drop in VMAF, the setting is a candidate. Then run a small A/B test on real viewers and measure rebuffering, start time, and quit rates.
+Only settings that pass both the offline score and the online test go to production. The loop repeats for each new codec version, such as new x265 or SVT-AV1 releases.
+used: Netflix created VMAF and uses it for encode decisions; Meta and YouTube have described similar metric-driven tuning.
+avoid: For very small catalogues where the savings do not repay the testing effort. Use well-known defaults.
+flow:
+  Test clips [lake: 100 clips] -> Encoder A [svc: current preset], Encoder B [svc: candidate preset] : same source | Both settings encode the same clips at several bitrates.
+  Encoder A, Encoder B -> VMAF scorer [svc: libvmaf] : decoded vs source | The scorer compares each output with the source video.
+  VMAF scorer -> Report [store: BD-rate table] : quality per bitrate | The report shows bitrate saved at equal quality, for example 8 percent.
+  Report -> A/B test [svc: 1 percent of viewers] : promote candidate | A passing preset goes to a small live test.
+  A/B test -> Report : rebuffer and quit rates | Real viewer data confirms or rejects the offline result.
+  * A/B test: passed, roll out | The new preset becomes the default for new encodes.
+ref: blog | Toward A Practical Perceptual Video Quality Metric | Netflix Technology Blog, 2016 | https://netflixtechblog.com/toward-a-practical-perceptual-video-quality-metric-653f208b9652
+
+@@ ffmpeg
+== Transcoding worker fleet fed by a job queue
+kind: competing-consumers, claim-check, autoscaling
+when: Users or partners upload many media files, and each must be converted into several formats without blocking anything.
+how: An upload service stores the source file in object storage, such as S3, and puts a small job message on a queue. The message holds the file location and the target profiles, not the video. This is a claim check.
+A fleet of stateless workers pulls jobs. Each worker downloads the file, runs ffmpeg with the profile's arguments, and uploads the outputs. A job message is hidden while a worker has it; if the worker dies, the message returns and another worker retries.
+An autoscaler reads the queue depth and adds machines, using spot instances for cost, and removes them when the queue is empty. For long files, a splitter cuts the file into segments, so many workers encode in parallel and a final job joins the results.
+used: AWS Elemental MediaConvert is the managed alternative; many teams run ffmpeg on Kubernetes jobs, Celery workers or AWS Batch; Mux, Cloudflare Stream and YouTube-like services use their own fleets.
+avoid: For a few files per day. A single machine with a cron job or a managed service is simpler.
+flow:
+  Upload API [svc] -> Source bucket [store: S3 originals] : put file | The original file goes to object storage first.
+  Upload API -> Job queue [queue: file path + profiles] : enqueue job | Only a small message with the file path is queued.
+  Job queue -> Worker 1 [svc: ffmpeg], Worker 2 [svc: ffmpeg] : pull job | Each job goes to one worker, which hides it from the others.
+  Worker 1 -> Output bucket [store: S3 renditions] : upload MP4 and HLS | The worker uploads the encoded files.
+  Worker 2 -x> Job queue : crash, no ack | The job becomes visible again and is retried by another worker.
+  Autoscaler [svc: queue depth] -> Worker 1 : add 20 spot workers | Queue depth rises, so the autoscaler adds workers.
+ref: docs | FFmpeg documentation | FFmpeg project | https://ffmpeg.org/documentation.html
+
+== Live ingest and packaging pipeline
+kind: pipes-filters, pipeline-stages
+when: A live event arrives as one contribution stream and must reach viewers as adaptive HLS and DASH within seconds.
+how: An encoder at the venue sends RTMP or SRT, often as H.264 at 8 to 15 Mbps, to an ingest server. FFmpeg reads the input and works as a pipeline of stages: demux, decode, filter (scale, de-interlace, burn in a logo), encode, and mux.
+For adaptive streaming, one decode feeds several scaled outputs, for example 1080p, 720p and 480p. Each is encoded with the same keyframe interval, such as 2 seconds, so segments line up across renditions. The outputs are written as 2 to 6 second segments plus playlists.
+A packager or origin serves the segments to the CDN. If the ingest drops, the pipeline must reconnect and keep timestamps continuous. A backup stream and a second ingest region protect important events.
+used: Common in self-run live platforms using ffmpeg; managed services like AWS MediaLive, Wowza and Mux use their own engines.
+avoid: When you need guaranteed uptime at scale without an on-call team; use a managed live service.
+flow:
+  Venue encoder [client: RTMP or SRT] -> Ingest server [svc: ffmpeg] : contribution stream | The venue sends one high-quality stream to the ingest server.
+  Ingest server -> Decode and scale [svc: filtergraph] : demux, decode | FFmpeg splits audio and video and decodes them once.
+  Decode and scale -> Encoder 1080p [svc: libx264], Encoder 720p [svc: libx264] : scaled frames | The filter graph feeds one scaled copy to each encoder.
+  Encoder 1080p, Encoder 720p -> Packager [svc: HLS and DASH muxer] : 2 s segments | Both outputs use the same 2 second keyframes, so segments align.
+  Packager -> Origin [store: segments + playlist] : write files | The packager writes segments and updates the playlist.
+  Venue encoder -x> Ingest server : stream drops | The ingest reconnects, or a backup stream takes over.
+ref: docs | FFmpeg Filters documentation | FFmpeg project | https://ffmpeg.org/ffmpeg-filters.html
+
+== Ad creative intake and normalization gate
+kind: async-request-reply, dead-letter
+when: Advertisers upload video ads in any format, and the player will only accept files that meet strict technical rules.
+how: The advertiser uploads a file through the ad platform. The platform returns a job id at once, and the work is done asynchronously. First, ffprobe reads the container and streams as JSON: codec, resolution, frame rate, duration, bitrate and audio layout.
+A rule engine checks the result against the specification: duration of 15 or 30 seconds, aspect ratio, maximum bitrate, an H.264 profile that the target devices play, and loudness. If the file is valid, FFmpeg normalizes it: it transcodes into the standard renditions and adjusts loudness, for example to -24 LKFS for TV, using the loudnorm filter.
+Files that fail go to a rejected state with a clear reason, so the advertiser can fix them. The client polls the job status or gets a callback. Only approved creatives get a VAST media file URL.
+used: Ad servers and DSPs that accept video creatives; the pattern is common in CTV ad platforms. Exact tool choices differ by company.
+avoid: For fixed in-house creatives, where one reviewed pipeline run is enough.
+flow:
+  Advertiser [user] -> Ad platform API [svc] : upload creative | The platform stores the file and returns a job id.
+  Ad platform API -> Intake queue [queue: creative jobs] : enqueue job | The check runs in the background.
+  Intake queue -> ffprobe check [svc: read metadata] : file path | ffprobe reads codec, size, duration and audio data.
+  ffprobe check -> Normalizer [svc: ffmpeg loudnorm] : valid file | A valid file is transcoded to standard renditions at the target loudness.
+  ffprobe check -x> Rejected store [store: reason codes] : fails rules | An invalid file is rejected with a reason such as "duration 17 s".
+  Normalizer -> Ad platform API : status approved | The job is marked approved, and the advertiser sees the result when polling.
+ref: docs | ffprobe documentation | FFmpeg project | https://ffmpeg.org/ffprobe.html
+
+@@ hlsdash
+== CDN delivery with origin shield
+kind: cdn-edge, cache-aside
+when: Millions of viewers request the same small video segments, and the origin must not see most of the traffic.
+how: HLS and DASH cut video into files of 2 to 6 seconds, listed in a playlist or manifest. Because the segments are plain HTTP files, any CDN can cache them. A segment never changes after it is written, so it can have a long cache time. Only the live playlist, which changes every few seconds, needs a short one such as 1 to 2 seconds.
+Viewers connect to an edge cache in their city. On a miss, the edge asks a regional shield cache and not the origin, so the origin gets one request per segment, not one per edge. Request coalescing makes a burst of identical misses become one fetch.
+Cache hit ratios of 95 to 99 percent are normal for popular streams. The origin then needs only to serve the shield. For live events, pre-warm the shield and use a multi-CDN setup for safety.
+used: Netflix Open Connect for its own video; Twitch, Disney+ and live sports services using Akamai, Fastly, CloudFront and others.
+avoid: For private one-to-few streams, or ultra-low latency calls, where WebRTC fits better.
+flow:
+  Viewer [client: player] -> Edge cache [cache: city PoP] : GET segment 4201.ts | The player requests the next segment from the nearest edge.
+  Edge cache -> Shield cache [cache: regional] : miss | The edge does not have the file, so it asks the shield.
+  Shield cache -> Origin [store: packager output] : miss, fetch once | Only the shield calls the origin, and identical requests are merged.
+  Origin -> Shield cache : segment, max-age 1 year | The origin returns the segment with a long cache lifetime.
+  Shield cache -> Edge cache : segment | The edge stores it and serves the viewer.
+  Viewer -> Edge cache : GET live.m3u8 | The playlist has a 2 second cache time, so viewers see new segments quickly.
+ref: spec | HTTP Live Streaming, RFC 8216 | R. Pantos & W. May, IETF, 2017 | https://www.rfc-editor.org/rfc/rfc8216
+
+== Adaptive bitrate control loop in the player
+kind: control-loop, feedback-loop
+when: Viewers have different and changing network speed, and the player must pick the best quality without stalls.
+how: The manifest lists renditions, such as 400 kbps, 1.5 Mbps and 5 Mbps. The player downloads one segment at a time and times each download. From this it estimates throughput, and it also watches the buffer level in seconds.
+A simple rule picks the highest rendition below about 80 percent of the measured throughput. Buffer-based rules such as BOLA choose by buffer size: with a low buffer, step down at once; with a full buffer, step up. This is a control loop with measured state and a decision at each segment.
+Switching only happens at segment edges, where each rendition has a keyframe. If the buffer runs dry, the player stalls and shows a spinner, which is the worst outcome, so rules are cautious in going up and quick in going down.
+used: hls.js, Shaka Player, dash.js, ExoPlayer and Apple's AVPlayer all implement ABR logic.
+avoid: For fixed-quality downloads or when the network is known and stable. A single rendition is enough.
+flow:
+  Player [client: ABR logic] -> CDN [cache: edge] : GET 1.5 Mbps segment | The player downloads a segment of the current rendition.
+  CDN -> Throughput meter [svc: in the player] : segment in 0.9 s | A 4 second segment arrives in 0.9 s, which means throughput of about 4.4x real time.
+  Throughput meter -> Player : estimate 6.6 Mbps | The meter passes its estimate to the ABR rule.
+  * Player: buffer 18 s, up | The buffer is full and throughput is high, so the rule can step up.
+  Player -> CDN : GET 5 Mbps segment | The player asks for the next segment at the higher quality.
+  CDN -x> Player : slow, 5.1 s | The network drops and the download is slower than playback.
+  Player -> CDN : GET 400 kbps segment | The player steps down at once, to avoid an empty buffer.
+ref: paper | BOLA: Near-Optimal Bitrate Adaptation for Online Videos | Spiteri, Urgaonkar & Sitaraman, INFOCOM 2016 |
+
+== Multi-CDN steering from the manifest
+kind: control-data-plane, health-check
+when: One CDN is not enough for a big live event, and you want to move viewers between CDNs on failure or cost.
+how: The platform contracts two or more CDNs. A steering service (the control plane) collects data: CDN health checks, error rates from player beacons, cost and capacity. It decides the weight of each CDN.
+The decision reaches the player in the manifest. HLS and DASH both define content steering: the manifest names a steering server URL. The player calls it from time to time, gets a priority list of CDN hosts and a time-to-live, and uses the first one. Without it, the platform can also rewrite the segment host names in the manifest, or use DNS.
+If a CDN fails, the steering server drops it from the list. Players move to the next CDN at the next check, within seconds. The downside is cache cold starts on the new CDN, so the shield or pre-warming is needed.
+used: Large streaming services and sports broadcasters use multi-CDN; vendors such as Akamai, Conviva and NS1 offer steering. Exact company set-ups are not public.
+avoid: For small audiences, where one CDN with good SLA is cheaper and easier.
+flow:
+  Player [client] -> Steering server [svc: control plane] : GET steering manifest | The player asks which CDN to use, at the interval from its manifest.
+  Steering server -> Player : CDN B first, TTL 300 | The server answers with a priority list and a time-to-live.
+  Player -> CDN B [cache: edge] : GET segments | Segments are fetched from the first CDN in the list.
+  Beacon collector [svc: QoE data] -> Steering server : error rate per CDN | Player reports give the server a live view of each CDN's health.
+  CDN B -x> Player : 5xx errors rise | CDN B starts failing for a region.
+  Steering server -> Player : CDN A first | At the next check the server moves the players to CDN A.
+ref: spec | HLS Content Steering, in HTTP Live Streaming 2nd Edition | Apple, IETF draft | https://datatracker.ietf.org/doc/draft-pantos-hls-rfc8216bis/
+
+@@ openrtb
+== Exchange auction with parallel fan-out and a deadline
+kind: rtb, scatter-gather, timeout-deadline
+when: A publisher's ad slot must be sold in real time to the best of many buyers, within about 100 ms.
+how: The page or app asks the exchange (SSP) for an ad. The exchange builds one OpenRTB BidRequest with the impression, site or app, device, user ids and floor price. It removes fields that privacy rules do not allow, and sends the request in parallel to 10 to 50 DSPs, using the tmax field to tell each bidder how long it has, often 100 to 150 ms.
+Each DSP answers with a BidResponse: a price, an ad markup or a VAST URL, and the notice URLs. Or it answers with no bid (HTTP 204). The exchange waits until tmax, ignores late replies, and runs a first-price auction: the highest bid above the floor wins and the winner pays its bid.
+Because the work is a fan-out, the slowest bidder sets the delay. So the exchange cuts the request list by bidder quality, and drops bidders that time out often.
+used: Google Ad Manager, Magnite, PubMatic, Xandr and Index Exchange run OpenRTB exchanges; Prebid Server uses the same protocol.
+avoid: For direct deals with a fixed price and volume; use an ad server with guaranteed line items, or programmatic guaranteed.
+flow:
+  Publisher page [client: ad slot] -> Exchange [svc: SSP] : ad request | The page asks the exchange for an ad for one slot.
+  Exchange -> DSP A [svc: bidder], DSP B [svc: bidder], DSP C [svc: bidder] : BidRequest, tmax 120 | The exchange sends the same request to many bidders at once with a deadline.
+  DSP A -> Exchange : bid 2.40 CPM | DSP A answers with a price and an ad.
+  DSP B -> Exchange : no bid, HTTP 204 | DSP B does not want this impression.
+  DSP C -x> Exchange : too late, ignored | DSP C answers after tmax, so its bid is thrown away.
+  Exchange -> Publisher page : winning ad A | The exchange runs a first-price auction, and DSP A wins at 2.40.
+ref: spec | OpenRTB 2.6 | IAB Tech Lab, 2022 | https://iabtechlab.com/standards/openrtb/
+
+== Bidder pipeline under a tight QPS and latency budget
+kind: precompute, load-shedding, feedback-loop
+when: A DSP receives hundreds of thousands of bid requests per second and must answer most in under 50 ms.
+how: A load balancer spreads requests over many stateless bidder instances. Each instance decides in four steps. First it filters out requests that match no campaign, using in-memory indexes. Second it finds eligible campaigns by targeting, such as geo, device, and segments. Third it scores each candidate with a model that predicts click or conversion chance. Fourth it picks a bid price and checks the campaign budget and pacing.
+All data for these steps is precomputed and kept in memory or in a local cache: campaign lists, user segments by id, and model weights. Nothing goes to a remote database on the hot path, or at best to a fast key-value store with a few ms latency.
+Most requests are not worth bidding on, so the bidder says no bid early. When load is too high, it sheds the lowest-value traffic first. Win and spend events return through a stream to update budgets and models.
+used: Common in DSPs such as The Trade Desk, Google DV360 and Amazon DSP; the design is typical in ad tech, though each company's details are private.
+avoid: Do not call slow external services per request. Move such work offline and ship the result as precomputed data.
+flow:
+  Load balancer [svc: L4] -> Bidder instance [svc: in-memory index] : BidRequest | The request arrives at one of many identical bidder instances.
+  Bidder instance -> Targeting filter [svc: campaign index] : match campaigns | In-memory indexes cut thousands of campaigns to a few dozen.
+  Targeting filter -> Scoring model [model: pCTR or pCVR] : candidates | The model scores each candidate with the probability of a click or conversion.
+  Scoring model -> Pacing and budget [cache: spend counters] : best bid | The bidder checks the budget and picks the final price.
+  Pacing and budget -> Bidder instance : bid 1.80 CPM | The decision goes back, all within 30 ms.
+  Load balancer -x> Bidder instance : shed low-value traffic | At peak load, low-value requests are dropped with no-bid to protect latency.
+ref: spec | OpenRTB 2.6 specification | IAB Tech Lab, 2022 | https://iabtechlab.com/standards/openrtb/
+
+== Win notice and billing reconciliation
+kind: webhook-callback, idempotent-consumer, event-driven
+when: A bid has won, and both sides must agree who owes how much, when impressions are counted and when they are not.
+how: The BidResponse can carry a nurl, a win notice URL. The exchange calls it when the bid wins the auction, often with the clearing price in a macro like ${AUCTION_PRICE}. The DSP counts this as a win, but not yet as a paid impression. A burl, the billing URL, is called when the ad renders and counts as billable. A lurl reports a lost bid.
+Notices are HTTP calls and can arrive twice, late or never. So each carries an auction id, and the receiver stores events in a log keyed by this id. Duplicates are dropped.
+Each day, the exchange and the DSP compare their counts and spend. Differences of a few percent are normal because of timeouts, ad blockers and fraud filters. Contracts say whose number is used. The DSP uses the stream to update budget and pacing.
+used: Used by all OpenRTB exchanges and DSPs; reconciliation reports are standard between SSPs and DSPs.
+avoid: Do not use notices as the only source of truth for money. Always reconcile against logs and invoices.
+flow:
+  Exchange [svc: SSP] -> DSP [svc: bidder] : win notice nurl, price | The exchange tells the DSP it won and shares the clearing price.
+  Player [client: video or web] -> Exchange : ad rendered | The player reports that the ad was displayed.
+  Exchange -> DSP : billing notice burl | The billing URL is called when the impression counts as billable.
+  DSP -> Event log [log: key auction id] : append event | The DSP stores each notice keyed by the auction id.
+  Exchange -x> DSP : duplicate burl | A retry arrives twice, and the DSP drops it by auction id.
+  Event log -> Reconciliation job [svc: daily] : compare with SSP report | A daily job compares counts and spend with the exchange's report and flags gaps.
+ref: spec | OpenRTB 2.6: nurl, burl and lurl | IAB Tech Lab, 2022 | https://iabtechlab.com/standards/openrtb/
+
+@@ pixels
+== Beacon collector into a stream and a lake
+kind: pubsub, load-leveling, medallion
+when: Millions of page views and ad events per minute must be recorded cheaply, and never slow the page.
+how: A pixel is a tiny image or a script call. The browser sends a GET request with parameters in the URL, such as event type, campaign id and a cookie id. The collector, a very thin HTTP service behind a CDN or load balancer, answers at once with a 1x1 GIF or HTTP 204.
+The collector does no business logic. It adds the time, IP address and user agent, and writes the event to a stream such as Kafka or Kinesis. This means a slow downstream job never slows the collector. The stream is a buffer that levels the load.
+Consumers read the stream. One loads raw events into a lake as the bronze table, another updates live counters, and another feeds fraud checks. A batch job cleans and de-duplicates the data into silver and gold reporting tables.
+used: Google Analytics and ad servers like Google Ad Manager use similar collectors; many companies run their own with Kafka and Spark.
+avoid: When the data must not be lost or must be strongly consistent, for example payments; use server-side APIs with retries.
+flow:
+  Browser [client: page] -> Beacon collector [svc: thin HTTP] : GET /p.gif?e=view&c=77 | The page loads the pixel, and the browser sends the event in the URL.
+  Beacon collector -> Browser : 204 No Content | The collector answers right away.
+  Beacon collector -> Events stream [log: Kafka] : enrich and append | It adds time, IP and user agent, then writes to the stream.
+  Events stream -> Lake loader [svc: batch writer] : micro-batches | The loader writes files in batches.
+  Lake loader -> Bronze lake [lake: raw Parquet] : write files | Raw events are stored for replay and audit.
+  Events stream -> Live counters [cache: Redis] : increment | A second consumer updates real-time counts for dashboards.
+ref: docs | Apache Kafka introduction | Apache Kafka documentation | https://kafka.apache.org/intro
+
+== Cookie sync redirect chain
+kind: identity-graph, webhook-callback
+when: Two ad tech systems need to learn that their own ids for a browser belong to the same user.
+how: A browser has a separate cookie id for each domain. The SSP's page calls a sync pixel at the DSP, passing the SSP's user id in the URL. The DSP sees its own cookie, so it knows both ids: it reads its id and the SSP's id in one request.
+The DSP answers with a redirect (HTTP 302) back to the SSP, passing the DSP's id. Now the SSP can save the pair too. Both sides store the mapping, usually in a key-value store keyed by their own id.
+Later, at bid time, the SSP puts the DSP's id for this user into the BidRequest, and the DSP finds the user's profile at once. The chain adds extra requests per page and does not work where third-party cookies are blocked, as in Safari and Firefox. So the industry moves to logins, hashed emails and clean rooms.
+used: Used by SSP and DSP pairs in programmatic advertising; Prebid's user sync feature runs these syncs for bidders.
+avoid: In browsers that block third-party cookies, or where consent is missing. Use first-party identifiers with consent, or contextual targeting.
+flow:
+  Browser [client] -> SSP sync pixel [svc: SSP] : page load | The SSP's page loads and knows its own user id, ssp-123.
+  SSP sync pixel -> DSP sync endpoint [svc: DSP] : redirect with ssp id=123 | The browser calls the DSP with the SSP's id in the URL.
+  DSP sync endpoint -> Id map at DSP [db: dsp id to ssp id] : save pair | The DSP reads its own cookie dsp-9 and stores 9 matched to 123.
+  DSP sync endpoint -> Browser : 302 to SSP, dsp id=9 | It redirects back and passes its id to the SSP.
+  Browser -> SSP sync pixel : GET with dsp id=9 | The browser follows the redirect to the SSP.
+  SSP sync pixel -> Id map at SSP [db: ssp id to dsp id] : save pair | The SSP stores the same pair, to use in later bid requests.
+ref: docs | Prebid user syncing | Prebid.org | https://docs.prebid.org/dev-docs/publisher-api-reference/setConfig.html#setConfig-Configure-User-Syncing
+
+== Browser pixel plus server-side event with dedup
+kind: idempotent-consumer, event-driven
+when: Conversion tracking loses events to ad blockers and browser limits, and you want a more reliable second path.
+how: When a user buys, the web page fires the platform's pixel with an event id, for example order-5521. At the same time, the advertiser's server sends the same purchase to the platform's server-side API (for example Meta Conversions API, or Google's server-side tagging). Both calls carry the same event id and name.
+The platform keeps recent event ids, usually for a few days. When the second copy arrives, it matches the id and event name and keeps just one. If the browser path was blocked, the server event still counts. If the server path fails, the pixel still counts.
+The server event can include hashed email or phone, which helps matching but must follow consent rules. The server path is not affected by ad blockers, but it also does not remove the need for consent.
+used: Meta Pixel with Conversions API, Google tag with server-side tagging and TikTok Events API all support deduplication by event id.
+avoid: When the advertiser has no consent for tracking, or when the event id cannot be shared between browser and server. Without it, counts will double.
+flow:
+  Shop page [client: browser] -> Ad platform pixel [svc: platform endpoint] : purchase, id order-5521 | The page fires the pixel with an event id.
+  Shop page -> Shop server [svc: backend] : place order | The same order is saved by the backend.
+  Shop server -> Ad platform API [svc: server-side API] : purchase, id order-5521 | The backend sends the same event through the server path.
+  Ad platform pixel -> Event store [db: seen ids for 7 days] : first copy | The platform stores the first copy with its id.
+  Ad platform API -x> Event store : same id, dropped | The second copy has a known id, so it is merged as a duplicate.
+  * Event store: 1 purchase counted | Only one purchase is counted, even if both paths worked.
+ref: docs | Conversions API: handling duplicate events | Meta for Developers | https://developers.facebook.com/docs/marketing-api/conversions-api/deduplicate-pixel-and-server-events/
+
+@@ prebid
+== Client-side header bidding auction
+kind: scatter-gather, timeout-deadline
+when: A publisher wants many demand partners to compete for each impression before the ad server makes its decision.
+how: Prebid.js runs in the page header. When the page loads, it sends bid requests in parallel from the browser to many bidder adapters, for example 8 to 12 SSPs. Each adapter calls its partner's endpoint. A timeout, often 1000 to 1500 ms, limits the wait.
+Bids that arrive in time are stored in the Prebid auction. Prebid picks the highest bid for each ad unit and sets key-values on the ad server request, such as hb_pb=2.40 and hb_bidder=ssp1. Then the page calls the ad server, for example Google Ad Manager.
+The ad server has line items that match these price buckets. If the header bid beats direct deals and AdX, Google Ad Manager returns the Prebid creative, and the page tells Prebid to render the winning ad. The cost is page weight and delay: every bidder adds browser requests.
+used: Prebid.js is used by thousands of publishers, and works with Google Ad Manager, Xandr, Magnite, PubMatic and many more.
+avoid: On slow mobile pages with many ad slots. Move some bidders to Prebid Server or reduce the bidder count.
+flow:
+  Page [client: Prebid.js] -> SSP 1 [svc: bidder adapter], SSP 2 [svc: bidder adapter], SSP 3 [svc: bidder adapter] : bid requests | Prebid sends parallel bid requests from the browser.
+  SSP 1 -> Page : bid 2.40 CPM | The first partner answers with a bid.
+  SSP 2 -> Page : bid 1.90 CPM | The second partner bids lower.
+  SSP 3 -x> Page : timeout 1000 ms | The third partner is too slow, so its bid is ignored.
+  Page -> Ad server [svc: Ad Manager] : hb_pb=2.40, hb_bidder=ssp1 | The page calls the ad server with the highest bid as key-values.
+  Ad server -> Page : header bid wins | The ad server compares it with direct deals, and the Prebid line item wins.
+ref: docs | How Prebid.js works | Prebid.org | https://docs.prebid.org/overview/intro-to-header-bidding.html
+
+== Prebid Server for server-side and hybrid bidding
+kind: scatter-gather, plugin-arch, api-gateway
+when: You want to cut browser load and speed up pages, but keep the open, transparent Prebid auction.
+how: In Prebid Server, the browser makes one request to the server, which the publisher or a hosting partner runs. The server holds the bidder adapters. It turns the request into OpenRTB requests, sends them in parallel to the SSPs from the data center, and returns the bids in one response.
+A data center connection is faster and more stable than many browser requests, and it does not use the user's device. A hybrid set-up keeps some bidders in Prebid.js, such as those that need browser cookies, and moves the others to the server.
+Adapters are plugins: each bidder has one module that maps the request and response. The server also stores request configs, so the page sends only a short config id. A weakness is user sync: the server has no cookies for bidder domains, so match rates can be lower.
+used: Prebid Server is open source in Go and Java versions; Magnite, Xandr, PubMatic and publishers like The Washington Post run or use it.
+avoid: When almost all bidders need the user's browser cookies. Then client-side bidding gives better match rates.
+flow:
+  Page [client: Prebid.js] -> Prebid Server [svc: auction host] : one request, config id | The browser sends one request with a short stored config id.
+  Prebid Server -> Stored config [db: per-publisher] : load config | The server loads the bidder list and settings.
+  Prebid Server -> SSP A [svc: adapter], SSP B [svc: adapter] : OpenRTB requests | Adapters call each SSP in parallel from the data center.
+  SSP A -> Prebid Server : bid 2.10 CPM | SSP A returns a bid.
+  SSP B -x> Prebid Server : timeout | SSP B misses the deadline and is skipped.
+  Prebid Server -> Page : bids in one response | All valid bids come back together to the browser.
+ref: docs | Prebid Server overview | Prebid.org | https://docs.prebid.org/prebid-server/overview/prebid-server-overview.html
+
+== Dynamic floors and analytics feedback loop
+kind: feedback-loop, external-config
+when: A publisher wants to raise yield by setting price floors from real auction data instead of one fixed number.
+how: Prebid analytics adapters send auction events to a data store: bids, wins, timeouts, bidder latency, and ad unit sizes. A batch job groups the data by dimensions such as country, device, ad size and bidder. It finds the clearing prices in each group and computes a floor, for example the 30th percentile of winning bids.
+The result is a JSON file with floor rules, hosted on a CDN. The Prebid Price Floors module fetches it at page load, with a refresh time. For each request, it picks the matching rule and sends the floor to bidders. Bids below it are rejected.
+The loop checks results. A control group of traffic, say 10 percent, runs with no or a lower floor, so the team can see whether the floors raise revenue or only reduce fill. The same data shows slow bidders to remove.
+used: Prebid's Price Floors module, and vendors such as Pubmatic and Magnite offer floor tuning with the same loop.
+avoid: For small sites with little traffic. There is not enough data, and a fixed floor is better.
+flow:
+  Page [client: Prebid.js] -> Analytics collector [svc: analytics adapter] : auction events | The page reports bids, wins and timeouts.
+  Analytics collector -> Data lake [lake: auction logs] : store events | Events are stored for analysis.
+  Data lake -> Floor model [svc: nightly job] : group by country and size | A job finds the winning prices per group and sets floors.
+  Floor model -> Floors JSON [store: on CDN] : publish rules | The rules are published as a JSON file.
+  Page -> Floors JSON : fetch at page load | The Price Floors module reads the rules, and refreshes them later.
+  Page -x> SSP [svc: bidder] : bids below floor rejected | Bids under the floor for this group are discarded.
+ref: docs | Prebid Price Floors module | Prebid.org | https://docs.prebid.org/dev-docs/modules/floors.html
+
+@@ vast
+== Wrapper chain unwrapping with limits
+kind: request-reply, timeout-deadline
+when: An ad server returns a pointer to another ad server, and the player must still find a playable ad quickly.
+how: A video player asks the ad server for a VAST document, which is XML. The response can be an InLine ad that holds the media files directly, or a Wrapper that holds a VASTAdTagURI. The URI points to another ad server, and the wrapper also adds its own tracking URLs.
+The player follows the chain: it fetches each URL in turn until it reaches an InLine ad. It collects the tracking pixels of every wrapper on the way, so each party can count the impression. Chains arise when an SSP, a DSP, and verification vendors each add a hop.
+Each hop adds delay, so players set limits: a maximum depth, usually 3 to 5, and a total time budget, such as 2 to 5 seconds. If the limit passes, or an error occurs, the player fires the Error URL with a code, such as 302 for wrapper limit reached, and goes on with the content.
+used: Google IMA SDK, Video.js, JW Player and CTV players follow wrappers; the VAST spec gives the wrapper limit and error codes.
+avoid: Long wrapper chains on mobile and TV, where start delay hurts. Use server-side ad insertion to resolve the chain on the server.
+flow:
+  Player [client: video] -> Ad server 1 [svc: SSP] : ad request | The player asks for an ad before the video starts.
+  Ad server 1 -> Player : VAST Wrapper, URI to DSP | The reply is a wrapper with a tag URL and tracking pixels.
+  Player -> Ad server 2 [svc: DSP] : fetch wrapped tag | The player follows the URL to the next server.
+  Ad server 2 -> Player : VAST InLine, MP4 file | The second reply has the real ad with a media file.
+  Player -x> Ad server 2 : 3 s budget over, error 301 | If the total time budget passes, the player stops waiting.
+  Player ~> Error endpoint [svc: error pixel] : error code | The player reports the error to the tracking party and continues with the content.
+ref: spec | VAST 4.2 | IAB Tech Lab, 2019 | https://iabtechlab.com/standards/vast/
+
+== Player-fired tracking beacons
+kind: event-driven, webhook-callback
+when: Advertisers, verification firms and the ad server all need proof that the ad was seen, step by step.
+how: The VAST document lists tracking URLs per event: Impression, start, firstQuartile, midpoint, thirdQuartile, complete, click, mute and more. The player watches playback and, at each moment, makes a simple GET request to every URL for that event. These are fire-and-forget beacons.
+The URLs have macros, such as [TIMESTAMP], [ASSETURI] and [ERRORCODE], that the player replaces with real values. A cache-busting random number prevents the CDN from serving a cached response and hiding the event.
+The beacon servers log every call to a stream, as in a pixel pipeline. Beacons can be lost, as the player may close, or be blocked. Because of this, vendors compare counts and report differences, and some use the OM SDK for measuring viewability.
+used: All VAST players, including IMA SDK and CTV apps, fire these events; collectors at ad servers and measurement firms such as DoubleVerify and IAS receive them.
+avoid: Do not use client beacons alone as the final bill. Compare them with server logs and fraud filters.
+flow:
+  Player [client: video] -> Impression pixel [svc: ad server], Verification pixel [svc: third party] : Impression | At ad start the player calls all impression URLs from the VAST file.
+  Player -> Quartile pixel [svc: ad server] : firstQuartile | At 25 percent of playback, it fires the next event.
+  Player -> Quartile pixel : complete | At the end, the complete event is sent.
+  Impression pixel -> Event stream [log: beacon logs] : append | Each call is logged with its macros filled in.
+  Player -x> Quartile pixel : user closed app | If the app closes early, later beacons are never sent.
+  Event stream -> Reporting job [svc: reconcile] : counts per event | A job compares the counts across parties.
+ref: spec | VAST 4.2: tracking events | IAB Tech Lab, 2019 | https://iabtechlab.com/standards/vast/
+
+== Server-side ad insertion with VAST resolution
+kind: manifest-stitching
+when: Connected TV and live streams need ads that cannot be blocked, and look like content, with one video stream.
+how: In server-side ad insertion (SSAI) the player requests one manifest from a stitcher service. The stitcher calls the ad decision server with the user's context. It gets VAST, resolves wrappers on the server, and downloads the creative. Ads are prepared in advance as segments in the same renditions as the content.
+The stitcher writes a manifest in which ad segments follow content segments, with discontinuity tags between. The player sees one stream, so there is no player switch and ad blockers see nothing. A session id links all requests of one viewer.
+Because the player does not run VAST, the server must fire the tracking beacons itself, when the viewer's player fetches each ad segment, or from player callbacks. This needs care to avoid counting errors, and to pass the device's IP and user agent to the ad servers.
+used: AWS Elemental MediaTailor, Google Ad Manager dynamic ad insertion, Yospace, Broadpeak and Netflix and Hulu ad tiers use SSAI in some form.
+avoid: When you need rich interactive ads or precise viewability from the player; use client-side ads with the IMA SDK.
+flow:
+  Player [client: CTV app] -> Stitcher [svc: manifest server] : request session manifest | The player requests one manifest from the stitcher.
+  Stitcher -> Ad decision server [svc: ad server] : ad request, session id | The stitcher sends the viewer's context and asks for ads.
+  Ad decision server -> Stitcher : VAST with wrapper | The reply is VAST, and the stitcher resolves the wrappers.
+  Stitcher -> Stitcher cache [cache: ad segments] : fetch prepared ad | Prepared ad renditions are loaded from the cache.
+  Stitcher -> Player : manifest with ad segments | The manifest has ad segments between content, with discontinuity tags.
+  Player -> Stitcher : GET ad segment 2 | When the player fetches an ad segment, the stitcher knows it was played.
+  Stitcher ~> Ad server beacon [svc: tracking] : fire quartile beacons | The stitcher fires VAST tracking events for the viewer.
+ref: docs | IAB Tech Lab Server-Side Ad Insertion (SSAI) guidelines | IAB Tech Lab | https://iabtechlab.com/standards/vast/

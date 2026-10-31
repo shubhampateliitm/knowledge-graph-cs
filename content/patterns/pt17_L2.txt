@@ -1,0 +1,675 @@
+# pt17_L2: architecture patterns for speculative ... scd
+
+@@ speculative
+== Backup tasks for stragglers in a batch stage
+kind: fork-join, scheduler-agent
+when: A parallel job has thousands of tasks, and a few slow machines hold up the whole stage.
+how: The scheduler splits a stage into many tasks and runs them on many executors. A monitor checks the running tasks on a short timer. After a set share of tasks has finished (Spark: 90%), it computes the median run time of the finished ones.
+A task that has run longer than a multiple of the median (Spark: 3 times) gets a second copy on a different executor. Both copies run. The first to finish wins, and the scheduler kills the other one.
+Only one copy may write the final output. Spark uses an output commit coordinator for this. The cost is extra CPU for the few duplicated tasks. It does not help when the task is slow because of skewed data, since every copy gets the same large input.
+used: MapReduce backup tasks (Google, 2004); Hadoop MapReduce; Apache Spark (spark.speculation, off by default).
+avoid: When tasks write to external systems with side effects that cannot be undone, or when slowness comes from data skew; fix the partitioning instead.
+flow:
+  Scheduler [svc: Spark driver] -> Executor A, Executor B [svc] : run tasks 1-1000 | The driver sends tasks to executors. Task 731 lands on a machine with a failing disk.
+  Executor A -> Scheduler : 900 tasks done | The stage reaches 90% done, so the median task time is now known: 10 s.
+  * Executor B: task 731 at 35 s | Task 731 has run for more than 3 times the median, so it is marked a straggler.
+  Scheduler -> Executor C [svc: healthy] : copy of task 731 | The driver starts a second attempt of task 731 on another machine.
+  Executor C -> Scheduler : task 731 done | The healthy copy finishes in about 10 s, so it wins the race.
+  Scheduler -x> Executor B : kill attempt | The slow attempt is killed. Only the winner may commit output.
+ref: paper | MapReduce: Simplified Data Processing on Large Clusters | Dean & Ghemawat, OSDI 2004 |
+ref: docs | Spark configuration: speculation | Apache Spark documentation | https://spark.apache.org/docs/latest/configuration.html
+
+== Hedged reads in a scatter-gather service
+kind: hedged-requests, scatter-gather
+when: A user request fans out to many replicas, and the slowest reply sets the latency users see.
+how: A front end sends each sub-request to one replica. It waits for a short delay, usually the 95th percentile of normal latency. If no answer has come, it sends the same request to a second replica and uses the first reply.
+Only about 5% of requests are duplicated, so the extra load is small. In the Tail at Scale paper, a hedge sent after 10 ms cut the 99.9th percentile of a 1,000-key read from 1,800 ms to 74 ms for about 2% more requests.
+Hedging is safe only for idempotent reads. A tied request goes further: it sends both copies at once and each replica cancels its copy when the other starts. Hedges must be capped, or they add load when the system is already slow.
+used: Cassandra speculative_retry; HDFS hedged reads; gRPC hedging policy; Google search leaf servers (Tail at Scale).
+avoid: For non-idempotent writes, or when the system is already overloaded; hedging then adds load and makes the tail worse.
+flow:
+  Client [client] -> Aggregator [svc: fan-out] : search query | One user query enters the aggregator, which fans out to many shards.
+  Aggregator -> Replica 1 [svc: shard 7 slow] : sub-request | The sub-request for shard 7 goes to its first replica, which is slow right now.
+  * Aggregator: waited 10 ms, no reply | The delay passes the 95th percentile. The aggregator decides to hedge.
+  Aggregator -> Replica 2 [svc: shard 7 copy] : same sub-request | The same read is sent to a second replica of shard 7.
+  Replica 2 -> Aggregator : result in 4 ms | The second replica answers fast, and the aggregator uses this answer.
+  Aggregator -x> Replica 1 : cancel | The slow copy is cancelled so it stops using resources.
+  Aggregator -> Client : merged answer | The merged answer is fast, because no shard held it back.
+ref: paper | The Tail at Scale | Dean & Barroso, CACM 2013 |
+
+@@ neuralrender
+== Capture, fit and serve a photoreal 3D scene
+kind: online-offline, offload-accelerator
+when: You need a realistic 3D view of a real place or product from photos, and new viewpoints must render in real time.
+how: Photos or video are taken of the scene. A structure-from-motion tool (COLMAP) estimates each camera pose and a sparse point cloud. This is the offline stage.
+Training starts from that point cloud. 3D Gaussian Splatting turns each point into a small 3D Gaussian with position, shape, opacity and color. A differentiable rasterizer renders the current Gaussians from each training camera. The loss compares the render with the real photo, and gradient descent updates every Gaussian. Training runs for about 30,000 steps, often 10 to 40 minutes on one GPU.
+The result is a file of millions of Gaussians. A viewer sorts them by depth and rasterizes them as sprites, so new viewpoints run at 100 frames per second or more on a desktop GPU. NeRF gives similar quality but is slower to render because it queries a network along every ray.
+used: Open-source 3D Gaussian Splatting (Inria, 2023) and Nerfstudio; scene-capture apps such as Luma and Polycam; photoreal 3D views in maps and product pages.
+avoid: When the scene moves or changes often, or you have no good camera poses; use a classic mesh pipeline or a dynamic-scene method.
+flow:
+  Photos [store: 100 to 300 images] -> COLMAP [svc: structure from motion] : images | Structure-from-motion finds a pose for each photo and a sparse set of 3D points.
+  COLMAP -> Trainer [svc: GPU, 30k steps] : poses + points | The points become the first Gaussians. Each camera pose is known.
+  Trainer -> Renderer [svc: differentiable] : Gaussians, camera k | The renderer draws the Gaussians as seen by training camera k.
+  Renderer -> Trainer : image + loss | The loss against the real photo gives gradients for every Gaussian.
+  * Trainer: loss falling | Position, shape, opacity and color of the Gaussians improve each step.
+  Trainer -> Scene file [store: millions of splats] : save | The trained scene is saved as one file of Gaussians.
+  Viewer [client: real-time] -> Scene file : load and sort by depth | The viewer rasterizes the sorted splats at a new viewpoint, in real time.
+ref: paper | 3D Gaussian Splatting for Real-Time Radiance Field Rendering | Kerbl, Kopanas, Leimkuehler & Drettakis, SIGGRAPH 2023 |
+ref: paper | NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis | Mildenhall et al., ECCV 2020 |
+
+== Streamed splat scene with level of detail
+kind: cdn-edge, tiered-storage
+when: A very large captured scene (a street or a building) is too big to send or draw in full.
+how: The scene is split offline into spatial tiles. Each tile has several levels of detail: a few large Gaussians for far views and many small ones for near views. Tiles are stored as files on object storage behind a CDN.
+The viewer knows the camera position. It downloads the coarse level of every nearby tile first, so the view appears at once. Then it fetches finer levels for tiles close to the camera and drops tiles that are far away or out of view.
+Memory and bandwidth stay bounded because only the visible tiles and the needed detail are loaded. The cost is extra build work to produce the tiles, and visible popping when a tile changes level.
+used: Hierarchical 3D Gaussians for very large scenes (Inria research); streaming splat viewers on the web; similar tile-and-level ideas in 3D Tiles for maps.
+avoid: For a small object that fits in one file; load it whole.
+flow:
+  Capture data [lake: street photos] -> Tile builder [svc: offline] : trained splats | The builder splits the trained scene into tiles and builds coarse and fine levels.
+  Tile builder -> Object store [store: tiles by level] : tile files | Each tile and level is saved as a separate file.
+  Object store -> CDN [cache: edge] : tile files | The CDN caches popular tiles close to users.
+  Viewer [client: camera pose] -> CDN : coarse tiles | The viewer first loads only the coarse level of tiles near the camera.
+  CDN -> Viewer : coarse splats | The first picture shows within a short time, but it is blurry.
+  Viewer ~> CDN : fine tiles near camera | As the camera stays, finer levels of near tiles load in the background.
+  * Viewer: far tiles dropped | Tiles that are far or out of view are removed to save memory.
+ref: paper | A Hierarchical 3D Gaussian Representation for Real-Time Rendering of Very Large Datasets | Kerbl et al., SIGGRAPH 2024 |
+
+@@ physsim
+== Fixed-step game loop with broad and narrow phase
+kind: pipeline-stages, event-loop
+when: Objects must move and collide in real time, with a fixed budget per frame such as 16 ms.
+how: The engine runs the physics at a fixed time step, for example 1/60 s, so the results do not depend on frame rate. If a frame took longer, it runs several physics steps to catch up.
+Each step has stages. The broad phase puts each body in a bounding box and uses a spatial grid or a bounding volume hierarchy to find pairs of boxes that overlap. With 10,000 bodies, this avoids checking 50 million pairs. The narrow phase tests the exact shapes of each pair and produces contact points.
+A solver then treats contacts as constraints and updates velocities, and an integrator (semi-implicit Euler) moves the bodies. The renderer reads the new transforms. A step that is too large makes fast objects tunnel through thin walls; continuous collision detection fixes this for chosen bodies.
+used: PhysX in Unreal and Unity; Bullet; Box2D; Havok in many games.
+avoid: When you need exact, repeatable engineering accuracy; use a finite element or multibody tool built for that.
+flow:
+  Game loop [svc: 60 steps per second] -> Broad phase [svc: BVH / grid] : body boxes | Each step starts by testing bounding boxes to find pairs that may touch.
+  Broad phase -> Narrow phase [svc: exact shapes] : candidate pairs | Only a few hundred pairs survive; the full shape test runs on those.
+  Narrow phase -> Solver [svc: constraints] : contact points | Each contact becomes a constraint: no overlap, with friction.
+  Solver -> Integrator [svc: semi-implicit Euler] : new velocities | The solver gives corrected velocities. The integrator advances each position.
+  Integrator -> Game loop : new transforms | Updated positions and rotations go back to the game state.
+  Game loop -> Renderer [svc: GPU] : transforms | The renderer draws the new frame from the updated transforms.
+ref: docs | Bullet Physics SDK | Bullet Physics | https://github.com/bulletphysics/bullet3
+ref: paper | Game Physics Engine Development | Ian Millington, 2nd ed., 2010 |
+
+== Parallel simulators for robot learning
+kind: data-parallel, offload-accelerator
+when: A robot policy needs millions of trial steps, which are too slow and unsafe on real hardware.
+how: A GPU simulator (Isaac Sim with Isaac Lab, or MuJoCo MJX and MuJoCo Warp) runs thousands of copies of the robot world at once. Physics state for all copies lives in GPU memory, and each step runs for all copies in one batch.
+A learner (PPO is common) reads observations and rewards from all environments, then updates the policy network on the same GPU. Actions go back to the simulator at once. No data crosses the PCIe bus between steps, which allows millions of steps per second.
+Simulation differs from the real world, so engineers randomize mass, friction and delays during training (domain randomization). The trained policy then goes to a real robot, and real data is used to correct the simulator. This is called the sim-to-real gap.
+used: NVIDIA Isaac Lab for legged and arm robots; MuJoCo Playground and MJX in research; Google DeepMind sim-to-real work.
+avoid: For tasks with soft or fluid contact that the simulator models badly; collect real data instead.
+flow:
+  Learner [svc: PPO on GPU] -> Simulator [svc: 4096 envs on GPU] : actions | The learner sends one action for each of 4,096 simulated robots.
+  Simulator -> Learner : observations, rewards | One batched physics step runs for all robots. Results stay in GPU memory.
+  * Learner: policy improving | The policy network is updated after each batch of steps.
+  Randomizer [svc: domain randomization] -> Simulator : mass, friction, delay | Physics settings are changed per robot so the policy does not overfit one setting.
+  Learner -> Policy store [store: checkpoints] : trained policy | The best policy is saved.
+  Policy store -> Real robot [client: on-board computer] : deploy | The policy runs on the real robot. Real logs reveal the sim-to-real gap.
+ref: paper | Isaac Lab: A GPU-Accelerated Simulation Framework for Multi-Modal Robot Learning | NVIDIA, 2025 |
+ref: docs | MuJoCo documentation | Google DeepMind | https://mujoco.readthedocs.io/
+
+@@ raster
+== Real-time GPU graphics pipeline
+kind: pipeline-stages, offload-accelerator
+when: You must draw a changing 3D scene at 60 frames per second or more on a GPU.
+how: The CPU prepares each frame. It culls objects, sorts draw calls and records command buffers (Vulkan, Metal, DirectX 12). It sends them to the GPU. The GPU runs fixed and programmable stages.
+The vertex shader moves each triangle vertex through the model, view and projection matrices to screen space. Fixed hardware then finds which pixels each triangle covers. This step is called rasterization. A fragment shader runs for every covered pixel to compute its color.
+Last, the depth test compares each fragment with the z-buffer. Only the nearest fragment is written to the frame buffer. Stages overlap, so a new triangle enters while an old one is shaded. A 4K frame has 8.3 million pixels, so shading cost is usually the limit.
+used: Every GPU through Vulkan, Metal, DirectX 12 and OpenGL; browser compositing; game engines such as Unreal and Unity.
+avoid: For exact reflections, soft shadows and global light; add ray tracing or use an offline path tracer.
+flow:
+  CPU [svc: engine] -> Vertex shader [svc: matrices on GPU] : draw calls | The CPU culls hidden objects and sends command buffers. Each vertex is projected by 4x4 matrices from model space to screen space.
+  Vertex shader -> Rasterizer [svc: fixed function] : screen triangles | The rasterizer finds each covered pixel and makes a fragment.
+  Rasterizer -> Fragment shader [svc: per pixel color] : fragments | A shader runs for each fragment: textures, lights, material.
+  Fragment shader -> Depth test [svc: z-buffer] : color + depth | Each fragment is compared with the stored depth for its pixel.
+  Depth test -> Frame buffer [store: color image] : nearest fragment | Only the nearest fragment is kept. The finished frame is scanned out to the display.
+  Depth test -x> Fragment shader : hidden fragment dropped | A fragment behind another surface is discarded.
+ref: docs | The Vulkan Specification | Khronos Group | https://registry.khronos.org/vulkan/
+ref: paper | A Subdivision Algorithm for Computer Display of Curved Surfaces | Edwin Catmull, PhD thesis, 1974 |
+
+== Deferred shading with a G-buffer
+kind: pipes-filters, pipeline-stages
+when: A scene has many lights, and shading every fragment for every light would cost too much.
+how: In the first pass, the engine rasterizes all geometry and writes surface data, not final color, into several textures. This is the G-buffer: depth, normal, albedo, roughness and metalness for each pixel.
+In the second pass, lights read the G-buffer. Each light shades only the pixels it touches, using a screen quad, a light volume or screen tiles. Shading cost is then about pixels times lights that reach them, not geometry times lights. A scene with hundreds of lights stays workable.
+Then post effects run: ambient occlusion, bloom, tone mapping and anti-aliasing. Costs are memory bandwidth for a wide G-buffer, and poor support for transparency and hardware multisampling. Forward+ rendering is the usual alternative.
+used: Many AAA game engines, including Unreal Engine and Unity's deferred paths; Forward+ in engines that need MSAA or VR.
+avoid: On mobile or VR with few lights, where bandwidth is tight; use forward or forward+ rendering.
+flow:
+  Geometry [store: meshes] -> G-buffer pass [svc: raster only] : triangles | The scene is rasterized once. No lighting is computed yet.
+  G-buffer pass -> G-buffer [store: normal albedo] : surface data | Each pixel stores normal, albedo, roughness, metalness and depth.
+  G-buffer -> Lighting pass [svc: per light shading] : read textures | Each light reads the G-buffer and shades only the pixels it reaches.
+  Lighting pass -> Post effects [svc: bloom and tone map] : HDR linear color | Lit pixels are summed into a high dynamic range image. Bloom and tone mapping then turn it into display color.
+  Post effects -> Display [client] : final frame | The final image goes to the screen.
+ref: docs | Unreal Engine rendering overview | Epic Games | https://dev.epicgames.com/documentation/en-us/unreal-engine/rendering-overview-in-unreal-engine
+
+@@ raytracing
+== BVH build and traversal on RT hardware
+kind: offload-accelerator, pipeline-stages
+when: You need exact shadows, reflections and global light, and scenes have millions of triangles.
+how: The CPU or GPU first builds a bounding volume hierarchy (BVH), a tree of boxes over the triangles. Vulkan and DirectX call the tree an acceleration structure. Objects have a bottom-level tree and a scene has a top-level tree of instances.
+For each pixel, a ray-generation shader shoots a ray. Dedicated RT cores (NVIDIA RTX) walk the tree: they test the ray against child boxes, skip the boxes it misses and test triangles in the leaf. This turns a test of millions of triangles into about 20 box tests.
+The closest hit runs a shader. It may shoot new rays for shadows or reflections. Moving objects need a BVH refit or rebuild each frame. Real-time scenes use few rays per pixel, so a denoiser cleans the noise.
+used: NVIDIA RTX with DXR and Vulkan ray tracing; Pixar RenderMan; Blender Cycles with OptiX; Embree on CPUs.
+avoid: When rasterization with baked or screen-space tricks looks good enough, and frame time is tight.
+flow:
+  Engine [svc: CPU] -> BVH builder [svc: GPU build] : triangle meshes | The engine submits meshes. The builder makes a box tree over the triangles.
+  BVH builder -> Acceleration structure [store: top and bottom trees] : built BVH | The tree is stored in GPU memory. A moving object is refit each frame.
+  Ray generation [svc: per pixel shader] -> RT core [svc: box and triangle tests] : ray | Each pixel shoots a ray into the scene.
+  RT core -> Acceleration structure : test child boxes | The hardware walks the tree, and skips every box the ray misses.
+  RT core -> Hit shader [svc: closest hit] : nearest triangle | The nearest triangle hit is shaded. It can shoot more rays for shadows.
+  Hit shader -> Denoiser [svc: AI or filter] : noisy 1 sample image | With 1 or 2 rays per pixel the image is noisy.
+  Denoiser -> Frame buffer [store] : clean image | The denoised image is shown.
+ref: docs | Vulkan Ray Tracing | Khronos Group | https://www.khronos.org/blog/ray-tracing-in-vulkan
+ref: paper | Physically Based Rendering: From Theory to Implementation | Pharr, Jakob & Humphreys, 4th ed., 2023 |
+
+== Distributed path-traced render farm
+kind: scatter-gather, competing-consumers
+when: A film frame needs thousands of light paths per pixel and takes hours, so one machine is too slow.
+how: A render manager (Deadline, Tractor or OpenCue) holds a queue of jobs. A frame, or a tile of a frame, is one task. Workers pull tasks, load the scene and textures from shared storage and render them.
+Each worker path-traces its tile: for each pixel it shoots many random paths and averages them (Monte Carlo). Noise falls with the square root of the sample count. 4 times the samples halves the noise.
+Finished tiles are written as image files and an assembly step merges them, often with a denoiser. A failed worker only loses its task, which the manager reruns. Costs are shared storage load and scene load time per task.
+used: Pixar RenderMan on Tractor; Blender Cycles on render farms; OpenCue (Sony Pictures Imageworks, open source).
+avoid: For interactive work; use a GPU real-time renderer or a progressive viewport render.
+flow:
+  Artist [user] -> Render manager [svc: job queue] : submit 240 frames | The artist submits a job with one task per frame.
+  Render manager -> Worker 1, Worker 2 [svc: path tracer] : task: frame 17 | Idle workers pull tasks. Each task is one frame or one tile.
+  Worker 1 -> Asset storage [store: scene files] : read scene | Workers read the scene and textures from shared storage.
+  Worker 1 -> Frame store [store: EXR files] : rendered tile | A worker writes its image after averaging thousands of random paths per pixel.
+  Worker 2 -x> Render manager : worker lost | One worker dies. Only its task is lost.
+  Render manager -> Worker 1 : rerun frame 18 | The manager puts the task back, and another worker renders it.
+  Frame store -> Denoiser [svc: merge, denoise] : tiles | A final step merges tiles and removes remaining noise.
+ref: docs | OpenCue documentation | Academy Software Foundation | https://www.opencue.io/docs/
+ref: book | Physically Based Rendering, 4th ed. | Pharr, Jakob & Humphreys, 2023 | https://www.pbr-book.org/
+
+@@ shading
+== Metallic-roughness PBR material pipeline
+kind: pipes-filters, interpreter-compiler
+when: Artists make materials once, and they must look right under any light and in many engines.
+how: A material is described by a small set of maps: base color, metalness, roughness, normal and ambient occlusion. glTF 2.0 standardizes this metallic-roughness model, so one asset works in many viewers.
+At run time, a fragment shader reads the maps. For each light it evaluates a BRDF, usually a Cook-Torrance model: a diffuse term plus a specular term from a normal distribution (GGX), a geometry term and a Fresnel term. Image-based lighting adds light from an environment map.
+All math runs in linear color space. A final tone-mapping step compresses the high dynamic range into the display range, then converts to sRGB. Textures that hold color are stored as sRGB and decoded to linear when sampled; data maps like roughness stay linear.
+used: glTF PBR materials in Khronos viewers and three.js; Unreal Engine's material system; Disney principled BRDF in film renderers.
+avoid: For stylized art such as toon shading, where a custom non-physical shader is simpler.
+flow:
+  Artist tools [client: Blender] -> glTF asset [store: maps + mesh] : export PBR maps | The artist exports base color, metalness, roughness and normal maps.
+  glTF asset -> Engine loader [svc: GPU upload] : textures | The loader uploads maps to GPU memory. Color maps decode from sRGB to linear.
+  Engine loader -> Fragment shader [svc: BRDF] : material inputs | The shader samples the maps for each pixel.
+  Environment map [store: HDR image] -> Fragment shader : image based light | The environment gives soft light from all directions.
+  Fragment shader -> Tone mapper [svc: HDR to display] : linear radiance | The shader computes the BRDF times light in linear space.
+  Tone mapper -> Display [client] : sRGB color | Tone mapping compresses the range, then the image is encoded to sRGB.
+ref: spec | glTF 2.0 Specification | Khronos Group | https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html
+ref: paper | Physically Based Shading at Disney | Brent Burley, SIGGRAPH course notes, 2012 |
+
+== Shader compile and cache across GPUs
+kind: interpreter-compiler, cache-aside
+when: One material graph must run on many GPUs and APIs, and compiling shaders in the middle of play causes stutter.
+how: Authors write shaders in a high-level language (HLSL, GLSL, or Slang). A compiler front end parses it into an intermediate form (SPIR-V, DXIL or Metal IR). A driver back end then turns this into the machine code of the user's exact GPU.
+The last step happens on the user's machine, and it can take tens of milliseconds for each shader variant. A game has thousands of variants. If one compiles during a frame, the frame is late and the player sees a stutter.
+So the engine keeps a pipeline cache on disk. On a hit the binary loads at once. On a miss it compiles. Engines also precompile known variants during loading, and Vulkan has pipeline cache objects for this. Steam's shader pre-caching shares compiled shaders between users with the same GPU.
+used: Unreal Engine's PSO precaching; Vulkan pipeline caches; Steam shader pre-caching; Slang in cross-platform shader tools.
+avoid: For consoles with fixed hardware, where shaders ship already compiled.
+flow:
+  Shader source [store: HLSL / Slang] -> Compiler [svc: front end] : source | The build compiles source into a portable intermediate form.
+  Compiler -> SPIR-V file [store: portable IR] : IR | The IR is shipped with the game, not machine code.
+  Game [client: at load time] -> Pipeline cache [cache: on disk] : lookup material variant | The game asks for a pipeline for this GPU and driver version.
+  Pipeline cache -x> Game : miss | On a miss, the pipeline does not exist yet.
+  Game -> GPU driver [svc: back end] : compile IR | The driver makes machine code for this exact GPU. This can take tens of ms.
+  GPU driver -> Pipeline cache : store binary | The binary is saved, so the next run hits at once.
+ref: docs | Vulkan pipeline cache | Khronos Group |
+
+@@ autoscaling
+== Metric-driven pod and node autoscaling
+kind: autoscaling, control-loop
+when: Load changes during the day, and you want to pay for the peak only while the peak lasts.
+how: The Horizontal Pod Autoscaler (HPA) in Kubernetes reads a metric every 15 seconds, such as average CPU. It computes desired replicas = current replicas times (current metric divided by target metric), rounded up. With 10 pods at 90% CPU and a target of 60%, it asks for 15 pods.
+If the cluster has no room, new pods stay Pending. A node autoscaler (Cluster Autoscaler or Karpenter) sees them and adds nodes. A node takes minutes to join, so the pods wait that long.
+Scale-down is slower on purpose. HPA keeps a stabilization window (5 minutes by default) and uses the highest recent recommendation, to avoid flapping. Always set minimum and maximum replicas, and readiness probes, so a new pod gets traffic only when it is ready.
+used: Kubernetes HPA with Cluster Autoscaler or Karpenter; AWS Auto Scaling groups with target tracking; GKE and AKS autoscalers.
+avoid: For stateful systems that rebalance slowly, or spiky load faster than startup time; keep spare capacity or use a queue.
+flow:
+  Metrics server [svc: CPU per pod] -> HPA [svc: control loop] : avg CPU 90% | Every 15 seconds the HPA reads the pod metric and compares it with the 60% target.
+  HPA -> Deployment [svc: 10 replicas] : scale to 15 | The HPA writes a new replica count: 10 x 90 / 60 = 15.
+  Deployment -> Scheduler [svc: Kubernetes] : 5 new pods | Five new pods are created and must be placed on nodes.
+  Scheduler -x> Deployment : no room: Pending | The cluster is full, so the pods stay Pending.
+  Scheduler -> Node autoscaler [svc: Karpenter] : pending pods | The node autoscaler sees the Pending pods and picks a node size that fits them.
+  Node autoscaler -> Cloud API [svc: EC2 or GCE] : launch node | A new node is launched. It takes 1 to 3 minutes to join.
+  * Deployment: 15 ready | The new pods start and are ready. CPU falls back to the target.
+ref: docs | Horizontal Pod Autoscaling | Kubernetes documentation | https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
+ref: docs | Karpenter documentation | Karpenter project | https://karpenter.sh/docs/
+
+== Queue-depth scaling of workers
+kind: autoscaling, competing-consumers, load-leveling
+when: Background jobs arrive in bursts, and the right number of workers depends on the backlog, not on CPU.
+how: Producers put jobs in a queue (SQS, RabbitMQ or Kafka). A pool of workers consumes them. CPU is a poor signal here: a worker waiting on I/O shows low CPU, even when the backlog grows.
+An autoscaler such as KEDA reads the queue length or Kafka consumer lag and sets the replica count. A simple rule is replicas = backlog divided by (jobs per worker per minute times the minutes you accept to drain it). It can scale to zero when the queue is empty and start workers when the first job arrives.
+For Kafka, extra consumers beyond the partition count sit idle, so the maximum replicas equal the partition count. Jobs must be idempotent, because a scaled-down worker may be stopped while it is still working.
+used: KEDA scalers for SQS, Kafka and RabbitMQ; AWS Lambda event source scaling on SQS; Spark dynamic allocation for executors.
+avoid: For latency-critical request paths where a queue adds delay; scale on request rate or concurrency instead.
+flow:
+  Producers [client] -> Job queue [queue: SQS] : jobs | Producers add jobs. A burst pushes the backlog up.
+  KEDA [svc: autoscaler] -> Job queue : read queue length | KEDA polls the queue length every 30 seconds.
+  KEDA -> Worker pool [svc: 2 replicas] : scale to 20 | The backlog is large, so KEDA raises the replica count.
+  Job queue -> Worker pool : pull jobs | The workers compete for jobs. Each job goes to one worker.
+  Worker pool -> Results DB [db] : results | Workers write results. A retried job must not cause a duplicate.
+  * KEDA: queue empty | When the backlog is gone, KEDA scales the pool back to its minimum or to zero.
+ref: docs | KEDA concepts | KEDA project | https://keda.sh/docs/latest/concepts/
+ref: docs | Dynamic Resource Allocation | Apache Spark documentation | https://spark.apache.org/docs/latest/job-scheduling.html
+
+@@ chaos
+== Steady-state experiment with a small blast radius
+kind: chaos-experiment
+when: You believe your failover and timeouts work, and you want proof before a real outage tests them.
+how: Define a steady-state metric, for example checkout success rate above 99.5%. Write a hypothesis: if one instance dies, the metric stays within limits. Pick a small blast radius, for example 1 pod or 5% of traffic.
+A chaos tool (Chaos Mesh, LitmusChaos, Gremlin or AWS Fault Injection Service) injects the fault: kill a pod, add 300 ms of latency or cut a network link. Monitoring compares the metric with the control group.
+A stop condition aborts the run at once if the metric leaves its limits. If the hypothesis fails, you have found a weakness safely and you fix it. Then you widen the scope and run the test again, often in a regular pipeline or game day.
+used: Netflix Chaos Monkey; Chaos Mesh and LitmusChaos on Kubernetes (CNCF projects); AWS Fault Injection Service; Gremlin.
+avoid: Without monitoring, alerts or rollback; first build observability, because you cannot see what an experiment breaks.
+flow:
+  Engineer [user] -> Experiment [svc: hypothesis + limits] : define steady state | The team writes the hypothesis, the blast radius and the stop condition.
+  Experiment -> Chaos tool [svc: Chaos Mesh] : kill 1 pod | The tool injects the fault into a small target.
+  Chaos tool -> Service [svc: checkout] : fault applied | The service loses one pod. Traffic must reroute through the health checks.
+  Monitoring [svc: metrics] -> Experiment : success rate 99.7% | Monitoring reads the steady-state metric during the fault.
+  Experiment -x> Chaos tool : abort if under 99.5% | If the metric falls below the limit, the run is stopped and the fault is removed.
+  * Experiment: hypothesis held | The metric stayed within limits, so failover works. The team can widen the blast radius.
+ref: paper | Chaos Engineering | Basiri et al., IEEE Software, 2016 |
+ref: docs | Principles of Chaos Engineering | principlesofchaos.org | https://principlesofchaos.org/
+
+== Fault injection in the CI pipeline
+kind: circuit-breaker, timeout-deadline
+when: A change might break a timeout, retry or fallback, and you want to catch it before release.
+how: In a staging cluster, the pipeline deploys the new build. A fault proxy (Toxiproxy, or a service mesh fault rule such as Istio delay and abort) sits between the service and its dependency.
+The test adds latency or errors to the dependency, then sends load. It asserts what must hold: the call times out in under 500 ms, the circuit breaker opens after 5 failures and a fallback answer is returned. A test that fails blocks the release.
+These tests are small and repeatable, so they run on every merge. They find broken timeouts and retry storms early. They do not replace production experiments, because staging has different scale and traffic.
+used: Toxiproxy in integration tests; Istio fault injection rules; Chaos Mesh in CI on Kubernetes; Jepsen for distributed databases.
+avoid: As the only test; also run production game days, since real traffic shape and scale differ from staging.
+flow:
+  CI pipeline [svc: GitHub Actions] -> Staging [svc: new build] : deploy | The pipeline deploys the build to a test cluster.
+  CI pipeline -> Fault proxy [svc: Toxiproxy] : add 2 s delay | The pipeline sets a 2 second delay on the database link.
+  Test client [client: load test] -> Staging : requests | The test sends traffic during the fault.
+  Staging -> Fault proxy : DB call | The service calls the database through the proxy.
+  Staging -x> Fault proxy : timeout at 500 ms | The call times out and the circuit breaker counts a failure.
+  Staging -> Test client : fallback answer | After the breaker opens the service returns a cached answer fast.
+  * CI pipeline: assertions passed | Timeouts and fallbacks work, so the release may continue.
+ref: docs | Toxiproxy | Shopify | https://github.com/Shopify/toxiproxy
+ref: docs | Istio fault injection | Istio documentation | https://istio.io/latest/docs/tasks/traffic-management/fault-injection/
+
+@@ erasurecoding
+== Erasure-coded object storage across failure domains
+kind: sharding, tiered-storage
+when: You must keep data durable across disk, node and rack failures at a lower cost than three copies.
+how: The store splits each object into k data fragments and adds m parity fragments computed with Reed-Solomon codes. Any k of the k+m fragments rebuild the object. A 10+4 code survives any 4 lost fragments and uses 1.4 times the raw size. Three-way replication uses 3 times.
+Fragments go to different disks, nodes or racks, so one failure domain loses at most one fragment. A read fetches fragments and decodes. A degraded read, with a fragment missing, needs more reads and CPU. After a failure, a repair job rebuilds the missing fragment from k others and writes it to a new disk.
+The costs are read traffic during repair (k fragments read to rebuild one) and CPU for encoding. Small objects are often replicated or packed together first, since splitting them gives tiny fragments.
+used: Ceph erasure-coded pools; MinIO; HDFS erasure coding (RS-6-3); Azure Storage and Google Colossus use erasure codes (common in large object stores).
+avoid: For small hot objects or latency-critical reads; use replication, which serves reads from one copy with no decoding.
+flow:
+  Client [client] -> Gateway [svc: encoder] : PUT 1 GB object | The client uploads an object. The gateway cuts it into 10 data pieces.
+  Gateway -> Parity coder [svc: Reed-Solomon] : 10 data pieces | The coder computes 4 parity pieces from the 10 data pieces.
+  Parity coder -> Rack A, Rack B, Rack C [store: disks] : 14 fragments | The 14 fragments are placed on different disks and racks.
+  * Rack B: node lost | A node fails. Its fragments are gone.
+  Client -> Gateway : GET object | A later read finds 13 fragments, which is enough since any 10 work.
+  Rack A -> Gateway : 10 fragments | The gateway reads any 10 fragments and decodes the object.
+  Repair job [svc: background] ~> Rack C : rebuild lost fragment | A repair job rebuilds the lost fragment from 10 others and writes it to a new disk.
+ref: paper | Erasure Coding in Windows Azure Storage | Huang et al., USENIX ATC 2012 |
+ref: docs | HDFS Erasure Coding | Apache Hadoop documentation | https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HDFSErasureCoding.html
+
+== Hot replicas that age into erasure-coded cold storage
+kind: tiered-storage, copy-on-write
+when: New data is read often, but older data is rarely read and storage cost dominates.
+how: New objects are written with 3 replicas. This gives fast writes, fast reads and simple repair. A background job watches age or access count.
+After a period such as 7 or 30 days, the job reads the object, encodes it with an erasure code and writes the fragments. When the new fragments are safe, it deletes the replicas. Storage drops from 3 times to about 1.4 times for a 10+4 code.
+Reads of cold data cost more, because they gather many fragments, and repair after a failure moves more data. If data turns hot again, a policy can copy it back. HDFS has this idea as storage policies with erasure coding for cold directories.
+used: HDFS erasure coding for cold data; Ceph cache tiering and EC pools; Facebook f4 warm blob storage (research paper).
+avoid: When data is small or access is unpredictable, where re-encoding churn costs more than it saves.
+flow:
+  Writer [client] -> Hot tier [store: 3 replicas] : write object | New data is written as 3 full copies.
+  Reader [client] -> Hot tier : read object | Reads of fresh data hit one replica. No decoding is needed.
+  Aging job [svc: background] -> Hot tier : list objects older 30 d | The job finds objects that have gone cold.
+  Aging job -> Encoder [svc: 10+4 coder] : object bytes | The job reads each cold object and encodes it into 14 fragments.
+  Encoder -> Cold tier [store: 14 fragments] : fragments | The 14 fragments are stored on separate failure domains.
+  Aging job -> Hot tier : delete replicas | Only after the fragments are safe are the 3 copies removed.
+  * Cold tier: 1.4x raw size | Storage cost fell from 3 times to 1.4 times the data size.
+ref: paper | f4: Facebook's Warm BLOB Storage System | Muralidhar et al., OSDI 2014 |
+
+@@ loadshed
+== Priority-based admission at the front door
+kind: load-shedding, priority-queue
+when: A service is overloaded, and you must keep critical requests working while you drop others.
+how: The service tracks load: in-flight requests, queue length or CPU. Below a limit, all requests pass. Above it, an admission controller rejects the least important traffic first. Each request is tagged with a priority, such as checkout above browsing above background sync.
+Rejection is cheap: it returns HTTP 503 or 429 at once, before the request uses a database or a thread. Rejected clients must not retry at once, so the response carries a Retry-After header, and clients use backoff with jitter.
+The goal is that accepted requests still meet their deadline. Without shedding, every request waits in a long queue and times out, which is worse than serving most requests and rejecting some.
+used: Amazon Builders' Library load shedding; Envoy overload manager; Google SRE criticality levels; API gateways dropping low-priority traffic.
+avoid: When all requests are equally important and overload is permanent; add capacity, since shedding then only hides a shortage.
+flow:
+  Client [client] -> Gateway [svc: admission control] : request + priority | Each request carries a priority class. Checkout is high; reports are low.
+  Gateway -> Load monitor [svc: in-flight count] : check load | The gateway reads the current in-flight count and queue delay.
+  Gateway -> Checkout service [svc: protected] : high priority | In overload, high priority requests still pass.
+  Gateway -x> Client : 503 + Retry-After | A low priority request is rejected at once. It costs almost nothing.
+  Checkout service -> Gateway : 200 OK in 80 ms | Accepted requests finish within their deadline.
+  * Gateway: shedding low priority | The gateway keeps shedding until load falls below the limit.
+ref: blog | Using load shedding to avoid overload | Amazon Builders' Library, 2021 | https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/
+ref: docs | Overload manager | Envoy documentation | https://www.envoyproxy.io/docs/envoy/latest/configuration/operations/overload_manager/overload_manager
+
+== Adaptive concurrency limit
+kind: load-shedding, control-loop
+when: You do not know how many concurrent requests a service can handle, and the answer changes with load and hardware.
+how: A concurrency limiter allows at most N requests in flight. It measures latency. When latency is near the best observed value, N goes up a little. When latency rises, N goes down. The rule is like TCP congestion control (AIMD, or gradient based as in Netflix concurrency-limits).
+Requests above N get a fast rejection, or wait in a short queue. The limit finds itself, so no one tunes it by hand, and it follows slow downstream services, noisy neighbours and hardware changes.
+This follows Little's law: in-flight requests equal arrival rate times latency. If latency doubles and the limit stays fixed, throughput halves, and the queue would grow without bound. A limit on in-flight work caps the queue.
+used: Netflix concurrency-limits library; Envoy adaptive concurrency filter; gRPC and service proxies that apply AIMD limits.
+avoid: For very low-traffic services, where latency samples are too few to be reliable; use a fixed limit.
+flow:
+  Caller [client] -> Limiter [svc: limit N = 40] : request | Each request asks the limiter for a slot.
+  Limiter -> Service [svc: backend] : admitted | If in-flight is below N, the request goes through.
+  Service -> Limiter : latency 50 ms | The limiter records the response time of each request.
+  * Limiter: N = 44 | Latency is near the minimum, so the limit grows slowly.
+  Service -> Limiter : latency 200 ms | The backend slows down because of a noisy neighbour.
+  * Limiter: N = 22 | Latency is 4 times higher, so the limit is cut quickly.
+  Limiter -x> Caller : rejected: over limit | Extra requests are rejected at once instead of waiting.
+ref: docs | Adaptive Concurrency filter | Envoy documentation | https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/adaptive_concurrency_filter
+ref: docs | concurrency-limits | Netflix | https://github.com/Netflix/concurrency-limits
+
+@@ merkle
+== Anti-entropy with Merkle tree comparison
+kind: gossip, quorum
+when: Replicas of a large key range drift apart, and you want to find the few differences without sending all the data.
+how: Each replica builds a Merkle tree over its key range. A leaf is the hash of a small range of rows. Each parent is the hash of its two children. The root is one hash for the whole range.
+Two replicas swap root hashes. If they are equal, the data is the same and nothing more is sent. If not, they compare the children and go down only the branches that differ. After about log n steps they know the exact ranges that differ. They stream just those rows and fix them.
+For 1 billion rows and 1 million leaves, a check needs about 20 hash exchanges, not a scan of all rows. The cost is building and refreshing the trees, which is done in the background.
+used: Apache Cassandra repair; Amazon Dynamo (anti-entropy); Riak active anti-entropy; ScyllaDB repair.
+avoid: When replicas rarely drift or the data is small; a simple full comparison or read repair is enough.
+flow:
+  Tree builder [svc: background job] -> Replica A [db: tree root h1] : refresh tree | Each replica rebuilds its tree in the background from hashes of row ranges.
+  Replica A -> Replica B [db: tree root h2] : root hash h1 | The replicas send their root hashes. They differ, so some data differs.
+  Replica B -> Replica A : left child hashes | They compare the two child hashes at the next level.
+  * Replica A: left subtree equal | The left half matches, so its thousands of rows are skipped.
+  Replica A -> Replica B : right child hashes | Only the right branch differs, so the search goes down that way.
+  Replica B -> Replica A : leaf range 9,000-9,100 | After about 20 steps the differing leaf range is found.
+  Replica A ~> Replica B : stream 100 rows | Only the rows of that range are sent and repaired.
+ref: paper | Dynamo: Amazon's Highly Available Key-value Store | DeCandia et al., SOSP 2007 |
+ref: docs | Cassandra repair | Apache Cassandra documentation | https://cassandra.apache.org/doc/latest/cassandra/managing/operating/repair.html
+
+== Content-addressed store with a hash DAG
+kind: copy-on-write, event-sourcing
+when: You want cheap snapshots, deduplication and tamper evidence for versions of a large tree of files.
+how: Every object is stored under the hash of its content. A file is a blob. A directory (a tree object) lists names and the hashes of its children. A commit lists the root tree hash and the hash of its parent commit. This makes a Merkle DAG.
+A change to one file gives that blob a new hash. Its parent directories and the commit also get new hashes. All unchanged objects keep their hash and are shared, so a new snapshot costs only the changed path. Equal content is stored once.
+Anyone can verify data by hashing it and comparing with the name. If a past commit is altered, every hash after it changes. This is why a commit hash identifies the whole history. Git, container image layers and IPFS all work this way.
+used: Git objects and commits; OCI container image manifests by digest; IPFS; Nix store paths; Bazel remote cache.
+avoid: When data must change in place or be deleted for legal reasons; content-addressed stores need garbage collection and make deletion hard.
+flow:
+  Developer [user] -> Working tree [store: files] : edit one file | The developer changes one file out of thousands.
+  Working tree -> Object store [store: objects by hash] : new blob b7 | The changed file is hashed. New content gets a new name, and old objects stay.
+  Object store -> Tree builder [svc: directories] : hashes of children | Directory objects are rebuilt only along the changed path.
+  Tree builder -> Commit [log: parent + root hash] : new root hash | A commit points to the new root tree and the parent commit.
+  Remote [svc: peer] -> Commit : fetch by hash | A peer asks for the commit hash. It only receives objects it does not already have.
+  Remote -x> Object store : hash mismatch rejected | If bytes do not match the hash, the peer rejects them. Tampering is visible.
+ref: book | Pro Git: Git Internals, Git Objects | Chacon & Straub | https://git-scm.com/book/en/v2/Git-Internals-Git-Objects
+ref: paper | A Digital Signature Based on a Conventional Encryption Function | Ralph Merkle, CRYPTO 1987 |
+
+@@ progressive
+== Automated canary analysis with rollback
+kind: blue-green, control-loop
+when: You deploy often, and you want a bad release to reach only a small share of users.
+how: A controller (Argo Rollouts or Flagger) starts the new version beside the stable one and sends it a small share of traffic, for example 5%. A service mesh or ingress does the weighted split.
+An analysis step reads metrics from Prometheus for both versions: error rate, p99 latency and saturation. It compares canary with baseline, not with a fixed number, because traffic changes over time. If the canary is worse by more than a set margin, the controller sets weight to 0 and the old version keeps serving.
+If the canary is healthy, the weight steps up: 5%, 25%, 50%, 100%, with a pause at each step. The whole run can take 30 minutes. Small steps limit the damage but make a deploy slower.
+used: Argo Rollouts; Flagger (Flux); Spinnaker with Kayenta canary analysis (Netflix and Google); Istio and Envoy weighted routing.
+avoid: When the change cannot run beside the old one, such as an incompatible schema migration; use expand and contract steps first.
+flow:
+  CI [svc: pipeline] -> Rollout controller [svc: Argo Rollouts] : new image v2 | The pipeline pushes version 2. The controller starts a canary pod set.
+  Rollout controller -> Mesh [svc: weighted routes] : canary weight 5% | The mesh routes 5% of requests to v2 and 95% to v1.
+  Mesh -> Stable v1, Canary v2 [svc: pods] : split traffic | Both versions serve real users.
+  Prometheus [db: metrics] -> Rollout controller : error rate v2 3.1% | Analysis finds v2 has 3.1% errors against 0.2% for v1.
+  Rollout controller -x> Mesh : weight 0 | The canary fails analysis. The weight goes to 0 and v1 serves all users.
+  * Canary v2: aborted | The release is aborted. Only about 5% of users saw errors for a few minutes.
+ref: docs | Argo Rollouts | Argo Project | https://argo-rollouts.readthedocs.io/
+ref: docs | Flagger | Flux project | https://docs.flagger.app/
+
+== Feature flags that separate deploy from release
+kind: feature-flags, external-config
+when: Code must reach production before the feature is ready for all users, and you need an instant off switch.
+how: The new code ships behind a flag that is off. The flag value lives in a flag service (LaunchDarkly, Unleash, Flagsmith or OpenFeature with a provider). SDKs in each service keep rules in memory, which they get by streaming or polling, so each check costs no network call.
+A rule decides per request: internal staff first, then 1% of users chosen by hashing the user id, then 10%, then everyone. Hashing keeps the same user in the same group on each request.
+If error metrics rise, someone turns the flag off. No deploy is needed and the effect takes seconds. Old flags must be removed after full rollout, or the code fills with dead branches and untested combinations.
+used: LaunchDarkly; Unleash; OpenFeature standard; trunk-based development teams at large companies.
+avoid: For changes that cannot hide behind a flag, such as a library upgrade or database migration; use canary or blue-green deploys.
+flow:
+  Developer [user] -> Flag service [svc: rules] : new-checkout flag at 1% | The flag is created off, then set to 1% of users.
+  Flag service -> App SDK [svc: in-memory rules] : stream rules | The SDK in each pod gets the rules by streaming and caches them.
+  User [client] -> App SDK : request, user id 42 | A request arrives. The SDK hashes the user id to a bucket.
+  App SDK -> New checkout [svc: new code] : bucket 0.7 of 100 | Users in the first 1% get the new code path.
+  App SDK -> Old checkout [svc: old code] : other users | All other users keep the old code path.
+  Monitoring [svc: metrics] -> Developer : errors up | The new path has more errors.
+  Developer -x> Flag service : kill switch off | One click turns the flag off. All users go to the old path in seconds.
+ref: blog | Feature Toggles (aka Feature Flags) | Pete Hodgson, martinfowler.com, 2017 | https://martinfowler.com/articles/feature-toggles.html
+ref: spec | OpenFeature specification | CNCF OpenFeature | https://openfeature.dev/specification/
+
+@@ ratelimit
+== Distributed token bucket at the gateway
+kind: rate-limit, api-gateway
+when: Many gateway instances must enforce one shared limit per API key, such as 100 requests per second.
+how: Each API key has a token bucket: a capacity b (the burst) and a refill rate r. A request takes one token. If the bucket is empty, the gateway returns 429 Too Many Requests with a Retry-After header.
+With many gateway instances, the bucket state lives in a shared store, usually Redis. A Lua script reads the tokens and the last refill time, adds tokens for the elapsed time, subtracts one and writes back, all in one atomic step. One round trip takes about 1 ms.
+To save that trip, each gateway may take a batch of tokens locally and refill the batch later. The limit is then approximate but cheap. If Redis fails, the gateway chooses to fail open (allow) or fail closed (deny); most choose open for availability.
+used: Envoy global rate limit service backed by Redis; Kong and NGINX rate limiting; Stripe and GitHub API limits.
+avoid: When you need exact global counts across regions at low cost; use local limits per instance plus quotas.
+flow:
+  Client [client: API key k1] -> Gateway [svc: limiter] : request | A client calls the API with its key.
+  Gateway -> Redis [cache: bucket per key] : atomic Lua script | The script refills the bucket and takes one token in one atomic step.
+  Redis -> Gateway : 41 tokens left | Redis answers with the tokens left.
+  Gateway -> Backend [svc: API] : allowed | The request is forwarded to the backend.
+  * Redis: bucket empty | A burst empties the bucket.
+  Gateway -x> Client : 429 Retry-After 1 | The gateway rejects extra requests at once, before the backend does work.
+ref: docs | Rate Limiting pattern | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/patterns/rate-limiting-pattern
+ref: docs | Envoy global rate limiting | Envoy documentation | https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/other_features/global_rate_limiting
+
+== Per-tenant quotas with a fair share
+kind: rate-limit, bulkhead
+when: One noisy tenant must not slow the others in a shared multi-tenant service.
+how: Each tenant gets its own limiter keyed by tenant id: a request rate and a concurrency cap. A tenant who goes over its quota is rejected or queued in its own lane, while the others keep their full capacity.
+The quota comes from the plan the tenant bought. Unused capacity can be shared: when the system is idle, a tenant may burst above quota, but under load each tenant is held to its fair share. Limits are also set at several layers: per user, per tenant and per whole service.
+Clients should see the limit: return headers with the limit, the tokens left and the reset time (the RateLimit header fields in an IETF draft). Good clients then slow themselves down and rarely get a 429.
+used: Cloud APIs such as AWS service quotas and throttling; Stripe API; Kubernetes API priority and fairness; SaaS APIs with plan tiers.
+avoid: For a single-tenant internal service, where a global concurrency limit or load shedding is simpler.
+flow:
+  Tenant A [client: 50 rps] -> Gateway [svc: tenant limiter] : requests | Tenant A sends a heavy stream of requests.
+  Tenant B [client: 5 rps] -> Gateway : requests | Tenant B sends a light stream.
+  Gateway -> Quota store [cache: bucket per tenant] : take token for A | Each tenant has its own bucket with its own rate.
+  Gateway -x> Tenant A : 429 over quota | Tenant A is above its 20 rps quota, so extra calls are rejected.
+  Gateway -> Backend [svc: shared service] : B and part of A | Tenant B is always served, and tenant A only up to its quota.
+  * Backend: p99 stays 90 ms | The noisy tenant does not raise latency for the others.
+ref: docs | API priority and fairness | Kubernetes documentation | https://kubernetes.io/docs/concepts/cluster-administration/flow-control/
+ref: docs | Rate Limiting pattern | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/patterns/rate-limiting-pattern
+
+@@ reconcile
+== Kubernetes controller with informer and work queue
+kind: control-loop, event-driven
+when: You declare desired state, and a program must keep the real system equal to it, even after crashes.
+how: A user writes desired state into the API server, which stores it in etcd. A controller does not poll. It uses an informer: a watch on the API server that keeps a local cache and sends an event for each change. Each event adds an object key to a work queue.
+A worker takes a key and runs the reconcile function. It reads the desired state and the observed state, computes the difference and takes one step, such as creating a missing pod. Then it writes status back. The function must be idempotent, because it can run many times for one change.
+If it fails, the key goes back on the queue with a growing delay. A periodic resync also re-queues everything, so a missed event is not lost. This is level-based, not edge-based: the loop compares states and does not trust that it saw every event.
+used: Kubernetes Deployment and ReplicaSet controllers; operators built with controller-runtime; Crossplane; Argo CD.
+avoid: For one-shot, ordered workflows; use a workflow engine or a saga.
+flow:
+  User [user] -> API server [svc: desired state] : replicas: 5 | The user declares 5 replicas. The API server stores this in etcd.
+  API server -> Informer [cache: local copy] : watch event | The informer receives the change and updates its cache.
+  Informer -> Work queue [queue: object keys] : key web/default | The event only adds the object key to a queue.
+  Work queue -> Reconciler [svc: controller] : next key | A worker takes the key and compares desired with observed state.
+  Reconciler -> API server : create 2 pods | The loop sees 3 pods but wants 5, so it creates 2.
+  Reconciler -x> Work queue : error: requeue with delay | If a call fails the key returns with a backoff delay.
+  * API server: 5 of 5 ready | The states now match, and the loop stays idle until the next change.
+ref: docs | Controllers | Kubernetes documentation | https://kubernetes.io/docs/concepts/architecture/controller/
+ref: docs | controller-runtime | Kubernetes SIGs | https://github.com/kubernetes-sigs/controller-runtime
+
+== GitOps reconciliation of drift
+kind: gitops, control-loop
+when: Cluster state must always match what is written in Git, and manual changes must be undone.
+how: Desired state, as manifests or Helm charts, is committed to a Git repository. A controller in the cluster (Argo CD or Flux) pulls the repository every few minutes, or on a webhook, and renders the manifests.
+It compares the rendered state with the live objects. Any difference is called drift. In auto-sync mode, the controller applies the manifests and fixes the drift. A change someone made by hand with kubectl is reverted. In manual mode it only reports the difference.
+Git gives history, review and rollback: reverting a commit changes the cluster. The cluster pulls, so CI needs no cluster credentials. The cost is that secrets need a separate tool, since Git must not hold plain secrets.
+used: Argo CD; Flux; Terraform plan and apply as a manual form of the same diff; common in platform teams on Kubernetes.
+avoid: For changes that must happen once and in order, such as a data migration; run these as a job.
+flow:
+  Engineer [user] -> Git repo [store: manifests] : merge pull request | A reviewed change to the desired state is merged.
+  Argo CD [svc: in cluster] -> Git repo : pull and render | The controller pulls the repo and renders the manifests.
+  Argo CD -> Cluster API [svc: live state] : read live objects | It reads the real objects and compares them with the rendered ones.
+  * Cluster API: replicas 8 (drift) | Someone ran kubectl scale by hand. Live state differs from Git.
+  Argo CD -> Cluster API : apply replicas 5 | Auto-sync applies Git state, which reverts the manual change.
+  Argo CD ~> Engineer : sync status | The controller reports Synced and Healthy. Every change has a commit.
+ref: docs | OpenGitOps principles | OpenGitOps, CNCF | https://opengitops.dev/
+ref: docs | Argo CD documentation | Argo Project | https://argo-cd.readthedocs.io/
+
+@@ sampling
+== Head-based trace sampling at the SDK
+kind: observability-pipeline
+when: Tracing every request costs too much, and a fixed share of traces is enough for typical latency.
+how: At the start of a request, the SDK makes a sampling decision once. A common rule is the ParentBased sampler with a trace-id ratio of, say, 1%. The ratio is applied to the trace id, so the same id gives the same answer in every service.
+The decision is written into the W3C traceparent header (sampled flag). Each downstream service obeys the flag. A trace is then either complete in all services or not recorded at all.
+Head sampling is cheap, since unsampled requests record nothing. Its weakness is that the choice is made before the outcome is known. At 1%, 99% of rare slow or failed requests are lost. Use tail sampling when those matter.
+used: OpenTelemetry SDK samplers (ParentBased and TraceIdRatioBased); Jaeger probabilistic sampling; Zipkin.
+avoid: When you must keep every error or slow trace; use tail sampling in a collector.
+flow:
+  Edge service [svc: entry point] -> Sampler [svc: SDK ratio 1%] : hash of trace id | The first service hashes the trace id and decides: sampled or not.
+  Sampler -> Orders service [svc: obeys flag] : traceparent sampled=1 | The decision travels in the traceparent header.
+  Orders service -> Payments service [svc: obeys flag] : traceparent sampled=1 | Every downstream service follows the same flag.
+  Orders service -> Collector [svc: OTel collector] : spans for trace 4bf9 | Only sampled traces send spans.
+  Collector -> Trace store [db: Tempo or Jaeger] : store spans | The complete trace is stored.
+  Sampler -x> Collector : 99% not recorded | Unsampled requests send nothing. This saves cost but loses rare errors.
+ref: docs | Sampling | OpenTelemetry documentation | https://opentelemetry.io/docs/concepts/sampling/
+ref: spec | Trace Context | W3C | https://www.w3.org/TR/trace-context/
+
+== Tail-based sampling in a collector tier
+kind: observability-pipeline, scatter-gather
+when: You want to keep all error and slow traces, and only a small share of normal ones.
+how: All services send their spans to a collector tier. A load balancer routes by trace id, so every span of one trace reaches the same collector (OpenTelemetry Collector with the loadbalancing exporter).
+The collector buffers the spans for each trace and waits a fixed time, for example 30 seconds, until the trace is probably complete. Then policies decide: keep any trace with an error, keep any trace over 2 seconds, and keep 1% of all others.
+Kept traces go to the trace store, and the rest are dropped. This keeps the interesting traces at a low volume. The costs are memory to hold traces during the wait, a routing layer, and late spans that arrive after the decision.
+used: OpenTelemetry Collector tail sampling processor; Grafana Tempo with Alloy; Honeycomb Refinery; Jaeger remote sampling.
+avoid: For tiny systems where the buffer and routing layer cost more than the storage saved; use head sampling.
+flow:
+  Services [svc: all spans sent] -> Routing tier [svc: hash by trace id] : spans, 100% | Every service sends every span, so decisions can see the whole trace.
+  Routing tier -> Sampler [svc: tail sampling] : spans of trace 77 | All spans of one trace land on the same sampler.
+  * Sampler: wait 30 s | The sampler buffers the trace until it is probably complete.
+  Sampler -> Trace store [db: kept traces] : error or over 2 s | Policies keep error traces and slow traces.
+  Sampler -x> Trace store : normal trace dropped | Ninety-nine percent of normal traces are dropped.
+  Engineer [user] -> Trace store : find slow checkouts | The engineer finds the slow and failed requests, which were all kept.
+ref: docs | Tail Sampling Processor | OpenTelemetry Collector contrib | https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/tailsamplingprocessor
+ref: docs | Sampling | OpenTelemetry documentation | https://opentelemetry.io/docs/concepts/sampling/
+
+@@ tracing
+== Trace context propagation across services
+kind: observability-pipeline, sidecar
+when: One user request crosses many services, and you need to see where its time went.
+how: The first service creates a trace id and a span id. It writes them into the W3C traceparent header: version, trace id, parent span id and flags. Each service reads the header, starts a child span with a new span id and passes the header on in its own calls.
+Each span records a name, start time, duration and attributes. Spans are sent in batches, outside the request path, to a collector (OpenTelemetry Collector). The collector forwards them to a back end (Jaeger, Tempo, Zipkin), which joins spans by trace id and draws a tree.
+The tree shows which call was slow, and which calls ran in parallel. Propagation must go through every hop, including queues and thread pools. One service that drops the header breaks the trace in two.
+used: OpenTelemetry SDKs and auto-instrumentation; Jaeger; Grafana Tempo; Google Dapper started the idea; service mesh sidecars add spans.
+avoid: For a single process, where a profiler gives more detail; tracing adds the most value across network hops.
+flow:
+  Browser [client] -> Gateway [svc: root span] : GET /checkout | The gateway creates trace id 4bf9 and the root span.
+  Gateway -> Orders [svc: child span] : traceparent 4bf9-a1 | The trace id and parent span id travel in a header.
+  Orders -> Payments [svc: child span] : traceparent 4bf9-b2 | Orders makes its own span and passes the id along.
+  Payments ~> Collector [svc: OTel collector] : span 220 ms | Each service sends its finished spans in the background.
+  Orders ~> Collector : span 260 ms | The collector gets spans out of order, from different services.
+  Collector -> Trace UI [db: Tempo or Jaeger] : spans by trace id | The back end joins the spans into a tree. Payments took 220 of 300 ms.
+ref: spec | Trace Context | W3C | https://www.w3.org/TR/trace-context/
+ref: paper | Dapper, a Large-Scale Distributed Systems Tracing Infrastructure | Sigelman et al., Google, 2010 |
+
+== Linking traces with logs and metrics
+kind: observability-pipeline, pipes-filters
+when: An alert fires, and you need to go from a metric spike to the exact slow request and its logs.
+how: Services emit three signals: metrics, logs and traces. Each log line carries the trace id and span id of the current span. A metric can carry exemplars: a trace id attached to a sample of a histogram bucket.
+An engineer sees a p99 latency spike on a dashboard. A click on an exemplar opens one slow trace. The trace shows the slow span, and a link filters the logs by that trace id, to show the error message from that exact request.
+This needs the same trace id in all three stores. OpenTelemetry sets it in SDK context and log appenders do the rest. The cost is that exemplars and trace-id fields add some data and need back ends that can join by id.
+used: Grafana with Tempo, Loki and Prometheus exemplars; OpenTelemetry log correlation; Datadog and Honeycomb correlate in the same way.
+avoid: When you do not run tracing at all; first get basic metrics and structured logs.
+flow:
+  Service [svc: OTel SDK] -> Prometheus [db: metrics] : latency + exemplar | The service emits latency with a trace id on one sample.
+  Service -> Loki [log: logs] : log line with trace id | Every log line carries the current trace id.
+  Service -> Tempo [db: traces] : spans | Spans carry the same trace id.
+  Alert [svc: p99 over 2 s] -> Engineer [user] : page | The p99 metric breaches its limit and the engineer is paged.
+  Engineer -> Prometheus : open exemplar | The engineer clicks the slow sample and gets a trace id.
+  Engineer -> Tempo : view trace 4bf9 | The trace shows that the payment call was slow.
+  Engineer -> Loki : logs for trace 4bf9 | The logs of that one request show the cause: a database timeout.
+ref: docs | Correlate signals with exemplars | Grafana documentation | https://grafana.com/docs/grafana/latest/fundamentals/exemplars/
+ref: docs | OpenTelemetry signals | OpenTelemetry documentation | https://opentelemetry.io/docs/concepts/signals/
+
+@@ backfill
+== Partition-overwrite backfill in a scheduler
+kind: backfill-replay, medallion
+when: A pipeline's logic changed or data arrived late, and you must recompute past days safely.
+how: Each task handles one time partition, for example one day, and writes its output with insert-overwrite on that partition only. The task is a pure function of its input partition and the logical date, never of "now". Re-running a day gives the same result and no duplicates.
+An orchestrator (Airflow, Dagster) holds the DAG and the date range. A backfill command creates one run per date and runs many in parallel, within a concurrency limit. Dependencies still decide the order, so the silver table for a day is rebuilt before the gold table for that day.
+Writes must be atomic: write to a temporary location and swap, or use a table format (Delta, Iceberg) with ACID commits. Readers then never see a half-written day. Cost is compute for all the dates, so limit the range and the parallelism.
+used: Airflow backfill and clear; Dagster partitioned assets; dbt incremental models with insert_overwrite; Spark dynamic partition overwrite.
+avoid: When the input history is gone or the logic depends on external state that changed; backfill cannot rebuild what you no longer have.
+flow:
+  Engineer [user] -> Orchestrator [svc: Airflow] : backfill 30 days | The engineer asks for a rerun of 30 days.
+  Orchestrator -> Silver task [svc: one run per day] : run date D | The orchestrator starts one run per date, 5 at a time.
+  Bronze [lake: raw by day] -> Silver task : read partition D | A task reads only the raw partition for its day.
+  Silver task -> Silver table [store: Delta by day] : overwrite partition D | The task replaces exactly its own day in one atomic commit.
+  Silver table -> Gold task [svc: after silver D] : partition D ready | The gold run for day D starts only after its silver day is done.
+  Gold task -> Gold table [store: daily KPIs] : overwrite partition D | A second run of day D gives the same rows. No duplicates appear.
+ref: docs | Backfill | Apache Airflow documentation | https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dag-run.html
+ref: docs | Partitions and backfills | Dagster documentation | https://docs.dagster.io/guides/build/partitions-and-backfills
+
+== Idempotent upsert with MERGE on business keys
+kind: idempotent-consumer, open-table-format
+when: Input is not neatly partitioned by time, and the same rows may be delivered or replayed more than once.
+how: The job loads a batch of changes into a staging table. Then it runs a MERGE into the target table on the business key, such as order_id. Matching rows are updated, and new keys are inserted. Running the same batch again changes nothing.
+To handle out-of-order data, the job keeps the latest row per key, using an event timestamp or a sequence number, and ignores older ones. A row hash can skip updates where nothing changed, which keeps the files small.
+Each MERGE is one transaction in Delta, Iceberg or a warehouse. A crash leaves the table at the old version, and the job retries. The cost is a join of the batch with the target, so cluster or partition the target by the key to limit the files scanned.
+used: Delta Lake MERGE INTO; Iceberg MERGE; Snowflake and BigQuery MERGE; Spark Structured Streaming foreachBatch upserts.
+avoid: When the volume is huge and rows are never updated; append only and deduplicate at read time.
+flow:
+  Source [lake: files or CDC] -> Staging [store: new batch] : batch 812 | The job lands the new batch of changes in a staging table.
+  Staging -> MERGE job [svc: Spark SQL] : rows by order_id | The job joins staging with the target on the business key.
+  MERGE job -> Target table [store: Delta table] : update or insert | Matching keys are updated and new keys are inserted in one transaction.
+  MERGE job -x> Target table : crash before commit | A crash leaves the table at its old version. No partial rows are visible.
+  * MERGE job: retry batch 812 | The same batch runs again.
+  MERGE job -> Target table : same result | Rows already applied are matched and rewritten as equal. No duplicates appear.
+ref: docs | Upsert into a Delta Lake table using merge | Delta Lake documentation | https://docs.delta.io/latest/delta-update.html
+ref: docs | Iceberg Spark writes: MERGE INTO | Apache Iceberg documentation | https://iceberg.apache.org/docs/latest/spark-writes/
+
+@@ scd
+== Type 2 dimension load with MERGE
+kind: star-schema, etl-elt
+when: Facts must join to an attribute as it was at the time of the event, for example a customer's region.
+how: The dimension table has a surrogate key, the business key, the tracked attributes, valid_from, valid_to and is_current. Each night, the job reads the source snapshot or change feed and compares the tracked attributes with the current rows.
+For a changed customer, the job closes the current row (valid_to = now, is_current = false) and inserts a new row with a new surrogate key. A MERGE statement can do both steps in one transaction. New customers are inserted. Unchanged rows are not touched.
+The fact table stores the surrogate key found at load time, by looking up the row valid at the event time. Old facts then keep the old region, and reports match the past. The cost is a bigger dimension and a more complex join.
+used: Kimball dimensional models in Snowflake, BigQuery and Databricks; dbt snapshots; Delta Lake MERGE patterns; Lakeflow AUTO CDC with SCD type 2.
+avoid: When history of the attribute does not matter; use Type 1 overwrite, which is simpler and smaller.
+flow:
+  Source system [db: customers] -> Staging [store: nightly snapshot] : changed rows | The job lands the new customer data.
+  Staging -> SCD job [svc: MERGE] : compare to current row | The job compares the tracked attributes with the current dimension row.
+  SCD job -> dim_customer [store: Type 2 table] : close old row | The old row is closed. is_current becomes false.
+  SCD job -> dim_customer : insert new version | A new row with a new surrogate key holds region = West.
+  Fact loader [svc: event time lookup] -> dim_customer : find key at event time | Each fact finds the row whose date range holds its event time.
+  Fact loader -> fact_orders [store: facts] : order with surrogate key | Old orders keep the old key and region. New orders get the new one.
+ref: book | The Data Warehouse Toolkit, 3rd ed. (Slowly Changing Dimensions) | Ralph Kimball & Margy Ross, 2013 |
+ref: docs | Snapshots | dbt documentation | https://docs.getdbt.com/docs/build/snapshots
+
+== Row history from a change feed
+kind: cdc, medallion
+when: The source database changes rows in place, and you need every past version in the lake without asking the source for history.
+how: A CDC tool (Debezium or a managed connector) reads the source database log and writes each insert, update and delete as an event to a topic or to bronze files. Events keep their order by log position or a sequence number.
+A job applies the events to a history table in order. An update closes the open row version (end time = change time) and adds a new open version. A delete closes the open version without adding one. Delta Live Tables and Lakeflow call this AUTO CDC with SCD type 2, and the engine handles late events.
+Because the full log is kept, history is exact, down to each commit, and not only one snapshot per night. The cost is more storage and the need to handle out-of-order events and schema changes in the source.
+used: Debezium into Kafka then Delta or Iceberg; Databricks Lakeflow AUTO CDC (formerly APPLY CHANGES); Snowflake streams and tasks; dbt snapshots as a batch alternative.
+avoid: When the source gives no log or key; a nightly snapshot compare is the simpler choice.
+flow:
+  Source DB [db: orders] -> Debezium [svc: CDC] : WAL records | Debezium reads committed changes from the source log.
+  Debezium -> Change topic [log: ordered events] : insert, update, delete | Each change becomes one event with a sequence number.
+  Change topic -> Bronze [lake: raw changes] : append | Raw events are stored as they arrived.
+  Bronze -> SCD job [svc: apply in order] : events by sequence | The job applies events in order and handles late arrivals.
+  SCD job -> History table [store: validity ranges] : close old, open new | An update closes the old version and opens a new one.
+  Analyst [user] -> History table : as of 2026-06-01 | The analyst asks for the state at one past date and gets exact rows.
+ref: docs | AUTO CDC APIs | Databricks documentation | https://docs.databricks.com/aws/en/dlt/cdc
+ref: docs | Debezium documentation | Debezium project | https://debezium.io/documentation/

@@ -1,0 +1,297 @@
+@@ swe
+== Modular monolith with enforced boundaries
+kind: modular-monolith, layered-arch
+when: A growing team shares one codebase and changes keep breaking unrelated code, but you are not ready to pay for microservices.
+how: Split the code into modules by business area: billing, catalog, search. Each module has a small public interface and hides its tables, classes and helpers. This is information hiding, as in Parnas's 1972 paper.
+A rule file states which module may call which. A build tool checks it on every commit, for example ArchUnit tests for Java or Packwerk-style checks for Ruby. A forbidden import fails the build.
+The result is one deployable unit with clear seams. A team changes its own module and runs its own tests. If one module later needs its own scaling or release cycle, the seam is already there and it can move out as a service.
+The cost is discipline. The rule check must stay strict, or the modules slowly grow links to each other again.
+used: Common in Java (Spring Modulith, ArchUnit) and Rails shops that delay microservices; Shopify has described a modular monolith in Rails.
+avoid: When teams need to deploy and scale on separate schedules today; then use services with versioned APIs.
+flow:
+  Developer [user] -> Git repo [store: one codebase] : commit | A developer changes code in the billing module only.
+  Git repo -> Boundary check [svc: ArchUnit rules] : run rules | The check reads the rule file and scans imports in every module.
+  Boundary check -x> Git repo : billing breaks the rule | The build fails, because billing reached into a catalog class that is not public.
+  Developer -> Git repo : use catalog API | The developer calls the public catalog interface instead.
+  Git repo -> Module tests [svc: per-module suite] : run | Only the changed module and its direct users are tested, so feedback is fast.
+  Module tests -> Release [svc: one artifact] : deploy | All modules ship together as one unit.
+ref: paper | On the Criteria To Be Used in Decomposing Systems into Modules | Parnas, CACM 1972 |
+ref: docs | ArchUnit user guide | TNG Technology Consulting | https://www.archunit.org/
+
+== Trunk-based CI with small changes and flags
+kind: feature-flags, blue-green
+when: Many engineers must ship often without long-lived branches and without breaking the main line.
+how: Everyone merges small changes into one main branch at least daily. Each change goes through code review and a CI run of unit and integration tests. A change that is not ready for users is hidden behind a feature flag that defaults to off.
+After merge, the pipeline builds one artifact and deploys it to a small share of servers, for example 1 to 5 percent (a canary). Automatic checks compare the error rate and latency with the old version. If they are bad, the pipeline rolls back; if good, it widens the rollout.
+Small changes are easy to review and easy to undo. Flags separate deploying code from releasing a feature, so a release becomes a config change and not a deploy.
+The cost is flag debt: old flags must be removed, or the code fills with dead branches that nobody dares to touch.
+used: Common at Google, Meta and many SaaS teams (trunk-based development); LaunchDarkly, Unleash and OpenFeature are flag tools; Argo Rollouts and Spinnaker do canary steps.
+avoid: When a release cannot be rolled back, such as a database change that is not backward compatible; plan expand-and-contract steps instead.
+flow:
+  Engineer [user] -> Main branch [store: trunk] : small PR, 80 lines | A small change is reviewed and merged, with its new code behind a flag set to off.
+  Main branch -> CI [svc: tests] : build and test | CI runs the test suite and builds one artifact.
+  CI -x> Main branch : test failed | A failing test blocks the merge, so the main line stays releasable.
+  CI -> Canary [svc: 2% of servers] : deploy v2 | The new build runs on a small share of traffic.
+  Canary -> Metrics [store: error rate] : error rate 0.2% | The pipeline compares the canary with the old version.
+  Metrics -> Fleet [svc: 100% of servers] : widen rollout | The checks pass, so the rollout widens to all servers.
+  Engineer -> Flag service [svc: flags] : enable for 10% | Later, the engineer turns the feature on for 10 percent of users with no deploy.
+ref: book | Software Engineering at Google | Winters, Manshreck & Wright, 2020 | https://abseil.io/resources/swe-book
+ref: docs | Trunk Based Development | Paul Hammant | https://trunkbaseddevelopment.com/
+
+@@ automata
+== Regex compiled to automaton in a log pipeline
+kind: pipes-filters, interpreter-compiler
+when: A pipeline must test millions of log lines per second against many user-written patterns, and one bad pattern must not stall it.
+how: At startup the pipeline compiles each pattern. A regex is parsed to a nondeterministic automaton (NFA). The engine then simulates the NFA with a set of active states, or builds a deterministic automaton (DFA) lazily, one state at a time, as input arrives.
+Each input byte moves the automaton one step, so the time is linear in the line length. Nothing backtracks. Engines like RE2 and Rust's regex crate work this way. Backtracking engines can take exponential time on a pattern like (a+)+$, which is a known outage cause (ReDoS).
+Many rules can be merged into one automaton, so one pass over a line checks all rules. Hyperscan does this for network intrusion detection.
+The cost is features: back-references and some look-around cannot be done in linear time. These engines reject them or need a fallback.
+used: RE2 inside Google systems and Go's regexp package (same design); Rust's regex crate; Hyperscan in Snort and Suricata; Cloudflare moved its WAF to a linear-time engine after a 2019 outage caused by regex backtracking.
+avoid: When rules need back-references or look-behind; use a backtracking engine with a time limit, and never on untrusted patterns.
+flow:
+  Rule author [user] -> Rule compiler [svc: regex to NFA] : pattern error\d{3} | An author submits a pattern; the compiler parses it into an NFA.
+  Rule compiler -> Rule set [store: merged DFA] : compiled automaton | Rules are merged and the DFA is built lazily and cached in memory.
+  Log shipper [svc: Fluent Bit] -> Match stage [svc: scans bytes] : line, 120 bytes | Each log line enters the match stage.
+  Rule set -> Match stage : state table | The stage reads the state table: one lookup per byte, no backtracking.
+  Match stage -> Alert topic [topic: matches] : rule 7 matched | The stage emits one event for each rule that matched.
+  Rule compiler -x> Rule author : back-reference rejected | A pattern that needs back-references is rejected, to keep the time linear.
+ref: blog | Regular Expression Matching Can Be Simple And Fast | Russ Cox, 2007 | https://swtch.com/~rsc/regexp/regexp1.html
+
+== Async function compiled to a state machine
+kind: event-loop
+when: One thread must serve many waiting tasks, and writing callbacks by hand is too hard to read.
+how: The compiler takes an async function and cuts it at every await point. Each cut becomes a state number. Local variables that live across a cut are moved into a struct. The function becomes a finite state machine with a poll or resume method.
+The event loop owns many such machines. It calls poll on one. The machine runs until the next await, saves its state number and returns "pending". When the awaited I/O is ready, the loop wakes that task and calls poll again. The machine jumps to the saved state and goes on.
+No thread is blocked while a task waits, and each task costs only the size of its struct, often a few hundred bytes. A server can hold 100,000 waiting requests on a few threads.
+The cost is that a task that never reaches an await blocks the whole loop, so CPU-heavy work must go to a separate thread pool.
+used: Rust async/await (futures compile to state machines, run by Tokio); C# async methods (compiler generated state machine); Kotlin coroutines; JavaScript generators and async functions in V8.
+avoid: For CPU-bound work or a handful of connections; plain threads are simpler and fast enough.
+flow:
+  Async handler [svc: compiled FSM] -> Event loop [svc: Tokio, 1 thread] : poll | The loop calls poll on the state machine for request 41.
+  Async handler -> Socket [client: waiting on DB] : read, state 1 | The handler starts a database read, saves state 1 and returns pending.
+  * Async handler: state 1, parked | The handler uses no thread while it waits; only its small struct stays in memory.
+  Event loop -> Async handler : poll request 42 | The loop polls other tasks while the first one waits.
+  Socket ~> Event loop : readable | The operating system tells the loop that the data has arrived.
+  Event loop -> Async handler : wake, poll | The loop polls the first handler again; it resumes at state 1 and finishes.
+ref: docs | Asynchronous Programming in Rust | Rust project | https://rust-lang.github.io/async-book/
+
+@@ computability
+== Sandbox untrusted code with hard limits
+kind: bulkhead, timeout-deadline
+when: A platform runs code or queries that users wrote, and you cannot know ahead of time whether they will finish.
+how: Rice's theorem says that no tool can decide in general what a program will do, and the halting problem says no tool can decide if it ends. So the platform does not try to judge the code. It limits it instead.
+Each run gets a wall-clock deadline, a CPU quota, a memory cap and an output size cap, enforced by the operating system (cgroups, seccomp) or a VM such as Firecracker. When a limit is hit, the supervisor kills the run and returns a clear error.
+Runs are isolated from each other so one stuck job costs only its own slot. The supervisor also puts a global deadline on the whole request, so a stuck run never holds a caller forever.
+The cost is false kills: a correct but slow program is stopped too. Limits must be tuned and shown to users.
+used: AWS Lambda (timeout up to 15 minutes, memory caps); online judges such as Codeforces and LeetCode; CI runners; BigQuery and Spark kill queries that pass resource limits.
+avoid: For trusted internal code with known cost; plain code review and normal monitoring are enough there.
+flow:
+  User [user] -> API [svc: job API] : submit script | A user submits a script; the platform cannot tell if it halts.
+  API -> Supervisor [svc: timer + cgroup] : run, limit 10 s, 256 MB | The supervisor starts the job in an isolated sandbox with a time and memory limit.
+  Supervisor -> Sandbox [svc: microVM] : start | The code runs inside the sandbox, which has no network and a small disk.
+  Sandbox -x> Supervisor : loops forever | The program never ends; the sandbox sends no result.
+  Supervisor -x> Sandbox : kill at 10 s | The deadline passes, so the supervisor stops the sandbox and frees its slot.
+  Supervisor -> API : error: time limit | The supervisor reports a time limit error, with logs, to the user.
+ref: docs | Firecracker design | AWS open source | https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md
+
+== Sound but incomplete analysis gate in CI
+kind: quality-gate
+when: You want to block a whole class of bugs before merge, but no checker can be both exact and automatic for every program.
+how: Rice's theorem says every non-trivial question about what a program does is undecidable. A static analyzer therefore gives up one side. A sound analyzer never misses a real bug, but it may warn about code that is fine (false positives). A bug finder like most linters misses some bugs but warns rarely.
+The CI job runs the analyzer on the changed files. A type checker is the best known case: it accepts only programs it can prove are type safe, and it rejects some safe programs. The programmer then adds an annotation or a cast.
+Teams tune the gate: they start with a baseline of existing warnings, fail only on new ones, and give a way to suppress one with a reason.
+The cost is trust. If false positives are common, people ignore the gate or suppress everything.
+used: Type checkers (TypeScript, mypy, Rust borrow checker); Infer at Meta; Error Prone at Google; CodeQL and Semgrep in pull-request checks.
+avoid: As a gate for rules with many false positives; run them as a report that people read, not as a blocker.
+flow:
+  Developer [user] -> Pull request [svc: PR] : change 40 lines | A developer opens a pull request.
+  Pull request -> CI [svc: analyzer job] : run on changed files | CI starts the analyzer with a baseline of known warnings.
+  CI -> Analyzer [svc: type + null checks] : analyze | The analyzer proves what it can and flags what it cannot prove.
+  Analyzer -x> Pull request : possible null dereference | A new warning blocks the merge. The code may be safe, but the tool cannot prove it.
+  Developer -> Pull request : add null check | The developer adds an explicit check that makes the proof easy.
+  Analyzer -> Pull request : no new warnings | The gate turns green and the merge can go on.
+ref: book | Static Program Analysis | Møller & Schwartzbach, Aarhus University | https://cs.au.dk/~amoeller/spa/
+
+@@ modelcheck
+== TLA+ spec checked in CI before a protocol change
+kind: formal-spec-check
+when: You are about to change a replication or locking protocol, and a rare interleaving bug would be costly in production.
+how: An engineer writes the protocol as a small TLA+ model: states, actions and invariants such as "two nodes are never both leader". The model uses tiny sizes, for example 3 nodes and 2 values, so the state space is finite.
+The TLC model checker explores every reachable state, usually millions, and checks each against the invariants. When one fails, TLC prints the shortest trace of steps that reaches it. The engineer fixes the design and runs again.
+A CI job runs TLC on every change to the spec, so the spec and the design stay in step. Longer checks with larger bounds run nightly. A pass is not a proof for all sizes, but it covers every interleaving at the small size, where most design bugs already show.
+used: AWS used TLA+ on DynamoDB, S3 and other services (CACM 2015); MongoDB checked its replication protocol with TLA+; the P language is used at AWS for similar checks; Azure Cosmos DB has published TLA+ specs.
+avoid: For the code itself or for big data paths; test the implementation with simulation or property tests, and model only the protocol.
+flow:
+  Engineer [user] -> Spec repo [store: Raft.tla] : change spec | The engineer changes the leader election action in the spec.
+  Spec repo -> CI job [svc: GitHub Actions] : on pull request | CI starts on every pull request that touches the spec.
+  CI job -> TLC [svc: 3-node model] : check invariants | TLC explores all reachable states of the small model.
+  TLC -x> CI job : trace: 2 leaders, 14 steps | TLC finds a state with two leaders and gives the 14-step path.
+  CI job -> Engineer : failed, trace attached | The engineer reads the trace, finds the missing term check and fixes the spec.
+  TLC -> CI job : 2.1M states, no error | After the fix, all states pass and the change can go to code review.
+ref: paper | How Amazon Web Services Uses Formal Methods | Newcombe et al., CACM 2015 |
+ref: docs | The TLA+ Home Page | Leslie Lamport | https://lamport.azurewebsites.net/tla/tla.html
+
+== Deterministic simulation as randomized model checking
+kind: deterministic-simulation
+when: The real code is too big to model check, but you still need to explore many failure orders of a distributed system.
+how: The system runs in one thread, with a fake network, fake disks and a fake clock. All randomness comes from one seed. A test driver injects faults: dropped messages, slow disks, crashes and restarts.
+Each run picks a random path through the huge space of event orders, instead of all paths. Properties, such as "no acknowledged write is lost", are checked while the run goes. A failure is replayed exactly by running with the same seed, so the bug can be debugged step by step.
+Thousands of simulated hours run in parallel on a cluster every night. Time is fast, because the fake clock jumps to the next event.
+The cost is building the system for it: all I/O must go through interfaces that the simulator can replace. Coverage is by sampling, not complete as in model checking.
+used: FoundationDB (simulation testing from the start); TigerBeetle's simulator; Antithesis (a commercial platform).
+avoid: When the system uses many outside libraries with their own threads and clocks; start with model checking of the design instead.
+flow:
+  Seed generator [svc: seed 8812] -> Simulator [svc: one thread] : start run, seed 8812 | A nightly job starts many runs; each has its own seed.
+  Simulator -> Cluster [svc: 5 nodes, fake net] : send client writes | The real database code runs on fake network, disk and clock.
+  Simulator -x> Cluster : drop msgs, crash node 2 | The simulator injects faults at random points picked by the seed.
+  Cluster -> Checker [svc: invariants] : history of operations | The checker compares the history with the rules, for example no lost acknowledged write.
+  Checker -x> Seed generator : violation, seed 8812 | A rule is broken. The seed is saved as a bug report.
+  Seed generator -> Simulator : replay seed 8812 | An engineer replays the same seed and gets the same failure each time, then fixes it.
+ref: docs | Simulation and Testing | FoundationDB documentation | https://apple.github.io/foundationdb/testing.html
+
+@@ pnp
+== Exact search with a heuristic fallback
+kind: none
+when: The best answer is NP-hard to find, inputs are usually small, and sometimes they are very large.
+how: Many planning problems are NP-hard: join order in a query, packing jobs onto servers, routing. No known algorithm is fast for all inputs, unless P equals NP. So the system uses a size threshold.
+Below the threshold, it runs an exact method, such as dynamic programming over join orders. Above it, it switches to a greedy or random search that gives a good answer in bounded time. PostgreSQL does this: its planner uses exhaustive search for up to 11 tables, and above that, by default, the genetic query optimizer (GEQO).
+The fallback is not optimal and may differ between runs, so teams add a way to hint or pin plans. They also keep a time budget in the loop, to stop search early.
+The cost is plan quality on big inputs. Check it by comparing the heuristic with the exact answer on mid-size inputs.
+used: PostgreSQL planner (exhaustive search and GEQO); the Kubernetes scheduler uses greedy filter and score for pod placement; many solvers (OR-Tools, Gurobi) stop at a time limit and return the best answer so far.
+avoid: When the input is always small; just run the exact method. Or when you need a proven bound; use an approximation algorithm.
+flow:
+  Client [client] -> Planner [svc: PostgreSQL] : query joins 14 tables | A query with 14 tables arrives. Exact search would check a huge number of orders.
+  Planner -> Size check [svc: geqo_threshold 12] : table count | The planner compares the table count with the threshold.
+  Size check -> DP search [svc: exact, 8 tables] : small query | Under the threshold the planner finds the cheapest order exactly.
+  Size check -> GEQO [svc: genetic search] : 14 tables, over limit | Over the threshold it evolves a pool of plans instead.
+  GEQO -> Planner : good plan, cost 4,120 | The search stops after a fixed number of generations and returns the best plan found.
+  Planner -> Executor [svc: runs plan] : execute | The plan may not be the best, but it was found in milliseconds.
+ref: docs | Genetic Query Optimizer | PostgreSQL documentation | https://www.postgresql.org/docs/current/geqo.html
+
+== Untrusted solver with a small trusted checker
+kind: none
+when: Finding an answer is hard but checking it is easy, and you must not trust the big program that found it.
+how: NP is the class of problems where an answer can be checked fast. This gives a design: let a large, fast, complex solver do the hard search, and ask it for a certificate with its answer. A satisfying assignment proves SAT. For UNSAT, the proof is a long list of clause steps in a format such as DRAT.
+A small checker reads the certificate and verifies it. For an assignment, it only checks every clause. For a proof, it replays each step. The checker has a few thousand lines at most, so it can be reviewed or even formally verified.
+Only the checker must be right. A bug in the solver gives a bad proof, and the checker rejects it. Proofs can be many gigabytes, so they are streamed to the checker.
+The cost is proof size and checker time, often as large as the solving time.
+used: SAT Competition requires proofs for UNSAT answers and checks them; the verified checker cake_lpr; hardware and proof-assistant tools that call SAT solvers; the same idea is behind proof-carrying code.
+avoid: When the solver is already small and trusted, or a wrong answer is cheap; skip the proof.
+flow:
+  Verification job [svc: chip check] -> SAT solver [svc: CaDiCaL] : formula, 4M clauses | A job sends a large formula to the solver.
+  SAT solver -> Proof file [store: DRAT] : log each learned clause | While it searches, the solver logs every clause it learns.
+  SAT solver -> Verification job : UNSAT | The solver says no assignment exists. The job does not trust this yet.
+  Proof file -> Proof checker [svc: small] : stream steps | The checker reads the proof step by step.
+  Proof checker -x> Verification job : step 981,204 invalid | If the solver had a bug, a bad step would be caught here and the answer rejected.
+  Proof checker -> Verification job : proof valid | The proof is valid, so the UNSAT answer is accepted.
+ref: paper | Efficient Certified RAT Verification | Cruz-Filipe, Heule, Hunt, Kaufmann & Schneider-Kamp, CADE 2017 |
+
+@@ sat
+== Dependency resolution as a SAT problem
+kind: solver-service
+when: A package manager must pick one version of each package so that every dependency rule holds, and the rules can conflict.
+how: Each package version becomes a Boolean variable: "foo 2.1 is installed". Rules become clauses. "Install app" is a unit clause. "app needs foo 1.x or 2.x" is the clause (not app OR foo-1 OR foo-2). "Two versions of foo cannot both be installed" is a clause for every pair.
+A CDCL solver picks versions, propagates what it forces, and on a conflict learns a clause that stops the same mistake. If no answer exists, the solver can explain which rules clash. That gives users a useful error message.
+The solver also needs to prefer new versions. The resolver does this with the order of decisions: try the newest version first, or use a weighted extension.
+The cost is that resolution is NP-complete in general, so a hard repository can be slow. Real repositories are friendly and finish in milliseconds to seconds.
+used: libsolv, used by DNF, zypper and Conda's mamba; PubGrub (Dart pub, uv, Cargo-style tools) is a related conflict-driven resolver; Debian's apt uses a different, heuristic solver.
+avoid: When the dependency rules are simple, such as one version per lock file; a plain graph walk is enough.
+flow:
+  User [user] -> Package manager [svc: dnf] : install app | The user asks to install one package.
+  Package manager -> Repo metadata [store: 60k packages] : load rules | The manager reads versions and dependency rules from the repository files.
+  Package manager -> SAT solver [svc: libsolv CDCL] : 200k clauses | It turns the rules into clauses and calls the solver.
+  SAT solver -x> Repo metadata : conflict: foo 1.x vs 2.x | The solver reaches a conflict between two rules and learns a clause that rules out this choice.
+  SAT solver -> Package manager : model: foo 2.1, bar 3.0 | The solver finds a consistent set of versions.
+  Package manager -> Disk [store: installed set] : install 12 packages | The manager downloads and installs the chosen versions.
+ref: docs | libsolv: package dependency solver | openSUSE project |
+
+== SMT policy analysis behind a cloud service
+kind: solver-service
+when: Users write rules, such as access policies, and you must answer exactly questions like "can anyone on the internet read this bucket?".
+how: The service translates each policy into logic formulas over strings, numbers and Booleans. An SMT solver such as Z3 or cvc5 handles these theories. A question becomes a formula: "is there a request that the policy allows and that comes from outside the account?".
+If the solver says satisfiable, the model is a concrete example request, which is shown to the user as proof of the problem. If it says unsatisfiable, no such request exists, and the answer is a guarantee, not a sample.
+This is stronger than testing: the solver covers all inputs, not just those someone thought of. Results can be cached by policy hash, and a new check runs only when the policy changes.
+The cost is the translation. It must match the real rule engine exactly, or answers will be wrong, so it is tested against the production engine.
+used: AWS Zelkova behind IAM Access Analyzer and S3 Block Public Access checks; network reachability checking; Dafny and other verifiers call Z3.
+avoid: When the rules are Turing-complete or use unbounded loops; the translation becomes undecidable and a test-based check is safer.
+flow:
+  Policy author [user] -> Policy service [svc: policy API] : save bucket policy | A user saves a policy on a storage bucket.
+  Policy service -> Translator [svc: policy to SMT] : policy JSON | The translator turns the policy into string and Boolean constraints.
+  Translator -> SMT solver [svc: Z3 / cvc5] : is public access possible? | It asks the solver: is there a request from any outside user that is allowed?
+  SMT solver -> Translator : sat, example request | The solver finds a request that is allowed, which shows the bucket is public.
+  Translator -> Policy author : finding: public read | The user sees the example request and fixes the policy.
+  SMT solver ~> Policy service : unsat, cache by hash | After the fix, no request exists. The answer is cached for this policy hash.
+ref: paper | Semantic-based Automated Reasoning for AWS Access Policies using SMT | Backes et al., FMCAD 2018 |
+
+@@ spacecomplex
+== External merge sort with a memory budget
+kind: external-sort
+when: A database or batch job must sort or group more data than fits in memory, and it must not crash with out-of-memory.
+how: Space is a resource you can plan. The operator gets a fixed memory budget, for example work_mem of 64 MB in PostgreSQL. It reads input in chunks that fit in that budget, sorts each chunk in memory and writes it to disk as a sorted run.
+Then it merges the runs. With 100 GB of data and 64 MB chunks, there are about 1,600 runs. A merge reads a small buffer from each run and keeps the smallest key. One pass can merge hundreds or thousands of runs, so the sort finishes in a few passes.
+Memory use stays constant while the data grows. The price is disk I/O: every row is written and read again, so the sort is slower than an in-memory one by a large factor.
+used: PostgreSQL sort and hash aggregate spill to temp files; Spark shuffle sort spills to disk; the sort of Hadoop MapReduce; LSM trees merge sorted runs the same way.
+avoid: When the data fits in memory; an in-memory sort is much faster. Or when only a rank or top-k is needed; use a heap of size k.
+flow:
+  Query executor [svc: ORDER BY] -> Sort operator [svc: work_mem 64 MB] : 100 GB of rows | The executor streams rows into a sort operator with a fixed memory limit.
+  Sort operator -> Temp disk [store: sorted runs] : spill run 1 (64 MB) | When memory is full, the operator sorts the chunk and writes it as a run.
+  * Sort operator: run 1,600 spilled | Memory never grows; only the number of runs on disk does.
+  Sort operator -> Temp disk : read a block of each run | The merge phase loads a small buffer from every run.
+  Temp disk -> Sort operator : smallest key of 1,600 runs | The operator takes the smallest key, using a heap.
+  Sort operator -> Client [client] : sorted rows, streamed | Rows stream out in order, with no full copy in memory.
+ref: docs | Resource Consumption: work_mem | PostgreSQL documentation | https://www.postgresql.org/docs/current/runtime-config-resource.html
+
+== One-pass sketch in constant space
+kind: pre-aggregation
+when: You must count unique users or events over billions of records, and storing every id would cost too much memory.
+how: An exact count of distinct ids needs space that grows with the number of ids. A sketch trades a small error for a fixed, small size. HyperLogLog keeps, for each of 2^14 buckets, the longest run of leading zeros seen in hashed ids. It needs about 12 KB and has about 1 percent error.
+Each event updates one bucket in constant time and is then forgotten. Sketches from different servers or hours merge by taking the maximum per bucket, so they fit a map-reduce or streaming job well.
+Ad systems use this for reach and unique-user counts by campaign and day. Each key stores one sketch, so a billion events become a few kilobytes per key.
+The cost is accuracy. Counts are approximate, and sketches do not support deleting an id. Billing needs exact counts from another path.
+used: Apache DataSketches (HLL, Theta sketches); Redis PFCOUNT; BigQuery APPROX_COUNT_DISTINCT; Druid and Pinot use sketches in ad-reporting rollups.
+avoid: For billing or audit counts that must be exact, or when the set of ids is small; use an exact set.
+flow:
+  Impression stream [topic: ad events] -> Aggregator [svc: Flink job] : user id, campaign 7 | Each impression event reaches the aggregator once.
+  Aggregator -> Sketch [cache: HLL, 12 KB] : add hash(user id) | The job updates one bucket per event and drops the id. The estimate grows but the sketch stays 12 KB.
+  Aggregator -> Rollup store [store: Druid / Pinot] : sketch per campaign-hour | Each hour, the job writes one sketch per key.
+  Dashboard [client] -> Rollup store : reach for 7 days | A report asks for the unique users over a week.
+  Rollup store -> Dashboard : merged sketch, 38.2M | The store merges 168 hourly sketches by max per bucket and returns the estimate.
+ref: paper | HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm | Flajolet, Fusy, Gandouet & Meunier, 2007 |
+ref: docs | Apache DataSketches | Apache Software Foundation | https://datasketches.apache.org/
+
+@@ turingmachine
+== Bytecode virtual machine loop
+kind: interpreter-compiler
+when: A language or rules engine must run the same program on many machines, or run code that is loaded at run time.
+how: A compiler turns source code into compact bytecode. A virtual machine (VM) is a loop that works like a Turing machine with a fixed control: fetch the instruction at the program counter, decode it, run it, and move on. State lives in a stack or registers and a heap, which play the role of the tape.
+Because this loop can run any bytecode, it is a universal machine: one program reads another program as data. This is why one VM can host every program in a language, and why the same bytecode runs on any CPU that has the VM.
+A fast VM adds tricks: a computed goto for dispatch, caches for method lookups, and a JIT that compiles hot loops to machine code. The model stays the same.
+The cost is speed. An interpreter is often 10 to 100 times slower than native code, unless a JIT helps.
+used: CPython bytecode in ceval; the JVM; Lua; the .NET CLR; SQLite compiles SQL to bytecode run by its VDBE; WebAssembly runtimes.
+avoid: When speed is the first goal and one target is enough; compile ahead of time to native code.
+flow:
+  Source file [store: app.py] -> Compiler [svc: parser + codegen] : parse | The compiler parses the text and builds a syntax tree.
+  Compiler -> Bytecode [store: .pyc file] : LOAD x, ADD, STORE y | It writes a flat list of simple instructions.
+  Bytecode -> VM loop [svc: fetch-decode-run] : instruction at pc 12 | The VM fetches the next instruction.
+  VM loop -> Value stack [store: operands] : push, pop | The instruction reads and writes the stack, like a Turing machine head on a tape.
+  VM loop -> Heap [store: objects] : allocate list | Some instructions create objects in the heap.
+  VM loop -> Bytecode : pc = 13, next | The program counter moves on. The loop ends at a return or halt instruction.
+ref: book | Crafting Interpreters: A Virtual Machine | Robert Nystrom | https://craftinginterpreters.com/a-virtual-machine.html
+
+== Gas and fuel metering for Turing-complete code
+kind: none
+when: Strangers can upload programs that run on your machines, and you need every run to stop in bounded time.
+how: A Turing-complete language can loop forever, and no checker can decide in general which programs do. So the platform does not check the code. It meters it.
+Every instruction has a price. The caller pays a budget up front, called gas in Ethereum or fuel in Wasmtime. The VM subtracts the price of each instruction before it runs it. When the budget reaches zero, the run stops at once and its effects are rolled back.
+The budget makes cost visible and fair: a heavy program pays more. The price per instruction must match real cost, or an attacker can find a cheap instruction that is slow in practice.
+Compared with a wall-clock timeout, metering is deterministic: every node gets the same result for the same input, which a blockchain needs.
+used: Ethereum EVM gas; Wasmtime fuel and epoch interruption; Cloudflare Workers CPU limits (time based); Solana compute units.
+avoid: When you only need a rough limit and not equal results; a timeout is simpler.
+flow:
+  Caller [user] -> Contract VM [svc: EVM] : call, gas limit 100,000 | The caller sends a transaction and a gas budget.
+  Contract VM -> Gas meter [svc: full budget] : charge 3 per ADD | Before each instruction, the VM subtracts its price.
+  * Gas meter: 41,500 left | The budget falls as the program runs.
+  Contract VM -> State DB [db: world state] : SSTORE, charge 20,000 | Storage writes cost much more than arithmetic, as they are costly for all nodes.
+  Gas meter -x> Contract VM : out of gas | A loop uses up the budget, and the meter stops the run.
+  Contract VM -x> State DB : revert all changes | All state changes of this call are undone. The caller still pays for the gas used.
+ref: docs | Gas and fees | ethereum.org | https://ethereum.org/en/developers/docs/gas/

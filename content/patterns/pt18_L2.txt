@@ -1,0 +1,731 @@
+@@ adversarial
+== Adversarial training inside the training loop
+kind: online-offline
+when: A model will face inputs from people who want to fool it, and you can afford several extra gradient steps per batch.
+how: For each training batch, the trainer first attacks its own current model. It computes the gradient of the loss with respect to the input pixels, takes a few small signed steps (projected gradient descent, PGD, often 7 to 10 steps) and keeps the change inside a budget such as 8/255 in L-infinity norm.
+The perturbed images, with their true labels, replace or join the clean batch. The model then takes a normal weight update on them. The attack gets stronger as the model gets stronger, so the loop is a min-max game, as in Madry and colleagues (2018).
+The cost is clear: 7 attack steps make each batch about 8 times more expensive. Clean accuracy usually drops a few points, and the robustness only holds for the attack type and budget used in training.
+used: Madry et al. PGD training; the RobustBench leaderboard entries; safety-critical vision teams that test against AutoAttack.
+avoid: When no attacker exists, or when you need a proof of safety; use randomized smoothing or certified bounds, and plain data augmentation for natural noise.
+flow:
+  Trainer [svc: min-max loop] -> Model [model: weights v_t] : forward + backward on x | The trainer computes the loss gradient with respect to the input x, not only the weights.
+  Model -> Attack step [svc: PGD 7 steps] : input gradient | The attack moves each pixel a small step in the direction that raises the loss.
+  * Attack step: clipped to 8/255 | After every step the change is clipped back inside the allowed L-infinity ball.
+  Attack step -> Model : adversarial batch | The final perturbed batch is sent to the model with the true labels.
+  Model -> Trainer : weight update | The model takes an ordinary gradient step on the hard examples and becomes harder to fool.
+ref: paper | Towards Deep Learning Models Resistant to Adversarial Attacks | Madry et al., ICLR 2018 | https://arxiv.org/abs/1706.06083
+
+== Red-team gate before model release
+kind: shadow-ab
+when: A new model is about to ship, and you must show that it does not get worse under attack than the model it replaces.
+how: Before release, a CI job runs a fixed attack suite against both the candidate and the current production model on a held-out set. The suite has white-box attacks (FGSM, PGD, AutoAttack) and black-box attacks that only use query outputs.
+The job reports clean accuracy and robust accuracy at set budgets. A release rule compares them: for example, robust accuracy must not fall more than 1 point, and clean accuracy must not fall more than 0.5 points. If the rule fails, the release is blocked and the report goes to the model team.
+Attacks are re-run when new attack methods appear, so the suite is versioned like test code. A pass is evidence, not a proof, because a stronger attack may exist.
+used: Common in vision and fraud-detection teams; open-source tools such as Foolbox, ART (Adversarial Robustness Toolbox) and the RobustBench benchmark.
+avoid: When the model has no adversarial exposure, or for text agents where prompt injection needs its own test set.
+flow:
+  CI pipeline [svc] -> Candidate model [model: v8] : run attack suite | The pipeline attacks the new model with FGSM, PGD and AutoAttack at fixed budgets.
+  CI pipeline -> Prod model [model: v7] : same suite | The same attacks run on the current model so the two are compared fairly.
+  Candidate model, Prod model -> Report [store: clean vs robust acc] : accuracy numbers | Both models write clean and robust accuracy to one report.
+  Report -> Release gate [svc: rule check] : compare | The gate checks that robust accuracy did not fall by more than the allowed margin.
+  Release gate -x> CI pipeline : block release | If the margin is exceeded, the release is rejected and the team must retrain.
+ref: paper | Explaining and Harnessing Adversarial Examples | Goodfellow, Shlens & Szegedy, 2014 | https://arxiv.org/abs/1412.6572
+
+== Input purification in front of the classifier
+kind: pipes-filters
+when: You cannot retrain the model, but you can add stages in front of it that remove or blunt small malicious changes.
+how: Place cheap defensive stages between the client and the model. Typical stages are JPEG re-compression, resizing, or a small denoising network. These remove part of a small high-frequency perturbation.
+A second stage can add random noise several times and send each noisy copy to the model. If the votes disagree, the request is flagged. This is the idea of randomized smoothing; with enough samples it gives a certified radius in L2 norm (Cohen et al., 2019).
+Be careful: simple preprocessing alone is weak against an attacker who knows the pipeline, because the attacker can include it in the gradient computation. Randomness and a vote make the attack harder, and the flag gives a signal for monitoring.
+used: Randomized smoothing in certified-robustness research; content-moderation and fraud pipelines that resize and re-encode uploads before scoring.
+avoid: When the attacker has full white-box access to a deterministic preprocessing step; combine with adversarial training instead.
+flow:
+  Client [client] -> Upload API [svc: image in] : image | The client sends an image that might have a hidden perturbation.
+  Upload API -> Purifier [svc: re-encode + resize] : image | The purifier compresses and resizes it, which removes part of the fine noise.
+  Purifier -> Noise sampler [svc: 20 noisy copies] : clean image | The sampler adds Gaussian noise to make 20 slightly different copies.
+  Noise sampler -> Classifier [model] : 20 copies | The classifier labels every copy separately.
+  Classifier -> Vote [svc: majority] : 20 labels | The vote takes the most common label and measures how much the copies agree.
+  Vote -x> Upload API : low agreement, flag | Weak agreement means the input is suspicious and is sent for review.
+ref: paper | Certified Adversarial Robustness via Randomized Smoothing | Cohen, Rosenfeld & Kolter, ICML 2019 | https://arxiv.org/abs/1902.02918
+
+@@ attention
+== Fused attention kernel on the GPU
+kind: offload-accelerator, memory-tiering
+when: Self-attention is the slow part of training or serving, and the N by N score matrix does not fit in fast memory.
+how: Plain attention writes the full score matrix (N by N, per head) to GPU high-bandwidth memory (HBM), reads it for the softmax, writes it again and reads it for the weighted sum. For a 32,000-token sequence this traffic dominates the run time.
+FlashAttention splits Q, K and V into tiles that fit in the on-chip SRAM. For each tile it computes scores, a running softmax and the partial output without ever writing the full matrix to HBM. The output is exactly the same as normal attention, only faster and with memory that grows with N, not N squared.
+The CPU or framework only launches one kernel. Training code (PyTorch scaled_dot_product_attention) picks this kernel when shapes and hardware allow.
+used: FlashAttention in PyTorch, JAX and vLLM; most large-model training stacks on NVIDIA GPUs.
+avoid: Very short sequences, where kernel launch cost matters more than memory traffic; or when you need the full attention matrix for debugging.
+flow:
+  Framework [svc: PyTorch] -> Fused kernel [svc: FlashAttention] : launch (Q, K, V) | The framework makes one kernel launch instead of several separate matrix operations.
+  Fused kernel -> HBM [store: 80 GB slow] : load tile of K, V | The kernel loads one tile of K and V from slow HBM.
+  HBM -> SRAM [cache: 20 MB fast] : tile | The tile moves into fast on-chip memory next to the compute units.
+  * SRAM: scores + softmax | Scores and the online softmax are computed on chip; the full N by N matrix is never stored.
+  SRAM -> HBM : write output tile | Only the small output tile goes back to HBM.
+ref: paper | FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness | Dao et al., NeurIPS 2022 | https://arxiv.org/abs/2205.14135
+
+== Cross-attention conditioning between two sequences
+kind: pipes-filters
+when: One stream of tokens must read from a second source, such as a translation input, an image or a text prompt.
+how: In cross-attention, the queries come from the stream being produced (decoder tokens, or image latents), while keys and values come from a separate encoder output. Each query scores all encoder positions and takes a weighted mix of their values.
+The encoder runs once. Its keys and values are stored and reused by every decoding or denoising step, so the extra cost per step is small. The attention weights show which source position each output token looked at.
+This is how the original Transformer decoder reads the encoder in translation, and how text-to-image diffusion models read a prompt embedding at each denoising step.
+used: Original Transformer encoder-decoder (Vaswani et al., 2017); T5 and Whisper decoders; Stable Diffusion U-Net text conditioning.
+avoid: When one decoder-only model with the source placed in its context window is simpler and good enough, which is the common choice for chat LLMs.
+flow:
+  Source text [client: prompt or image] -> Encoder [model: runs once] : tokens | The encoder reads the whole source once and builds one vector per position.
+  Encoder -> KV store [cache: K and V of source] : keys and values | The encoder output is turned into keys and values and kept for reuse.
+  Decoder [model: step t] -> KV store : query from token t | At each step the decoder asks a question from its current state.
+  KV store -> Decoder : weighted mix of V | Attention weights pick the useful source positions and return their values.
+  Decoder -> Output [log: generated tokens] : next token | The decoder emits one token and repeats with the same stored keys and values.
+ref: paper | Attention Is All You Need | Vaswani et al., NeurIPS 2017 | https://arxiv.org/abs/1706.03762
+
+== Sliding-window and sparse attention for long inputs
+kind: scatter-gather
+when: Inputs are far longer than full attention can afford, for example whole documents or long chat logs.
+how: Full attention costs O(N squared) in time. Sparse attention lets each token look at only a chosen subset: a local window of the last W tokens, plus a few global tokens that every token can see.
+With W = 4,096, a 128,000-token input costs about 32 times fewer score computations per layer than full attention. Information still travels far, because stacked layers extend the reach by W per layer.
+Mistral 7B uses a sliding window with a rolling cache, so cache size stays fixed at W per layer. Longformer adds global tokens for tasks such as question answering. Some recent models mix full and window layers, for example one full layer for every few window layers.
+used: Longformer; Mistral 7B sliding window; mixed local and global layers in several open models.
+avoid: When exact recall of any early token is required at every layer; use full attention with FlashAttention, or retrieval.
+flow:
+  Long input [client: 128k tokens] -> Local layer [model: window 4096] : all tokens | Each token in a local layer attends only to its last 4,096 neighbours.
+  Local layer -> Global tokens [note: see all tokens] : summary tokens | A few special tokens attend to everything and carry information across the whole input.
+  Global tokens -> Local layer : broadcast | Every token can read the global tokens, so far-away facts can still reach it.
+  Local layer -> Output head [svc: next token] : hidden states | After stacked layers the output head predicts the next token.
+ref: paper | Longformer: The Long-Document Transformer | Beltagy, Peters & Cohan, 2020 | https://arxiv.org/abs/2004.05150
+
+@@ bpe
+== Train the tokenizer once, then freeze it
+kind: online-offline
+when: A language model needs a fixed vocabulary that handles any text, including rare words and typos, without unknown tokens.
+how: Offline, a trainer counts character pairs in a large sample of the training text. It merges the most frequent pair into a new symbol, then repeats, for example 32,000 to 200,000 times. Each merge is saved in order. The list of merges plus the vocabulary is the tokenizer.
+Byte-level BPE starts from the 256 byte values, so any text can be encoded and there is no unknown token. The tokenizer is then frozen. The model is trained with it, and it must never change afterward, because the embedding table rows are tied to token ids.
+At run time the same merge list is applied in order to each new text.
+used: GPT-2 and later OpenAI tokenizers (tiktoken); Llama 3 tokenizer; Hugging Face tokenizers library; SentencePiece BPE.
+avoid: When the language has no good segmentation by frequency, or you need characters; consider character or byte models. Changing the vocabulary later forces retraining.
+flow:
+  Text sample [lake: 100 GB corpus] -> BPE trainer [svc: count pairs] : raw text | The trainer reads a large sample of text and counts adjacent symbol pairs.
+  * BPE trainer: merge top pair | It merges the most frequent pair into one symbol and repeats thousands of times.
+  BPE trainer -> Vocab file [store: merges + ids] : 50,000 merges | The ordered merge list and the id table are written once.
+  Vocab file -> Model training [svc: embeddings tied to ids] : frozen ids | Pretraining uses these ids; embedding row i always means token i.
+  Vocab file -> Serving tokenizer [svc: same files] : same version | Production loads the exact same file so ids match what the model learned.
+ref: paper | Neural Machine Translation of Rare Words with Subword Units | Sennrich, Haddow & Birch, ACL 2016 | https://arxiv.org/abs/1508.07909
+
+== Tokenizer service in front of an LLM gateway
+kind: api-gateway, rate-limit
+when: Cost, context limits and rate limits are counted in tokens, so the gateway must count tokens before the model call.
+how: Each request passes through a gateway that runs the model's own tokenizer on the prompt. It gets the exact input token count in a few milliseconds.
+With the count, the gateway can reject prompts above the context window, charge by tokens, and apply a token-per-minute limit per customer. It can also pick a smaller model for short prompts or trim old chat history until the prompt fits.
+The tokenizer version must match the model. Counts from another model family can differ by 10 to 30 percent for the same text, and they differ more for code and for non-English text.
+used: Token budgets and per-minute token limits in hosted LLM APIs; tiktoken and similar libraries used inside gateways.
+avoid: When a rough word count is enough, for example a soft quota; exact counting adds CPU cost to every request.
+flow:
+  App [client] -> Gateway [svc: tokenizer inside] : prompt text | The app sends a prompt in plain text.
+  * Gateway: 3,200 tokens | The gateway tokenizes with the model's own tokenizer and counts tokens.
+  Gateway -> Limiter [cache: tokens per minute] : check budget | The limiter checks that this customer still has token budget this minute.
+  Limiter -x> App : 429 too many tokens | Over budget, the request is rejected before using any GPU time.
+  Gateway -> LLM server [model: ids in] : token ids | A passing request is sent to the model as token ids.
+ref: docs | tiktoken | OpenAI | https://github.com/openai/tiktoken
+
+@@ contrastive
+== Dual-encoder retrieval trained with in-batch negatives
+kind: two-tower-retrieval, precompute
+when: You need to find the best few items out of millions by meaning, with one fast vector search per query.
+how: Two encoders (towers) map queries and documents (or users and ads) into the same vector space. Training uses a contrastive loss (InfoNCE). In a batch of 1,024 pairs, each query's matching document is the positive and the other 1,023 documents are free negatives. The loss pulls positives together and pushes negatives apart.
+After training, the document tower runs offline over the whole catalog and the vectors go into an approximate nearest neighbour index (HNSW or IVF). At serve time only the query tower runs, once, and the index returns the top 100 in a few milliseconds.
+Big batches give more negatives and better vectors, but need more memory. Hard negatives, which are close but wrong, improve quality further.
+used: Dense passage retrieval (DPR); sentence-embedding models; two-tower candidate generation in recommenders and ad retrieval.
+avoid: When exact keyword match matters most; combine with BM25 in a hybrid search. For final ranking use a cross-encoder that sees both texts together.
+flow:
+  Pairs dataset [lake: query + positive] -> Query tower [model] : batch of 1,024 | Each batch holds query and matching-document pairs.
+  Pairs dataset -> Doc tower [model] : positives | The document tower encodes the same batch of positives.
+  Query tower, Doc tower -> InfoNCE loss [svc: 1 positive 1023 negatives] : two matrices | The loss compares every query with every document in the batch.
+  Doc tower -> Vector index [store: HNSW] : offline encode of catalog | After training, every catalog item is encoded once and stored.
+  Query tower -> Vector index : live query vector | At serve time one query vector returns the nearest items in milliseconds.
+ref: paper | Representation Learning with Contrastive Predictive Coding | van den Oord, Li & Vinyals, 2018 | https://arxiv.org/abs/1807.03748
+ref: paper | Dense Passage Retrieval for Open-Domain Question Answering | Karpukhin et al., EMNLP 2020 | https://arxiv.org/abs/2004.04906
+
+== Image and text pretraining with a shared space
+kind: online-offline
+when: You want one model that links images and text, so you can search or classify images with plain words and no labelled set.
+how: CLIP trains an image encoder and a text encoder on about 400 million image and caption pairs from the web. In each batch the loss makes the right image-caption pair score high and every wrong pair in the batch score low.
+Afterward, zero-shot classification works like this. Write a prompt per class ("a photo of a dog"), encode the prompts once, encode the image, and pick the class with the nearest text vector. No new training is needed.
+The same space is used for image search, for filtering training data by caption match, and as the text encoder that conditions image-generation models.
+used: OpenAI CLIP; OpenCLIP models; image search and dataset filtering; text conditioning in Stable Diffusion.
+avoid: When you need fine detail such as counting or reading small text, or labelled data is plentiful and a supervised model is cheaper to trust.
+flow:
+  Image-caption pairs [lake: 400M pairs] -> Image encoder [model: ViT] : images | Images go through the image encoder in large batches.
+  Image-caption pairs -> Text encoder [model: transformer] : captions | The captions go through a text encoder at the same time.
+  Image encoder, Text encoder -> Similarity matrix [svc: N x N scores] : normalised vectors | Every image is scored against every caption in the batch.
+  Similarity matrix -> Image encoder : push matches up | The loss raises the diagonal (true pairs) and lowers all other cells.
+  Class prompts [note: a photo of a dog] -> Text encoder : zero-shot labels | After training, class names become vectors and classification is a nearest-vector lookup.
+ref: paper | Learning Transferable Visual Models From Natural Language Supervision | Radford et al., ICML 2021 | https://arxiv.org/abs/2103.00020
+
+== Self-supervised pretraining then fine-tune
+kind: online-offline
+when: You have a lot of unlabelled images or logs and very few labels.
+how: In SimCLR, each image is cut into two random views with crops, colour changes and blur. Both go through an encoder and a small projection head. The loss treats two views of one image as positives and views of other images as negatives.
+This teaches the encoder to ignore changes that do not matter, such as lighting, and keep what does. After pretraining, the projection head is dropped. A small classifier is trained on the frozen features with 1 percent to 10 percent of the labels, or the whole encoder is fine-tuned.
+Augmentation choice is critical: without strong crops and colour jitter the model finds shortcuts and the features are poor.
+used: SimCLR, MoCo and similar methods in vision research; contrastive pretraining for audio and for user-behaviour sequences in recommenders.
+avoid: When labelled data is plentiful, or when you cannot define augmentations that keep the meaning; use supervised learning or masked-modelling methods.
+flow:
+  Unlabelled images [lake] -> Augmenter [svc: crop + colour] : image x | Each image is turned into two random views.
+  Augmenter -> Encoder [model: ResNet] : view 1, view 2 | Both views pass through the same encoder.
+  Encoder -> Contrastive loss [svc: NT-Xent] : projected vectors | The loss pulls the two views together and pushes other images away.
+  Encoder -> Linear head [model: few labels] : frozen features | After pretraining, a small head is trained on a few labelled examples.
+  Linear head -> Evaluation [svc: top-1 accuracy] : predictions | The score shows how good the learned features are with little labelled data.
+ref: paper | A Simple Framework for Contrastive Learning of Visual Representations | Chen et al., ICML 2020 | https://arxiv.org/abs/2002.05709
+
+@@ conv
+== Convolutional backbone with task heads
+kind: pipes-filters
+when: One image model must feed several tasks, such as classification, detection and segmentation, without training each from zero.
+how: A backbone of stacked convolution blocks (ResNet, ConvNeXt, EfficientNet) turns an image into feature maps at several scales. Early layers find edges, later layers find parts and objects. Each filter is shared across the whole image, so a 3 by 3 kernel has 9 weights per channel pair no matter how large the image is.
+Small heads sit on top of the backbone features: a linear layer for classification, a feature pyramid with box heads for detection, or an upsampling decoder for segmentation. The backbone is first pretrained on a large dataset such as ImageNet, then fine-tuned.
+Residual connections (ResNet, 2015) let you stack 50 to 150 layers without the gradient vanishing.
+used: ResNet backbones in detection and segmentation systems; ConvNeXt; on-device vision in phones.
+avoid: When long-range relations across the whole image dominate and data is huge; a vision transformer may do better.
+flow:
+  Image [client: 224x224 RGB] -> Backbone [model: ResNet-50] : pixels | The backbone applies shared 3 by 3 filters in many layers.
+  Backbone -> Feature maps [cache: 4 scales] : stride 4, 8, 16, 32 | Feature maps at four scales hold edges, parts and objects.
+  Feature maps -> Class head [model: linear], Box head [model: FPN] : features | Each task head reads the same shared features.
+  Class head -> Result [svc: label + boxes] : label | The classifier returns one label for the image.
+  Box head -> Result : boxes | The detector returns box coordinates and labels.
+ref: paper | Deep Residual Learning for Image Recognition | He et al., CVPR 2016 | https://arxiv.org/abs/1512.03385
+
+== Transfer learning with a frozen backbone
+kind: online-offline
+when: You have a small labelled image set, for example 2,000 images, and need a good classifier fast.
+how: Download a backbone pretrained on ImageNet or a larger set. Remove its final classification layer and add a new small layer for your classes.
+First freeze the backbone and train only the new layer for a few epochs. This is cheap and avoids damaging good features. Then unfreeze the last blocks and train them with a learning rate 10 to 100 times smaller than that of the new layer. Use data augmentation such as flips and crops, because the dataset is small.
+Features learned on millions of images usually beat training from scratch on a small set. Check that your images are not very different from the pretraining data; medical or satellite images may need more unfrozen layers.
+used: Common in industrial inspection, medical imaging and retail photo tagging; torchvision and Keras Applications pretrained models.
+avoid: When you have a large domain-specific dataset (millions of images), where training from scratch or full fine-tuning works better.
+flow:
+  Pretrained weights [store: ImageNet] -> Backbone [model: frozen] : load | The team downloads a backbone trained on ImageNet.
+  Labelled set [lake: 2,000 images] -> Backbone : augmented batches | Augmented images pass through the frozen backbone.
+  Backbone -> New head [model: your classes] : features | Only the new head learns, so training takes minutes.
+  * Backbone: last blocks unfrozen | In stage two the last blocks are unfrozen and trained with a small learning rate.
+  New head -> Validation [svc: held-out set] : predictions | A held-out set shows if fine-tuning helped or only overfit.
+ref: docs | Transfer learning and fine-tuning | TensorFlow Keras guide | https://www.tensorflow.org/guide/keras/transfer_learning
+
+== Depthwise-separable convolutions for edge devices
+kind: offload-accelerator
+when: A vision model must run on a phone or camera with a small CPU, limited memory and a power budget.
+how: A standard 3 by 3 convolution with 256 input and 256 output channels has about 590,000 weights. A depthwise-separable block splits it into a 3 by 3 depthwise filter (one filter per channel) and a 1 by 1 pointwise convolution that mixes channels. This costs about 8 to 9 times fewer operations for 3 by 3 kernels.
+MobileNets use this block throughout. The model is then quantized to 8-bit integers and compiled for the device NPU or DSP (for example with TensorFlow Lite or Core ML).
+The result runs at tens of frames per second on a phone, with a few points lower accuracy than a large network.
+used: MobileNet and EfficientNet families; on-device camera features such as face detection and photo search on phones.
+avoid: When a server GPU is available and accuracy matters more than latency; use a larger backbone there.
+flow:
+  Camera [client: 30 fps] -> Preprocess [svc: resize 224] : frame | Each camera frame is resized and normalised on the device.
+  Preprocess -> MobileNet [model: depthwise + pointwise] : tensor | The network uses cheap depthwise and 1 by 1 convolutions.
+  MobileNet -> NPU runtime [svc: int8 kernels] : quantized ops | The quantized model runs on the neural accelerator, not the main CPU.
+  NPU runtime -> App [svc: on-device] : scores | The app receives class scores in a few milliseconds without a network call.
+  App ~> Cloud [svc: optional] : hard cases only | Uncertain frames can be sent to a larger cloud model.
+ref: paper | MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications | Howard et al., 2017 | https://arxiv.org/abs/1704.04861
+
+@@ cot
+== Reasoning then answer with a separate checker
+kind: llm-workflow
+when: A question needs several steps, such as maths or a plan, and a one-shot answer is often wrong.
+how: The prompt asks the model to write its reasoning steps first and the final answer last (chain of thought). The intermediate steps give the model more computation tokens to work with, which raises accuracy on multi-step tasks.
+The application parses the final answer from a fixed format, for example a line "Answer:". A second step then checks it: run code on the computed result, test it against a rule, or ask a verifier model to review the steps.
+If the check fails, the workflow retries or returns a safe fallback. Reasoning text adds latency and cost, since the model may write 300 to 2,000 extra tokens. It is also not always a faithful record of how the model decided.
+used: Math and code assistants; Wei et al. (2022) showed gains on grade-school maths; reasoning models are trained to do this by themselves.
+avoid: For simple lookups or classification, where extra tokens add cost with no gain; also do not show raw reasoning to users as proof.
+flow:
+  App [svc: workflow] -> LLM [model: step by step] : question + format rule | The prompt asks for steps first and a final line "Answer:".
+  LLM -> App : reasoning + answer | The model writes its steps and then the answer.
+  App -> Parser [svc: regex on Answer] : full text | The app extracts only the final answer from the text.
+  Parser -> Checker [svc: code or rule] : candidate | A checker runs code or a rule on the candidate answer.
+  Checker -x> LLM : failed, retry | If the check fails the app asks again, with the error as a hint.
+  Checker -> User [user] : verified answer | A passing answer goes to the user.
+ref: paper | Chain-of-Thought Prompting Elicits Reasoning in Large Language Models | Wei et al., NeurIPS 2022 | https://arxiv.org/abs/2201.11903
+
+== Self-consistency voting over sampled reasoning paths
+kind: scatter-gather, llm-workflow
+when: Accuracy on hard reasoning matters more than cost, and the answer is short enough to compare across runs.
+how: The app samples the same question N times (for example 10 to 40) with temperature above zero, so each run takes a different reasoning path. Calls run in parallel.
+Each response ends with a final answer. The app extracts these answers and takes the most frequent one (majority vote). Different paths that reach the same answer are a good sign that it is right.
+Cost grows linearly with N, while latency stays close to a single call if the calls run in parallel. Wang et al. (2022) reported large gains on maths benchmarks. The method needs answers that can be matched, such as numbers or labels, not long free text.
+used: Math and science benchmarks; test-time compute in reasoning systems, often as best-of-N with a verifier instead of a plain vote.
+avoid: Open-ended writing where answers cannot be matched; and when per-request cost or latency must be minimal.
+flow:
+  App [svc: orchestrator] -> LLM sample 1 [model: T=0.7], LLM sample 2 [model: T=0.7], LLM sample N [model: T=0.7] : same prompt | The app sends one question to N parallel calls with random sampling.
+  LLM sample 1, LLM sample 2, LLM sample N -> Answer extractor [svc: parse final line] : N reasoning texts | Each path reasons differently and ends with an answer.
+  Answer extractor -> Vote [svc: majority] : votes 7 / 2 / 1 | The extractor lists the final answers and counts them.
+  Vote -> App : "42" | The most common answer wins and is returned.
+ref: paper | Self-Consistency Improves Chain of Thought Reasoning in Language Models | Wang et al., ICLR 2023 | https://arxiv.org/abs/2203.11171
+
+@@ decoding
+== Sampling pipeline with temperature and top-p
+kind: pipes-filters
+when: A chat or writing product must produce varied, natural text, while avoiding rare nonsense tokens.
+how: At each step the model gives scores (logits) for every token in the vocabulary, often 32,000 to 200,000. The decoder applies a chain of filters. Temperature divides the logits: below 1 sharpens the choice, above 1 flattens it.
+Top-k keeps only the k best tokens. Top-p (nucleus) keeps the smallest set whose probabilities add up to p, for example 0.9. This set grows when the model is unsure and shrinks when it is sure. The scores are renormalised and one token is drawn at random.
+Repetition penalties and stop-sequence checks run after the draw. The token is appended and the loop repeats until a stop token or the length limit.
+used: Hosted LLM APIs expose temperature and top_p; Hugging Face generate; vLLM sampling parameters.
+avoid: For tasks needing one exact answer, such as extraction or code tests; use temperature 0 (greedy) or constrained decoding.
+flow:
+  LLM [model: forward pass] -> Logits [note: 128k scores] : scores per token | Each step produces one score for every token in the vocabulary.
+  Logits -> Temperature [svc: divide by T] : raw scores | A temperature below 1 makes the top token more likely.
+  Temperature -> Top-p filter [svc: p = 0.9] : probabilities | Only the smallest set of tokens with 90 percent of mass is kept.
+  Top-p filter -> Sampler [svc: random draw] : renormalised set | One token is drawn at random from the kept set.
+  Sampler -> LLM : append token | The chosen token is fed back as input for the next step.
+ref: paper | The Curious Case of Neural Text Degeneration | Holtzman et al., ICLR 2020 | https://arxiv.org/abs/1904.09751
+
+== Speculative decoding with a draft model
+kind: pipeline-stages, offload-accelerator
+when: Serving is slow because each token needs one full pass of a large model, and the GPU is memory-bound.
+how: A small draft model writes k tokens quickly, for example k = 4. The large target model then checks all k tokens in one forward pass, because checking in parallel costs about the same as producing one token.
+The target compares its own probabilities with the draft's. It accepts tokens up to the first mismatch, and then it samples one corrected token itself. A special acceptance rule makes the output follow exactly the target model's distribution.
+If the draft is right about 70 percent of the time, each target pass yields about 2 to 3 tokens instead of 1. The gain depends on acceptance rate; a poor draft model wastes work.
+used: Leviathan et al. (Google) and Chen et al. (DeepMind) in 2022 and 2023; supported in vLLM and TensorRT-LLM.
+avoid: With large batches where the GPU is already compute-bound; the speed gain shrinks or turns negative.
+flow:
+  Prompt [client] -> Draft model [model: 1B fast] : context | The small model reads the context and drafts the next tokens.
+  Draft model -> Target model [model: 70B] : 4 draft tokens | The draft sends four candidate tokens to the large model.
+  * Target model: verifying 4 tokens | The large model scores all four positions in a single forward pass.
+  Target model -> Output [log: accepted tokens] : 3 accepted + 1 new | Three tokens match; the target adds its own fourth token.
+  Target model -x> Draft model : rejected token 4 | Tokens after the first mismatch are dropped and drafting restarts from the last good one.
+ref: paper | Fast Inference from Transformers via Speculative Decoding | Leviathan, Kalman & Matias, ICML 2023 | https://arxiv.org/abs/2211.17192
+
+== Constrained decoding for structured output
+kind: pipes-filters
+when: A program must parse the model's output, for example JSON that matches a schema, and a parse error would break the next step.
+how: A grammar or JSON schema is compiled into a finite-state machine over tokens. At each step the decoder asks the machine which tokens are legal next, and sets the scores of all other tokens to minus infinity before sampling.
+Because only valid tokens can be picked, the output always parses and fits the schema. There is no need to retry on a syntax error.
+Costs are small if the machine is precompiled and cached. The model can still put wrong values inside a valid structure, so you still validate the meaning. Very strict grammars can also hurt quality if they block the natural wording.
+used: Outlines, llama.cpp grammars, vLLM guided decoding and hosted structured-output modes in several LLM APIs.
+avoid: When free text is wanted; or when the schema is huge and compile time dominates.
+flow:
+  Schema [store: JSON schema] -> Grammar compiler [svc: token FSM] : compile once | The schema is compiled into a state machine and cached.
+  LLM [model: logits] -> Mask [svc: legal tokens only] : scores | At each step the mask sets illegal tokens to minus infinity.
+  Grammar compiler -> Mask : allowed set for state | The state machine tells the mask which tokens may come next.
+  Mask -> Sampler [svc: pick token] : masked scores | The sampler can only pick a token that keeps the output valid.
+  Sampler -> Parser [svc: JSON.parse] : final text | The output always parses, so the next step needs no error handling.
+ref: paper | Efficient Guided Generation for Large Language Models | Willard & Louf, 2023 | https://arxiv.org/abs/2307.09702
+
+@@ distill
+== Teacher to student distillation for cheaper serving
+kind: online-offline
+when: A large model is accurate but too slow or costly to serve, and you can train a smaller one offline.
+how: The big teacher model runs offline over a large set of inputs and records its soft output: the full probability distribution over classes or tokens, not only the top label. A temperature above 1 softens these probabilities so that small values carry information, such as "this cat looks a bit like a dog".
+The student is trained to match the teacher's distribution (KL loss), often mixed with the normal label loss. Because soft targets carry far more information per example than hard labels, the student learns more from the same data.
+DistilBERT keeps about 97 percent of BERT's language understanding score with 40 percent fewer parameters and 60 percent faster inference, as reported by its authors. The student is then served online.
+used: DistilBERT; distilled reasoning models released by DeepSeek from larger teachers; production ranking and ads models distilled from large offline models.
+avoid: When the teacher is not much better than a small model trained directly, or when the extra training and evaluation pipeline is not worth the savings.
+flow:
+  Unlabelled inputs [lake] -> Teacher [model: 340M params] : batches | The teacher runs offline on a large pool of inputs.
+  Teacher -> Soft labels [store: probabilities T=2] : full distributions | The teacher's soft outputs are stored as training targets.
+  Soft labels -> Student [model: 66M params] : KL loss | The student learns to match the teacher's distribution.
+  Labelled data [lake: true labels] -> Student : hard-label loss | A normal label loss is added to keep the student anchored to ground truth.
+  Student -> Serving [svc: low latency] : deploy | The small student is served online at a fraction of the cost.
+ref: paper | Distilling the Knowledge in a Neural Network | Hinton, Vinyals & Dean, 2015 | https://arxiv.org/abs/1503.02531
+ref: paper | DistilBERT, a distilled version of BERT | Sanh et al., 2019 | https://arxiv.org/abs/1910.01108
+
+== Synthetic data from a strong model to train a small one
+kind: feedback-loop
+when: You lack labelled data for a task, but a strong model can label or write examples that a small model can learn from.
+how: A large teacher model gets task prompts and writes answers, labels or reasoning steps. A filter keeps only good samples: those that pass a code test, match a known answer, or score high on a judge model. The kept samples form a fine-tuning set for a small model.
+This is sequence-level distillation: the student sees the teacher's text, not its probabilities. This is useful when the teacher is behind an API that does not return logits.
+Check the teacher's licence terms before training on its outputs. Evaluate the student on a held-out human-labelled set, because errors of the teacher are copied and can be repeated at scale.
+used: Distilled reasoning models trained on larger models' reasoning traces; many open instruction-tuned models trained on synthetic data.
+avoid: When the licence forbids using outputs for training, or when no reliable filter exists to remove wrong samples.
+flow:
+  Task prompts [lake: 100k prompts] -> Teacher LLM [model: large] : prompts | A strong model answers each prompt with reasoning and a final answer.
+  Teacher LLM -> Filter [svc: tests + judge] : candidate answers | The filter runs unit tests, compares with known answers and scores with a judge.
+  Filter -x> Teacher LLM : drop failures | Bad samples are discarded; only verified ones continue.
+  Filter -> SFT set [store: 60k kept] : verified samples | The verified samples become a fine-tuning dataset.
+  SFT set -> Student [model: small LLM] : fine-tune | The small model is fine-tuned on the dataset.
+  Student -> Eval [svc: human-labelled set] : accuracy | A held-out human-labelled set measures what the student really learned.
+ref: paper | Sequence-Level Knowledge Distillation | Kim & Rush, EMNLP 2016 | https://arxiv.org/abs/1606.07947
+
+@@ embeddings
+== Embedding index for semantic search
+kind: precompute, rag
+when: Users search by meaning, so exact keyword match misses relevant items.
+how: An embedding model turns each document into a vector of, say, 768 to 3,072 numbers. An offline job embeds the whole corpus and loads the vectors into a vector index (HNSW, IVF or a managed vector database), with the document id and metadata.
+At query time the same model embeds the query. The index returns the nearest vectors by cosine similarity, approximately, in a few milliseconds even with 100 million vectors.
+Do not mix models: vectors from two different embedding models live in different spaces and cannot be compared. If you change the model, you must re-embed everything and build a new index. Hybrid search, which adds BM25 keyword scores, often helps for names and codes.
+used: Semantic search in e-commerce and documentation; FAISS, pgvector, Elasticsearch and OpenSearch k-NN; retrieval for RAG.
+avoid: When exact filters and keywords decide the answer, such as order numbers; use a normal inverted index.
+flow:
+  Corpus [lake: documents] -> Embedding model [model: 768 dims] : text chunks | An offline job embeds every document chunk.
+  Embedding model -> Vector index [store: HNSW] : vector + doc id | Vectors are written with ids and metadata for filtering.
+  User [user] -> Search API [svc] : query text | A user types a query in plain words.
+  Search API -> Embedding model : embed query | The same model embeds the query so both live in one space.
+  Search API -> Vector index : top-10 nearest | The index returns the ten closest documents by cosine similarity.
+ref: paper | Billion-scale similarity search with GPUs | Johnson, Douze & Jegou, 2017 | https://arxiv.org/abs/1702.08734
+
+== Learned ID embeddings for recommendation and ads
+kind: two-tower-retrieval, feature-store
+when: Users, items and ads are IDs with no natural features, and a model must learn what they mean from clicks.
+how: Each ID (user, ad, campaign, site) is a row in an embedding table, a lookup that returns a learned vector of 16 to 128 numbers. Rows are trained from click data together with the rest of the network, so IDs that behave alike end up close.
+In an ads or recommendation system, the user tower and ad tower use these embeddings for retrieval. A ranking model uses them as input features next to numeric ones. Tables can have billions of rows, so they are sharded across many machines, and only the rows used in a batch are fetched.
+At serving, the table lives in memory or in a key-value store next to the model. New IDs have no learned row, so a common fix is hashing IDs into a fixed number of buckets or using an average vector until data arrives.
+used: Two-tower retrieval in YouTube recommendations; ad CTR models at large ad platforms; sharded embedding tables in PyTorch TorchRec.
+avoid: For rare IDs with little data, where content features (text, image) give better results than an ID vector.
+flow:
+  Click log [log: impressions + clicks] -> Trainer [svc: sharded] : training examples | The trainer reads user, ad and click-label rows.
+  Trainer -> Embedding table [store: sharded by id hash] : lookup + gradient | Each batch fetches only its rows and writes back the updated rows.
+  Embedding table -> Ranking model [model: dense net] : id vectors | Looked-up vectors join numeric features as input.
+  Embedding table -> Feature store [store: online KV] : export vectors | After training, the vectors are copied to an online store.
+  Ad server [svc] -> Feature store : get user + ad vectors | At serve time the ad server fetches vectors by id in a millisecond.
+  Ad server -> Ranking model : score candidates | The ranking model scores the candidate ads and the best one is shown.
+ref: paper | Deep Neural Networks for YouTube Recommendations | Covington, Adams & Sargin, RecSys 2016 | https://research.google/pubs/deep-neural-networks-for-youtube-recommendations/
+
+== Embedding drift and versioned re-embedding
+kind: blue-green, backfill-replay
+when: You must upgrade the embedding model for a live search system without breaking quality or downtime.
+how: Vectors from the new model are not comparable with the old ones. So you build a second index beside the live one. A backfill job re-embeds all documents with the new model into index v2 while index v1 still serves traffic.
+New and changed documents are written to both indexes during the migration. When v2 is complete, you compare it with v1 on a fixed set of queries with known good results (recall at 10, click rate). Then traffic shifts gradually from v1 to v2, and v1 is deleted after a safe period.
+Store the model name and version with every vector. Re-embedding 100 million documents can take hours to days of GPU time, so plan the cost.
+used: Common in production search and RAG systems when upgrading an embedding model; works with any vector database that supports multiple indexes or collections.
+avoid: Never query one index with vectors from a different model to save time; results look plausible but are wrong.
+flow:
+  Change feed [log: doc updates] -> Writer [svc: dual write] : new or changed doc | New documents are embedded by both models during migration.
+  Corpus [lake] -> Backfill job [svc: new model] : all documents | A batch job re-embeds the entire corpus with the new model.
+  Backfill job -> Index v2 [store: model B] : vectors | The new vectors fill a second index.
+  Writer -> Index v1 [store: model A live] : vectors | Live traffic still uses the old index.
+  Router [svc: traffic split] -> Index v2 : 5 percent of queries | After evaluation a small share of traffic moves to the new index.
+  * Router: 100 percent on v2 | When metrics hold, all traffic moves and the old index is retired.
+ref: docs | Embeddings guide | OpenAI API documentation | https://platform.openai.com/docs/guides/embeddings
+
+@@ flows
+== Density estimation and anomaly scoring with a flow
+kind: online-offline
+when: You need an exact likelihood for each data point, for example to find outliers in sensor data or check that inputs resemble training data.
+how: A normalizing flow is a chain of invertible layers that turns complex data into a simple base distribution such as a Gaussian. Because each layer is invertible and its Jacobian determinant is cheap to compute, the exact log-likelihood of any input is available by the change-of-variables formula.
+Train by maximising likelihood on normal data. At run time, pass each new sample through the flow and compute its log-likelihood. Samples with very low likelihood go to an alert queue.
+Be careful with images: flows sometimes give high likelihood to out-of-distribution data such as digits when trained on clothing images (Nalisnick et al., 2019), so test the score on known outliers before you trust it.
+used: Density modelling in physics and astronomy; anomaly scoring in research on sensor and tabular data; RealNVP and Glow as standard designs.
+avoid: When you only need good samples; GANs and diffusion models produce sharper images. For simple data, a Gaussian mixture is cheaper.
+flow:
+  Normal data [lake: training set] -> Flow model [model: invertible layers] : x | The flow is trained to maximise likelihood of normal data only.
+  Flow model -> Latent z [note: Gaussian base] : z = f(x) | Each input is mapped to a simple Gaussian latent.
+  Latent z -> Scorer [svc: log p(x)] : z + log-det | The scorer adds the Jacobian term to give the exact log-likelihood.
+  Sensor stream [log: new samples] -> Flow model : x | New samples go through the same flow at run time.
+  Scorer -x> Alert queue [queue: outliers] : log p below threshold | Samples with very low likelihood are sent for review.
+ref: paper | Density estimation using Real NVP | Dinh, Sohl-Dickstein & Bengio, ICLR 2017 | https://arxiv.org/abs/1605.08803
+
+== Flow-based vocoder or TTS with parallel sampling
+kind: offload-accelerator
+when: A text-to-speech system must generate audio fast, and autoregressive sampling one sample at a time is too slow.
+how: A flow maps a noise vector to a spectrogram or waveform in one parallel pass through all layers, instead of one value at a time. Sampling cost is fixed, with no loop over time steps, so a GPU can process the whole utterance at once.
+Glow-TTS uses a flow to map text-conditioned speech features to a Gaussian, and it can learn alignment itself. VITS combines a flow with a variational autoencoder and a GAN-trained decoder to produce a waveform end to end.
+The trade-off is model size, since invertible layers must keep the same dimension. Training is also harder than for a plain autoregressive model.
+used: Glow-TTS, VITS and open-source speech models built from them; Parallel WaveNet used a distilled flow student at Google for fast speech generation.
+avoid: When a diffusion or neural codec language model already gives the needed quality, and the team has no flow expertise.
+flow:
+  Text [client: sentence] -> Text encoder [model: phonemes] : phonemes | The encoder turns text into phoneme features.
+  Text encoder -> Duration module [svc: alignment] : features | A module decides how many frames each phoneme gets.
+  Duration module -> Flow decoder [model: invertible layers] : frame features + noise z | The flow turns noise into speech features in one parallel pass.
+  Flow decoder -> Vocoder [model: waveform] : spectrogram | A vocoder converts features into audio samples.
+  Vocoder -> Speaker [client: audio out] : waveform | The user hears audio, produced much faster than real time.
+ref: paper | Glow-TTS: A Generative Flow for Text-to-Speech via Monotonic Alignment Search | Kim et al., NeurIPS 2020 | https://arxiv.org/abs/2005.11129
+
+@@ gans
+== Adversarial training of generator and discriminator
+kind: online-offline
+when: You need sharp, realistic samples such as images, and you can train offline for days on GPUs.
+how: Two networks play a game. The generator turns random noise into a sample. The discriminator sees real samples and generated samples and tries to tell them apart. The discriminator is trained to be right; the generator is trained to fool it.
+In each step, the training loop updates the discriminator on a real batch and a fake batch, and then updates the generator through the discriminator's gradient. They improve each other, until the fakes look real.
+Training is unstable. Typical problems are mode collapse, where the generator makes few kinds of output, and a discriminator that wins too early. Remedies include Wasserstein loss, spectral normalisation, gradient penalties and careful learning rates.
+used: StyleGAN for faces; BigGAN; image super-resolution (ESRGAN); GAN-based vocoders such as HiFi-GAN.
+avoid: When you need stable training and wide coverage of the data; diffusion models usually cover modes better and are easier to train.
+flow:
+  Noise z [note: random vector] -> Generator [model: G] : z | The generator maps a random vector to a fake sample.
+  Generator -> Discriminator [model: D] : fake batch | The discriminator receives the fakes.
+  Real data [lake: real images] -> Discriminator : real batch | The same discriminator also sees real samples.
+  Discriminator -> Discriminator loss [svc: real vs fake] : scores | The discriminator is updated to separate real from fake.
+  Discriminator -> Generator : gradient of fake score | The generator is updated to raise the discriminator's fake score.
+ref: paper | Generative Adversarial Networks | Goodfellow et al., NeurIPS 2014 | https://arxiv.org/abs/1406.2661
+
+== GAN loss as a perceptual add-on to a decoder
+kind: pipes-filters
+when: A decoder that is trained with plain pixel loss gives blurry output, and you want sharper detail without a full GAN pipeline.
+how: Train the main model (a super-resolution network, or the autoencoder of a latent diffusion model) with the usual reconstruction loss. Add a small patch discriminator that scores local image patches as real or fake.
+The adversarial term pushes the output towards sharp texture, since blur is easy for the discriminator to spot. A perceptual loss based on features from a pretrained network is often added too. The weights of these losses are tuned so that the adversarial one does not dominate.
+At serving time the discriminator is thrown away. Only the decoder is deployed, so the cost at inference is the same as without the GAN.
+used: The image autoencoder in latent diffusion models uses a patch-based adversarial loss; ESRGAN super-resolution; video upscalers.
+avoid: When blur is acceptable or when faithfulness matters more than sharpness; adversarial loss can invent details that were not in the source.
+flow:
+  Low-res image [client] -> Decoder [model: SR network] : input | The decoder upsamples the low-resolution image.
+  Decoder -> Pixel loss [svc: L1 vs target] : output | A pixel loss keeps the result faithful to the target.
+  Decoder -> Patch discriminator [model: real or fake] : output patches | A small discriminator scores each patch.
+  High-res target [lake] -> Patch discriminator : real patches | It also sees real high-resolution patches.
+  Patch discriminator -> Decoder : sharpness gradient | Its gradient pushes the decoder to make sharp texture.
+  * Patch discriminator: dropped at serving | At deployment only the decoder is kept.
+ref: paper | High-Resolution Image Synthesis with Latent Diffusion Models | Rombach et al., CVPR 2022 | https://arxiv.org/abs/2112.10752
+
+@@ gnn
+== Neighbour sampling for web-scale graph training
+kind: scatter-gather, offload-accelerator
+when: The graph has billions of edges, so full-graph message passing does not fit in GPU memory, and you need node embeddings.
+how: A graph neural network updates each node by aggregating messages from its neighbours. Doing this for all nodes at once is too big. GraphSAGE samples a fixed number of neighbours per layer, for example 10 for the first hop and 5 for the second, so a node's computation tree has at most 50 leaves.
+Mini-batches are built from target nodes plus their sampled neighbourhoods. The graph lives in a graph store on CPU memory or disk. A sampler service fetches the neighbour lists and node features and sends compact batches to the GPU.
+PinSage at Pinterest used random-walk sampling on a graph of billions of nodes. Its learned embeddings feed recommendations.
+used: PinSage at Pinterest; GraphSAGE; DGL and PyTorch Geometric neighbour loaders.
+avoid: When the graph is small enough for full-batch training (GCN on a single GPU), or when node features alone are enough for a plain MLP.
+flow:
+  Graph store [store: CPU RAM / disk] -> Neighbour sampler [svc: 10 then 5] : adjacency lists | The sampler picks a few neighbours per hop for each target node.
+  Neighbour sampler -> Batch builder [svc: dedupe nodes] : sampled subgraph | The batch builder joins overlapping neighbourhoods and fetches node features.
+  Batch builder -> GPU trainer [model: 2-layer GNN] : mini-batch | The GPU runs two rounds of message passing on the small subgraph.
+  GPU trainer -> Embedding store [store: node vectors] : node embeddings | The trained model writes one vector per node after training.
+  Recommender [svc] -> Embedding store : nearest neighbours | The recommender searches these vectors to find similar items.
+ref: paper | Inductive Representation Learning on Large Graphs | Hamilton, Ying & Leskovec, NeurIPS 2017 | https://arxiv.org/abs/1706.02216
+ref: paper | Graph Convolutional Neural Networks for Web-Scale Recommender Systems | Ying et al., KDD 2018 | https://arxiv.org/abs/1806.01973
+
+== Fraud detection on a transaction graph
+kind: feature-store, online-offline
+when: Fraud rings share devices, cards or addresses, so single-transaction features miss the pattern.
+how: Build a graph where accounts, cards, devices and IP addresses are nodes and shared use is an edge. An offline GNN is trained on labelled past fraud, so it learns that a node linked to known fraud nodes is risky even if its own features look normal.
+Node embeddings from the GNN are written to a feature store. At scoring time, the payment service reads the embeddings of the card and device, adds them to the usual features, and the main model gives a risk score in under 100 milliseconds.
+Embeddings are refreshed in batch, for example every few hours, because running a GNN on each request is too slow. New nodes have no embedding yet, so the model must handle missing values.
+used: Common in payments and marketplace fraud teams; graph features are used alongside gradient-boosted trees.
+avoid: When fraud is mostly independent of links, or when labels are too few; plain tabular models are simpler to run and explain.
+flow:
+  Transaction log [log: cards + devices] -> Graph builder [svc: nightly] : edges | A batch job links accounts, cards and devices into a graph.
+  Graph builder -> GNN [model: trained on fraud labels] : graph + features | The GNN learns from known fraud rings.
+  GNN -> Feature store [store: node embeddings] : embeddings | Embeddings are published to the online store each few hours.
+  Payment API [svc] -> Feature store : lookup card and device | At payment time the API fetches the stored embeddings.
+  Payment API -> Risk model [model: GBDT] : features + embeddings | A fast tree model scores the payment using the graph signal.
+  Risk model -x> Payment API : decline or review | High-risk payments are declined or sent to a human.
+ref: paper | Semi-Supervised Classification with Graph Convolutional Networks | Kipf & Welling, ICLR 2017 | https://arxiv.org/abs/1609.02907
+
+@@ gqa
+== Grouped KV heads to fit more users per GPU
+kind: memory-tiering, continuous-batching
+when: Serving a long-context chat model runs out of GPU memory for the KV cache before it runs out of compute.
+how: In multi-head attention each of the 64 query heads has its own key and value heads. Grouped-query attention (GQA) lets groups of query heads share one key-value pair. With 64 query heads and 8 KV heads, each KV head serves 8 query heads.
+The KV cache per token shrinks 8 times. A model with 80 layers, 128-dim heads and 8 KV heads stores about 2 x 80 x 8 x 128 x 2 bytes = 327 KB per token in 16-bit. At 8,000 tokens that is 2.6 GB per user instead of about 21 GB.
+This lets a serving engine keep many more users in one continuous batch. Quality stays near full multi-head attention, and the model is usually trained with GQA from the start, or converted with a short uptraining run.
+used: Llama 2 70B, Llama 3 and Mistral 7B use GQA; vLLM and TensorRT-LLM serve these models.
+avoid: Small models or short contexts where cache memory is not the bottleneck; multi-head attention then gives slightly higher quality.
+flow:
+  Requests [client: many users] -> Scheduler [svc: continuous batching] : prompts | The scheduler admits requests while KV memory is still free.
+  Scheduler -> GQA model [model: 64 Q heads 8 KV heads] : batch step | Every step, 64 query heads read only 8 shared key-value heads.
+  GQA model -> KV cache [cache: 8x smaller] : write new K and V | Each new token adds a cache entry that is 8 times smaller.
+  KV cache -> GQA model : read history | Later steps read the stored keys and values for attention.
+  * Scheduler: batch 8x larger | The memory saved allows a batch about 8 times larger, so cost per token falls.
+ref: paper | GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints | Ainslie et al., EMNLP 2023 | https://arxiv.org/abs/2305.13245
+
+== Converting a multi-head checkpoint by uptraining
+kind: online-offline
+when: You already own a trained multi-head model and want its cheaper-to-serve version without full pretraining.
+how: Take the existing checkpoint. For each group of heads, mean-pool the key and value projection matrices of the heads in that group into one. This gives a GQA model with the same layers and same query weights.
+Run a short uptraining phase on the original data mix, about 5 percent of the original pretraining compute in the GQA paper. This lets the model adapt to the shared heads.
+Then evaluate quality against the original model on your benchmarks and measure serving throughput and memory. If quality loss is small, deploy the GQA version and retire the old one.
+used: Method from Ainslie et al. (2023) at Google; the same idea is used by teams that convert open checkpoints for cheaper serving.
+avoid: When you can train a new model anyway; build GQA in from the start. Also avoid if quality loss on your tasks exceeds your limit.
+flow:
+  MHA checkpoint [store: 64 KV heads] -> Head merger [svc: mean-pool groups] : K and V weights | The converter averages the key and value weights of each head group.
+  Head merger -> GQA model [model: 8 KV heads] : converted weights | The result has 8 shared KV heads and the same query heads.
+  Pretrain data [lake: original mix] -> GQA model : 5 percent of steps | A short uptraining run lets the model recover quality.
+  GQA model -> Eval [svc: quality + throughput] : metrics | The team compares quality and speed with the old model.
+  Eval -> Serving [svc: new fleet] : promote | If quality holds, the cheaper model replaces the old one.
+ref: paper | Fast Transformer Decoding: One Write-Head is All You Need | Shazeer, 2019 | https://arxiv.org/abs/1911.02150
+
+@@ interp
+== Linear probes on hidden activations
+kind: online-offline
+when: You want to know what information a model layer holds, or you need a cheap detector from its internal state.
+how: Run the model on a labelled dataset and save the hidden activations from one layer. Train a simple linear classifier (the probe) to predict a property from them, such as part of speech, a fact, or whether the input is toxic.
+If a linear probe reaches high accuracy on held-out data, the property is linearly readable at that layer. Compare layers to see where the information appears. Include a control task with random labels, to check that the probe is not simply learning the task itself.
+A probe shows that information is present, not that the model uses it. To test use, intervene: change the activation along the probe direction and see if the output changes.
+used: Probing studies of BERT and of language models; probes used as monitors for truthfulness or harmful intent in research on model safety.
+avoid: When you need causal claims; use activation patching or steering instead.
+flow:
+  Labelled prompts [lake: 10k examples] -> Model [model: frozen] : forward pass | The model runs without any weight change.
+  Model -> Activation store [store: layer 20 states] : hidden vectors | One layer's hidden states are saved with their labels.
+  Activation store -> Linear probe [model: logistic regression] : train split | The probe is trained to predict the label from the activation.
+  Linear probe -> Report [svc: accuracy per layer] : held-out accuracy | Accuracy by layer shows where the property is readable.
+  Report -> Model : patch test | A follow-up edit of the activation checks if the model really uses the feature.
+ref: paper | Understanding intermediate layers using linear classifier probes | Alain & Bengio, 2016 | https://arxiv.org/abs/1610.01644
+
+== Sparse autoencoder to find features in activations
+kind: online-offline
+when: Neurons mix many ideas, and you want separate, human-readable features inside a model.
+how: Collect many millions of activation vectors from one layer of a language model. Train a sparse autoencoder (SAE): an encoder expands each vector into a much wider layer, for example 16 to 256 times wider, with a sparsity penalty so only a few units fire; a decoder rebuilds the original vector.
+Each active unit becomes a candidate feature. Researchers read the top-activating examples of a feature to give it a name, such as "Golden Gate Bridge" or "code bugs". Then they test the feature by clamping it higher or lower and watching the model's output change.
+Anthropic's Towards Monosemanticity and Scaling Monosemanticity reported this on a small model and on Claude 3 Sonnet. Many features are clear, but SAEs do not rebuild activations perfectly, and coverage is incomplete.
+used: Anthropic and other labs' interpretability research; open SAE releases for open-weight models by research groups.
+avoid: When you only need accuracy on a task. The method is for research and audit, not for cheap runtime decisions.
+flow:
+  LLM [model: layer 12] -> Activation dump [lake: 1B vectors] : residual stream | A large set of activation vectors is saved from one layer.
+  Activation dump -> Sparse autoencoder [model: 16x wider] : vectors | The autoencoder learns a wide code where few units are active.
+  Sparse autoencoder -> Feature browser [svc: top examples] : feature ids | Each feature is shown with the texts that activate it most.
+  Feature browser -> Analyst [user] : label proposals | A person reads the examples and names the feature.
+  Analyst -> LLM : clamp feature up | Raising a feature during a run tests if it really changes the output.
+ref: blog | Towards Monosemanticity: Decomposing Language Models With Dictionary Learning | Bricken et al., Anthropic, 2023 | https://transformer-circuits.pub/2023/monosemantic-features/index.html
+
+== Activation patching to find a causal circuit
+kind: shadow-ab
+when: You must find which components cause a specific behaviour, such as a model's answer to a fact question.
+how: Run the model on two inputs that differ in one key way: a clean prompt and a corrupted prompt, for example a changed subject name. Save all activations from the clean run.
+Then rerun the corrupted prompt, but replace one component's output (a head or an MLP layer at one position) with the clean activation. If the answer moves back towards the clean answer, that component carries the needed information.
+Repeating this for every head and layer gives a map of the circuit. The method is causal, unlike probing, but it costs one forward pass per component tested, so teams use sampled or approximate versions on large models.
+used: Research on induction heads and indirect-object circuits in GPT-2; tools such as TransformerLens.
+avoid: When you only need a quick signal; patching a full large model is expensive, so start with a narrow set of components.
+flow:
+  Clean prompt [client] -> Model [model: run 1] : forward | The model runs on the clean prompt and activations are saved.
+  Model -> Activation cache [cache: all heads and layers] : clean activations | Every head and layer output is stored.
+  Corrupted prompt [client] -> Model [model: run 2] : forward + patch | The model runs on the changed prompt, with one component replaced.
+  Activation cache -> Model : patch layer 9 head 6 | One stored clean activation is inserted into the corrupted run.
+  Model -> Effect map [store: score per component] : answer shift | The change in answer score shows how much that component matters.
+ref: blog | A Mathematical Framework for Transformer Circuits | Elhage et al., Anthropic, 2021 | https://transformer-circuits.pub/2021/framework/index.html
+
+@@ kvcache
+== Per-request KV cache with paged memory
+kind: memory-tiering, continuous-batching
+when: An LLM server handles many requests of different lengths, and reserving the maximum length for each wastes GPU memory.
+how: Without a cache, each new token would recompute attention over the whole prompt. A KV cache stores the keys and values of every past token per layer, so each step only computes the new token.
+The cache grows with each generated token. Reserving space for the maximum length per request wastes 60 to 80 percent of memory through fragmentation, as vLLM's authors measured. PagedAttention instead splits the cache into fixed blocks of, say, 16 tokens, kept in a block table per request, like pages in an operating system.
+Blocks are allocated on demand and freed when the request ends. The scheduler can then run a much larger batch. The vLLM paper reported 2 to 4 times higher throughput than earlier systems at similar latency.
+used: vLLM PagedAttention; adopted in several serving engines such as TensorRT-LLM and SGLang.
+avoid: Single-user local use with short prompts, where simple preallocation is enough.
+flow:
+  Request [client: prompt 700 tokens] -> Scheduler [svc: block allocator] : new request | The scheduler checks for free cache blocks.
+  Scheduler -> Block table [store: logical to physical] : allocate blocks | It assigns small blocks, not one big contiguous slab.
+  Scheduler -> GPU model [model: decode step] : batch of requests | The model runs one decoding step for all active requests.
+  GPU model -> KV blocks [cache: 16-token blocks] : new K and V | The new token's keys and values are written to the last block.
+  Scheduler -x> Request : preempt when full | If memory runs out, a request is paused and its blocks are freed or swapped.
+ref: paper | Efficient Memory Management for Large Language Model Serving with PagedAttention | Kwon et al., SOSP 2023 | https://arxiv.org/abs/2309.06180
+
+== Prefix cache for shared system prompts
+kind: cache-aside
+when: Many requests start with the same long text, such as a system prompt, tool list or document, and you want to avoid recomputing it.
+how: The prompt prefix is hashed block by block. When a request arrives, the server looks up the longest prefix whose KV blocks are already in the cache. It reuses those blocks and computes only the new part of the prompt (prefill).
+For a 6,000-token system prompt and a 200-token question, prefill work drops by about 97 percent on a cache hit, and time to first token falls with it. Blocks are reference-counted, and the least recently used unused blocks are evicted when memory is needed.
+Hosted LLM APIs expose this as prompt caching with a lower price for cached input tokens. To get hits, keep stable content at the start of the prompt and put changing content at the end.
+used: vLLM automatic prefix caching; SGLang RadixAttention; prompt caching in hosted LLM APIs.
+avoid: When prompts rarely share a prefix, or the changing part comes first; the cache then only costs memory.
+flow:
+  Request [client: system prompt + question] -> Hasher [svc: hash blocks] : prompt tokens | The prompt is split into blocks and each block is hashed.
+  Hasher -> Prefix cache [cache: KV blocks by hash] : lookup | The cache looks for the longest matching prefix.
+  Prefix cache -> Prefill [model: GPU] : hit: 5,900 of 6,100 tokens | Only the 200 new tokens must be computed.
+  Prefill -> Prefix cache : store new blocks | New blocks are added for later requests.
+  Prefill -> Decode [model: GPU] : KV state | Decoding continues from the full cached state.
+ref: paper | SGLang: Efficient Execution of Structured Language Model Programs | Zheng et al., 2023 | https://arxiv.org/abs/2312.07104
+
+== KV cache offload and disaggregated serving
+kind: tiered-storage, data-locality
+when: Contexts are very long, or prefill and decode compete for the same GPUs, and cache memory is the limit.
+how: Move KV blocks between tiers. Hot blocks stay in GPU memory, warm blocks go to CPU memory, and cold blocks go to NVMe or a remote cache. When a returning chat session continues, its blocks are loaded back instead of recomputed.
+In disaggregated serving, prefill runs on one pool of GPUs, which is compute-bound, and decode on another pool, which is memory-bound. After prefill, the KV cache is sent over a fast network to a decode GPU. Each pool can then be tuned and scaled on its own.
+The cost is transfer time: a 2 GB cache over a 50 GB/s link takes about 40 ms, so networks and block sizes must be planned.
+used: Research systems such as DistServe and Mooncake; NVIDIA Dynamo and vLLM offer KV offload and disaggregated modes.
+avoid: Short prompts and small deployments, where one GPU pool is simpler and the transfer cost outweighs any gain.
+flow:
+  Router [svc: session-aware] -> Prefill pool [model: compute-bound] : new prompt | The router sends new prompts to GPUs tuned for prefill.
+  Prefill pool -> KV transfer [queue: RDMA link] : 2 GB KV cache | The finished cache moves over a fast link to a decode GPU.
+  KV transfer -> Decode pool [model: memory-bound] : KV cache | Decode GPUs generate tokens using the received cache.
+  Decode pool ~> CPU and NVMe tier [store: warm and cold KV] : evict idle sessions | Idle sessions move to cheaper tiers, freeing GPU memory.
+  CPU and NVMe tier ~> Decode pool : reload on return | When the user returns, the cache is reloaded, not recomputed.
+ref: paper | DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving | Zhong et al., OSDI 2024 | https://arxiv.org/abs/2401.09670
+
+@@ layernorm
+== Pre-norm residual block in a deep transformer
+kind: pipes-filters
+when: You train a transformer with dozens of layers, and training must stay stable at a high learning rate.
+how: In a pre-norm block, normalisation is applied to the input of each sublayer, and the sublayer output is added back to the residual stream: x = x + Attention(Norm(x)), then x = x + MLP(Norm(x)). The residual path stays a clean identity route from the first layer to the last.
+Gradients flow along this path without passing through a norm, which makes deep stacks trainable without long learning-rate warmup. The original Transformer put the norm after the add (post-norm), which needs careful warmup and often fails beyond 12 layers or so.
+Layer norm computes the mean and variance across the features of one token, so it does not depend on batch size or on other tokens. It then scales and shifts with learned parameters.
+used: GPT-2 and later GPT models; Llama; most current large language models use pre-norm. Xiong et al. (2020) analysed why it is stable.
+avoid: When you want the best quality in a shallow model, post-norm can be slightly better; very deep pre-norm models may need extra care of the final-layer norm.
+flow:
+  Residual x [note: stream] -> Norm 1 [svc: layer norm] : x | The stream goes through a norm before the attention sublayer.
+  Norm 1 -> Attention [model: sublayer] : normalised x | Attention reads the normalised copy only.
+  Attention -> Residual add 1 [svc: x + out] : sublayer output | The output is added to the untouched stream.
+  Residual add 1 -> Norm 2 [svc: layer norm] : stream | The same pattern repeats for the MLP sublayer.
+  Norm 2 -> MLP [model: sublayer] : normalised x | The MLP reads a normalised copy and adds its output to the stream.
+ref: paper | On Layer Normalization in the Transformer Architecture | Xiong et al., ICML 2020 | https://arxiv.org/abs/2002.04745
+ref: paper | Layer Normalization | Ba, Kiros & Hinton, 2016 | https://arxiv.org/abs/1607.06450
+
+== RMSNorm as a drop-in cheaper norm
+kind: offload-accelerator
+when: You want to reduce normalisation cost in a large model without hurting quality.
+how: RMSNorm skips the mean subtraction of layer norm and divides each token's features by their root mean square, then multiplies by a learned scale. It has no bias term.
+This saves a reduction and some parameters. The paper reported 7 to 64 percent faster running time than layer norm on several models, with similar quality. On a GPU the norm is memory-bound, so the team usually fuses it with the neighbouring operations into one kernel to avoid extra reads and writes.
+Switching norm type in a trained model is not safe, since the weights were learned with one of them. Choose it at design time.
+used: Llama family models and many other open large language models use RMSNorm.
+avoid: When you must load existing weights trained with layer norm, or when a task needs the mean-centring effect.
+flow:
+  Token vector [note: 4,096 features] -> RMS stat [svc: mean of squares] : x | One reduction computes the mean of squared features.
+  RMS stat -> Scale [svc: divide by rms] : 1/rms | Each feature is divided by the root mean square.
+  Scale -> Gain [svc: learned weights] : normalised x | A learned per-feature gain is applied; there is no bias.
+  Gain -> Fused kernel [model: norm + matmul] : output | The framework fuses these steps with the next matrix multiply on the GPU.
+  Fused kernel -> Next layer [svc] : activations | The result goes to the next sublayer with fewer memory trips.
+ref: paper | Root Mean Square Layer Normalization | Zhang & Sennrich, NeurIPS 2019 | https://arxiv.org/abs/1910.07467
+
+@@ lora
+== Multi-adapter serving on one base model
+kind: multi-adapter
+when: Many customers or tasks each need a fine-tuned model, and one full copy per customer would cost too much GPU memory.
+how: LoRA freezes the base weights W and learns a low-rank update B x A, where A and B have rank r (often 8 to 64). For a 4,096 by 4,096 layer, a rank-16 adapter has 131,072 weights instead of 16.8 million, about 0.8 percent.
+The serving system loads one copy of the base model and keeps many small adapters in memory or on disk. Each request names its adapter. The server computes the base output once, adds the small adapter path for that request, and batches requests with different adapters together.
+Adapter files are tens of megabytes, so thousands can be stored and swapped in on demand. Throughput falls somewhat compared with a merged model, because of the extra small matrix operations.
+used: vLLM multi-LoRA serving; S-LoRA; LoRAX; hosted fine-tuning services that serve adapters on shared base models.
+avoid: When one fine-tuned model serves all traffic; merge the adapter into the base weights to remove the overhead.
+flow:
+  Tenant request [client: adapter = acme] -> Router [svc: adapter lookup] : prompt + adapter id | Each request names the adapter it needs.
+  Router -> Adapter cache [cache: GPU slots] : load if missing | Missing adapters are loaded from storage into GPU slots.
+  Adapter store [store: 30 MB per adapter] ~> Adapter cache : adapter weights | Adapters live in cheap storage and are fetched on demand.
+  Router -> Base model [model: shared weights] : mixed batch | One batch has requests from many tenants.
+  Adapter cache -> Base model : add B x A per request | The small adapter path is added only for the matching requests.
+ref: paper | LoRA: Low-Rank Adaptation of Large Language Models | Hu et al., ICLR 2022 | https://arxiv.org/abs/2106.09685
+ref: paper | S-LoRA: Serving Thousands of Concurrent LoRA Adapters | Sheng et al., 2023 | https://arxiv.org/abs/2311.03285
+
+== Fine-tuning pipeline with QLoRA on one GPU
+kind: online-offline
+when: You want to adapt a large open model to your data, but you only have one or a few GPUs.
+how: QLoRA keeps the base model frozen in 4-bit precision, which cuts memory by about 4 times against 16-bit. Small 16-bit LoRA adapters are added and are the only weights that get gradients. Gradients flow through the frozen 4-bit weights, which are dequantised on the fly.
+The QLoRA paper fine-tuned a 65 billion parameter model on a single 48 GB GPU. Adapter weights plus optimiser state are small, so the checkpoint is only tens to hundreds of MB.
+The workflow is: prepare instruction data, train for a few epochs, evaluate on a held-out set, then either keep the adapter separate or merge it into the base weights for deployment.
+used: Hugging Face PEFT and TRL; bitsandbytes; common for domain tuning of open models such as Llama.
+avoid: When you need the best possible quality on a very different domain; full fine-tuning may do better. Also avoid for tiny models that fit easily.
+flow:
+  Instruction data [lake: 20k examples] -> Trainer [svc: PEFT + TRL] : formatted batches | The trainer feeds examples to the model with a chat template.
+  Base model [store: 4-bit weights] -> Trainer : frozen weights | The base model stays frozen and quantised.
+  Trainer -> LoRA adapters [model: rank 16] : gradients | Only the small adapters are updated.
+  LoRA adapters -> Eval [svc: held-out set] : checkpoint | The team tests the adapter on held-out tasks.
+  Eval -> Registry [store: adapter or merged] : promote | A good adapter is stored alone or merged into the base weights.
+ref: paper | QLoRA: Efficient Finetuning of Quantized LLMs | Dettmers et al., NeurIPS 2023 | https://arxiv.org/abs/2305.14314
+
+@@ mlp
+== Feed-forward block as the per-token compute in a transformer
+kind: pipes-filters
+when: You are designing or reading a transformer and need to see where most parameters and per-token compute sit.
+how: After attention mixes information across tokens, the MLP block works on each token alone. It expands the vector from d to about 4d (or about 2.7d with gated variants), applies a nonlinearity, and projects back to d. For d = 4,096 this holds about 134 million weights per layer, roughly two thirds of the layer's parameters.
+Modern models use gated units such as SwiGLU: two projections are multiplied together, one passed through a swish gate. This tends to give better quality at equal size (Shazeer, 2020).
+Researchers describe MLP layers as key-value memories that store facts and patterns (Geva et al., 2021). Since the block is plain matrix multiplication on every token, it maps well to tensor parallelism: split the wide layer across GPUs by columns, then rows.
+used: All GPT, Llama and Mistral style models; Megatron-LM tensor parallelism for the MLP.
+avoid: Not a choice but a block; when compute per token is too high, replace it with a mixture of experts.
+flow:
+  Token vector [note: d = 4096] -> Up projection [svc: d to 2.7d] : x | The first matrix widens each token vector.
+  Up projection -> Gate [svc: SiLU * linear] : wide vector | A gated nonlinearity picks which features pass.
+  Gate -> Down projection [svc: 2.7d to d] : gated vector | The second matrix brings the vector back to model width.
+  Down projection -> Residual add [svc: x + out] : output | The result is added back to the residual stream.
+ref: paper | GLU Variants Improve Transformer | Shazeer, 2020 | https://arxiv.org/abs/2002.05202
+ref: paper | Transformer Feed-Forward Layers Are Key-Value Memories | Geva et al., EMNLP 2021 | https://arxiv.org/abs/2012.14913
+
+== Mixture of experts replacing the dense MLP
+kind: scatter-gather, model-parallel
+when: You want more model capacity without paying that compute for every token.
+how: A mixture-of-experts (MoE) layer replaces one MLP with many (for example 8 to 256), each a normal MLP. A small router scores the experts for each token and picks the top 1 or 2.
+Only the chosen experts run, so compute per token stays near that of a smaller dense model while total parameters are much larger. Mixtral 8x7B has about 47 billion parameters and uses about 13 billion for each token.
+Experts are spread over GPUs (expert parallelism), and an all-to-all exchange sends tokens to their experts and back. A load-balancing loss keeps the router from sending every token to the same few experts, which would overload one GPU.
+used: Switch Transformer; Mixtral 8x7B; several large open and hosted models use sparse MoE layers.
+avoid: Small deployments, where all experts must still sit in memory and communication costs outweigh savings; use a dense model.
+flow:
+  Tokens [note: 4,096 in batch] -> Router [svc: top-2 gate] : hidden vectors | The router scores every expert for each token.
+  Router -> Expert 1 [model: GPU 0], Expert 2 [model: GPU 1] : tokens by expert | An all-to-all sends tokens to the GPUs holding their experts.
+  Expert 1, Expert 2 -> Combine [svc: weighted sum] : expert outputs | The expert outputs come back and are mixed by gate weights.
+  Combine -> Next layer [svc] : output | The mixed output continues through the network.
+  Router -x> Expert 1 : capacity full: drop token | If an expert gets too many tokens, extras are dropped or rerouted.
+ref: paper | Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity | Fedus, Zoph & Shazeer, JMLR 2022 | https://arxiv.org/abs/2101.03961

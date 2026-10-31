@@ -1,0 +1,862 @@
+@@ flashattn
+== Tiled attention with recompute in training
+kind: memory-tiering, offload-accelerator
+when: Attention at long sequence length runs out of GPU memory or is slow because it moves the score matrix through HBM.
+how: Standard attention writes the full N by N score matrix to HBM, reads it back for softmax, writes it again, and reads it for the second matrix multiply. At N = 8192 one head in BF16 holds 8192 x 8192 x 2 bytes, about 134 MB, and a model has dozens of heads per layer.
+FlashAttention loads a tile of queries, then loops over tiles of keys and values that fit in SRAM. It keeps a running max and running sum for the softmax, so the full matrix never exists. Only the output and one number per row (the log-sum-exp) go back to HBM.
+In the backward pass the kernel recomputes the score tiles from queries and keys using that saved number. It does more arithmetic but far less memory traffic, and memory grows linearly with sequence length. The result is exact attention, not an approximation.
+used: PyTorch scaled_dot_product_attention can pick a flash kernel; the flash-attn library; most open LLM training stacks (Megatron-LM, Hugging Face Transformers) offer it.
+avoid: Very short sequences, where launch overhead dominates; or attention variants with unusual masks that no fused kernel supports (use a flex-style compiled kernel instead).
+flow:
+  Training loop [svc: PyTorch] -> Attention layer [svc: SDPA call] : Q, K, V | The model calls one fused attention operator instead of three separate steps.
+  Attention layer -> Flash kernel [svc: GPU thread blocks] : launch | The operator dispatches to a flash kernel when shapes and dtype allow it.
+  Flash kernel -> SRAM tile [cache: on-chip] : load Q tile, K/V tile | Each thread block loads small tiles into fast on-chip memory.
+  * SRAM tile: running max and sum | The softmax statistics are updated tile by tile, so no N x N matrix is built.
+  Flash kernel -> HBM [store: GPU memory] : write O and logsumexp | Only the output and one value per row are written back.
+  HBM -> Flash kernel : read Q, K, V, dO | In backward, the kernel rereads inputs and recomputes the score tiles.
+ref: paper | FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness | Dao et al., NeurIPS 2022 | https://arxiv.org/abs/2205.14135
+
+== Fused prefill kernel in an LLM serving engine
+kind: offload-accelerator, continuous-batching
+when: An LLM server must process long prompts quickly and still decode many users at once.
+how: A request has two phases. Prefill reads the whole prompt at once and is dominated by attention over thousands of tokens. Decode produces one token per step and reads the KV cache.
+The serving engine calls a flash-style kernel for prefill, so a 32,000-token prompt never builds a 32,000 x 32,000 matrix. For decode, engines use a variant that splits the long KV cache across thread blocks (often called flash decoding), because one query row would otherwise leave most of the GPU idle.
+The scheduler can chunk a long prompt into pieces so a prefill does not block decode steps of other users. The kernels read the KV cache through a block table when the engine uses paged memory.
+used: vLLM and SGLang use FlashAttention or FlashInfer kernels; Hugging Face Transformers exposes flash attention as an option; TensorRT-LLM ships fused attention kernels.
+avoid: CPU-only or very old GPUs without kernel support; use the framework's plain attention path.
+flow:
+  Client [client] -> Scheduler [svc: serving engine] : prompt, 32k tokens | A long prompt arrives at the serving engine.
+  Scheduler -> Prefill kernel [svc: flash attention] : chunk of 8k tokens | The engine splits the prompt into chunks so decode steps are not starved.
+  Prefill kernel -> KV cache [store: paged blocks] : write K, V | Each chunk writes its keys and values into the paged KV cache.
+  Scheduler -> Decode kernel [svc: split-KV attention] : one token per user | Decode steps for many users run in the same batch.
+  KV cache -> Decode kernel : read K, V pages | The decode kernel reads the cached keys and values through the block table.
+  Decode kernel -> Client : streamed tokens | Tokens stream back as they are produced.
+ref: blog | Flash-Decoding for long-context inference | Dao et al., Stanford CRFM, 2023 | https://crfm.stanford.edu/2023/10/12/flashdecoding.html
+
+@@ gemm
+== Blocked GEMM across the memory hierarchy
+kind: memory-tiering, offload-accelerator
+when: A kernel multiplies large matrices and must reach close to the hardware's peak arithmetic speed.
+how: A naive triple loop reads each element of A and B from memory many times, so it is limited by memory bandwidth. Blocking splits C into tiles. A thread block on a GPU owns one tile, for example 128 x 128, and walks along the shared K dimension.
+In each step it copies a slice of A and a slice of B from HBM into shared memory, then each warp loads smaller fragments into registers. Tensor core instructions multiply the fragments and accumulate into registers. Every value loaded from HBM is reused about 128 times.
+Good kernels overlap the next copy with the current compute (double buffering or an asynchronous copy pipeline). The accumulators stay in registers until the K loop ends, and then the tile is written once.
+used: cuBLAS and CUTLASS on NVIDIA GPUs; oneMKL and OpenBLAS on CPUs; every dense layer in PyTorch calls one of them.
+avoid: Tiny matrices where launch cost dominates (batch them into one grouped GEMM); or sparse matrices, which need sparse formats.
+flow:
+  Linear layer [svc: PyTorch] -> cuBLAS [svc: library] : C = A x B | The framework hands the matrix shapes to the vendor library.
+  cuBLAS -> Thread block [svc: owns a 128x128 tile] : launch grid of tiles | The library picks a tile size and launches one thread block per output tile.
+  HBM [store: GPU memory] -> Shared memory [cache: per SM] : A and B slices | Each step copies one slice of A and B for the current K range.
+  Shared memory -> Registers [cache: per warp] : fragments | Warps load small fragments into registers.
+  Registers -> Tensor core [svc: matrix unit] : fragment multiply | Tensor cores multiply fragments and accumulate in registers.
+  * Registers: accumulator full | After the last K step, the finished tile is ready to store.
+  Registers -> HBM : write C tile once | The tile is written to memory a single time.
+ref: docs | CUTLASS: CUDA Templates for Linear Algebra Subroutines | NVIDIA | https://github.com/NVIDIA/cutlass
+ref: paper | Anatomy of High-Performance Matrix Multiplication | Goto & van de Geijn, ACM TOMS 2008 |
+
+== Library heuristic and fused epilogue
+kind: offload-accelerator, plugin-arch
+when: Many different matrix shapes and dtypes must each run fast, and the work after the multiply should not cost extra memory trips.
+how: No single tile size is best for every shape. A GEMM library holds many kernels with different tile sizes, data types and pipeline depths. At call time a heuristic picks one from the shapes, the dtype and the GPU model. Some frameworks also benchmark a few candidates once and cache the winner per shape.
+Tall and thin shapes, as in decode with batch size 4, may use split-K: several blocks each handle part of K, and a final step adds the partial sums.
+An epilogue is the code that runs on the tile in registers after the multiply. Bias add and activation functions (ReLU, GELU) can run there. This saves writing the intermediate matrix to HBM and reading it again, which for a memory-bound step is most of the cost.
+used: cuBLASLt matmul with epilogues; CUTLASS epilogue visitors; PyTorch autotuning for matmul in torch.compile; Triton kernels for custom fusion.
+avoid: When the post-op needs a global reduction over the whole row (softmax over a large dimension); use a separate fused kernel.
+flow:
+  Framework [svc: torch.compile] -> Heuristic [svc: kernel selector] : shape 4096x4096x32 | The framework passes the problem size to the library's selector.
+  Heuristic -> Kernel catalog [store: tuned kernels] : query by shape, dtype | The selector looks for the fastest known kernel for this case.
+  Kernel catalog -> Heuristic : split-K kernel | A skinny shape gets a split-K kernel to use all multiprocessors.
+  Heuristic -> GEMM kernel [svc: GPU] : launch with bias + GELU | The launch includes the epilogue to fuse after the multiply.
+  GEMM kernel -> HBM [store: GPU memory] : final output only | Only the activated result is written; there is no intermediate matrix.
+  * Framework: shape cached | Next time the same shape reuses the choice without a search.
+ref: docs | cuBLASLt API reference | NVIDIA | https://docs.nvidia.com/cuda/cublas/
+
+@@ mixedprec
+== FP32 master weights with BF16 compute
+kind: mixed-precision
+when: Training a large model must run at tensor-core speed and use half the memory for activations, without losing accuracy.
+how: The optimizer keeps a master copy of the weights in FP32. At each step the framework casts weights to BF16 and runs the forward and backward matrix multiplies in BF16 on tensor cores. The multiply results are accumulated in FP32 inside the hardware.
+Gradients come out in low precision. The optimizer adds them to the FP32 master weights, because a small update such as 1e-5 would vanish if added to a 16-bit weight. Optimizer state (Adam's two moments) is also FP32.
+Some operations stay in FP32 for safety: softmax, layer norm statistics, loss, and large reductions. Frameworks keep an allow list of ops that are safe in low precision.
+BF16 has the same exponent range as FP32, so it needs no loss scaling. Memory per parameter is about 16 bytes with Adam (2 BF16 weight, 2 BF16 grad, 4 master, 8 state), not 4.
+used: PyTorch autocast; Megatron-LM and DeepSpeed training runs; common in nearly all large LLM pretraining.
+avoid: When the model is small and fits easily: plain FP32 or TF32 is simpler. For numerically fragile models, test before switching.
+flow:
+  Optimizer [svc: Adam] -> Master weights [store: FP32] : read weights | The optimizer owns the full-precision copy of every weight.
+  Master weights -> Cast op [svc: autocast] : FP32 weights | Before each step the weights are cast to BF16.
+  Cast op -> Tensor cores [svc: BF16 matmul] : BF16 weights, activations | Forward and backward multiplies run in BF16 with FP32 accumulation.
+  Tensor cores -> Optimizer : BF16 gradients | Gradients come back in low precision.
+  Optimizer -> Master weights : FP32 update | The small update is added in FP32, so it is not lost to rounding.
+  Tensor cores -x> Softmax and norm [svc: kept in FP32] : not cast | Sensitive ops are kept in FP32 by an allow list.
+ref: paper | Mixed Precision Training | Micikevicius et al., ICLR 2018 | https://arxiv.org/abs/1710.03740
+
+== Dynamic loss scaling for FP16
+kind: control-loop
+when: Training in FP16, whose small exponent range makes tiny gradients round to zero.
+how: FP16 can only represent values down to about 6e-8, so many gradients underflow to zero. The fix is to multiply the loss by a scale S, for example 65,536, before the backward pass. All gradients grow by S and stay in range.
+Before the optimizer step the framework divides the gradients by S. It also checks them for inf or NaN. If any are found, the step is skipped and S is halved. If many steps in a row are clean (for example 2,000), S is doubled.
+This is a small feedback loop that keeps S as large as possible without overflow. Skipped steps are rare after the first few hundred. Monitor the scale: a scale that keeps collapsing means a real instability.
+used: PyTorch GradScaler; NVIDIA Apex AMP; TensorFlow LossScaleOptimizer. FP8 training uses a related idea with per-tensor scales.
+avoid: When training in BF16, which has FP32's range and does not need loss scaling.
+flow:
+  Loss [svc: FP16 forward] -> Scaler [svc: scale S = 65536] : loss x S | The loss is multiplied by the current scale before backward.
+  Scaler -> Backward pass [svc: FP16] : scaled loss | Scaled gradients stay inside FP16 range.
+  Backward pass -> Scaler : scaled gradients | Gradients return to the scaler before the update.
+  Scaler -x> Optimizer [svc: Adam] : inf found, skip step | If a gradient is inf or NaN, the step is skipped.
+  * Scaler: S = 32768 | The scale is halved after an overflow.
+  Scaler -> Optimizer : gradients / S | On a clean step the gradients are unscaled and applied.
+  * Scaler: S = 65536 after 2000 clean | After a long clean run the scale is doubled again.
+ref: docs | Automatic Mixed Precision package | PyTorch documentation | https://pytorch.org/docs/stable/amp.html
+
+@@ mlcompilers
+== Trace, fuse and generate kernels (torch.compile)
+kind: interpreter-compiler
+when: A model is memory-bound because many small operations each read and write full tensors in HBM.
+how: The compiler front end captures Python code as a graph. TorchDynamo reads Python bytecode and records tensor operations into an FX graph. Where it meets code it cannot trace, it breaks the graph and falls back to normal Python.
+AOTAutograd traces the backward pass too. The middle end then optimizes the graph: it removes dead code and fuses chains such as add, multiply and ReLU into one operation. Fusion means the data is read from HBM once and written once.
+The back end (Inductor) writes Triton kernels for GPUs and C++ for CPUs, then compiles them. Guards check shapes and types on each call. If a guard fails, the function is recompiled.
+Typical gains are 1.3x to 2x on transformer training or inference, larger on memory-bound elementwise chains.
+used: PyTorch 2 torch.compile; JAX jit through XLA; TensorFlow with XLA; Apache TVM for edge targets.
+avoid: Short scripts that run once (compile time exceeds the gain), or highly dynamic Python control flow that causes many graph breaks.
+flow:
+  Python model [svc: PyTorch code] -> TorchDynamo [svc: graph capture] : bytecode | The front end reads bytecode and records tensor operations.
+  TorchDynamo -> FX graph [note: IR of ops] : captured graph | The model becomes a graph; guards record the shapes it assumed.
+  FX graph -> Inductor [svc: optimizer] : graph | The compiler fuses elementwise chains and plans memory.
+  Inductor -> Triton [svc: kernel generator] : fused kernel source | Each fused group becomes one Triton kernel.
+  Triton -> GPU [svc: compiled kernels] : PTX binary | The kernel is compiled for the GPU and launched.
+  TorchDynamo -x> Python model : graph break | Untraceable code falls back to eager Python, which splits the graph.
+ref: paper | PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation | Ansel et al., ASPLOS 2024 |
+ref: paper | Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations | Tillet et al., MAPL 2019 |
+
+== Compile cache and shape buckets for serving
+kind: cache-aside, precompute
+when: A service uses compiled models, and slow compilation or recompilation on new shapes would hurt latency.
+how: Compilation can take tens of seconds to minutes. A server must not pay that on the first user request, and it must not recompile for every new input length.
+At deploy time a warm-up job runs the model on a fixed set of shapes, for example batch sizes 1, 2, 4, 8 and sequence lengths 128, 512, 2048. Each run compiles once. The compiled kernels are stored in an on-disk cache keyed by a hash of the graph and the settings.
+At run time the server pads each request up to the nearest bucket, so only a few shapes ever occur. A cache hit loads kernels in seconds. The readiness probe passes only after warm-up ends, so no traffic reaches a cold replica.
+Ship the cache with the container image or a shared volume, so new replicas start fast. A change of compiler or driver version invalidates the cache.
+used: common in JAX and XLA serving, where each new shape triggers a recompile; PyTorch Inductor and Triton keep on-disk caches; vLLM captures CUDA graphs for chosen batch sizes.
+avoid: When inputs are truly any shape and padding wastes too much compute; consider dynamic-shape compilation.
+flow:
+  Deploy job [svc: warm-up] -> Compiler [svc: XLA or Inductor] : run bucket shapes | A warm-up job runs each planned shape once.
+  Compiler -> Kernel cache [cache: on disk] : kernels by graph hash | Compiled kernels are saved under a hash key.
+  Replica [svc: model server] -> Kernel cache : load at start | A new replica loads kernels instead of compiling.
+  Replica -> Load balancer [svc: readiness] : ready | The replica reports ready only after warm-up.
+  User [client] -> Replica : request, length 700 | A request arrives with an odd length.
+  Replica -> Kernel cache : pad to 2048 bucket | The server pads to the next bucket, so a cached kernel is found.
+  Replica -x> Compiler : odd shape, compile |  A shape outside every bucket forces a slow compile, so avoid it. 
+ref: docs | torch.compile documentation | PyTorch | https://pytorch.org/docs/stable/torch.compiler.html
+ref: docs | Just-in-time compilation with JAX | JAX documentation | https://docs.jax.dev/en/latest/jit-compilation.html
+
+@@ pagedattn
+== Block table for the KV cache
+kind: paged-kv
+when: Many LLM requests of unknown length share one GPU, and reserving the maximum length for each wastes memory.
+how: Without paging, the server reserves one contiguous KV buffer per request, sized for the longest allowed output. Most requests stop early, so large parts of the reserved memory stay empty. Studies of earlier serving systems reported that well over half of KV memory was wasted this way.
+PagedAttention splits GPU KV memory into fixed blocks, for example 16 tokens each. Each request has a block table that maps its logical blocks (token 0-15, 16-31, ...) to physical blocks anywhere in memory. A new block is taken from a free list only when the last one is full.
+The attention kernel reads keys and values through the block table. Waste is limited to the last, partly filled block of each request. A finished request returns its blocks to the free list at once.
+used: vLLM (where the idea started); SGLang and TensorRT-LLM use similar paged KV caches.
+avoid: Tiny models or single-user local use, where one contiguous buffer is simple and enough.
+flow:
+  Request [client] -> Scheduler [svc: vLLM] : prompt, 40 tokens | A new request arrives with a 40-token prompt.
+  Scheduler -> Block manager [svc: free list] : need 3 blocks | The scheduler asks for ceil(40 / 16) = 3 blocks.
+  Block manager -> Block table [note: logical to physical] : 0->7, 1->2, 2->9 | The blocks are not next to each other, and that is fine.
+  Scheduler -> Attention kernel [svc: paged] : decode step | A decode step starts for this request.
+  Block table -> Attention kernel : block addresses | The kernel gathers keys and values through the table.
+  * Block table: block 3 added | When block 2 fills at token 48, a new block is taken from the free list.
+  Scheduler -> Block manager : request done, free | Finished requests return all blocks at once.
+ref: paper | Efficient Memory Management for Large Language Model Serving with PagedAttention | Kwon et al., SOSP 2023 | https://arxiv.org/abs/2309.06180
+
+== Shared blocks with copy-on-write
+kind: copy-on-write
+when: Several outputs share the same prompt, as in parallel sampling or beam search, and copying the KV cache would waste memory.
+how: A request that asks for 4 samples from one prompt has one prompt but four continuations. A contiguous cache would copy the prompt KV four times.
+With paging, all four sequences point their block tables at the same physical prompt blocks. Each block has a reference count. When a sequence needs to write into a shared block, for example its last partly filled block, the engine copies that block to a new one and updates only that sequence's table. This is copy-on-write.
+Beam search uses the same trick: when a beam is dropped, its reference counts fall and blocks that reach zero return to the free list.
+The same sharing works across different requests that start with the same system prompt, which is the base of prefix caching.
+used: vLLM parallel sampling and beam search; SGLang and vLLM prefix sharing.
+avoid: Workloads with a single output and no shared prefix, where there is nothing to share.
+flow:
+  Prompt [client: n = 4 samples] -> Block manager [svc: ref counts] : 3 prompt blocks | The prompt fills 3 blocks, written once.
+  Block manager -> Sample A, Sample B, Sample C, Sample D [svc: block table] : point to same blocks | Four sequences share the prompt blocks; each count is 4.
+  Sample A -> Block manager : append token to last block | Sample A must write into a shared block.
+  * Block manager: copy block, new count 1 | The manager copies that block for A, and the old block's count drops to 3.
+  Block manager -> Sample A : private block | A now writes freely without touching the others.
+  Sample D -x> Block manager : sample finished | When D stops, its counts drop and unshared blocks are freed.
+ref: paper | Efficient Memory Management for Large Language Model Serving with PagedAttention | Kwon et al., SOSP 2023 | https://arxiv.org/abs/2309.06180
+
+== Admission and preemption by free blocks
+kind: continuous-batching, load-shedding
+when: A server must decide each step which requests run, when GPU KV memory is the limiting resource.
+how: In continuous batching the scheduler picks the batch again at every decoding step. With paging, the main limit is the number of free blocks, not the number of requests.
+A waiting request is admitted only if enough free blocks exist for its prompt. Each running request needs about one new block every 16 tokens, so the scheduler also keeps a reserve for growth.
+When free blocks run out while requests are still generating, the scheduler preempts the newest request. It either swaps that request's blocks to CPU memory, or drops them and recomputes the prompt later. It resumes the request when blocks are free again.
+Watch the preemption rate. Frequent preemption means the engine is overloaded; lower the maximum batch size, add GPUs, or use a quantized KV cache.
+used: vLLM scheduler with swap and recompute preemption; similar policies in other paged-KV engines.
+avoid: Fixed small workloads with no memory pressure, where simple first-come batching is enough.
+flow:
+  Waiting queue [queue: 120 requests] -> Scheduler [svc: each step] : next request | At each step the scheduler looks at the head of the queue.
+  Scheduler -> Block manager [svc: free blocks 85] : can I get 40 blocks? | Admission needs enough free blocks for the whole prompt.
+  Block manager -> Scheduler : yes | Blocks are granted and the request joins the running batch.
+  Scheduler -> GPU batch [svc: running requests] : decode step | The step runs with all admitted requests.
+  * Block manager: free blocks 0 | Long outputs grow and use every free block.
+  Scheduler -x> GPU batch : preempt newest request | The scheduler stops the newest request to free its blocks.
+  GPU batch ~> CPU memory [store: swapped KV] : swap out blocks | Its blocks can move to CPU memory and return later.
+ref: paper | Efficient Memory Management for Large Language Model Serving with PagedAttention | Kwon et al., SOSP 2023 | https://arxiv.org/abs/2309.06180
+
+@@ parallelism
+== Data parallel with sharded states (FSDP / ZeRO)
+kind: data-parallel
+when: A model plus its optimizer state does not fit on one GPU, but one layer at a time fits.
+how: In plain data parallelism every GPU holds a full copy of weights, gradients and optimizer state, and all-reduce averages gradients. With Adam in mixed precision this is about 16 bytes per parameter, so a 7B model needs about 112 GB per GPU before activations.
+ZeRO stage 3 and PyTorch FSDP shard weights, gradients and optimizer state over N GPUs, so each holds 1/N. Before a layer runs, an all-gather collects its full weights from all GPUs. After use, the weights are freed.
+In backward, each layer's gradients are reduce-scattered, so each GPU keeps only its shard and updates only its shard.
+Communication is about 1.5 times that of plain data parallelism, but it overlaps with compute by prefetching the next layer. It works best on fast links (NVLink, InfiniBand).
+used: PyTorch FSDP; DeepSpeed ZeRO; used for many open-model fine-tuning and pretraining runs.
+avoid: Slow networks between GPUs, or very large models where one layer's weights do not fit; add tensor parallelism.
+flow:
+  Data loader [svc: per GPU shards] -> GPU 0, GPU 1, GPU 2, GPU 3 [svc: 1/4 of states each] : different micro-batches | Each GPU trains on its own slice of the batch.
+  GPU 1, GPU 2, GPU 3 -> GPU 0 : all-gather layer 5 weights | Before layer 5 runs, each GPU shares its piece of the weights.
+  * GPU 0: layer 5 full | The full layer exists on every GPU for a short time.
+  GPU 0 -> GPU 1 : reduce-scatter gradients | Each GPU receives the summed gradients of only its own shard.
+  GPU 1 -> Optimizer shard [store: Adam state 1/4] : update own shard | Each GPU updates only the weights it owns.
+  GPU 0 ~> GPU 1 : prefetch layer 6 | The next layer's all-gather overlaps with current compute.
+ref: paper | ZeRO: Memory Optimizations Toward Training Trillion Parameter Models | Rajbhandari et al., SC 2020 | https://arxiv.org/abs/1910.02054
+
+== Tensor parallel in a node, pipeline across nodes
+kind: model-parallel
+when: A model is too large for one GPU even when sharded, so layers or matrices must be split by hand across devices.
+how: Tensor parallelism splits each big matrix across GPUs in one node. In a transformer MLP, the first matrix is split by columns and the second by rows, so each GPU computes its part and one all-reduce per block joins the results. This needs very fast links, so it stays inside one 8-GPU NVLink node.
+Pipeline parallelism puts groups of layers on different nodes. A node sends activations to the next stage over InfiniBand, which carries much less traffic than tensor all-reduces.
+Data parallelism then copies the whole arrangement. A job on 1,024 GPUs might use tensor 8, pipeline 8 and data 16 (8 x 8 x 16 = 1,024). Place the most chatty form of parallelism on the fastest links.
+used: Megatron-LM; NVIDIA NeMo; large open-model training stacks such as Megatron-DeepSpeed.
+avoid: Models that fit with FSDP alone; the extra code and bubbles are not worth it.
+flow:
+  Batch [client: global batch] -> Pipeline stage 1 [svc: layers 1-12] : micro-batches | The global batch is cut into micro-batches for stage 1.
+  Pipeline stage 1 -> NVLink group [svc: 8 GPUs] : matmul shards | Inside stage 1 each GPU holds one slice of every matrix.
+  NVLink group -> Pipeline stage 1 : all-reduce over NVLink | One all-reduce per block joins the partial results at high speed.
+  Pipeline stage 1 -> Pipeline stage 2 [svc: layers 13-24] : activations by InfiniBand | Activations go to the next node; this is much less data than all-reduce.
+  Pipeline stage 2 -> Pipeline stage 1 : activation gradients | Backward sends gradients in the other direction.
+  Pipeline stage 2 ~> Data replica [svc: same layout] : gradient all-reduce | Data-parallel replicas average gradients at the end of the step.
+ref: paper | Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism | Shoeybi et al., 2019 | https://arxiv.org/abs/1909.08053
+ref: paper | Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM | Narayanan et al., SC 2021 | https://arxiv.org/abs/2104.04473
+
+== Pipeline micro-batches to shrink the bubble
+kind: pipeline-stages, model-parallel
+when: A model is split by layers into stages, and each stage sits idle while waiting for the others.
+how: If one batch goes through stages one by one, only one stage works at a time. The fix is to cut the batch into m micro-batches. Stage 1 starts micro-batch 2 as soon as it sends micro-batch 1 to stage 2.
+The idle time is the bubble. With p stages and m micro-batches, the idle fraction is about (p - 1) / (m + p - 1). For p = 4 and m = 16 it is 3 / 19, about 16 percent. For m = 4 it is 3 / 7, about 43 percent.
+The 1F1B schedule runs one forward and one backward in turn, so each stage keeps only a few activations alive. Interleaved schedules give each GPU several small stages to cut the bubble more, at the cost of more messages.
+Use more micro-batches until the bubble is small, but each micro-batch must still be big enough to keep the GPU busy.
+used: GPipe; PipeDream; Megatron-LM 1F1B and interleaved schedules; DeepSpeed pipeline engine.
+avoid: When a model fits without pipelining; or on slow links where activation transfer dominates.
+flow:
+  Batch [client: 16 micro-batches] -> Stage 1 [svc: GPU 0] : micro-batch 1 | The batch is cut into micro-batches fed in order.
+  Stage 1 -> Stage 2 [svc: GPU 1] : activations 1 | Stage 2 starts as soon as it has micro-batch 1.
+  * Stage 1: micro-batch 2 | Stage 1 does not wait; it starts the next micro-batch.
+  Stage 2 -> Stage 3 [svc: GPU 2] : activations 1 | Work flows down the pipeline like an assembly line.
+  Stage 3 -> Stage 4 [svc: GPU 3] : activations 1 | The last stage computes the loss and starts backward.
+  * Stage 4: first backward | After this point 1F1B alternates forward and backward on each stage.
+  Stage 4 -x> Stage 1 : bubble at start and end | At the start and end some stages idle; this is the bubble.
+ref: paper | GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism | Huang et al., NeurIPS 2019 | https://arxiv.org/abs/1811.06965
+
+@@ promptcache
+== Stable-prefix prompt layout with a provider cache
+kind: cache-aside
+when: Every request to an LLM API starts with the same long text, such as a system prompt, tool definitions or documents.
+how: The provider stores the KV cache for a prompt prefix. If the next request starts with the same tokens, it loads the stored cache instead of recomputing it. This lowers latency and cost for the cached part.
+For this to work you must put stable content first and changing content last: system prompt, tool schemas, reference documents, then conversation history, and the new user message at the end. A change at token 500 of a 10,000-token prompt breaks the cache from token 500 on.
+Some APIs need you to mark cache breakpoints (Anthropic); others cache automatically once the prompt is long enough (OpenAI, for prompts over about 1,000 tokens). Entries expire after a short time, in minutes, so steady traffic keeps them warm.
+Check the usage fields in each response for cache read and write counts, and alert when the hit rate drops.
+used: Anthropic and OpenAI prompt caching; agent products that resend a long tool list and history on each turn.
+avoid: Prompts that are short, or that change at the start (timestamps or user names at the top). Move those to the end.
+flow:
+  App [svc: agent backend] -> LLM API [svc: provider] : prefix + new message | The app sends the same long prefix with each request.
+  LLM API -> Prefix cache [cache: KV by prefix hash] : lookup prefix | The provider looks up the stored KV cache for the prefix.
+  Prefix cache -> LLM API : hit, 9,000 tokens | A hit skips recomputing the prefix.
+  LLM API -> Model [model: prefill new tokens only] : 400 new tokens | Only the new tokens are processed.
+  Model -> App : answer + usage | The usage field reports cached and uncached input tokens.
+  App -x> LLM API : timestamp at top of prompt | A changing first line gives a different prefix, so the cache misses.
+ref: docs | Prompt caching | Anthropic documentation | https://docs.claude.com/en/docs/build-with-claude/prompt-caching
+ref: docs | Prompt caching | OpenAI API documentation | https://platform.openai.com/docs/guides/prompt-caching
+
+== Radix tree prefix cache in the serving engine
+kind: memory-tiering
+when: You run your own LLM server and many requests share prefixes: few-shot examples, system prompts, or chat history.
+how: The engine keeps KV cache blocks of finished requests instead of freeing them. SGLang stores them in a radix tree whose edges are token sequences. A new request walks the tree to find its longest matching prefix and reuses those blocks.
+vLLM does the same with hashed blocks: each block's hash covers its tokens and the hash of the block before it, so equal prefixes give equal hashes.
+Only the unmatched suffix goes through prefill. Reuse is safe because the same prefix gives the same KV values. While a request uses a block, a reference count stops it from being evicted.
+When GPU memory is full, unused leaves are evicted by least recent use. Some systems also move cold blocks to CPU memory or SSD.
+used: SGLang RadixAttention; vLLM automatic prefix caching; agent loops and chat services with long shared history.
+avoid: Workloads where every prompt is unique, since the cache only costs memory then.
+flow:
+  Request A [client: system + Q1] -> Radix tree [cache: token prefixes] : lookup | A new request looks for its longest cached prefix.
+  Radix tree -> Prefill [svc: GPU] : miss, compute all | The first request has no match and computes everything.
+  Prefill -> Radix tree : insert KV blocks | The new KV blocks are inserted under the prefix.
+  Request B [client: system + Q2] -> Radix tree : lookup | Request B shares the system prompt.
+  Radix tree -> Prefill : hit 1,500; compute 20 | Only the new 20 tokens are computed.
+  * Radix tree: leaf evicted | When memory is full, the least recently used leaf is removed.
+ref: paper | SGLang: Efficient Execution of Structured Language Model Programs | Zheng et al., NeurIPS 2024 | https://arxiv.org/abs/2312.07104
+
+== Prefix-aware routing across replicas
+kind: consistent-hashing, horizontal-scale
+when: Several model replicas each keep their own prefix cache, and a plain round-robin balancer scatters related requests.
+how: A prefix cache lives inside one replica's GPU memory. With round-robin routing, the second turn of a chat often lands on a replica that has never seen the history, so the hit rate falls to about 1 in N for N replicas.
+A router in front hashes the first part of the prompt, or a session id, and sends requests with the same prefix to the same replica. Consistent hashing keeps most assignments when replicas join or leave.
+A pure hash can overload one replica when a single prefix is very popular. Better routers also look at queue length and break the tie by load, or keep a prefix index that tells which replica holds which prefix.
+Measure the hit rate per replica and the load skew together.
+used: SGLang router and the llm-d and vLLM production-stack projects offer prefix-aware routing; common in large LLM serving fleets.
+avoid: Few replicas, or short prompts; plain least-loaded routing is simpler and enough.
+flow:
+  Client [client] -> Router [svc: prefix-aware] : chat turn 2 | A client sends the second turn of a chat.
+  Router -> Prefix index [store: prefix to replica] : hash of first 512 tokens | The router finds which replica holds this prefix.
+  Prefix index -> Router : replica 3 | Replica 3 served the first turn.
+  Router -> Replica 3 [svc: warm cache] : request | The request goes to the warm replica.
+  Replica 3 -> Client : answer, TTFT 80 ms | Only new tokens are processed, so first-token time is short.
+  Router -x> Replica 3 : queue too long | If the replica is overloaded, the router sends the request elsewhere and accepts a cache miss.
+  Router ~> Replica 1 [svc: cold cache] : full prefill | The cold replica computes the whole prompt.
+ref: docs | SGLang router and cache-aware load balancing | SGLang project | https://docs.sglang.ai/
+
+@@ quant
+== Offline weight quantization, online low-bit serving
+kind: online-offline, precompute
+when: A model is too big or too slow to serve in 16-bit, because decoding is limited by reading weights from memory.
+how: Quantization runs once, offline. A tool takes the 16-bit checkpoint and a small calibration set, for example a few hundred text samples. It stores each weight in 4 bits, with one scale factor per group of 64 or 128 weights. Methods such as GPTQ and AWQ choose the rounding so the output error stays small.
+The quantized checkpoint goes to the model registry. At serving time the engine loads it and keeps weights in 4 bits in GPU memory. A kernel reads the small weights and converts them to 16-bit inside the chip, just before the multiply.
+A 70B model needs about 140 GB in BF16 but about 35 to 40 GB at 4 bits, so it fits on one 80 GB GPU. Decode is memory-bound, so reading a quarter of the bytes can speed it up close to 2 to 3 times.
+Always compare the quantized model with the original on your own evaluation set before release.
+used: vLLM and TensorRT-LLM serve GPTQ, AWQ and FP8 checkpoints; llama.cpp uses GGUF formats; Hugging Face hosts many quantized models.
+avoid: When quality is critical and memory is not tight, or for small models where the loss is larger; use FP8 or BF16.
+flow:
+  BF16 checkpoint [store: 140 GB] -> Quantizer [svc: GPTQ or AWQ] : weights | An offline job reads the full-precision weights.
+  Calibration set [store: 512 samples] -> Quantizer : activations | Sample inputs show which weights matter most.
+  Quantizer -> Model registry [store: 4-bit 38 GB] : packed weights + scales | The result is a small checkpoint with group scales.
+  Eval gate [svc: quality check] -> Model registry : compare with BF16 | A test on real tasks must pass before release.
+  Model registry -> Serving engine [svc: vLLM] : load checkpoint | The engine loads 4-bit weights onto one GPU.
+  Serving engine -> GPU kernel [svc: dequant + matmul] : read 4-bit, compute 16-bit | The kernel expands weights on chip, so memory traffic is cut about 4 times.
+ref: paper | GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers | Frantar et al., ICLR 2023 | https://arxiv.org/abs/2210.17323
+ref: paper | AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration | Lin et al., MLSys 2024 | https://arxiv.org/abs/2306.00978
+
+== Quantized vector index with full-precision rerank
+kind: two-tower-retrieval, memory-tiering
+when: A vector index of billions of embeddings must fit in memory and still return accurate results.
+how: A billion vectors of 768 float32 values need about 3 TB. Product quantization (PQ) splits each vector into parts and replaces each part by the id of its nearest centroid. With 96 bytes per code the same data is about 96 GB, a 32 times saving.
+The search first scans the compressed codes, usually after a coarse step such as an IVF list lookup. Distances come from small lookup tables, which is fast. This gives a few hundred candidates, with some error from compression.
+A second step reads the full vectors for only those candidates, from SSD or a separate store, and computes exact distances. It returns the top 10. Recall rises back near the exact result.
+Tune the number of candidates: more candidates give better recall and cost more reads.
+used: FAISS IVF-PQ; ScaNN; DiskANN-style systems keep compressed vectors in RAM and full vectors on SSD; vector databases such as Milvus and Qdrant offer quantization options.
+avoid: Small collections (under a few million vectors) that fit in RAM in full precision; use an uncompressed index.
+flow:
+  Query [client: embedding] -> IVF index [svc: coarse centroids] : query vector | The query finds its nearest coarse cells first.
+  IVF index -> PQ codes [store: 96 GB in RAM] : scan 16 cells | Only vectors in those cells are scanned, using compressed codes.
+  PQ codes -> Candidates [note: top 200 approx] : approximate distances | Table lookups give fast but rough distances.
+  Candidates -> Full vectors [store: 3 TB on SSD] : fetch 200 vectors | Only 200 full vectors are read from disk.
+  Full vectors -> Reranker [svc: exact distance] : float32 vectors | Exact distances remove most of the compression error.
+  Reranker -> Query : top 10 | The final list is returned to the caller.
+ref: paper | Product Quantization for Nearest Neighbor Search | Jegou, Douze & Schmid, IEEE TPAMI 2011 |
+ref: docs | Faiss: indexes and quantization | Meta Faiss wiki | https://github.com/facebookresearch/faiss/wiki
+
+@@ specdecode
+== Draft model proposes, target model verifies
+kind: speculative-decoding
+when: Decoding is slow because each token needs one full pass of a big model, and the GPU is mostly waiting for memory.
+how: A small draft model (for example 1B parameters) generates k tokens ahead, say k = 4, one at a time. This is cheap. The large target model then scores all k positions in one forward pass. That pass costs about the same as generating one token, because decode is memory-bound.
+The engine compares the two models' probabilities token by token. A draft token is accepted with probability min(1, p_target / p_draft). At the first rejection, the engine resamples that position from a corrected distribution and drops the rest. If all k are accepted, the target adds one bonus token.
+This rejection rule keeps the output distribution exactly the same as the target model's. Speed-up depends on the acceptance rate: at 70 to 80 percent and k = 4, the typical gain is about 2 to 3 times.
+Both models keep a KV cache. Entries for rejected tokens are rolled back.
+used: Supported in vLLM, TensorRT-LLM and llama.cpp; the idea comes from Leviathan et al. at Google and Chen et al. at DeepMind in 2022-2023.
+avoid: Large batch sizes where the GPU is already compute-bound and draft work only adds cost; or when no good draft model exists.
+flow:
+  Prompt [client] -> Draft model [model: 1B] : context | The draft model reads the current text.
+  Draft model -> Draft tokens [note: k = 4 tokens] : propose 4 tokens | It generates four tokens ahead, cheaply.
+  Draft tokens -> Target model [model: 70B] : verify in one pass | The target scores all four positions at once.
+  Target model -> Verifier [svc: rejection sampling] : target probabilities | The verifier compares probabilities with the draft's.
+  * Verifier: accepted 3, rejected 1 | The first three tokens pass; the fourth is resampled.
+  Verifier -> Prompt : 4 tokens in one step | The user gets four tokens from one target pass.
+  Verifier -x> Draft model : roll back KV after reject | Draft KV entries after the rejection are discarded.
+ref: paper | Fast Inference from Transformers via Speculative Decoding | Leviathan, Kalman & Matias, ICML 2023 | https://arxiv.org/abs/2211.17192
+ref: paper | Accelerating Large Language Model Decoding with Speculative Sampling | Chen et al., DeepMind, 2023 | https://arxiv.org/abs/2302.01318
+
+== Adjust speculation length to the load
+kind: control-loop, continuous-batching
+when: A serving engine has both light and heavy traffic, and speculation helps only when the GPU has spare compute.
+how: At low load the GPU is idle during decode, so checking extra draft tokens is almost free. At high load, with a large batch, every extra token that gets rejected uses real compute and slows other users.
+So the engine acts as a control loop. It measures the acceptance rate and the batch size. If acceptance is low or the batch is large, it uses a shorter draft length or turns speculation off. If acceptance is high and the batch is small, it increases the length.
+The policy can be fixed thresholds, for example off above batch size 32, or a learned rule. Track tokens per second per request and per GPU, not just one of them.
+Latency-sensitive traffic can use speculation while batch jobs do not, by routing them to different pools.
+used: Tuning choice in engines that support speculation (vLLM, TensorRT-LLM, SGLang); the exact policies differ between products.
+avoid: Fixed low traffic with one user, where a constant draft length is simple and enough.
+flow:
+  Scheduler [svc: serving engine] -> Metrics [svc: acceptance rate] : read stats | The scheduler reads recent acceptance rate and batch size.
+  Metrics -> Scheduler : acceptance 0.55, batch 48 | Both numbers say speculation is not paying off.
+  * Scheduler: draft length 4 -> 1 | The scheduler shortens the draft to reduce wasted work.
+  Scheduler -> Target model [model: verifier] : verify 1 draft token | Fewer tokens are checked per step.
+  Scheduler -x> Draft model [model: small] : speculation off, batch 80 | At a very large batch size the draft model is skipped.
+  Load balancer [svc: router] ~> Scheduler : traffic drops | When the load drops, the scheduler turns speculation back on.
+ref: paper | Fast Inference from Transformers via Speculative Decoding | Leviathan, Kalman & Matias, ICML 2023 | https://arxiv.org/abs/2211.17192
+
+@@ anomaly
+== Real-time scoring with rules, model and review queue
+kind: online-offline, feature-store
+when: Each payment, login or ad event must get a fraud decision in tens of milliseconds, and labels arrive days later.
+how: The event reaches a scoring service. It reads fresh features from an online store: counts of recent events per card, device or IP, and the account's normal behavior. A model (often gradient-boosted trees, sometimes an isolation forest or autoencoder) returns a risk score.
+A rules layer then combines the score with hard rules such as block lists and velocity limits. The result is one of three actions: allow (most traffic), block, or send to review. The review queue holds the uncertain band, for example scores between 0.6 and 0.9.
+Human decisions and later chargebacks become labels. A batch job joins them to the logged features and retrains the model weekly. The bank cannot wait for labels to catch new attacks, so unsupervised scores and rules cover the gap.
+Because attackers adapt, track the score distribution daily and keep a champion and challenger model.
+used: Common in payment processors, banks and marketplaces; open-source stacks combine Kafka, Flink, a feature store and XGBoost.
+avoid: Very low volume, where analysts can review everything; plain rules are enough.
+flow:
+  Event [client: payment] -> Scoring service [svc: under 50 ms] : card, amount, device | The decision path has a strict latency budget.
+  Scoring service -> Online features [cache: velocity counts] : lookup by card id | It reads counts such as payments in the last hour.
+  Scoring service -> Risk model [model: GBDT] : feature vector | The model returns a risk score from 0 to 1.
+  Risk model -> Rules layer [svc: hard rules] : score 0.74 | Rules combine the score with block lists and limits.
+  Rules layer -> Review queue [queue: analysts] : uncertain band | Medium scores go to a human instead of being blocked.
+  Review queue -> Label store [lake: outcomes] : fraud or not | Review results and chargebacks become labels.
+  Label store ~> Risk model : weekly retrain | Fresh labels are used to retrain the model offline.
+ref: book | Machine Learning Design Patterns | Lakshmanan, Robinson & Munn, 2020 |
+ref: paper | Isolation Forest | Liu, Ting & Zhou, IEEE ICDM 2008 |
+
+== Per-entity baseline with streaming windows and alerts
+kind: windowed-agg, control-loop
+when: You must find unusual metrics, such as a sudden drop in events from one partner, without labelled examples.
+how: A stream job aggregates a metric per entity in time windows, for example events per minute per partner. It keeps a baseline for each entity: a rolling median and spread, often split by hour of day and day of week, because traffic has daily and weekly cycles.
+Each new window gets a score such as (value - median) / spread. When the score is beyond a limit, for example 4, for several windows in a row, the system raises an alert. The "several in a row" rule cuts noise from single spikes.
+Alerts go to an on-call tool with the baseline chart. Operators mark alerts as real or false, and the thresholds are tuned per entity. Updating the baseline must skip flagged windows, otherwise the attack becomes the new normal.
+used: Data-quality and volume monitors; observability alerting; ad pipelines that watch impressions per publisher. Tools include Prometheus-style rules and Flink or Spark jobs.
+avoid: Sparse or new entities with no history; use group baselines or fixed floors there.
+flow:
+  Event stream [log: impressions] -> Window job [svc: 1-minute windows] : events | The job counts events per partner per minute.
+  Window job -> Baseline store [store: median by hour] : read baseline | It loads the normal level for this partner at this hour.
+  Window job -> Scorer [svc: z-score] : count 120, normal 1,000 | A sudden drop gives a large negative score.
+  Scorer -> Alert manager [svc: 3 windows rule] : score -9 | An alert fires only after 3 bad windows in a row.
+  Alert manager -> On-call [client: pager] : partner 17 volume drop | An engineer gets the alert with a chart.
+  On-call ~> Baseline store : mark as real, skip update | Flagged windows are kept out of the baseline.
+ref: docs | Anomaly detection | scikit-learn user guide | https://scikit-learn.org/stable/modules/outlier_detection.html
+
+== Pre-bid filtering plus post-bid correction
+kind: lambda-arch, rtb
+when: Ad traffic includes bots, and buyers must avoid bidding on invalid traffic and be refunded for what slips through.
+how: Two layers work at different speeds. The fast layer sits in the bid path. It checks each bid request against block lists (bad IPs, app ids, device ids) and a light model, within the few milliseconds the auction allows. It drops or flags suspect requests before any bid is made.
+The slow layer runs in batch over logged impressions and clicks. It uses richer signals: click timing, conversion rates per source, repeated devices, and graph links between devices and publishers. It finds patterns that a single request cannot show.
+The batch layer updates the block lists for the fast layer and produces a list of impressions to credit back. Invalid-traffic reports then go to partners and to the billing system.
+Keep both layers on the same feature definitions, or their verdicts will drift apart.
+used: Common in demand-side platforms, exchanges and third-party verification vendors; the MRC sets invalid-traffic standards for the industry.
+avoid: Closed, low-volume campaigns where manual review is enough.
+flow:
+  Bid request [client: from exchange] -> Pre-bid filter [svc: block lists + light model] : IP, app, device | Each request is checked within a few milliseconds.
+  Pre-bid filter -x> Bid request : suspect, no bid | Suspect traffic never gets a bid.
+  Pre-bid filter -> Bidder [svc: RTB] : clean request | Clean traffic goes on to bidding.
+  Bidder -> Impression log [lake: ad events] : served ad events | Every win is logged with its signals.
+  Impression log -> Batch detector [svc: daily job] : full day of events | A batch job looks for bot patterns across many events.
+  Batch detector ~> Pre-bid filter : new block list | New bad sources are fed back to the fast layer.
+  Batch detector -> Billing [svc: credits] : invalid impressions | Invalid impressions are credited back to the buyer.
+ref: spec | MRC Invalid Traffic Detection and Filtration Guidelines | Media Rating Council |
+
+@@ autodiff
+== Reverse-mode tape in a training step
+kind: autodiff-tape
+when: A model has millions or billions of parameters and one scalar loss, and you need all gradients cheaply.
+how: In reverse mode the framework records each operation during the forward pass, with the tensors it needs for its derivative. This record is called the tape or the autograd graph. Each node knows the local derivative of its operation.
+When you call backward on the loss, the framework walks the tape from the end to the start. For each node it multiplies the incoming gradient by the local derivative and passes the result to the node's inputs. Gradients from several uses of one tensor are added.
+Cost is about two to three times one forward pass for all parameters at once. Forward mode would need one pass per parameter. The price is memory: saved activations stay alive until backward uses them.
+After backward, optimizer.step() uses the gradients, and the tape is freed.
+used: PyTorch autograd (a tape built as the code runs); TensorFlow GradientTape; JAX reverse mode through jax.grad.
+avoid: Few outputs and many inputs (forward mode is cheaper); or non-differentiable steps such as argmax, where you need a surrogate.
+flow:
+  Training loop [svc: Python] -> Forward pass [svc: ops run] : batch | Operations run as normal Python code.
+  Forward pass -> Tape [note: graph of ops] : record op + saved tensors | Each operation adds a node with what it needs later.
+  Forward pass -> Loss [note: scalar] : prediction | The forward pass ends in one number.
+  Loss -> Tape : backward() | Calling backward starts the reverse walk.
+  * Tape: walking in reverse | Each node multiplies its incoming gradient by its local derivative.
+  Tape -> Parameters [store: .grad fields] : gradients | Each weight gets its gradient, summed over uses.
+  Parameters -> Optimizer [svc: update] : step | The optimizer updates weights and the tape is freed.
+ref: paper | Automatic Differentiation in Machine Learning: a Survey | Baydin et al., JMLR 2018 | https://arxiv.org/abs/1502.05767
+ref: docs | A gentle introduction to torch.autograd | PyTorch documentation | https://pytorch.org/tutorials/beginner/blitz/autograd_tutorial.html
+
+== Function transforms: grad, jit and vmap
+kind: interpreter-compiler
+when: You want derivatives, per-example gradients and compiled speed from plain numeric functions, composed freely.
+how: JAX treats grad, jit and vmap as transformations of a function. It runs the function once with abstract tracer values, which records the operations in an intermediate representation called a jaxpr. Each transform rewrites that representation.
+grad turns the jaxpr into one that returns derivatives. vmap adds a batch dimension to every operation, so per-example gradients are vmap(grad(f)), with no Python loop. jit sends the final jaxpr to XLA, which fuses operations and builds GPU or TPU code.
+Because the transforms compose, you can take the gradient of a gradient for second-order methods, or jit a whole training step including the optimizer.
+Functions must be pure, and shapes must be static for jit. Python control flow on traced values needs lax.cond or lax.scan.
+used: JAX; Flax and Optax training loops; research on differentiable physics and large-scale training on TPUs.
+avoid: Code with heavy side effects or data-dependent shapes; eager PyTorch may be easier.
+flow:
+  Python function [svc: loss fn] -> Jaxpr [note: recorded ops] : trace with placeholders | JAX runs the function once with abstract values, not data, and records the operations.
+  Jaxpr -> grad transform [svc: reverse mode] : rewrite | The grad transform builds a backward program.
+  grad transform -> vmap transform [svc: add batch axis] : rewrite | vmap adds a batch axis to every operation.
+  vmap transform -> XLA [svc: jit compiler] : final jaxpr | jit compiles the result and fuses operations.
+  XLA -> Accelerator [svc: GPU or TPU] : compiled program | The compiled program runs fast on the device.
+ref: docs | Automatic differentiation | JAX documentation | https://docs.jax.dev/en/latest/automatic-differentiation.html
+
+== Gradient checkpointing to save activation memory
+kind: checkpoint-restart
+when: Activations from the forward pass fill GPU memory, so the batch or the sequence length must stay small.
+how: Reverse mode keeps all intermediate tensors until backward. For a deep transformer, these activations can be larger than the weights.
+With checkpointing, the forward pass keeps only the input of each block, for example each of 32 layers. Everything inside the block is dropped. In backward, when the gradient reaches a block, the framework reruns that block's forward from its saved input to rebuild the tensors, then computes the gradients.
+Activation memory falls from all layers to about one block plus the saved inputs. The cost is about one extra forward pass, around 30 percent more compute. Choose which blocks to recompute: cheap ops (elementwise) are good targets, expensive matrix multiplies are not.
+Combined with FlashAttention, which already recomputes attention, this lets long sequences train on the same GPU.
+used: PyTorch torch.utils.checkpoint; JAX jax.checkpoint (remat); used in many large language model training stacks.
+avoid: When memory is not a problem. Recompute adds time with no benefit.
+flow:
+  Forward pass [svc: layers 1-32] -> Checkpoints [store: block inputs only] : save input of each block | Only the input of each block is saved.
+  Forward pass -x> Activations [store: inner tensors] : dropped | The inner tensors of each block are freed at once.
+  Loss [note: scalar] -> Backward pass [svc: reverse order] : gradient | Backward starts from the last block.
+  Backward pass -> Checkpoints : fetch input of block 20 | Backward needs the activations of block 20.
+  Checkpoints -> Recompute [svc: rerun forward] : block 20 input | The block's forward is rerun to rebuild the dropped tensors.
+  Recompute -> Backward pass : activations of block 20 | Backward can now compute block 20's gradients.
+ref: paper | Training Deep Nets with Sublinear Memory Cost | Chen et al., 2016 | https://arxiv.org/abs/1604.06174
+
+@@ backprop
+== Forward, backward, update with gradient accumulation
+kind: offload-accelerator
+when: Training needs a large batch, but one GPU can hold only a small micro-batch in memory.
+how: One training step has three parts. The forward pass computes predictions and the loss. The backward pass applies the chain rule from the loss back through each layer and fills a gradient for every weight. The optimizer then updates the weights.
+To reach an effective batch of 512 with room for only 32 samples, the loop runs 16 forward and backward passes. Gradients add up in the .grad buffers. The loss of each micro-batch is divided by 16, so the sum is the average. After the 16th pass, the optimizer steps once and the gradients are zeroed.
+The CPU only launches work and loads data. The GPU holds weights, activations and gradients. Activations saved by the forward pass are used and freed during backward, so peak memory is reached at the start of backward.
+Clip the global gradient norm before the step, often to 1.0, to stop rare spikes from ruining training.
+used: Almost every PyTorch and JAX training loop; Hugging Face Trainer exposes gradient accumulation steps.
+avoid: When a large micro-batch already fits; accumulation only adds loop time. Batch norm layers also behave differently with small micro-batches.
+flow:
+  Data loader [svc: CPU workers] -> GPU forward [svc: layers] : micro-batch of 32 | A CPU worker prepares a small batch and sends it to the GPU.
+  GPU forward -> Loss [note: scalar / 16] : predictions | The loss is divided by the number of accumulation steps.
+  Loss -> GPU backward [svc: chain rule] : backward() | Backward runs from the loss to the first layer.
+  GPU backward -> Grad buffers [store: .grad per weight] : add gradients | Gradients are added to the buffers, not replaced.
+  * Grad buffers: 16 micro-batches summed | After 16 passes the buffer holds the gradient of a batch of 512.
+  Grad buffers -> Optimizer [svc: AdamW] : clip norm 1.0, step | The optimizer clips and updates once, then zeroes the buffers.
+ref: book | Deep Learning, chapter 6: back-propagation | Goodfellow, Bengio & Courville, 2016 | https://www.deeplearningbook.org/
+ref: paper | Learning representations by back-propagating errors | Rumelhart, Hinton & Williams, Nature 1986 |
+
+== Gradient all-reduce overlapped with the backward pass
+kind: data-parallel
+when: Several GPUs train copies of one model, and gradient exchange must not become a pause after each backward pass.
+how: Each GPU runs forward and backward on its own micro-batch, so each gets different gradients. They must be averaged before the update, or the copies would drift apart.
+Backward produces gradients layer by layer, from the last layer to the first. A data-parallel framework groups gradients into buckets, for example 25 MB each in PyTorch DDP. As soon as a bucket is full, an all-reduce starts for it in the background while backward keeps computing earlier layers.
+When backward ends, most of the communication is already finished, and only the last bucket is waited for. On NVLink or InfiniBand the exposed cost can be a few percent of the step.
+Every GPU then holds the same averaged gradient, applies the same optimizer step, and stays identical to the others.
+used: PyTorch DistributedDataParallel; Horovod; NCCL all-reduce in nearly all multi-GPU training.
+avoid: Models too big for one GPU (use sharding or model parallelism); or very slow networks, where gradient compression or local-update methods may help.
+flow:
+  GPU 0 [svc: replica] -> Backward 0 [svc: layers N to 1] : micro-batch A | Each GPU starts backward on its own data.
+  Backward 0 -> Bucket 1 [cache: 25 MB gradients] : last layers' gradients | The last layers finish first and fill the first bucket.
+  Bucket 1 -> NCCL [svc: all-reduce] : bucket 1 | The all-reduce starts while earlier layers are still computing.
+  * Backward 0: layers continue | Backward keeps computing earlier layers while the all-reduce runs, so compute and communication overlap.
+  NCCL -> GPU 1 [svc: replica] : averaged gradients | All replicas receive the same average.
+  GPU 1 -> Optimizer [svc: same step on all] : update | Every replica applies the same update and stays identical.
+ref: paper | PyTorch Distributed: Experiences on Accelerating Data Parallel Training | Li et al., VLDB 2020 | https://arxiv.org/abs/2006.15704
+
+@@ boosting
+== Gradient-boosted trees: offline training, online scoring
+kind: online-offline, feature-store
+when: Tabular data such as clicks, prices or risk needs a strong model that serves in under a few milliseconds.
+how: Training runs offline on a table of features and labels, often from a feature store. XGBoost, LightGBM or CatBoost builds trees one by one. Each new tree fits the errors (the gradient of the loss) of the sum of the earlier trees, and is scaled by a learning rate such as 0.05.
+Validation data decides the number of trees: training stops when the validation loss has not improved for 50 rounds. The model file, a few MB, goes to a registry with its feature list.
+The online service loads the file and fetches the same features by key. Scoring walks each of, say, 500 trees of depth 6 down to a leaf and adds the leaf values. This takes microseconds to a millisecond per row on a CPU, so no GPU is needed.
+Check that online features match offline features, otherwise the model sees a different world at serving time.
+used: Common in ad click and conversion prediction, credit and fraud scoring, and search ranking; XGBoost, LightGBM and CatBoost are open source.
+avoid: Raw images, audio or text, where neural networks learn the features; or when features have no stable meaning.
+flow:
+  Feature store [store: offline table] -> Trainer [svc: XGBoost or LightGBM] : features + labels | An offline job reads training rows.
+  * Trainer: 412 trees, early stop | Trees are added one by one until validation stops improving.
+  Trainer -> Model registry [store: model + feature list] : model file, 4 MB | The finished model is saved with its feature schema.
+  Model registry -> Scoring service [svc: CPU pods] : load model | The online service loads the model at start.
+  Scoring service -> Online store [cache: features by key] : get features | It fetches the same features used in training.
+  Scoring service -> Client [client: caller] : score in 1 ms | It returns the sum of leaf values from 500 trees.
+ref: paper | XGBoost: A Scalable Tree Boosting System | Chen & Guestrin, KDD 2016 | https://arxiv.org/abs/1603.02754
+ref: paper | LightGBM: A Highly Efficient Gradient Boosting Decision Tree | Ke et al., NeurIPS 2017 |
+
+== Tree model as the re-ranker after retrieval
+kind: two-tower-retrieval
+when: A search or feed system must rank hundreds of candidates with many hand-built features within a few milliseconds.
+how: Retrieval comes first. An index or a vector search picks about 500 candidates from millions. This step is cheap and has few features.
+A ranking stage then builds a feature row for each candidate: query-document match scores, price, freshness, click rates, and user features. Gradient-boosted trees trained with a ranking loss (LambdaMART) score the rows. The ranking loss pushes good items above bad ones in each list, not just toward the right label.
+The top 20 are sent to the page. Trees handle mixed numeric features, missing values and odd scales without much preparation. Many systems add a neural re-ranker on top, or replace trees with a neural network when features include text or images.
+The labels come from clicks, which are biased by position, so apply position-bias correction when training.
+used: LambdaMART powered the Bing and Yahoo ranking; common in e-commerce search and ads ranking; XGBoost and LightGBM support ranking objectives.
+avoid: Fewer than a few thousand labelled queries; use hand-tuned scoring first.
+flow:
+  Query [client: user search] -> Retriever [svc: index] : query text | The user query goes to a cheap first-stage retriever.
+  Retriever -> Feature builder [svc: fetch features] : 500 candidate ids | About 500 items are picked from millions, and each needs a feature row.
+  Feature builder -> GBDT ranker [model: LambdaMART] : 500 feature rows | Trees score all rows in about 5 ms.
+  GBDT ranker -> Results page [client: top 20] : sorted list | The best 20 are shown to the user.
+  Results page ~> Click log [log: clicks] : clicks | Clicks become training labels for the next model.
+ref: paper | From RankNet to LambdaRank to LambdaMART: An Overview | Burges, Microsoft Research, 2010 |
+
+== Histogram training sharded over workers
+kind: data-parallel
+when: The training table is too large or too slow for one machine, but you still want tree models.
+how: A tree splits on the feature value that reduces the loss most. Checking every possible split on billions of rows is slow, so XGBoost and LightGBM first bucket each feature into about 256 bins. For each bin they keep the sum of gradients and the count.
+In distributed training, rows are split across workers. Each worker builds histograms from its own rows. The workers then add their histograms together with an all-reduce, and every worker picks the same best split. Only the small histograms cross the network, not the data.
+The tree grows level by level this way. Orchestration comes from Dask, Spark or Ray, which also handle worker failures at the job level.
+With GPUs, building histograms is very fast, and a large table may fit on a few GPUs instead of a whole cluster.
+used: XGBoost on Dask and Spark; LightGBM distributed; XGBoost GPU training with the RAPIDS stack.
+avoid: Data that fits on one machine; single-node training is simpler and often faster.
+flow:
+  Table [lake: Parquet] -> Worker 1 [svc: rows 0-250M], Worker 2 [svc: rows 250M-500M] : row shards | Each worker reads its own part of the rows.
+  Worker 1 -> Histogram 1 [note: 256 bins x features] : gradient sums | Each worker bins its rows and sums gradients per bin.
+  Worker 2 -> Histogram 2 [note: same layout] : gradient sums | The second worker does the same on its rows.
+  Histogram 1, Histogram 2 -> All-reduce [svc: add histograms] : small arrays | Histograms are added over the network.
+  All-reduce -> Worker 1, Worker 2 : global histogram | Both workers see the same totals and choose the same split.
+  * Worker 1: tree depth 3 | The tree grows one level, and the loop repeats.
+ref: paper | XGBoost: A Scalable Tree Boosting System | Chen & Guestrin, KDD 2016 | https://arxiv.org/abs/1603.02754
+
+@@ clfmetrics
+== Offline metric gate before a model ships
+kind: shadow-ab, online-offline
+when: A new model must show it is better than the current one before it takes live traffic.
+how: A release pipeline scores a fixed held-out set with both the old and the new model. It computes the metrics that match the product: ROC-AUC or PR-AUC for ranking quality, log loss and calibration error for probability quality, and NDCG or recall at k for ranked lists.
+Each metric comes with a confidence interval, for example by bootstrap resampling of the test rows. A change smaller than the interval is treated as noise. The gate also slices the metrics by country, device or new versus old users, so a gain on average cannot hide a loss for one group.
+Only a model that passes the gate goes to shadow or A/B testing. A better offline metric does not prove a better product, so the online test decides the final release.
+Store metrics with the model version in the registry so releases can be compared later.
+used: Common in ML platforms; MLflow and Weights & Biases log these metrics; scikit-learn computes most of them.
+avoid: Skewed or stale test sets; and a metric that does not match the business goal, for example accuracy on rare-event data.
+flow:
+  Candidate model [model: v8] -> Eval job [svc: offline] : score held-out set | The pipeline scores a fixed test set.
+  Champion model [model: v7] -> Eval job : score same set | The current model scores the same rows.
+  Eval job -> Metrics [note: AUC, logloss, ECE] : per-slice numbers | Metrics are computed overall and per slice.
+  Metrics -> Gate [svc: threshold rules] : delta with 95% CI | The gate checks the change against its confidence interval.
+  Gate -> Registry [store: model + metrics] : pass: promote to shadow | Only passing models go on to shadow and A/B tests.
+  Gate -x> Candidate model : fail: stay offline | A model that fails is sent back to the team.
+ref: docs | Metrics and scoring: quantifying the quality of predictions | scikit-learn user guide | https://scikit-learn.org/stable/modules/model_evaluation.html
+
+== Calibrated probabilities and a cost-based threshold
+kind: online-offline
+when: Decisions depend on the true probability, such as ad bids, fraud holds or loan approvals.
+how: A classifier's score is not always a probability. A model that says 0.1 may be right only 4 percent of the time. For an ad bid, bid = predicted click rate x value per click, so a biased score means a biased bid and money lost.
+A calibration step is fitted on held-out data. It maps raw scores to observed rates, with Platt scaling (a logistic curve) or isotonic regression (a step function). A reliability diagram and expected calibration error show whether predicted 10 percent matches the observed rate.
+For yes-or-no decisions, choose the threshold from costs. Flag when p x cost of a miss is greater than (1 - p) x cost of a false alarm. This gives a different cutoff than 0.5 when errors cost different amounts.
+Recheck calibration in production, because data drift breaks it.
+used: Common in pCTR and pCVR systems for ad auctions; fraud and credit scoring; scikit-learn CalibratedClassifierCV.
+avoid: When only the order of items matters (pure ranking); calibration is then not required.
+flow:
+  Model [model: classifier] -> Raw scores [note: uncalibrated] : p = 0.10 | The model outputs scores for the held-out set.
+  Raw scores -> Calibrator [svc: isotonic fit] : scores + labels | A calibration step learns the real rate for each score.
+  Calibrator -> Reliability check [svc: ECE report] : calibrated p | A report checks predicted against observed rates.
+  Calibrator -> Decision service [svc: live] : mapping file | The mapping is loaded in the online service.
+  Decision service -> Bidder [client: bid or hold] : p x value | Calibrated p is multiplied by value to give a bid or a flag.
+  Decision service ~> Reliability check : live outcomes | Live outcomes are used to detect drift in calibration.
+ref: paper | On Calibration of Modern Neural Networks | Guo et al., ICML 2017 | https://arxiv.org/abs/1706.04599
+
+== Delayed-label monitoring of live metrics
+kind: feedback-loop, windowed-agg
+when: A model is live, but true labels, such as conversions or chargebacks, arrive hours or weeks later.
+how: Each prediction is logged with an id, the model version, the score and the features. When a label arrives, a join job matches it to its prediction by id. Metrics are then computed per prediction day, since labels for recent days are not complete yet.
+For fast signals use proxies. Watch the score distribution, the share of positive predictions, and feature drift. These need no labels and warn within minutes.
+For slow labels, show a matured window: for a 7-day conversion window, report AUC for events at least 7 days old. Mark recent days as incomplete in the dashboard.
+Alert when the matured metric falls below its offline baseline by more than the confidence interval.
+used: Common in ad conversion models, fraud detection and credit models; tools include Evidently, Arize, WhyLabs and custom Spark jobs.
+avoid: Cases where labels never arrive; use human sampling to create labels.
+flow:
+  Model server [svc: v8] -> Prediction log [log: id + score] : log each prediction | Every prediction is logged with a unique id.
+  Label source [svc: conversions] -> Join job [svc: by id] : label after 3 days | Labels arrive late and are matched by id.
+  Prediction log -> Join job : predictions of that day | The join reads the matching predictions.
+  Join job -> Metric store [store: AUC by day] : matured metrics | Metrics are written for days whose labels are complete.
+  Metric store -> Alert rule [svc: below baseline?] : AUC 0.71 vs 0.76 | The alert rule compares to the offline baseline.
+  Alert rule -> On-call [client: ML team] : page | The team investigates drift or a data bug.
+ref: book | Designing Machine Learning Systems | Chip Huyen, O'Reilly, 2022 |
+
+@@ clustering
+== Coarse quantizer for an IVF vector index
+kind: precompute, sharding
+when: Nearest-neighbour search over millions of vectors is too slow if every vector is compared with the query.
+how: An IVF (inverted file) index uses k-means as a router. Offline, k-means runs on a sample of the vectors and finds, for example, 4,096 centroids. Each vector is assigned to its nearest centroid and stored in that centroid's list.
+At query time the engine compares the query with the 4,096 centroids, picks the nprobe closest, for example 16, and scans only the vectors in those lists. That is about 16 / 4,096, or 0.4 percent, of the data, in the ideal balanced case.
+nprobe trades speed for recall: a higher value finds more true neighbours and costs more time. A neighbour in an unprobed cell is missed. Clusters of very different size cause uneven work, so check list sizes.
+Retrain the centroids when the data distribution changes much. Lists can be spread over machines, one set of cells per shard.
+used: FAISS IVF indexes; Milvus; many vector databases use IVF variants, often with product quantization.
+avoid: Small data sets, where brute force is exact and fast; or when very high recall is required (graph indexes such as HNSW may do better).
+flow:
+  Vectors [lake: 10M embeddings] -> k-means [svc: offline training] : 1M-sample | Offline, k-means finds 4,096 centroids from a sample.
+  k-means -> Centroid table [store: 4096 centroids] : centroids | The centroids are saved as the routing table.
+  Vectors -> Inverted lists [store: one list per cell] : assign to nearest centroid | Each vector is stored in the list of its centroid.
+  Query [client: embedding] -> Centroid table : find nprobe = 16 nearest | The query is compared with the centroids first.
+  Centroid table -> Inverted lists : scan 16 lists | Only 16 lists out of 4,096 are scanned.
+  Inverted lists -> Query : top 10 | The nearest vectors from those lists are returned.
+ref: paper | Billion-scale similarity search with GPUs | Johnson, Douze & Jegou, IEEE Transactions on Big Data 2019 | https://arxiv.org/abs/1702.08734
+
+== Nightly user segmentation as a feature
+kind: online-offline, feature-store
+when: You want to group users or items by behaviour, without labels, and give the group id to other models.
+how: A nightly batch job reads each user's behaviour as a vector, for example embeddings, category shares and activity counts. It scales the features and runs k-means (or a Gaussian mixture, when soft membership helps) with a chosen k such as 20. The silhouette score or a stability check across runs helps to select k.
+Each user gets a cluster id, and with a Gaussian mixture also a probability for each cluster. The job writes these to the feature store. Online models then read the cluster id as one more feature, and analysts use the clusters for reports and campaigns.
+Clusters need names and a review: an analyst checks the centroid of each cluster and its size. Keep the cluster ids stable between runs by matching new centroids to old ones, otherwise every dashboard changes meaning each night.
+used: Common in marketing audiences, recommenders and customer analytics; scikit-learn and Spark MLlib implement k-means and Gaussian mixtures.
+avoid: When labels exist for the goal; train a supervised model. Also when clusters are not stable between runs.
+flow:
+  User events [lake: behaviour logs] -> Vectorizer [svc: user vectors] : 30-day activity | A job turns each user's history into a vector.
+  Vectorizer -> k-means [svc: Spark MLlib] : scaled vectors | The batch job clusters all users.
+  k-means -> Cluster matcher [svc: align to last run] : new centroids | New centroids are matched to the old ones to keep ids stable.
+  Cluster matcher -> Feature store [store: user cluster id] : user id, cluster | Cluster ids are written as a user feature.
+  Feature store -> Ranking model [model: online] : cluster id | Online models use the cluster id as a feature.
+  Feature store -> Analyst dashboard [client: BI] : cluster sizes | Analysts review cluster sizes and profiles.
+ref: docs | Clustering | scikit-learn user guide | https://scikit-learn.org/stable/modules/clustering.html
+
+@@ crossval
+== Time-based split with a sealed test set
+kind: holdout-eval
+when: Data has a time order, such as clicks or sales, and the model will predict the future from the past.
+how: A random split puts tomorrow's rows into training and yesterday's into test, so the model sees the future. Scores look good and production results disappoint. Split by time instead.
+Example: train on weeks 1 to 10, validate on week 11 and test on week 12. For a model that is retrained often, use rolling windows: train on the past, validate on the next block, then move forward and repeat, which gives several honest scores.
+Leave a gap (an embargo) between train and validation when labels take days to arrive, or when features look back over a window. Otherwise rows near the boundary leak.
+Freeze the test set. Use the validation set for tuning and early stopping, and read the test set once at the end. Each peek at test and change after it makes the final score optimistic.
+Record split dates and data versions with the model.
+used: Common in ad, fraud and demand-forecasting systems; scikit-learn TimeSeriesSplit; the pattern is standard practice in ML platforms.
+avoid: Data with no time order and independent rows, where a random or stratified split is fine.
+flow:
+  Event table [lake: 12 weeks] -> Splitter [svc: by event time] : all rows | A pipeline step splits rows by event time, not at random.
+  Splitter -> Train set [store: weeks 1-10] : past rows | The model learns only from the older weeks.
+  Splitter -> Validation set [store: week 11] : after 3-day gap | A gap of three days keeps late labels out of both sets.
+  Train set -> Trainer [svc: fit and tune] : features + labels | The trainer fits the model and tunes settings.
+  Trainer -> Validation set : score each trial | Validation scores pick the best settings and the stopping point.
+  Trainer -> Test set [store: week 12 sealed] : final score once | The sealed test set is read one time for the report.
+ref: docs | Cross-validation: evaluating estimator performance | scikit-learn user guide | https://scikit-learn.org/stable/modules/cross_validation.html
+
+== K-fold search fanned out to workers
+kind: scatter-gather
+when: You must tune settings on a modest data set, and each trial needs a reliable score, not one lucky split.
+how: K-fold cross-validation cuts the training data into k parts, for example 5. For each part, the model trains on the other four and is scored on the held-out part. The mean of the five scores, and their spread, show how good and how stable the model is.
+Hyperparameter search multiplies this: 40 settings times 5 folds is 200 independent training jobs. A scheduler sends them to worker processes or cluster nodes in parallel, which is a scatter-gather. Each worker returns one score.
+The coordinator collects the scores, picks the best mean, and retrains once on all training data. The test set stays untouched. For a fair estimate when tuning many settings, use nested cross-validation: an outer loop for the estimate, an inner loop for the tuning.
+Use grouped folds when rows from one user or device must stay together.
+used: scikit-learn GridSearchCV and RandomizedSearchCV with joblib; Optuna, Ray Tune and Spark ML CrossValidator.
+avoid: Very large data or deep models, where one training run is costly; use a single validation split.
+flow:
+  Coordinator [svc: tuner] -> Worker 1, Worker 2, Worker 3 [svc: trial runner] : setting x fold | The tuner sends each pair of setting and fold to a worker.
+  Worker 1, Worker 2, Worker 3 -> Training data [lake: 80% per fold] : read train part | Each worker reads the four training parts of its fold.
+  Worker 1 -> Coordinator : score 0.81 | A worker returns the score on its held-out part.
+  Worker 2 -> Coordinator : score 0.79 | Other workers return their scores.
+  * Coordinator: setting B mean 0.80 | The coordinator averages the five fold scores for each setting.
+  Coordinator -> Final trainer [svc: refit] : best setting | The best setting is retrained once on all training data.
+ref: docs | Tuning the hyper-parameters of an estimator | scikit-learn user guide | https://scikit-learn.org/stable/modules/grid_search.html
+
+== Deterministic split by entity hash
+kind: sharding
+when: Rows of the same user, device or document must always land in the same split, now and in every future run.
+how: If one user has rows in both train and test, the model can memorize that user and the test score is too high. Splitting by row id leaks in this way. Split by the entity instead.
+Hash the entity id with a stable hash such as farmhash or a salted SHA-256, and take the value modulo 100. Ids with a value under 80 go to train, 80 to 89 to validation, and 90 to 99 to test. The assignment needs no stored table, and it is the same on every machine and every day.
+New data keeps its assignments: a user stays in its split as the data grows, so the test set never leaks into later training sets. Check the split sizes and label rates after the hash, because a few very large entities can skew them.
+used: Common in recommender and ad pipelines; TensorFlow Extended and BigQuery examples use hash-based splits.
+avoid: When time order matters more than entities; combine with a time split.
+flow:
+  Raw rows [lake: events] -> Hash splitter [svc: hash(user id) mod 100] : user id | Each row is routed by the hash of its user id.
+  Hash splitter -> Train [store: 0-79] : 80% of users | Users with a low hash go to train.
+  Hash splitter -> Validation [store: 80-89] : 10% of users | Users in the middle range go to validation.
+  Hash splitter -> Test [store: 90-99] : 10% of users | Users with a high hash go to test.
+  Test -> Split check [svc: size and label rate] : counts | A check confirms that sizes and label rates look right.
+  New rows [lake: next month] ~> Hash splitter : same user, same split | Next month a known user lands in the same split.
+ref: docs | Cross-validation: evaluating estimator performance | scikit-learn user guide | https://scikit-learn.org/stable/modules/cross_validation.html
+
+@@ evals
+== Eval suite as a release gate in CI
+kind: shadow-ab, blue-green
+when: Every change to a model, a prompt or a retrieval setting could make quality worse without anyone noticing.
+how: The team keeps a versioned eval set: real examples with expected answers or grading rules, in groups by task and by risk. A pipeline runs it on every pull request and on each candidate release.
+Each example runs several times when output is random. Scores come with confidence intervals, because a test set of 200 cases moves by several points from noise alone. The pipeline compares the candidate against the current production model on the same cases and reports wins, losses and the examples that changed.
+A gate blocks the release when a key score falls below its limit, or when any safety case fails. Passing candidates move to shadow traffic and then to a small canary or A/B test.
+Keep a private holdout that is never used for tuning, and check public benchmarks for contamination.
+used: Common in LLM and ML teams; open-source harnesses include lm-evaluation-harness and OpenAI Evals; MLflow and Braintrust track runs.
+avoid: Tiny or stale eval sets, which give false comfort; add cases from real failures first.
+flow:
+  Pull request [client: prompt change] -> CI pipeline [svc: eval runner] : candidate version | A change starts the eval job.
+  Eval set [store: 800 cases] -> CI pipeline : load cases | The job loads the versioned eval set.
+  CI pipeline -> Candidate [model: new prompt] : run all cases | The candidate answers every case.
+  CI pipeline -> Production [model: baseline] : same cases | The production version answers the same cases.
+  Candidate, Production -> Scorer [svc: graders + CI] : answers | Graders score both sets and compute intervals.
+  Scorer -> Release gate [svc: thresholds] : -1.2 points on safety | The gate compares scores with its limits.
+  Release gate -x> Pull request : blocked | A drop in a key score blocks the merge.
+ref: docs | lm-evaluation-harness | EleutherAI | https://github.com/EleutherAI/lm-evaluation-harness
+ref: paper | Holistic Evaluation of Language Models | Liang et al., TMLR 2023 | https://arxiv.org/abs/2211.09110
+
+== LLM judge calibrated against human labels
+kind: llm-workflow, feedback-loop
+when: Outputs are open-ended text, so exact match fails, and human review of every output is too slow or costly.
+how: A strong model acts as the judge. It gets the question, the answer and a rubric (for example, "correct, grounded in the sources, no unsafe advice") and returns a score and a short reason. This runs on thousands of outputs for a small cost.
+Judges have biases: they favour longer answers, their own style and the first option in a pair. Reduce them by swapping the order of pairs, by using a clear rubric, and by asking for a reason before the score.
+Calibrate the judge: humans label a sample of 100 to 200 outputs, and the team measures how often the judge agrees with them (for example Cohen's kappa). If agreement is low, fix the rubric. Re-sample humans every month to detect drift.
+Keep human review for high-risk cases and disagreements.
+used: MT-Bench and Chatbot Arena studies; Ragas and DeepEval style RAG evaluations; common in LLM product teams.
+avoid: Tasks with a checkable answer (code tests, math, exact facts); use programmatic checks, which are cheaper and exact.
+flow:
+  Outputs [lake: 5,000 answers] -> Judge [model: strong LLM] : question, answer, rubric | The judge model reads each item with the rubric.
+  Judge -> Scores [store: score + reason] : 1-5 and reason | It returns a score and a short reason for each answer.
+  Human raters [user: 150-sample audit] -> Scores : human labels | People label a small random sample.
+  Scores -> Agreement check [svc: kappa] : judge vs human | The team measures how much the judge agrees with people.
+  Agreement check -x> Judge : kappa 0.45, rewrite rubric | Low agreement means the rubric is revised and the run repeated.
+  Agreement check -> Dashboard [client: team] : trusted scores | Scores are used only when agreement is good.
+ref: paper | Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena | Zheng et al., NeurIPS 2023 | https://arxiv.org/abs/2306.05685
+
+== Production logs grow the regression set
+kind: feedback-loop
+when: Your fixed eval set no longer matches what real users ask, and new failures keep escaping.
+how: The application logs inputs, outputs, retrieved context and user signals such as thumbs down, retries and escalations, after removing personal data. A sampler picks from the logs: all negative signals, plus a random 1 percent of the rest, so rare failures and normal traffic are both seen.
+Reviewers or a judge model label the sampled cases and write the expected behavior. Confirmed failures are added to the eval set with a tag for the failure type. Next time the suite runs, the same bug cannot come back unseen.
+Track the share of eval cases that come from production and the age of the set. Keep the old cases, as they show whether a change fixed one thing and broke another.
+Respect privacy rules and retention limits for logged data.
+used: Common in LLM application teams; tools include Langfuse, LangSmith, Braintrust and MLflow tracing.
+avoid: Products with no logging allowed or very low traffic; use a hand-written scenario set.
+flow:
+  App [svc: LLM product] -> Trace log [log: inputs, outputs] : request + response | The app logs each interaction with a trace id.
+  User [user: end user] -> App : thumbs down | Negative feedback is attached to the trace.
+  Trace log -> Sampler [svc: negatives + 1%] : traces | The sampler keeps all negatives and a small random share.
+  Sampler -> Reviewer [user: labeler] : cases | A person or judge writes the expected behavior.
+  Reviewer -> Eval set [store: tagged cases] : new failure case | Confirmed failures become permanent test cases.
+  Eval set ~> CI pipeline [svc: eval runner] : runs on each change | The new cases run in every later release check.
+ref: docs | Evaluation concepts | LangSmith documentation | https://docs.smith.langchain.com/evaluation
+
+@@ featureeng
+== Point-in-time correct training set
+kind: feature-store, backfill-replay
+when: You build training rows from event history, and a feature must show only what was known at that moment.
+how: Each training example has an entity (a user), a label time (when the click happened) and a label. Its features, for example "purchases in the last 30 days", must be computed as of that label time, not as of today. Using later data is leakage: the model learns from the future and fails in production.
+An as-of join does this. For each example, take the latest feature value with a timestamp at or before the label time. Feature stores (Feast, Tecton, Databricks and others) provide this join over timestamped feature tables.
+Data that arrives late needs care: use the time when the value became available, not only the time of the event. Rebuilding a feature after a bug fix means replaying history over raw events.
+Check that online and offline values agree for the same entity and time. A mismatch is called training-serving skew.
+used: Feast point-in-time joins; Tecton and Databricks feature engineering; common in ad, fraud and recommendation pipelines.
+avoid: Static data with no time dimension, where a plain join is fine.
+flow:
+  Label events [lake: clicks with time] -> As-of join [svc: point-in-time] : user, label time | The join takes each label with its timestamp.
+  Feature tables [store: values with time] -> As-of join : timestamped features | Feature tables keep every value with its time.
+  As-of join -> Training set [lake: leak-free rows] : latest value at or before | For each row the join picks the latest value known at that time.
+  As-of join -x> Feature tables : value after t ignored | Values written later than the label time are skipped.
+  Training set -> Trainer [svc: model fit] : features + label | The model trains on rows that mirror serving.
+  Trainer ~> Skew check [svc: online vs offline] : compare values | Online and offline values are compared to catch skew.
+ref: docs | Point-in-time joins | Feast documentation | https://docs.feast.dev/
+ref: book | Machine Learning Design Patterns | Lakshmanan, Robinson & Munn, O'Reilly, 2020 |
+
+== Streaming window aggregates for online features
+kind: windowed-agg, stream-table-join, feature-store
+when: A model needs fresh counts, such as clicks in the last 10 minutes, at request time.
+how: A stream job reads the event log and keeps windowed aggregates per entity: counts, sums and distinct counts over 5 minutes, 1 hour and 24 hours. It uses event time and watermarks, so late events are handled in a defined way.
+The results go to a low-latency online store such as Redis or DynamoDB, keyed by entity id. At request time the model service looks up the key and gets a ready feature vector in one or two milliseconds. It does not scan raw events.
+The same events also land in a lake. A batch job uses the same feature definitions to build training data, so the offline and online values match. Use one definition in code, or generate both from a shared spec.
+Windows that slide often cost more state. Choose the smallest set of windows that the model really needs.
+used: Flink and Spark Structured Streaming feature pipelines; Feast and Tecton streaming features; common in fraud and ad targeting.
+avoid: Features that change slowly (daily batch is enough); or when freshness of minutes is not worth the extra system.
+flow:
+  Event log [log: clicks] -> Stream job [svc: Flink] : click events | The job reads events as they arrive.
+  Stream job -> Online store [cache: Redis] : user:42 clicks_10m = 7 | Windowed counts are written under the user key.
+  Event log ~> Lake [lake: Parquet] : raw copy | The same events are archived for training.
+  Model service [svc: ranker] -> Online store : get user:42 | At request time the model reads the ready features.
+  Online store -> Model service : feature vector in 2 ms | The lookup takes a few milliseconds.
+  Lake ~> Batch job [svc: same definitions] : build training data | Batch uses the same definitions, so values match offline.
+ref: docs | Feature store concepts | Feast documentation | https://docs.feast.dev/
+ref: paper | The Dataflow Model | Akidau et al., VLDB 2015 |
+
+== Hashing trick for high-cardinality IDs
+kind: hashing-trick
+when: A feature, such as user id, ad id or URL, has millions or billions of values, and a lookup dictionary would be too large or too slow.
+how: A dictionary that maps each raw value to a column or row number must be built, stored and kept up to date on every serving machine. New values appear every day and break it.
+The hashing trick skips the dictionary. Compute hash(value) modulo B, for example B = 2^22, about 4 million, and use the result as the index in the feature vector or in an embedding table. No state is needed, and unseen values still map to a valid slot.
+Collisions happen: two values share a slot. With B large enough relative to the number of active values, the effect on accuracy is small. Embeddings can use two hash functions per value to reduce harm. Feature crosses (user x category) can be hashed in the same way.
+Choose B from memory limits. Use the same hash function and seed in training and serving, or the indexes will not match.
+used: Vowpal Wabbit; scikit-learn FeatureHasher; large-scale CTR models with hashed ID embedding tables.
+avoid: When values are few and each needs its own clear meaning (use one-hot); or when a collision on a key value would be costly.
+flow:
+  Raw event [client: user and ad] -> Hasher [svc: hash mod 2^22] : string values | Each categorical value is hashed to a number.
+  Hasher -> Embedding table [store: 4M rows] : index 1,204,553 | The index selects one row of the embedding table.
+  Embedding table -> Model [model: CTR network] : embedding vector | The row is the learned vector for that value.
+  Hasher -> Cross hasher [svc: user x category] : two values | Feature crosses can be hashed into the same table.
+  Cross hasher -x> Embedding table : collision, shared row | Two different values can land on the same row.
+  Model -> Trainer [svc: training job] : gradient on that row | Training updates the shared row in both directions.
+ref: paper | Feature Hashing for Large Scale Multitask Learning | Weinberger et al., ICML 2009 | https://arxiv.org/abs/0902.2206
+ref: docs | FeatureHasher | scikit-learn documentation | https://scikit-learn.org/stable/modules/feature_extraction.html#feature-hashing

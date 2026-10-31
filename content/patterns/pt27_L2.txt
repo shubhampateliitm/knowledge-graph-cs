@@ -1,0 +1,855 @@
+@@ tee
+== Remote attestation before key release
+kind: zero-trust, envelope-encryption
+when: A secret (a data key or model key) must reach a workload running on a cloud host that you do not fully trust.
+how: The workload starts inside a TEE, for example an Intel TDX or AMD SEV-SNP confidential VM. The CPU measures the code and settings that were loaded and signs this measurement with a key rooted in the chip vendor.
+The workload sends this signed evidence to a verifier. The verifier checks the vendor certificate chain and compares the measurement to an allow-list. Only then does a key broker (a KMS) release the data key, wrapped for a key that exists only inside the TEE.
+If the code changes by one byte, the measurement changes and the key is not released. The cloud operator can still stop the workload, but cannot read its memory or its keys.
+used: Confidential VMs on major clouds with attestation services; the IETF RATS architecture (RFC 9334) describes the roles; confidential containers projects.
+avoid: When the main threat is a bug in your own code or a side channel; a TEE does not fix either. Use normal isolation and review.
+flow:
+  Workload [svc: inside TEE] -> Verifier [svc: attestation] : signed measurement | The CPU signs a hash of the loaded code. The workload sends this evidence to the verifier.
+  * Verifier: hash on allow-list | The verifier checks the vendor certificate chain and compares the hash to its allow-list.
+  Verifier -> Key broker [svc: KMS] : attestation OK | A good result is passed to the key broker as a signed token.
+  Key broker -> Workload : wrapped data key | The key is wrapped for a key held only inside the TEE, so the host cannot read it.
+  Workload -> Encrypted store [store: ciphertext] : read and decrypt | The workload decrypts data inside the TEE. Plain text never leaves protected memory.
+  Tampered workload [svc: changed code] -x> Verifier : different hash | A changed binary gives a different measurement, so no key is released.
+ref: spec | Remote ATtestation procedureS (RATS) Architecture, RFC 9334 | IETF, 2023 | https://www.rfc-editor.org/rfc/rfc9334
+
+== Confidential analytics over joined private data
+kind: privacy-clean-room, zero-trust
+when: Two companies want a joint result, such as ad overlap, without either side seeing the other's raw rows.
+how: Each party encrypts its dataset and uploads it to a clean room that runs inside a TEE. The enclave is attested to both parties. Each party's KMS releases its key only to the attested code.
+Inside the enclave, an agreed query runs, for example a join on hashed identifiers and a count. Output rules are fixed in the attested code: a minimum group size, noise, and no row-level output. Only the aggregate leaves the enclave.
+The trust moves from the clean-room operator to the chip vendor and the audited code. Memory encryption costs a few percent of speed on common workloads, but I/O to encrypted storage can cost more.
+used: Confidential clean rooms offered by cloud and ad-tech vendors; confidential computing is one of several ways to build a clean room, next to differential privacy and cryptographic protocols.
+avoid: When the two parties can share data under a plain contract; or when the query is simple enough for secure aggregation without hardware trust.
+flow:
+  Advertiser [client] -> Clean room [svc: runs in TEE] : encrypted audience | The advertiser uploads encrypted customer hashes.
+  Publisher [client] -> Clean room : encrypted exposures | The publisher uploads encrypted ad exposure logs.
+  Clean room -> Advertiser KMS [svc], Publisher KMS [svc] : attestation evidence | Each party checks the code hash before it releases its key.
+  Advertiser KMS, Publisher KMS -> Clean room : data keys | Both keys go only to the attested enclave.
+  * Clean room: join and count | The agreed query joins the two sets inside protected memory.
+  Clean room -> Advertiser : counts, groups of 50+ | Only aggregates above a minimum group size are returned.
+ref: docs | Confidential Computing Consortium | Linux Foundation | https://confidentialcomputing.io/
+
+== Confidential GPU for model inference
+kind: offload-accelerator, zero-trust
+when: A model or the prompts are sensitive, and inference must run on shared GPU servers.
+how: The host starts a confidential VM, and the GPU is attached in confidential mode (supported on NVIDIA H100 and later). The CPU TEE and the GPU each produce attestation evidence.
+The client or key service checks both reports. Then the model weights and the prompt are decrypted only inside the VM and the GPU. Data moves between CPU and GPU over an encrypted channel, using bounce buffers in shared memory.
+The extra encryption adds overhead, most visible for small batches and many small transfers; large batches hide most of it. Side channels are not removed, so access control and code review still apply.
+used: Confidential AI offerings on major clouds using H100 or Blackwell GPUs; private inference services for regulated data.
+avoid: When data is public and the model is open; the cost and the attestation work bring nothing.
+flow:
+  Client [client] -> Inference gateway [svc: in TEE VM] : encrypted prompt | The prompt is encrypted to a key that only the attested VM can use.
+  Inference gateway -> Attestation service [svc] : CPU and GPU reports | The VM and the GPU each give signed evidence.
+  Attestation service -> Inference gateway : verified token | Both reports match the allow-list.
+  Inference gateway -> GPU [svc: confidential mode] : encrypted transfer | Data crosses PCIe encrypted, through bounce buffers.
+  GPU -> Inference gateway : encrypted tokens | The result returns the same way and is encrypted again for the client.
+  Inference gateway -> Client : response | Only the client sees the plain answer.
+ref: docs | Confidential Computing Consortium | Linux Foundation | https://confidentialcomputing.io/
+
+@@ threatmodel
+== Data-flow diagram with trust boundaries
+kind: threat-model
+when: A new feature or service is designed, and you want to find security flaws before any code exists.
+how: The team draws a data-flow diagram: external actors, processes, data stores and flows. Then it draws dashed lines where trust changes, such as the internet edge, the service to database link, and the tenant boundary.
+For each element that touches a boundary, the team asks the six STRIDE questions: spoofing, tampering, repudiation, information disclosure, denial of service, elevation of privilege. Each threat gets a score (likelihood and impact) and an owner.
+The output is a short list of fixes, ranked by risk, and tracked as normal tickets. A review takes a few hours for one feature, and it is repeated when the diagram changes.
+used: Microsoft's STRIDE method and the Threat Modeling Tool; OWASP Threat Dragon and pytm keep the model as a file next to the code.
+avoid: As a one-time document that nobody updates. Keep the model small and in the repository, or it will go stale.
+flow:
+  Architect [user] -> DFD [note: processes, stores, flows] : draw system | The architect draws actors, services, stores and flows.
+  Architect -> DFD : mark trust boundaries | Dashed lines show where data crosses from less trusted to more trusted zones.
+  DFD -> Review team [user: STRIDE per element] : each crossing flow | For every flow that crosses a boundary, the team asks the six STRIDE questions.
+  Review team -> Threat list [store: score + owner] : 14 threats ranked | Each threat gets a risk score, an owner and a fix.
+  Threat list -> Backlog [queue: tickets] : top fixes | The highest-risk items become tickets. Low risks are accepted in writing.
+  Backlog ~> DFD : re-review on change | When the design changes, the diagram and the threats are updated.
+ref: docs | Threat Modeling | OWASP Foundation | https://owasp.org/www-community/Threat_Modeling
+
+== Mapping STRIDE threats to standard controls
+kind: rate-limit, federated-identity
+when: A model lists many threats, and the team needs a consistent way to choose fixes instead of inventing new ones each time.
+how: Each STRIDE category has usual answers. Spoofing is answered by authentication, for example single sign-on with short-lived tokens. Tampering is answered by signatures, TLS and integrity checks. Repudiation is answered by append-only audit logs.
+Information disclosure is answered by encryption and access control. Denial of service is answered by rate limits and quotas at the gateway. Elevation of privilege is answered by least privilege and input validation.
+The team writes the chosen control next to each threat, and a test or a monitor that proves it works. A threat with no control and no test is an open risk that someone must accept.
+used: Common practice in security design reviews at cloud and SaaS companies; the mapping appears in Microsoft's SDL guidance.
+avoid: When used as a tick-box list without looking at the real design; threats unique to your system will be missed.
+flow:
+  Threat list [store] -> Spoofing [note: fake caller], Tampering [note: changed data], Overload [note: denial of service] : classify | Each threat is placed in one STRIDE category.
+  Spoofing -> SSO gateway [svc: OIDC tokens] : require identity | Spoofing is answered by strong authentication with short-lived tokens.
+  Tampering -> Signed messages [svc: HMAC or signature] : verify integrity | Tampering is answered by signatures checked at the receiver.
+  Overload -> Rate limiter [svc: token bucket] : 100 req/s per client | Denial of service is answered by limits at the gateway.
+  SSO gateway, Signed messages, Rate limiter -> Test suite [svc: security tests] : prove each control | Every control gets a test, so the threat is closed with evidence.
+ref: docs | Threat Modeling | OWASP Foundation | https://owasp.org/www-community/Threat_Modeling
+
+@@ archstyles
+== Hexagonal ports and adapters
+kind: hexagonal
+when: Business rules must stay testable and stable while databases, queues and web frameworks change around them.
+how: The core holds the domain logic and defines ports, which are interfaces such as OrderRepository or PaymentGateway. Adapters implement the ports: a Postgres adapter, a REST adapter, a test double. The core depends on the ports only. The adapters depend on the core, never the reverse.
+Driving adapters (HTTP, CLI, a queue consumer) call the core. Driven adapters (database, email, payment API) are called by the core through ports. At startup, one composition root wires the chosen adapters in.
+Tests run the core with in-memory adapters in milliseconds. Changing the database means writing one new adapter, not editing business code. The cost is extra interfaces and mapping code.
+used: Alistair Cockburn's original description (2005); common in Java and Kotlin services built with Spring and in Clean Architecture projects.
+avoid: For a small CRUD service where the interfaces add more code than the logic they protect.
+flow:
+  REST adapter [svc: driving] -> Order core [svc: domain logic] : PlaceOrder command | An HTTP request is translated into a plain command for the core.
+  Order core -> OrderRepository port [note: interface] : save(order) | The core calls an interface it owns. It does not know which database is behind it.
+  OrderRepository port -> Postgres adapter [svc: driven] : SQL insert | The adapter implements the port and talks to the real database.
+  Postgres adapter -> Postgres [db] : INSERT | The only code that knows SQL lives in this adapter.
+  Test adapter [svc: in-memory] -> Order core : same command | Tests use a fake adapter and run in milliseconds.
+ref: blog | Hexagonal architecture | Alistair Cockburn, 2005 | https://alistair.cockburn.us/hexagonal-architecture/
+
+== Pipes and filters for stream processing
+kind: pipes-filters
+when: Data passes through several independent transforms, and you want to reorder, reuse or scale each step alone.
+how: Each filter reads from an input channel, does one job and writes to an output channel. Examples are parse, validate, enrich and aggregate. Filters share nothing except the message format, so each one can be tested and deployed alone.
+The pipes can be Unix pipes, in-memory queues or Kafka topics. With topics, each filter is a consumer group that can scale to as many instances as there are partitions. A slow filter builds lag on its input topic and does not block the earlier ones.
+The cost is latency at each hop and the need for a clear schema. Errors need a dead-letter pipe, or one bad record blocks the line.
+used: Unix shell pipelines; Kafka Streams and Flink job graphs; log shippers such as Logstash and Vector.
+avoid: When steps need shared mutable state or one transaction across all of them; use a single service with a database transaction.
+flow:
+  Raw events [topic] -> Parse filter [svc: JSON to record] : read | The first filter turns raw bytes into typed records.
+  Parse filter -> Validate filter [svc: schema check] : typed record | Only well-formed records move on.
+  Parse filter -x> Dead-letter topic [topic] : bad record | A record that cannot be parsed goes to a side channel with the error.
+  Validate filter -> Enrich filter [svc: add geo + device] : valid record | The third filter joins lookup data.
+  Enrich filter -> Clean events [topic] : enriched record | The result is written to a topic that other teams can read.
+ref: docs | Pipes and Filters pattern | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/patterns/pipes-and-filters
+
+== Layered web application with a one-way dependency rule
+kind: layered-arch
+when: A typical business application needs a clear structure that many developers can follow with little training.
+how: Code is split into layers: presentation (controllers), application (use cases), domain (rules and entities) and data access. A layer may call only the layer directly below it, or only inward in a strict variant. The rule is checked in the build, for example with ArchUnit in Java.
+A request enters at the top, passes the layers once, and returns the same way. Cross-cutting parts such as logging, auth and transactions are applied at one layer, so the others stay clean.
+Layers are easy to learn but can turn into a "big ball of mud" if the rule is not enforced. A change to one feature often touches every layer, so teams that own features end up in each other's way.
+used: Most enterprise web back ends (Spring MVC, ASP.NET, Django apps); the first style in many architecture books.
+avoid: When several teams must change and deploy features on their own; split by business area (modular monolith or services) instead of by layer.
+flow:
+  Browser [client] -> Controller [svc: presentation] : POST /orders | The request enters the top layer, which only parses input and formats output.
+  Controller -> Order service [svc: application] : placeOrder(cmd) | The use case runs in one transaction.
+  Order service -> Order entity [svc: domain] : validate and price | The rules live in the domain layer and do not know HTTP or SQL.
+  Order service -> Order repository [svc: data access] : save | The data layer is the only one that talks to the database.
+  Order repository -> Postgres [db] : INSERT | One write inside the transaction.
+  Controller -x> Postgres : forbidden call | A direct call that skips layers fails the architecture test in the build.
+ref: docs | Layered architecture style | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles/n-tier
+
+@@ qualityattr
+== Quality scenarios and a utility tree
+kind: none
+when: Stakeholders say "it must be fast and reliable" and the team needs targets it can design and test against.
+how: Each goal is rewritten as a scenario with six parts: source, stimulus, artifact, environment, response and response measure. For example: "At peak load (environment), 5,000 users (source) search (stimulus); the system (artifact) answers (response) in under 300 ms at p99 (measure)."
+The scenarios are placed in a utility tree: quality attribute, then refinement, then scenario. Each scenario is rated for business importance and technical difficulty. Scenarios rated high on both are the architecture drivers.
+In an ATAM review, the team then walks each driver through the design and records risks, sensitivity points and trade-off points. The result is a short ranked list, not a long report.
+used: The SEI's ATAM method; teams that set SLOs and write fitness tests from the same scenarios.
+avoid: For a small prototype where the cost of the workshop exceeds the cost of a rewrite.
+flow:
+  Stakeholders [user] -> Scenarios [note: six parts] : fast becomes p99 < 300 ms | Vague goals are rewritten as measurable scenarios.
+  Scenarios -> Utility tree [store: attribute > scenario] : rate both scales | Each scenario is rated high, medium or low on both scales.
+  Utility tree -> Architect [user: ATAM review] : top 5 drivers | Scenarios high on both scales drive the design.
+  Architect -> Design [svc: candidate architecture] : walk each driver | The team traces each scenario through the design.
+  Design -> Risk list [store: risks] : 3 risks, 2 trade-offs | The review records risks and trade-off points for the next iteration.
+ref: book | Software Architecture in Practice | Bass, Clements & Kazman, 4th ed., 2021 |
+
+== Tactic choice with a visible trade-off
+kind: cache-aside, read-replicas
+when: One quality scenario fails, such as read latency, and you must pick a fix that does not break another quality.
+how: For each failing scenario, list tactics from the known catalog. For latency these are caching, read replicas, precomputing and batching. For each tactic, write which other attribute it hurts. A cache adds speed but risks stale data. A read replica adds capacity but adds replication lag.
+The team picks the tactic that fits the scenario and records the cost in a decision record. A test then proves the target: for example, a load test at p99 under 300 ms and a freshness check that data is never older than 5 seconds.
+The record also states what would make the team revisit the choice, such as a stricter freshness need.
+used: Architecture decision records (ADRs) in engineering teams; the tactics catalog from the SEI.
+avoid: Choosing a tactic by habit. A cache for a scenario that is limited by writes only adds a second source of truth.
+flow:
+  Load test [svc: p99 = 900 ms] -> Scenario [note: p99 < 300 ms] : target missed | The measured latency fails the scenario.
+  Scenario -> Tactic list [note: known options] : find options | The team lists known tactics for latency.
+  Tactic list -> Cache [cache: Redis, TTL 5 s] : cache-aside chosen | Cache-aside fits: reads dominate and 5 seconds of staleness is fine.
+  Cache -> Orders DB [db] : miss, load row | A miss reads the database once, then the next reads are served from memory.
+  Load test -> Scenario : p99 = 180 ms | The new test passes. The cost, staleness, is written in the decision record.
+ref: book | Software Architecture in Practice | Bass, Clements & Kazman, 4th ed., 2021 |
+
+== Decision records with fitness functions
+kind: decision-record
+when: The team makes many design choices and must keep them from being forgotten or silently broken over time.
+how: Each significant decision gets a short record in the repository: context, options, decision, and consequences. The record is reviewed in a pull request like code. A new record can supersede an older one, so the history stays readable.
+Quality goals are turned into automated fitness functions that run in CI: a latency test on a fixed dataset, a check that no module imports a forbidden module, a check that the container image is under a size limit. A failing check blocks the merge.
+This keeps the architecture honest: the written reason is next to the code, and drift is caught on the day it happens, not in an annual review.
+used: Michael Nygard's ADR format; ArchUnit and similar tools for dependency rules; the "evolutionary architecture" approach.
+avoid: Writing records for trivial choices. Keep them for decisions that are costly to reverse.
+flow:
+  Architect [user] -> ADR repo [store: docs/adr/*.md] : propose ADR-014 | The author writes the context, options and decision as a file in a pull request.
+  ADR repo -> Reviewers [user] : PR review | The team debates and changes the record before it is merged.
+  ADR repo -> CI [svc: fitness tests] : merge triggers checks | Each decision that has a measurable goal is linked to a test.
+  CI -> Build gate [svc: pass or fail] : latency, dependency rules | The tests check the goals on every commit.
+  Build gate -x> Developer [user] : forbidden import | A change that breaks a rule fails the build, with a link to the record.
+ref: blog | Documenting Architecture Decisions | Michael Nygard, 2011 | https://www.cognitect.com/blog/2011/11/15/documenting-architecture-decisions
+
+@@ ddd
+== Anti-corruption layer between bounded contexts
+kind: anti-corruption
+when: A new context must use a legacy or partner system whose model does not fit your own domain language.
+how: Each bounded context has its own model. The word "customer" in billing is not the same as "customer" in support. When two contexts meet, one side must not copy the other model into its own code.
+The downstream context puts a translation layer at the border. It calls the upstream API, maps its data into the local model, and hides odd names, codes and rules. Inside the context, the code sees only clean domain types.
+If the upstream changes, only the translator changes. The cost is extra code and one more hop, so use it where the upstream model is old, unstable or foreign.
+used: Eric Evans' context map patterns; common when new services wrap a mainframe or ERP; Azure architecture guidance lists it as a standard pattern.
+avoid: When both contexts are owned by one team and share the same model; a shared kernel is simpler.
+flow:
+  Shipping context [svc: new model] -> ACL [svc: translator] : getAddress(customerId) | The new context asks for data in its own words.
+  ACL -> Legacy ERP [svc: old model] : SOAP CUST_ADDR_RQ | The layer calls the legacy API with its own codes and format.
+  Legacy ERP -> ACL : CUST_REC, code 07 | The ERP returns a record with odd field names and status codes.
+  ACL -> Shipping context : Address value object | The layer maps the record to a clean type, so legacy terms stop at the border.
+  Legacy ERP -x> ACL : timeout | A failure is turned into a domain error that the context understands.
+ref: blog | Bounded Context | Martin Fowler | https://martinfowler.com/bliki/BoundedContext.html
+ref: docs | Anti-corruption Layer pattern | Microsoft Azure Architecture Center | https://learn.microsoft.com/en-us/azure/architecture/patterns/anti-corruption-layer
+
+== Domain events between contexts
+kind: event-driven, outbox
+when: One context changes state, and other contexts must react without sharing a database or calling it directly.
+how: The owning context publishes a domain event when something important happens, for example OrderPlaced. The event uses the language of that context and is a fact in the past tense. It is stored in an outbox table in the same transaction as the change, then sent to a broker.
+Other contexts subscribe and keep their own copy of what they need. Inventory reserves stock, and billing creates an invoice. Each subscriber may translate the event into its own model, often through an anti-corruption layer.
+This keeps contexts loosely coupled and free to deploy alone. The price is eventual consistency: a reader may see old data for seconds. Event schemas become a public contract and need versions.
+used: Event-driven microservices on Kafka or RabbitMQ; teams that follow Evans' and Vernon's DDD books.
+avoid: When a business rule needs an immediate answer from another context; use a synchronous call, or move the rule into one context.
+flow:
+  Sales context [svc: owns orders] -> Sales DB [db: order + outbox] : one transaction | The order and the OrderPlaced event are saved together.
+  Sales DB -> Event broker [log: OrderPlaced] : relay | A relay publishes the stored event to the broker.
+  Event broker -> Inventory context [svc], Billing context [svc] : OrderPlaced | Both contexts receive the same fact.
+  Inventory context -> Inventory DB [db] : reserve stock | Inventory acts in its own language and its own database.
+  Billing context -> Billing DB [db] : create invoice | Billing keeps its own view of the order.
+ref: blog | Domain event | Martin Fowler | https://martinfowler.com/eaaDev/DomainEvent.html
+
+== Bounded contexts as modules of a modular monolith
+kind: modular-monolith, strangler-fig
+when: The team wants clear domain boundaries now, but is not ready for the cost of many deployed services.
+how: Start by naming the bounded contexts through event storming with domain experts. Then create one module per context inside one deployable application. Each module owns its tables and exposes a small public interface. Other modules may not read its tables or call its internals.
+Calls between modules go through that interface or through in-process events. A build rule, such as ArchUnit or a module system, enforces it.
+When a module needs its own scaling or team, it can be moved out into a service with little change, because the boundary already exists. The old call is replaced step by step, like a strangler fig. The risk is that boundaries drawn without domain knowledge are wrong, and wrong service boundaries are very costly to fix.
+used: Shopify's modular monolith work on its Rails app; Spring Modulith; many teams that reverse their early move to microservices.
+avoid: When teams in different companies or regions must release on their own; separate services give that independence.
+flow:
+  Event storming [user: domain experts] -> Context map [note: 4 contexts] : find boundaries | Experts and developers find where the language changes.
+  Context map -> Orders module [svc: owns orders tables], Billing module [svc: owns billing tables] : one module each | Each context becomes a module inside one application.
+  Orders module -> Billing module : public API call | Modules talk only through a small public interface.
+  Orders module -x> Billing module : read its tables | A direct table read breaks the architecture test and the build.
+  Billing module -> Billing service [svc: extracted later] : move out | Later the module is deployed alone, and the call becomes a network call.
+ref: blog | Bounded Context | Martin Fowler | https://martinfowler.com/bliki/BoundedContext.html
+
+@@ designpatterns
+== In-process observer and event bus
+kind: pubsub
+when: One object's state change must trigger several reactions, and the source should not know who reacts.
+how: The subject keeps a list of observers behind an interface. When its state changes, it calls each observer's notify method. New reactions are added by registering a new observer, without editing the subject. This is the Open/Closed principle in practice.
+In larger apps the subject posts events to an in-process event bus. Handlers are registered by event type. React state stores, UI frameworks and domain event dispatchers all use this shape.
+Be careful with order, with errors thrown by one handler, and with observers that are never removed, since they cause memory leaks. For work that must survive a crash, use a durable queue, not an in-memory list.
+used: Java Swing listeners; the DOM addEventListener; Redux and React subscriptions; Guava EventBus; Spring application events.
+avoid: When a reaction must be reliable, ordered or run in another process; use a message broker instead.
+flow:
+  Cart [svc: subject] -> Event bus [svc: type to handlers] : post ItemAdded | The cart posts an event and does not know who is listening.
+  Event bus -> Price badge [svc: observer], Analytics [svc: observer] : notify handlers | The bus calls every handler registered for this event type.
+  Price badge -> Page [client] : update total | One observer updates the screen.
+  Analytics -> Metrics queue [queue] : send add_to_cart | Another observer records the event for later.
+  Analytics -x> Event bus : handler throws | A failing handler must not stop the others, so the bus catches it.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson & Vlissides, 1994 |
+
+== Decorator chain for resilient clients
+kind: retry-backoff, circuit-breaker
+when: Every call to a remote service needs the same extras, such as retry, timeout and logging, and they must be easy to combine.
+how: Each extra is a decorator: a class that implements the same interface as the real client and wraps another one. The caller sees only the interface. The chain is built once at startup: logging wraps retry, retry wraps the circuit breaker, and the breaker wraps the HTTP client.
+Each layer does one job. The retry layer waits 100 ms, 200 ms, 400 ms with jitter. The breaker opens after, say, 5 failures in a row and fails fast for 30 seconds. Order matters: retry outside the breaker counts every try.
+New behavior is added by adding a layer, not by editing the client. Many libraries, such as Resilience4j, Polly and Envoy filters, provide ready layers.
+used: Resilience4j decorators in Java; Polly pipelines in .NET; HTTP middleware stacks in most web frameworks.
+avoid: When a long chain makes the stack trace hard to read; keep it to the few layers that earn their place.
+flow:
+  Order service [svc] -> Logging layer [svc: decorator] : getPrice(sku) | The caller uses the plain interface and does not see the chain.
+  Logging layer -> Retry layer [svc: 3 tries] : same call | Each decorator forwards to the next one with the same interface.
+  Retry layer -> Breaker layer [svc: opens at 5 fails] : attempt 1 | The retry layer sends the first attempt.
+  Breaker layer -> Pricing API [svc] : HTTP GET | The innermost layer is the real client.
+  Pricing API -x> Breaker layer : 503 | A failure is counted by the breaker.
+  Retry layer ~> Breaker layer : attempt 2 after 100 ms | The retry layer waits with jitter and tries again.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson & Vlissides, 1994 |
+
+== Strategy and dependency inversion for pluggable policies
+kind: plugin-arch
+when: A business rule, such as a pacing or pricing algorithm, must change by configuration or by customer without edits to the caller.
+how: The caller depends on an interface, for example PacingStrategy with one method. Concrete strategies implement it: even pacing, front-loaded pacing, ASAP. This is the Strategy pattern together with dependency inversion, the D in SOLID.
+A factory or a dependency injection container reads configuration and gives the caller the right strategy for each campaign. A new strategy is a new class, or a new plug-in jar, with no change in the caller. In languages with first-class functions the strategy is just a function.
+Tests inject a fake strategy. The risk is too many tiny strategies, which hide simple logic behind many files.
+used: Spring and Guice injection of strategy beans; pricing, routing and pacing engines in ad servers; Java's Comparator is a strategy.
+avoid: When there is only one algorithm and no real chance of a second; a plain function is enough.
+flow:
+  Config [store: campaign settings] -> Factory [svc: DI container] : strategy = asap | The settings name the strategy for each campaign.
+  Factory -> Budget pacer [svc: uses interface] : inject AsapStrategy | The container gives the pacer a concrete strategy.
+  Budget pacer -> AsapStrategy [svc: implements it] : nextBudget(now) | The pacer calls only the interface method.
+  AsapStrategy -> Budget pacer : spend 40 USD | The strategy returns the amount allowed in this interval.
+  Config -> Factory : change to even | An operator changes the setting and no pacer code is edited.
+  Factory -> Budget pacer : inject EvenStrategy | The next campaign run uses the new strategy.
+ref: book | Design Patterns: Elements of Reusable Object-Oriented Software | Gamma, Helm, Johnson & Vlissides, 1994 |
+
+@@ btree
+== Secondary index lookup then heap fetch
+kind: index-table
+when: A query filters on a column that is not the primary key, and the table has millions of rows.
+how: The database keeps a separate B+tree for the indexed column. Its leaf entries hold the key and a pointer to the row. In PostgreSQL the pointer is a tuple id (page and slot) into the heap. In InnoDB the pointer is the primary key, so a second lookup in the clustered index follows.
+A lookup walks from the root to a leaf in 3 or 4 page reads for hundreds of millions of rows, because each node holds hundreds of keys. The upper levels are almost always in memory. Then each match costs one more page read to fetch the row.
+For many matches, the random heap reads dominate. The planner may choose a bitmap scan or a full table scan. A covering index, which stores the needed columns in the index, avoids the fetch.
+used: PostgreSQL btree indexes; MySQL InnoDB secondary indexes; SQLite indexes; almost every relational database.
+avoid: When a query reads most of the table; a sequential scan is faster. Or when writes are very heavy and many indexes slow each insert.
+flow:
+  Query [client] -> Index root [store: 1 page] : email = 'a@x.com' | The search starts at the root page, which is always cached.
+  Index root -> Index internal [store: 1 page] : child pointer | A binary search over the keys picks one child.
+  Index internal -> Index leaf [store: 1 page] : child pointer | The leaf holds the key and a row pointer.
+  Index leaf -> Heap page [db: table rows] : tuple id (7, 3) | One more random page read fetches the full row.
+  Heap page -> Query : row | The row is returned. Total cost: about 4 page reads.
+ref: docs | Index types: B-Tree | PostgreSQL documentation | https://www.postgresql.org/docs/current/indexes-types.html
+
+== Keyset pagination over the leaf chain
+kind: index-table
+when: A list or feed must page through a large ordered result without slowing down on deep pages.
+how: B+tree leaves are linked in key order, so a range scan finds the first key and then follows the leaf links. Offset paging does not use this well: OFFSET 100000 still reads and drops 100,000 entries.
+Keyset paging remembers the last key of the previous page and asks for the next rows after it: WHERE (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT 50. The tree descends to the right place in a few page reads, then reads 50 entries along the leaves. The cost is the same for page 1 and page 10,000.
+The index must match the sort order, and the sort key must be unique, so the id is added as a tie-breaker. You cannot jump to page N directly.
+used: Feeds and timelines in web apps; API cursors in Stripe-style and GitHub-style list endpoints; batch jobs that walk a big table in chunks.
+avoid: When users need random access to page N or a total count; use offset with a limit on depth, or a search engine.
+flow:
+  App [client] -> Orders index [db: key + id] : after (t9, id 812) | The app sends the last key it saw as a cursor.
+  * Orders index: seek done in 3 reads | The tree descends to the first key after the cursor.
+  Orders index -> App : 50 keys and row ids | The scan follows leaf links and returns 50 entries in order.
+  App -> User [user] : next page | The page is shown with a new cursor, the last key of this page.
+  App -x> Orders index : OFFSET 100000 | Offset paging would read and discard 100,000 entries on every request.
+ref: docs | Index types: B-Tree | PostgreSQL documentation | https://www.postgresql.org/docs/current/indexes-types.html
+
+== Crash-safe page split with the write-ahead log
+kind: wal
+when: An index must stay correct after a crash in the middle of an insert that splits pages.
+how: Inserting into a full leaf splits it in two and adds a separator key to the parent. This changes at least 3 pages, and a crash after only some of them are written would break the tree.
+The engine first appends a log record that describes the whole split to the write-ahead log. The log is flushed to disk at commit. The changed pages stay in the buffer pool and are written later, in any order, by the background writer or at a checkpoint.
+After a crash, recovery replays the log from the last checkpoint and redoes the split, so the tree is whole again. Without the log, the engine would need a careful write order or a full rewrite. The cost is that every change is written twice: once to the log, once to the page.
+used: PostgreSQL, InnoDB, SQL Server and Oracle; PostgreSQL has special WAL records for btree splits.
+avoid: When data is rebuilt easily, such as a cache; then a copy-on-write tree like LMDB can skip the log.
+flow:
+  Insert [client] -> Buffer pool [cache: leaf page full] : add key 42 | The engine finds the leaf and sees it is full.
+  Buffer pool -> WAL [log: sequential file] : record: split leaf | One log record describes the split and the parent change.
+  WAL -> Disk log [store: fsync] : flush at commit | The commit waits until this record is on disk.
+  * Buffer pool: 3 dirty pages | The new leaf and the parent are changed in memory only.
+  Buffer pool ~> Data files [store: B-tree pages] : write back later | A checkpoint writes the dirty pages in the background.
+  Data files -x> Buffer pool : crash before write | After a crash, recovery replays the WAL and finishes the split.
+ref: docs | Write-Ahead Logging (WAL) | PostgreSQL documentation | https://www.postgresql.org/docs/current/wal-intro.html
+
+@@ bufferpool
+== Page cache with pinning and clock eviction
+kind: memory-tiering
+when: Many queries read the same hot pages, and the database must serve them from memory with its own control.
+how: The pool is an array of fixed-size frames, for example 8 KB each. A page table maps a page id to its frame. A query asks for a page. On a hit, the pool pins it (a counter) so that it cannot be evicted while in use, and returns the frame.
+On a miss, the pool picks a victim frame with a policy such as clock sweep (PostgreSQL) or LRU. It skips pinned frames, writes the victim back if it is dirty, reads the new page from disk, and returns it.
+A good hit ratio (95 to 99 percent) is the main lever for speed. The database keeps its own pool rather than rely on the OS page cache, because it knows the access pattern and the write-ahead rule. The cost is double buffering with the OS cache unless direct I/O is used.
+used: PostgreSQL shared_buffers; InnoDB buffer pool; SQLite's pager cache; Oracle and SQL Server buffer caches.
+avoid: When data fits fully in memory and a pure in-memory engine is simpler; or when the OS cache is good enough, as in some embedded stores.
+flow:
+  Executor [svc: query] -> Buffer pool [cache: 16384 frames] : get page 812 | The executor asks for a page by id.
+  Buffer pool -> Executor : hit, pin count 1 | If the page is cached the frame is pinned and returned at once.
+  Buffer pool -> Disk [store: data files] : read page 9120 | On a miss the pool chooses a victim frame and reads the page into it.
+  Disk -> Buffer pool : 8 KB page | The page lands in the freed frame.
+  Buffer pool -x> Disk : pinned frame skipped | A frame in use is never chosen as a victim.
+  Executor -> Buffer pool : unpin page | When done, the executor unpins the page so it can be evicted later.
+ref: docs | Resource consumption: shared_buffers | PostgreSQL documentation | https://www.postgresql.org/docs/current/runtime-config-resource.html
+
+== Dirty-page write-back under the WAL rule
+kind: wal, write-through
+when: Writes must be fast and durable, so the commit should not wait for random page writes.
+how: A transaction changes a page in the pool and marks it dirty. It also adds a log record to the write-ahead log. Each page remembers the log position (LSN) of its last change.
+At commit, only the log is flushed to disk, which is one sequential write. The dirty page stays in memory. A background writer and the checkpointer write dirty pages later. Before writing a page, the pool makes sure the log is flushed up to that page's LSN. This is the write-ahead rule.
+After a crash, recovery replays the log to rebuild pages that were never written. A checkpoint limits the replay time, for example to a few minutes of log. Too many dirty pages cause a burst of I/O at checkpoints, so writes are spread over time.
+used: PostgreSQL bgwriter and checkpointer; InnoDB flush lists and adaptive flushing; ARIES-style engines.
+avoid: For data that cannot be replayed from a log; write-through to disk at each change is the simple choice there.
+flow:
+  Transaction [svc] -> Buffer pool [cache: page 77] : update row | The change is made in memory. The page is marked dirty.
+  Buffer pool -> WAL [log: LSN 9001] : log record | The record is appended with a new log sequence number.
+  Transaction -> WAL : commit, flush | Commit waits only for one sequential log flush.
+  * Buffer pool: page 77 dirty, LSN 9001 | The page waits in memory and will be written later.
+  Buffer pool ~> Data files [store: heap pages] : bgwriter or checkpoint | The writer first checks the log is flushed to LSN 9001. Then it writes the page.
+  WAL -> Buffer pool : replay after crash | After a crash the log rebuilds pages that never reached the disk.
+ref: docs | WAL configuration | PostgreSQL documentation | https://www.postgresql.org/docs/current/wal-configuration.html
+
+== Scan resistance with a ring buffer or midpoint insertion
+kind: memory-tiering
+when: A big table scan or a backup must not push the hot working set out of the cache.
+how: A plain LRU is easy to ruin: one scan of a 100 GB table touches each page once and evicts every hot page. Engines protect against this in two ways.
+PostgreSQL gives large sequential scans a small ring buffer, 256 KB, and reuses those frames, so the shared pool is hardly touched. InnoDB splits its LRU list into a young part and an old part, about 5/8 and 3/8. New pages enter at the midpoint, the old head. They move to the young part only if they are touched again after a short delay.
+The effect is that a page must prove it is used twice before it can displace hot data. The cost is that a table that is truly hot but is scanned once is cached less eagerly.
+used: PostgreSQL buffer access strategies; MySQL InnoDB midpoint insertion; LRU-K and 2Q in research and other engines.
+avoid: When all queries are scans on a small table that fits in memory; then plain LRU is fine.
+flow:
+  Hot queries [client] -> Buffer pool [cache: young and old lists] : point lookups | Hot pages stay in the young list and are reused many times.
+  Report job [client] -> Table scan [svc: 100 GB seq scan] : SELECT count(*) | A large scan starts and reads every page once.
+  Table scan -> Ring buffer [cache: 256 KB] : reuse same frames | The scan recycles a few frames, so the main pool is not flushed.
+  Table scan -> Buffer pool : new pages enter old list | In InnoDB new pages enter the old part at the midpoint.
+  Buffer pool -x> Table scan : not promoted | A page touched only once is evicted from the old list and never reaches the young list.
+  Hot queries -> Buffer pool : still cache hits | The hot working set is still in memory.
+ref: docs | Resource consumption: shared_buffers | PostgreSQL documentation | https://www.postgresql.org/docs/current/runtime-config-resource.html
+
+@@ columnar
+== Column pruning and predicate pushdown on lake files
+kind: open-table-format, data-locality
+when: Analysts query a few columns of a very wide table on object storage, and scans must stay cheap.
+how: Data is stored as Parquet files. Inside each file, rows are split into row groups, and each row group stores one chunk per column. A footer holds the schema and per-chunk min and max values.
+The engine reads the footer first. It then fetches only the chunks of the needed columns, with ranged GET requests. It skips whole row groups when the min and max values show that the filter cannot match. A query that uses 3 of 200 columns reads about 1.5 percent of the bytes before compression gains.
+The table format (Iceberg or Delta) adds file-level statistics, so entire files are skipped before any footer is read. The cost is slow single-row lookup and slow updates, because a row is spread over many chunks.
+used: Spark, Trino, DuckDB and Athena on Parquet; Iceberg and Delta file-level pruning; ClickHouse and BigQuery use the same idea in their own formats.
+avoid: For point lookups and frequent row updates; use a row store such as PostgreSQL.
+flow:
+  Query [client] -> Engine [svc: Trino or Spark] : SELECT sum(rev) for day D | The query needs 2 columns and one day.
+  Engine -> Table metadata [store: file stats] : list files, check min/max | File statistics remove 95 percent of files by the day filter.
+  Engine -> Parquet file [lake: row groups] : GET footer | The engine reads the small footer with schema and chunk statistics.
+  Engine -> Parquet file : GET 2 column chunks | Ranged reads fetch only the needed columns of the surviving row groups.
+  Engine -x> Parquet file : skip row group | A row group whose max day is below D is not read at all.
+  Engine -> Query : result | The scan read a small share of the table bytes.
+ref: docs | Parquet file format | Apache Parquet | https://parquet.apache.org/docs/file-format/
+
+== Row store for writes with a column copy for analytics
+kind: cdc, cqrs
+when: The same data needs fast transactions and fast big scans, and scans must not slow down the transactions.
+how: Transactions write to a row store such as PostgreSQL or MySQL, which is good at point reads and updates. A change data capture stream sends every committed change to a column store, for example ClickHouse, Pinot or a lakehouse table.
+The column copy is rebuilt from changes in small batches, often every few seconds or minutes. Analytical queries run on it and read only needed columns, compressed 5 to 10 times. The OLTP database sees none of this load.
+The price is a delay (usually seconds), a second system to run, and the need to handle updates and deletes in the column store. Some HTAP databases keep both copies inside one product, such as TiDB with TiFlash, but the idea is the same.
+used: Debezium into ClickHouse, Pinot or Iceberg; TiDB TiFlash; SingleStore; many ad-tech and e-commerce reporting stacks.
+avoid: When reports need the very latest write with no delay; query the row store, or use an HTAP engine with strong reads.
+flow:
+  App [svc] -> Postgres [db: row store] : INSERT order | The app writes each order to a row store, one row per page.
+  Postgres -> Debezium [svc: CDC] : WAL change | The connector reads committed changes from the log.
+  Debezium -> Changes topic [topic] : OrderCreated | The changes flow through a topic, in order per key.
+  Changes topic -> Column store [lake: columnar segments] : micro-batch of 5,000 | Rows are turned into column segments in batches.
+  Analyst [user] -> Column store : scan 3 of 80 columns | Reports read only the needed columns. The OLTP database is not touched.
+ref: docs | ClickHouse architecture | ClickHouse documentation | https://clickhouse.com/docs/en/development/architecture
+
+== Time-partitioned segments with pruning
+kind: scatter-gather, sharding
+when: A dashboard needs sub-second aggregates over billions of recent events, with many users at once.
+how: Events are written to immutable column segments, each covering a time range such as one hour or one day. Each segment holds compressed columns, a sorted or indexed dimension, and min and max values of its time column.
+A broker receives the query, uses the segment metadata to drop segments outside the time filter, and sends the query to the servers that hold the rest. Each server scans its segments column by column, often with SIMD, and returns a small partial aggregate. The broker merges the partials.
+Because only needed columns and segments are read, a query over 30 days of 10 billion rows can finish in well under a second. The limits are the cost of keeping segments in memory or on fast disks and slow row-level updates.
+used: Apache Pinot, Apache Druid and ClickHouse in ad-tech and product analytics; Pinot is used for user-facing analytics at LinkedIn and Uber.
+avoid: For ad-hoc joins across many large tables; use a warehouse or lakehouse engine.
+flow:
+  Dashboard [client] -> Broker [svc: query router] : SUM(clicks) last 7 days | The dashboard sends one query to the broker.
+  Broker -> Segment map [store: time ranges] : which segments? | Segment metadata shows that 168 of 5,000 hourly segments match.
+  Broker -> Server A [svc: 84 segments], Server B [svc: 84 segments] : scan column clicks | The query goes only to servers that hold matching segments.
+  Server A -> Broker : partial sum | Each server scans one column and returns one number.
+  Server B -> Broker : partial sum | The second server does the same on its segments.
+  Broker -> Dashboard : total | The broker adds the partial sums and replies in about 100 ms.
+ref: docs | Pinot architecture | Apache Pinot documentation | https://docs.pinot.apache.org/basics/architecture
+
+@@ compaction
+== Scheduled compaction of streaming small files
+kind: batching, open-table-format
+when: Streaming or frequent micro-batch writes create thousands of tiny files, and queries or listing have become slow.
+how: A streaming job commits every minute, so each commit adds files of a few MB. After a day a partition holds 1,440 small files. Each file costs an open, a footer read and a list entry on object storage, so query time grows with file count and not with data size.
+A compaction job (Iceberg rewrite_data_files, Delta OPTIMIZE) reads the small files of a partition and writes a few files near the target size, for example 128 to 512 MB. It then commits one new snapshot that swaps old files for new ones. Readers see either the old set or the new set, never a mix.
+Compaction costs I/O and compute, so run it on a schedule or a trigger, on cold partitions first. It also can sort or cluster the data in the same pass.
+used: Iceberg rewrite_data_files; Delta Lake OPTIMIZE and auto compaction; Hudi clustering; Databricks predictive optimization.
+avoid: Compacting hot partitions that are still being written; wait until they are closed, or you cause commit conflicts.
+flow:
+  Flink job [svc: commit every 1 min] -> Table partition [lake] : append 2 MB files | The stream writes 1,440 small files a day. It writes many small files into the day partition.
+  Query engine [svc] -> Table partition : list and open files | Each query pays an open and a footer read for each file, so it is slow.
+  Compaction job [svc: Spark] -> Table partition : read small files | The job reads one closed partition on a schedule.
+  Compaction job -> Table partition : write 4 files of 256 MB | The job writes big files and sorts rows on the way.
+  Compaction job -> Table metadata [store: snapshot log] : commit new snapshot | One atomic commit swaps the old file list for the new one.
+  Query engine -> Table partition : list 4 files | Queries now open 4 files instead of 1,440.
+ref: docs | Maintenance: rewrite data files | Apache Iceberg documentation | https://iceberg.apache.org/docs/latest/maintenance/
+
+== Compact, expire and clean up loop
+kind: control-loop
+when: A lake table grows in files and metadata over time, and storage cost and planning time must stay bounded.
+how: Compaction alone does not free space: the old small files are still referenced by older snapshots, which keep time travel working. A maintenance loop runs on each table in four steps. First, compact data files. Second, rewrite manifests so planning reads few metadata files.
+Third, expire snapshots older than a retention window, for example 7 days. This drops the references to the old files. Fourth, remove orphan files, which are files in storage that no snapshot refers to, for example from failed jobs. Orphan removal uses an age limit of a few days, so it never deletes files of a job still running.
+A scheduler or a managed service checks table health (file count, small file ratio, snapshot count) and decides which step to run. Time travel is only possible inside the retention window.
+used: Iceberg maintenance procedures run by Airflow or Spark jobs; Delta VACUUM; managed table optimization in several lakehouse services.
+avoid: When legal hold or audit needs long time travel; keep the snapshots, or copy needed versions to a separate table.
+flow:
+  Scheduler [svc: Airflow] -> Table stats [store: file count + age] : check health | The loop reads the number of files, their sizes and the snapshot count.
+  Scheduler -> Compactor [svc: Spark] : rewrite small files | If many files are under 32 MB, the table is compacted.
+  Compactor -> Table metadata [store: snapshots] : commit snapshot 812 | The compaction becomes a new snapshot. Old files are still referenced.
+  Scheduler -> Table metadata : expire snapshots over 7d | Old snapshots are removed, so old files are no longer referenced.
+  Scheduler -> Object store [lake: data files] : delete unreferenced files | Files that no snapshot uses are deleted and the space is freed.
+  Object store -x> Scheduler : skip files under 3 days | Young unreferenced files may belong to a running job, so they stay.
+ref: docs | Maintenance | Apache Iceberg documentation | https://iceberg.apache.org/docs/latest/maintenance/
+
+@@ cowmor
+== Copy-on-write for read-heavy tables
+kind: copy-on-write
+when: A table is read many times for each update, and updates arrive in large batches, such as a nightly merge.
+how: With copy-on-write, an update reads each affected data file, applies the change, and writes a whole new file. A new snapshot then points to the new file and drops the old one. Readers just read plain data files, with no merge work.
+This makes reads as fast as possible. The price is write amplification: changing one row in a 256 MB file rewrites 256 MB. If an update touches rows in 1,000 files, it rewrites all 1,000 files.
+It is a good fit when updates are batched and clustered, so that few files are touched, and when many readers share the table. It is a poor fit for a stream of random single-row updates.
+used: Iceberg and Delta default behavior for row-level operations in many setups; Hudi copy-on-write tables; dimension tables in warehouses.
+avoid: For frequent small random updates or deletes; use merge-on-read.
+flow:
+  Nightly MERGE [svc: Spark] -> Table [lake: 400 files] : update 20,000 rows | The batch job finds the rows to change.
+  Table -> Nightly MERGE : read 18 affected files | Only files that contain matching rows are read.
+  Nightly MERGE -> Table : write 18 new files | Each affected file is rewritten in full with the changes applied.
+  Nightly MERGE -> Snapshot log [store: table versions] : commit v57 | One commit swaps 18 old files for 18 new ones.
+  BI query [client] -> Table : plain scan | Readers scan plain files and need no merge step.
+ref: docs | Write modes: copy-on-write and merge-on-read | Apache Iceberg documentation | https://iceberg.apache.org/docs/latest/configuration/
+
+== Merge-on-read for streaming upserts
+kind: lsm-compaction, cdc
+when: A table receives a constant stream of small updates and deletes, such as CDC from an OLTP database.
+how: With merge-on-read, a write does not rewrite the base file. It appends a small delta: a log file of changed rows or a delete file that lists removed rows. A commit costs only the size of the change, so it takes seconds, and many writers collide less often.
+A reader must merge the base file with its deltas, so reads cost more as deltas pile up. The idea is the same as an LSM tree: fast writes, then background compaction folds deltas into new base files.
+The team tunes how often compaction runs. Too rare, and reads slow down. Too often, and the write savings are lost.
+used: Hudi merge-on-read tables; Iceberg position and equality delete files; Delta deletion vectors; Flink CDC pipelines into lakehouse tables.
+avoid: When many readers need the fastest scans and updates are rare; copy-on-write is simpler.
+flow:
+  Debezium [svc: CDC] -> Flink job [svc: upsert] : row changes | Changes from the OLTP database arrive as a stream.
+  Flink job -> Table [lake: base + delta files] : append delta file | Each commit adds a small file of changed rows. Base files are unchanged.
+  Query engine [svc] -> Table : read base + deltas | Readers merge the base with the deltas for the latest view.
+  * Table: 40 delta files | Reads get slower as deltas pile up.
+  Compactor [svc: scheduled] -> Table : fold deltas into base | A background job rewrites base files with deltas applied.
+  * Table: 0 delta files | Reads are fast again.
+ref: docs | Table types: merge-on-read | Apache Hudi documentation | https://hudi.apache.org/docs/table_types
+
+== Hybrid by partition age
+kind: tiered-storage
+when: Recent data gets many updates, and older data is mostly read.
+how: Choose the mode per partition, not per table. The current day uses merge-on-read, so streaming upserts are cheap. Older partitions are compacted into clean base files with no deltas, which is the copy-on-write layout that readers like most.
+A scheduled job takes each partition that is closed, for example older than 2 days, and rewrites it once with all deltas applied. After that step, the partition is read as plain files and is sorted or clustered for best scans.
+Late updates to old partitions still work but cost a rewrite of the affected files. This matches a common access pattern: new data is hot and changing, old data is cold and stable.
+used: Lakehouse pipelines that use Hudi or Iceberg with daily compaction; ad-event tables with a late-data window of a few days.
+avoid: When updates hit old partitions all the time; then every partition needs delta handling, and a simple uniform mode is easier.
+flow:
+  Stream writer [svc] -> Today partition [lake: delta files] : upserts | Today's partition takes small delta writes at low cost.
+  Scheduler [svc] -> Compactor [svc: Spark] : close day D-2 | A daily job picks partitions that are older than the late-data window.
+  Compactor -> Today partition : read base + deltas | It reads the old partition with its deltas applied.
+  Compactor -> Old partition [lake: clean base files] : write sorted files | The result is a clean, sorted partition without deltas.
+  BI query [client] -> Old partition : fast plain scan | Reports on history read plain files, which is the fastest case.
+  Late event [svc: 3 days late] -x> Old partition : rewrite needed | A very late update forces a costly file rewrite.
+ref: docs | Table types | Apache Hudi documentation | https://hudi.apache.org/docs/table_types
+
+@@ delvec
+== Row-level delete without rewriting files
+kind: copy-on-write, open-table-format
+when: A few rows must be deleted or updated in very large files, and rewriting each file is too slow or costly.
+how: A deletion vector is a compact bitmap, usually a Roaring bitmap, that lists the row positions deleted in one data file. A DELETE writes or updates only this small bitmap file and commits a new table snapshot. The big Parquet file is not touched.
+A reader loads the data file and its bitmap, and skips the marked positions. Deleting 10 rows from a 1 GB file now writes a few hundred bytes, not 1 GB. Delta Lake and Iceberg format version 3 both support this.
+The cost is a small extra read at scan time, which grows with the number of marked rows. The bitmap is tied to one version of one file, so a file rewrite replaces it.
+used: Delta Lake deletion vectors; Iceberg v3 deletion vectors stored in Puffin files; engines such as Spark and Trino read them.
+avoid: When whole partitions are dropped; drop the files instead. Or when old readers cannot read deletion vectors.
+flow:
+  DELETE [client: WHERE user = 7] -> Engine [svc: Spark] : delete 10 rows | A delete for one user arrives.
+  Engine -> Data file [lake: 1 GB Parquet] : find row positions | The engine finds the positions of matching rows inside the file.
+  Engine -> Bitmap file [store: roaring bitmap] : write positions 5 and 91 | Only a tiny bitmap is written. The data file is unchanged.
+  Engine -> Snapshot log [store: table versions] : commit v58 | The commit links the data file to its new bitmap.
+  Reader [client] -> Data file : scan | The reader loads the file and its bitmap together.
+  Data file -x> Reader : skip marked rows | Rows in the bitmap are dropped before they reach the query.
+ref: spec | Delta Lake protocol: deletion vectors | Delta Lake project | https://github.com/delta-io/delta/blob/master/PROTOCOL.md
+
+== Purge deletes for privacy requests
+kind: lsm-compaction
+when: A law such as GDPR requires that a person's data is physically gone, not just hidden, within a set time.
+how: A deletion vector hides rows at once, but the bytes still sit in the old file and in older snapshots. So a delete request has two stages. Stage one: mark the rows with deletion vectors, and the data stops appearing in queries in seconds.
+Stage two: a purge job rewrites the files that have deletion vectors, so the rows are gone from the new files. Then old snapshots that still hold the data are expired and the old files are vacuumed. In Delta Lake this is REORG TABLE ... APPLY (PURGE) followed by VACUUM after the retention period.
+The team records the time of each step to prove it met the deadline. The retention window of time travel must be shorter than the legal limit, or the data stays reachable.
+used: Lakehouse privacy pipelines for consent withdrawal and deletion requests; Delta Lake purge and vacuum; Iceberg snapshot expiry.
+avoid: When the law needs proof of erasure from backups too; the plan must then cover backups, which this pattern does not.
+flow:
+  Privacy request [client: user 7] -> Delete job [svc: finds rows] : erase user 7 | A verified deletion request starts the job.
+  Delete job -> Table [lake: with bitmaps] : mark rows deleted | Deletion vectors hide the rows from queries at once.
+  Purge job [svc: weekly] -> Table : rewrite files with bitmaps | The purge job writes new files without the deleted rows.
+  Purge job -> Snapshot log [store] : expire old snapshots | Older versions that contain the rows are removed.
+  Purge job -> Object store [lake: files] : vacuum old files | The old files are deleted, and the bytes are really gone.
+  Audit log [store: timestamps] -> Privacy request : done in 9 days | The system records the proof for the legal deadline.
+ref: spec | Delta Lake protocol: deletion vectors | Delta Lake project | https://github.com/delta-io/delta/blob/master/PROTOCOL.md
+
+@@ encoding
+== Layered encoding then general compression
+kind: none
+when: Column data must be small on disk and fast to scan, and plain gzip of whole blocks is too slow or too large.
+how: Each column chunk is first encoded by its type. A low-cardinality string column (country) uses dictionary encoding: a list of 200 values and a small integer per row. Sorted or repeated values use run-length encoding. Integers that are close together use delta encoding and bit-packing, which stores each value in only as many bits as needed.
+After that, the encoded page goes through a general codec such as Zstd, LZ4 or Snappy. The first step removes the structure of the data cheaply. The second step catches what is left.
+Many encoded forms can be scanned without full decompression, for example a filter on a dictionary code. A column of 1 billion country strings can drop from tens of GB to under 1 GB. Zstd gives better ratio than LZ4, which decompresses faster.
+used: Parquet and ORC encodings (dictionary, RLE, delta, bit-packing) plus Zstd or Snappy; ClickHouse codecs; Arrow IPC.
+avoid: For high-entropy data such as encrypted or already compressed blobs; encoding adds CPU and gains nothing.
+flow:
+  Writer [svc: Spark] -> Column chunk [store] : plain strings | The writer collects 1 million values of one column.
+  Column chunk -> Dictionary encoder [svc: 200 distinct] : map to ids | Each string becomes a small integer id, 8 bits each.
+  Dictionary encoder -> RLE and bit-pack [svc: runs] : id stream | Repeated ids become runs, and the rest is bit-packed.
+  RLE and bit-pack -> Zstd [svc: codec] : encoded page | A general codec squeezes the leftover redundancy.
+  Zstd -> Parquet file [lake: 3 MB page] : write page | The chunk shrinks from about 6 MB to under 1 MB on disk.
+  Reader [client] -> Parquet file : decode ids, filter | A filter can compare ids and skip decoding the strings.
+ref: docs | Parquet encodings | Apache Parquet | https://parquet.apache.org/docs/file-format/data-pages/encodings/
+
+== Delta-of-delta and XOR for time series
+kind: tiered-storage
+when: A system stores billions of metric points, and each point must cost only a few bits.
+how: Timestamps arrive at regular steps, such as every 15 seconds. The encoder stores the difference between differences (delta of delta), which is almost always zero and fits in one bit. Values are floats that change a little. The encoder XORs each value with the previous one. Equal leading and trailing zero bits are stored by count, so a repeated value costs one bit.
+This is the Gorilla method from Facebook, and it gives about 1.4 to 1.6 bytes per point on real data, against 16 bytes raw. Prometheus uses a similar scheme in its chunks.
+Recent data stays in memory in this form for fast queries. Older chunks go to disk and then to object storage, often with extra compression and downsampling.
+used: Prometheus TSDB chunks; Facebook Gorilla; VictoriaMetrics and other time-series databases use related codecs.
+avoid: For values that jump randomly, such as hashes or IDs; the XOR trick only helps when neighbors are similar.
+flow:
+  Scraper [svc: 15 s interval] -> Head chunk [cache: in memory] : t=1030, v=0.71 | A point arrives with a timestamp and a float value.
+  * Head chunk: 2 h of points | Each new point costs about 1.4 bytes in this form.
+  Head chunk -> Block on disk [store: 2 h blocks] : cut block | Every two hours the head is written as an immutable block.
+  Block on disk -> Object storage [lake: long term] : upload block | Old blocks move to cheap storage, with the same encoding.
+  Dashboard [client] -> Head chunk : query recent range | Recent queries read memory and decode bit by bit.
+ref: paper | Gorilla: A Fast, Scalable, In-Memory Time Series Database | Pelkonen et al., Facebook, VLDB 2015 |
+
+== Compressed batches on the wire
+kind: batching
+when: Network or broker storage is the bottleneck, and messages are small, similar and sent in large numbers.
+how: Compression works best on a large block. A producer collects many records into one batch, for example 64 KB or 10 ms of data, and compresses the whole batch once with LZ4 or Zstd. JSON events of the same shape often shrink 5 to 10 times, because field names repeat.
+The broker stores and replicates the batch as it is, so disk and network use fall. Consumers decompress each batch they read. The CPU cost is paid at the edges, not at the broker, if the broker keeps the producer's codec.
+Larger batches compress better but add delay. A common setting trades a few milliseconds of wait for a large cut in bytes. Pick LZ4 for low CPU, and Zstd for higher ratio.
+used: Kafka producer compression.type with lz4, zstd or snappy; HTTP response compression; log shippers sending batches.
+avoid: For tiny batches or encrypted payloads; the codec has little to find, and it only adds CPU.
+flow:
+  Producer [svc: batch 64 KB] -> Batch buffer [cache: 400 JSON events] : append events | The producer collects events until the batch is full or 10 ms pass.
+  Batch buffer -> Zstd codec [svc: compress] : 64 KB block | The whole block is compressed at once.
+  Zstd codec -> Kafka broker [log: stores as is] : 9 KB batch | The batch is about 7 times smaller on the network.
+  Kafka broker -> Replica [log] : replicate 9 KB | Replication also moves the small batch, not the raw one.
+  Kafka broker -> Consumer [svc: decompress] : fetch batch | The consumer decompresses and reads the events.
+ref: docs | Producer configs: compression.type | Apache Kafka documentation | https://kafka.apache.org/documentation/#producerconfigs_compression.type
+
+@@ lsm
+== Write-heavy ingest with memtable and compaction
+kind: lsm-compaction, wal
+when: A store takes a very high rate of writes, such as events or counters, and reads are mostly by key.
+how: A write is appended to a write-ahead log for safety and inserted into an in-memory sorted table, the memtable. Both are sequential and cheap. When the memtable reaches a size, for example 64 MB, it is frozen and written to disk as an immutable sorted file (an SSTable) at level 0.
+Background compaction merges sorted files into larger ones on deeper levels, drops overwritten values and removes deleted keys. In leveled compaction, each level is about 10 times larger than the one above. The price is write amplification: one byte may be rewritten 10 to 30 times during its life.
+Because all writes are sequential, an LSM engine suits SSD and cloud disks well. A write stall can occur if compaction cannot keep up, so the team watches the level 0 file count.
+used: RocksDB and LevelDB; Cassandra, ScyllaDB and HBase; CockroachDB uses Pebble, a RocksDB-style engine, and TiKV uses RocksDB.
+avoid: For read-heavy workloads with many range scans and little writing; a B-tree gives lower read cost.
+flow:
+  Client [client] -> Memtable [cache: 64 MB sorted] : put(k, v) | The write goes to the log and the in-memory table. It is acknowledged in microseconds.
+  Client -> WAL [log] : append record | The log protects the memtable if the process crashes.
+  Memtable -> Level 0 [lake: 4 SSTables] : flush when full | A full memtable is written as one sorted file.
+  * Level 0: 4 files | When this passes a limit compaction must start, or writes stall.
+  Level 0 -> Level 1 [lake: 10x bigger] : compact | Compaction merges overlapping files, drops old versions and keeps the newest.
+  Level 1 -> Level 2 [lake: 100x bigger] : compact later | Data moves down in larger merges as it ages.
+ref: paper | The Log-Structured Merge-Tree (LSM-Tree) | O'Neil, Cheng, Gawlick & O'Neil, Acta Informatica, 1996 |
+ref: docs | RocksDB Compaction | RocksDB wiki | https://github.com/facebook/rocksdb/wiki/Compaction
+
+== Read path with Bloom filters across levels
+kind: lsm-compaction
+when: A key lookup must find the newest value among many sorted files without reading all of them.
+how: The same key may exist in the memtable and in several files. A get checks the memtable first, then each file from newest to oldest, and stops at the first hit. A miss would have to touch every file.
+To avoid that, each file has a Bloom filter in memory. The filter says "definitely not here" or "maybe here". With 10 bits per key, the false positive rate is about 1 percent. Only files that say "maybe" are read. Each file also has an index block, so one lookup costs about one block read.
+Tombstones mark deleted keys, and a read must see them before older values. Range scans merge the iterators of all files. Fewer files and more cache make reads cheaper, which is the aim of compaction.
+used: RocksDB and LevelDB Bloom filters; Cassandra per-SSTable filters; HBase block cache and Bloom filters.
+avoid: When most reads are range scans over everything; Bloom filters do not help there.
+flow:
+  Client [client] -> Memtable [cache] : get(k) | The newest data is in memory, so it is checked first.
+  Memtable -x> Client : miss | The key is not in the memtable.
+  Client -> Bloom filters [cache: one per file] : may file hold k? | Each file's filter answers from memory.
+  Bloom filters -> Client : 9 say no, 1 maybe | Nine files are skipped without any disk read.
+  Client -> SSTable L2 [lake: sorted file] : index, then read block | One block is read from the single candidate file.
+  SSTable L2 -> Client : value v7 | The newest version found is returned.
+ref: docs | RocksDB Bloom filter | RocksDB wiki | https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter
+
+== Embedded LSM as local state for stream jobs
+kind: checkpoint-restart, lsm-compaction
+when: A stream job keeps more state than fits in memory, such as per-user counters, and must restore it after failure.
+how: The job keeps keyed state in an embedded LSM store on each worker's local disk. Flink with the RocksDB state backend does this, and so does Kafka Streams. Reads and writes are local and fast. State can be many times larger than memory.
+For recovery, the job takes checkpoints. With RocksDB, the immutable SSTable files are a good fit: Flink's incremental checkpoints upload only the new files since the last checkpoint to object storage. A restart downloads the files and continues from the saved stream offset.
+Compaction runs on the worker and takes CPU and disk I/O, so the team gives the worker headroom. Tuning block cache and memtable size matters more than in a normal app.
+used: Flink RocksDB state backend with incremental checkpoints; Kafka Streams state stores backed by RocksDB and a changelog topic.
+avoid: When state is small; in-memory state is faster and simpler.
+flow:
+  Kafka topic [log: input events] -> Stream task [svc: keyed by user] : event for user 9 | The task reads an event and needs the state of user 9.
+  Stream task -> RocksDB [db: local LSM state] : get and put counter | State is read and updated on local disk through the memtable.
+  Stream task -> Checkpoint coordinator [svc] : barrier reached | A checkpoint barrier flows with the events.
+  RocksDB -> Object store [lake: S3 checkpoints] : upload new SSTables only | An incremental checkpoint copies only files added since the last one.
+  Stream task -x> Stream task 2 [svc: replacement] : worker crash | A worker fails, and a new one starts.
+  Object store -> Stream task 2 : restore files | The new task downloads the files and resumes from the saved offset.
+ref: docs | State backends | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/state/state_backends/
+
+@@ mvcc
+== Snapshot reads without read locks
+kind: mvcc-snapshot
+when: Many readers and writers use the same rows, and readers must never block or be blocked.
+how: Each write creates a new version of a row and does not overwrite the old one. In PostgreSQL each row version carries xmin (the transaction that created it) and xmax (the transaction that deleted it). A reader takes a snapshot, the list of transactions that were committed at that moment.
+A reader sees a version only if its creator is in the snapshot and its deleter is not. Two readers at different times see different but consistent states. Writers on the same row still conflict, but readers take no locks.
+Old versions pile up. Background cleanup (VACUUM in PostgreSQL, purge in InnoDB) removes versions that no snapshot needs. A long-running transaction holds back this cleanup and causes bloat.
+used: PostgreSQL, MySQL InnoDB, Oracle and SQL Server snapshot modes; CockroachDB and Spanner use versions with timestamps.
+avoid: For tiny, write-only tables where versions only cost space; or when each reader must see writes at once and a lock is wanted.
+flow:
+  Reader [client: snapshot at T5] -> Orders table [db: row versions] : SELECT order 9 | The reader takes a snapshot when its query begins.
+  Writer [client] -> Orders table : UPDATE order 9 | The writer adds a new version at T6. The old version stays.
+  Orders table -> Reader : version from T3 | The reader sees the T3 version because T6 is after its snapshot.
+  Reader -> Orders table : second SELECT in same txn | The reader repeats the query inside one snapshot.
+  Orders table -> Reader : same version again | The result is the same, so reads are repeatable.
+  Vacuum [svc: cleanup] -> Orders table : remove dead versions | After the reader ends, old versions are removed.
+ref: docs | Concurrency Control (MVCC) | PostgreSQL documentation | https://www.postgresql.org/docs/current/mvcc.html
+
+== Table snapshots and time travel in a lakehouse
+kind: open-table-format, copy-on-write
+when: Readers and writers share a lake table, and readers must get a stable view while data changes.
+how: Data files are immutable. Each commit writes new files and adds a new table version (a snapshot) to the metadata log. The snapshot is a list of the files that make up the table at that time.
+A query reads the current snapshot id once at the start and uses only the files in that list. A concurrent write cannot change what the query sees. Old snapshots stay until they are expired, so a user can query "as of" a past version, restore a bad write, or reproduce a report.
+Retention is the limit: expiring snapshots saves storage but ends time travel for those versions. Long-running jobs must finish before their snapshot is expired.
+used: Iceberg snapshots and time travel; Delta Lake versions with VERSION AS OF; Hudi timeline.
+avoid: When the table has no readers during writes; the extra metadata gives little benefit.
+flow:
+  Writer [svc: Spark] -> Table files [lake: immutable Parquet] : write new files | The writer adds files. It never edits old ones.
+  Writer -> Snapshot log [store] : commit v42 | A commit adds a snapshot that lists the files.
+  Reader [client: long query] -> Snapshot log : read v41 | The reader pins version 41 at its start.
+  Reader -> Table files : scan v41 files only | New files from v42 are invisible to this query.
+  Analyst [user] -> Snapshot log : VERSION AS OF 40 | A user reads an older version to compare or to roll back.
+  Maintenance [svc] -x> Snapshot log : expire v40 | After expiry, time travel to v40 is gone.
+ref: docs | Table spec: snapshots | Apache Iceberg documentation | https://iceberg.apache.org/spec/#snapshots
+
+== Point-in-time reads for training features
+kind: feature-store
+when: Model training needs the feature values as they were at each event time, so that no future data leaks in.
+how: The feature store keeps feature rows with a validity time or a version, as in MVCC. A training set is built from labeled events, each with its timestamp. For each event, the store joins the feature value that was valid just before that timestamp.
+Reading the newest value would leak the future into training, and the model would look better offline than it is in production. Point-in-time join uses the version history to avoid it.
+The history must be kept long enough to cover the training window, for example 90 days. The same feature definitions serve online lookups with only the latest version, which keeps training and serving consistent.
+used: Feast point-in-time joins; Tecton and Databricks feature tables with timestamps; lakehouse time travel for dataset reproducibility.
+avoid: When the feature never changes, such as a country code; a plain join is correct.
+flow:
+  Label events [store: click at T] -> Feature store [db: versioned features] : training request | Each labeled event carries its own event time.
+  Feature store -> History [lake: versions with valid time] : value valid before T | The store finds the last version before time T for each key.
+  History -> Training set [lake: Parquet] : row with feature at T-1 | The row holds features as they were then.
+  Training set -> Trainer [model: CTR model] : fit | The model trains on data that matches what serving will see.
+  Feature store -x> Label events : newest value rejected | Using the latest value would leak the future.
+  Online store [cache] -> Model server [svc] : latest value only | Serving reads only the newest version, with the same definition.
+ref: docs | Point-in-time joins | Feast documentation | https://docs.feast.dev/
+
+@@ occ
+== Atomic pointer commit with retry on conflict
+kind: optimistic-concurrency
+when: Many writers update one shared table or document, conflicts are rare, and locks would be costly or impossible.
+how: The writer reads the current version, say v41, and prepares its change without any lock. To commit, it makes one atomic compare-and-swap: "set the current version to v42 only if it is still v41". The catalog or the storage layer gives this one atomic step.
+If the swap fails, someone else committed first. The writer reloads the new version and checks whether the two changes conflict. If they touch different files or partitions, it commits again as v43. If they overlap, it aborts or fails the job.
+Work is wasted when conflicts are common, and a hot table with many writers can starve. The method works best when conflicts are rare and the retry is cheap.
+used: Iceberg catalog commits (Glue, REST catalog, Nessie); Delta Lake log with put-if-absent; Hudi optimistic concurrency control.
+avoid: When many writers update the same rows all the time; use locks or one writer per partition.
+flow:
+  Writer A [svc: Spark job] -> Catalog [db: current = v41] : read current version | Writer A reads v41 and starts its work with no lock.
+  Writer B [svc: Flink job] -> Catalog : read current version | Writer B also reads v41.
+  Writer B -> Catalog : swap v41 to v42 | Writer B commits first. The swap succeeds.
+  Writer A -x> Catalog : swap v41 to v42 | Writer A's swap fails because current is no longer v41.
+  Writer A -> Catalog : reload v42, check | Writer A sees no overlap with B's files.
+  Writer A -> Catalog : swap v42 to v43 | The retry succeeds, and both changes are in the table.
+ref: docs | Reliability: optimistic concurrency | Apache Iceberg documentation | https://iceberg.apache.org/docs/latest/reliability/
+
+== Version column in web APIs
+kind: optimistic-concurrency
+when: Two users or services may edit the same record from stale copies, and the lost update must be detected.
+how: Each record has a version number or an ETag. A client reads the record and gets the version, say 7. When it saves, it sends the version back, for example in an If-Match header. The database runs UPDATE ... SET ..., version = 8 WHERE id = ? AND version = 7.
+If one row is updated, the save worked. If zero rows are updated, someone else saved first, and the API answers 409 Conflict or 412 Precondition Failed. The client shows the new data and lets the user merge or retry.
+No lock is held while a person thinks, so the method scales to many users. Clients must handle conflicts, and a high-contention record, such as a counter, should use an atomic increment instead.
+used: HTTP ETag with If-Match; JPA and Hibernate @Version; DynamoDB conditional writes; Cosmos DB ETags.
+avoid: For hot counters or inventory with many writers per second; use atomic update statements or a queue.
+flow:
+  Editor A [client] -> API [svc] : GET doc 12 | Editor A loads the doc and gets version 7.
+  Editor B [client] -> API : GET doc 12 | Editor B loads the same version.
+  Editor B -> API : PUT, If-Match v7 | Editor B saves first.
+  API -> Docs DB [db: version = 7] : UPDATE where version = 7 | One row is changed and the version becomes 8.
+  Editor A -x> API : PUT, If-Match v7 | Editor A's copy is old.
+  API -> Editor A : 412 Precondition Failed | Editor A must reload version 8 and merge before saving.
+ref: spec | HTTP Semantics: If-Match | IETF RFC 9110, 2022 | https://www.rfc-editor.org/rfc/rfc9110#field.if-match
+
+== Conditional put on object storage
+kind: optimistic-concurrency
+when: A lake or a log is on plain object storage with no database, and writers must not overwrite each other.
+how: Object stores such as S3 now support conditional writes: put an object only if it does not exist (If-None-Match) or only if its ETag still matches (If-Match). This is a compare-and-swap on one object.
+A table format uses it to commit. The writer wants to add log entry number 42, so it puts the file 00000042.json with If-None-Match. If another writer already created that name, the put fails, and the first writer reloads, checks conflicts and tries number 43. The log gives a total order of commits without a lock service.
+Before conditional writes, systems needed an extra lock store such as DynamoDB. Support differs between object stores, so check the one you use.
+used: Delta Lake log commits on stores with put-if-absent; Iceberg and other table formats on S3 with conditional writes; some object-store based queues.
+avoid: On stores without conditional writes; add a small lock or catalog service.
+flow:
+  Writer 1 [svc] -> S3 log [log: 00000041.json] : PUT 42 if-none-match | Writer 1 tries to create the next log entry.
+  S3 log -> Writer 1 : 200 created | The entry did not exist, so Writer 1 wins.
+  Writer 2 [svc] -x> S3 log : PUT 42 if-none-match | Writer 2 tries the same name and is rejected.
+  S3 log -x> Writer 2 : 412 exists | Entry 42 exists, so Writer 2 must retry.
+  Writer 2 -> S3 log : read 42, check conflict | Writer 2 reads the new entry and checks for conflicts.
+  Writer 2 -> S3 log : PUT 43 if-none-match | The retry creates entry 43 and the commit is done.
+ref: docs | Conditional writes | Amazon S3 documentation | https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html
+
+@@ raid
+== RAID 10 volume for a transactional database
+kind: disk-redundancy
+when: A single-server database needs fast random writes and must survive one disk failure without downtime.
+how: RAID 10 mirrors disks in pairs (RAID 1) and stripes data across the pairs (RAID 0). With 8 disks there are 4 pairs, and the usable space is half of the raw space. Each write goes to both disks of one pair. A read can be served by either disk of a pair.
+Random writes cost two disk writes and no parity work, so latency stays low. This is why databases are often placed on RAID 10 rather than RAID 5, where each small write needs a read-modify-write of parity.
+If one disk fails, its partner serves all reads, and the array keeps running. A spare disk rebuilds by copying only the partner, which is fast. A second failure in the same pair loses the volume, so a replica and backups are still needed.
+used: Self-managed PostgreSQL and MySQL servers on bare metal; Linux md RAID 10; hardware RAID controllers with a battery-backed cache.
+avoid: When capacity cost matters more than write speed; use RAID 6 or erasure coding. And RAID never replaces backups or replication.
+flow:
+  Database [svc: OLTP engine] -> RAID controller [svc: RAID 10 of 8 disks] : write 8 KB page | The database writes a page to the volume.
+  RAID controller -> Disk 1 [store: pair A], Disk 2 [store: pair A mirror] : same block | The block goes to both disks of one mirror pair. Striping chooses the pair.
+  Database -> RAID controller : read page | A read can use either disk of the pair, which doubles read capacity.
+  Disk 1 -x> RAID controller : disk failed | One disk fails. The volume stays online.
+  RAID controller -> Disk 2 : serve all reads | The partner serves reads, and the volume runs in degraded mode.
+  RAID controller -> Spare disk [store: hot spare] : copy from Disk 2 | The spare takes over the pair by copying one disk only.
+ref: paper | A Case for Redundant Arrays of Inexpensive Disks (RAID) | Patterson, Gibson & Katz, SIGMOD 1988 |
+
+== Parity array with hot spare and scrubbing
+kind: disk-redundancy
+when: Large, mostly sequential data, such as media or backups, needs cheap redundancy with a good share of usable space.
+how: In RAID 6, data and two parity blocks per stripe are spread over all disks. With 10 disks, 8 hold data, so usable space is 80 percent. Any two disks can fail without data loss. ZFS RAID-Z2 follows the same idea.
+When a disk fails, the array rebuilds onto a hot spare by reading all other disks and computing the missing blocks. A 20 TB disk at 200 MB/s takes about 28 hours, and the array is slower and at higher risk during that time. A second failure or an unreadable sector during the rebuild is the main danger.
+So the array runs a scrub every few weeks. A scrub reads all data, checks parity and checksums, and repairs bad sectors before a failure makes them fatal. Use two parity disks, not one, for large drives.
+used: Linux md and ZFS RAID-Z2 on storage servers; NAS and backup appliances; hardware RAID 6 controllers.
+avoid: For write-heavy random workloads, where parity updates are slow; use RAID 10. For many machines, use erasure coding across nodes.
+flow:
+  File server [svc] -> RAID 6 array [svc: 8+2] : write stripe | Each stripe has 8 data blocks and 2 parity blocks on different disks.
+  Scrub job [svc: monthly] -> RAID 6 array : read all, verify parity | The scrub finds a bad sector while all disks still work.
+  RAID 6 array -> Disk 5 [store] : rewrite from parity | The block is rebuilt from the other disks and rewritten.
+  Disk 7 [store] -x> RAID 6 array : disk failed | A disk fails. Reads use parity to rebuild missing blocks.
+  RAID 6 array -> Hot spare [store: 20 TB] : rebuild, about 28 h | The array reads all other disks and writes the spare.
+  * RAID 6 array: degraded, one more failure allowed | During rebuild one more failure can still be survived.
+ref: paper | A Case for Redundant Arrays of Inexpensive Disks (RAID) | Patterson, Gibson & Katz, SIGMOD 1988 |
+ref: docs | Linux software RAID (md) | Linux kernel documentation | https://docs.kernel.org/admin-guide/md.html
+
+== Striping several cloud volumes for throughput
+kind: sharding
+when: One cloud block volume does not give the IOPS or throughput that a database or a log needs.
+how: Cloud volumes have per-volume limits, for example a fixed MB/s and IOPS. The VM attaches several volumes and builds a RAID 0 stripe over them with Linux md or LVM. Reads and writes are split in chunks, such as 512 KB, round-robin over the volumes. With 4 volumes, the limits add up to about 4 times.
+The cloud provider already keeps each volume replicated in its zone, so the team uses RAID 0 for speed and does not add mirroring. The weak point is that losing any one volume loses the whole stripe. The failure rate rises with the number of volumes.
+So the stripe is paired with snapshots, with a replica on another VM, or with a log that can rebuild the data. Also check the VM's own limit, because it can be lower than the sum of the volumes.
+used: Self-managed databases and Kafka or Elasticsearch nodes on AWS, Azure and GCP; LVM striped volumes.
+avoid: When a larger single volume or a faster volume type already meets the limit; striping only adds a failure risk.
+flow:
+  Database VM [svc] -> md RAID 0 [svc: 512 KB chunks] : write 4 MB | The kernel splits a large write into chunks.
+  md RAID 0 -> Volume 1 [store: 400 MB/s], Volume 2 [store: 400 MB/s], Volume 3 [store: 400 MB/s], Volume 4 [store: 400 MB/s] : chunk i mod 4 | Chunks go round-robin so all four volumes work at once.
+  Volume 1, Volume 2, Volume 3, Volume 4 -> md RAID 0 : acks | The write finishes when the slowest volume answers.
+  Database VM ~> Snapshot store [store: object storage] : nightly snapshots | Snapshots protect the data, since the stripe has no redundancy.
+  Volume 3 -x> md RAID 0 : volume lost | One lost volume breaks the whole stripe.
+  Snapshot store -> Database VM : restore | The team restores from the snapshot or fails over to a replica.
+ref: docs | Linux software RAID (md) | Linux kernel documentation | https://docs.kernel.org/admin-guide/md.html
+
+@@ rowlineage
+== Change feed to update downstream tables incrementally
+kind: cdc, medallion
+when: A silver or gold table must follow a large bronze table, and a full recompute each run is too slow or costly.
+how: With row tracking, each row has a stable row id and the version of the last commit that changed it. The table can then list what changed between two versions. In Delta Lake this is the Change Data Feed. Each change row has _change_type (insert, update_preimage, update_postimage or delete), _commit_version and _commit_timestamp.
+A downstream job remembers the last version it processed, for example 1204. It reads only changes after that version and applies them with MERGE to the silver table. If 0.5 percent of a 2 TB table changed, the job reads about 10 GB, not 2 TB.
+Deletes arrive as change rows too, so the downstream table can remove them. The feed is only available for versions that are still kept, so the job must run before cleanup removes old files.
+used: Delta Lake change data feed feeding silver and gold layers; Iceberg changelog views and incremental reads; Databricks streaming from a Delta table.
+avoid: When most rows change in every run; a full rebuild is as cheap. Or when the retention is shorter than the job gap.
+flow:
+  Bronze table [lake: Delta] -> Change feed [store: changes by version] : commit v1205 | Each commit records the changed rows with their change type.
+  Silver job [svc: Spark stream] -> Change feed : read after v1204 | The job reads only changes since its saved version.
+  Change feed -> Silver job : 12,000 changes | Inserts, updates and deletes arrive with the commit version.
+  Silver job -> Silver table [lake] : MERGE changes | The job applies the changes by key. Deletes remove rows.
+  Silver job -> Checkpoint [store: last version] : save v1205 | The job records the version, so a restart does not repeat work.
+  Cleanup [svc: VACUUM] -x> Change feed : v1100 expired | If cleanup removes old versions, a late job cannot read them.
+ref: docs | Change data feed | Delta Lake documentation | https://docs.delta.io/latest/delta-change-data-feed.html
+
+== Incremental materialized view refresh
+kind: materialized-view
+when: A summary table, such as revenue per campaign, should refresh in minutes without scanning all source data.
+how: The source table records, for every row, the sequence number of the last commit that changed it. This is the idea behind Iceberg v3 row lineage (the _last_updated_sequence_number field) and Delta row tracking. The refresh job stores the last sequence number it read.
+On each run it selects only rows changed after that number. For each changed row it also knows the stable row id. The job subtracts the old effect of an updated or deleted row, and adds the new effect to the summary. For sums and counts this is exact.
+Rows that did not change are never read. The cost is bookkeeping: the engine must handle non-additive functions such as distinct counts, and the view must be rebuilt in full if lineage metadata is lost.
+used: Declarative pipeline engines that refresh materialized views incrementally; Iceberg v3 row lineage fields; Delta row tracking.
+avoid: When the query is not incremental, for example a global median; schedule a full refresh instead.
+flow:
+  Source table [lake: Iceberg v3] -> Refresh job [svc: incremental] : rows with seq > 812 | Row lineage lets the job find rows changed since the last run.
+  Refresh job -> Summary table [lake: revenue by campaign] : read old totals | The job loads the totals only for campaigns that were touched.
+  * Refresh job: 3,400 changed rows | Only changed rows are processed. The others stay unread.
+  Refresh job -> Summary table : subtract old, add new | Updated and deleted rows first remove their old amounts.
+  Refresh job -> State [store: last seq 845] : save position | The job saves the highest sequence number it processed.
+  BI dashboard [client] -> Summary table : read totals | Readers see fresh totals without a full scan.
+ref: spec | Iceberg table spec: row lineage | Apache Iceberg | https://iceberg.apache.org/spec/#row-lineage
+

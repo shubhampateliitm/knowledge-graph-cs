@@ -1,0 +1,928 @@
+@@ bellman
+what: Bellman–Ford finds shortest paths by relaxing every edge again and again. After round r, each distance is the best one that uses at most r edges. Dijkstra breaks when an edge is negative, but this method does not. Limiting the rounds to k + 1 also limits the path to k stops.
+signals: "at most k stops" or "at most k edges" ; edge weights can be negative ; "detect a negative cycle" ; a small graph given as a list of edges, not an adjacency list ; shortest path with a hard cap on path length
+code:
+```python
+def find_cheapest_price(n: int, flights: list[list[int]], src: int, dst: int, k: int) -> int:
+    INF = float("inf")
+    dist = [INF] * n
+    dist[src] = 0
+    for _ in range(k + 1):          # k stops means at most k + 1 edges
+        nxt = dist[:]               # copy: this round may only use last round's values
+        for u, v, w in flights:
+            if dist[u] + w < nxt[v]:
+                nxt[v] = dist[u] + w
+        dist = nxt
+    return -1 if dist[dst] == INF else dist[dst]
+```
+walk: #787 Cheapest Flights Within K Stops
+step: Take n = 4, src = 0, dst = 3, k = 1. Flights: 0>1 cost 100, 1>2 cost 100, 2>0 cost 100, 1>3 cost 600, 2>3 cost 200. So k + 1 = 2 rounds.
+step: Start: dist = [0, inf, inf, inf].
+step: Round 1 reads the old dist. Only flight 0>1 helps: nxt = [0, 100, inf, inf].
+step: Round 2 reads [0, 100, inf, inf]. Flight 1>2 gives 200 and flight 1>3 gives 700: dist = [0, 100, 200, 700].
+step: Flight 2>3 would give 400, but 2 was only reached in round 2, so it needs a third round. Two rounds are done.
+step: Return dist[3] = 700. With k = 2 a third round would reach 3 for 400.
+bugs: Updating dist in place, so one round can chain several edges and break the k limit ; Running k rounds instead of k + 1, because k stops mean k + 1 edges ; Forgetting that INF + w is still INF, and returning INF instead of -1 ; Stopping early when nothing changed while a cap on edges is needed
+cost: O(k · E) time and O(n) extra space, because each round scans all E edges and keeps one distance array (plus a copy).
+
+@@ binlift
+what: Binary lifting stores, for every node, its 1st, 2nd, 4th, 8th ... ancestor in a table. Any jump of k levels is a sum of powers of two, so it takes one table lookup per set bit of k. Walking up one parent at a time costs O(k); this costs O(log k) per query after a one-time build.
+signals: "k-th ancestor" of a node, asked many times ; "lowest common ancestor" of many pairs ; many queries on a fixed tree ; jump up a huge number of steps ; "parent array" given
+code:
+```python
+class TreeAncestor:
+    def __init__(self, n: int, parent: list[int]):
+        self.log = max(1, n.bit_length())
+        self.up = [parent[:]]                # up[j][v] = 2^j-th ancestor of v, or -1
+        for j in range(1, self.log):
+            prev = self.up[-1]
+            self.up.append([prev[prev[v]] if prev[v] != -1 else -1 for v in range(n)])
+
+    def getKthAncestor(self, node: int, k: int) -> int:
+        j = 0
+        while k and node != -1:
+            if j >= self.log:
+                return -1
+            if k & 1:                        # this bit of k is set: jump 2^j levels
+                node = self.up[j][node]
+            k >>= 1
+            j += 1
+        return node
+```
+walk: #1483 Kth Ancestor of a Tree Node
+step: Take n = 7, parent = [-1, 0, 0, 1, 1, 2, 2]. The log is 7.bit_length() = 3, so there are 3 rows.
+step: Row 0 is the parent array. Row 1 is the grandparent: up[1][5] = up[0][up[0][5]] = up[0][2] = 0.
+step: Row 2 is the 4th ancestor. Every node here is at depth 2 or less, so row 2 is all -1.
+step: Query getKthAncestor(5, 2). The number 2 is binary 10. Bit 0 is not set, so skip row 0.
+step: Bit 1 is set, so node = up[1][5] = 0. Now k is 0 and the loop ends.
+step: Return 0. Query (6, 3): bit 0 gives node 2, bit 1 gives up[1][2] = -1, so the answer is -1.
+bugs: Not stopping at -1, so the table is read with index -1 and gives a wrong answer ; Too few rows: the log must cover the largest possible k ; Building row j before row j - 1 is complete ; Looping over all k parents one by one in each query, which is too slow
+cost: O(n log n) time and space to build the table, then O(log k) per query, because k has at most log k bits.
+
+@@ dijkstra-state
+what: Sometimes the node alone is not enough to describe where you are. You also need the time used, the stops made, or the keys held. Make each pair (node, extra) one state, then run Dijkstra on these pairs. The cost is still the thing you minimise, and the extra value must stay inside its limit.
+signals: "within at most T minutes" while also minimising cost ; "at most k stops" or "at most k keys" ; the same node can be good with a different leftover budget ; shortest path with a second limited resource ; "minimum cost to reach in time"
+code:
+```python
+import heapq
+
+def min_cost(max_time: int, edges: list[list[int]], passing_fees: list[int]) -> int:
+    n = len(passing_fees)
+    g = [[] for _ in range(n)]
+    for u, v, t in edges:
+        g[u].append((v, t))
+        g[v].append((u, t))
+    INF = float("inf")
+    best = [[INF] * (max_time + 1) for _ in range(n)]   # best[node][time used]
+    best[0][0] = passing_fees[0]
+    pq = [(passing_fees[0], 0, 0)]                      # (cost, time, node)
+    while pq:
+        cost, t, u = heapq.heappop(pq)
+        if u == n - 1:
+            return cost
+        if cost > best[u][t]:
+            continue
+        for v, w in g[u]:
+            nt, nc = t + w, cost + passing_fees[v]
+            if nt <= max_time and nc < best[v][nt]:
+                best[v][nt] = nc
+                heapq.heappush(pq, (nc, nt, v))
+    return -1
+```
+walk: #1928 Minimum Cost to Reach Destination in Time
+step: Take maxTime = 30, fees = [5, 1, 2, 20, 20, 3]. Roads: 0-1 and 1-2 and 2-5 take 10 each, 0-3 takes 1, 3-4 takes 10, 4-5 takes 15.
+step: Start state (cost 5, time 0, node 0). The fee of the start city is paid first.
+step: Pop it. Road to 1 gives (6, 10, 1). Road to 3 gives (25, 1, 3).
+step: Pop (6, 10, 1). Road to 2 gives (8, 20, 2). Pop (8, 20, 2). Road to 5 gives time 30, which is allowed: (11, 30, 5).
+step: Pop (11, 30, 5). It is the destination, so return 11.
+step: The other route 0-3-4-5 takes only 26 minutes but costs 48. With maxTime = 29 the first route is too slow, so the answer would be 48.
+bugs: Keeping only the best cost per node, which throws away cheap paths that are slow ; Not checking nt <= max_time before pushing the new state ; Marking a node visited on first pop, even though other times may still matter ; Making the state table too small: it needs max_time + 1 columns
+cost: O(E · T · log(E · T)) time and O(n · T) extra space, because there are n · T states and each edge is tried from each time value.
+
+@@ euler
+what: An Eulerian path uses every edge exactly once. Hierholzer's method walks along unused edges until it gets stuck. A stuck node must be the end of what is left, so write it down and step back. At the end, the written list is reversed to give the path.
+signals: "use every ticket exactly once" ; "reconstruct the itinerary" ; visit every edge, not every node ; "smallest lexical order" among valid paths ; in-degree and out-degree differ by at most one
+code:
+```python
+from collections import defaultdict
+
+def find_itinerary(tickets: list[list[str]]) -> list[str]:
+    g = defaultdict(list)
+    for a, b in sorted(tickets, reverse=True):
+        g[a].append(b)                  # smallest destination ends up last
+    route, stack = [], ["JFK"]
+    while stack:
+        while g[stack[-1]]:             # follow unused edges as far as possible
+            stack.append(g[stack[-1]].pop())
+        route.append(stack.pop())       # stuck: this node is final in the path
+    return route[::-1]
+```
+walk: #332 Reconstruct Itinerary
+step: Take tickets JFK>KUL, JFK>NRT, NRT>JFK. Sorted in reverse, g[JFK] = [NRT, KUL] and g[NRT] = [JFK]. Pop takes the smallest, so KUL is tried first.
+step: stack = [JFK]. JFK has edges, so pop KUL and push it: stack = [JFK, KUL].
+step: KUL has no edges. It is stuck, so route = [KUL] and the stack is [JFK].
+step: JFK still has NRT. Push NRT, then push JFK (from NRT). The last JFK has no edges left.
+step: Unwind the stack: route = [KUL, JFK, NRT, JFK].
+step: Reverse it: JFK, NRT, JFK, KUL. The dead end KUL ended up last, which is right.
+bugs: Appending a node to the answer when first reached, not when stuck ; Forgetting to reverse the final list ; Removing edges with list.pop(0), which is O(n), or using a set that loses repeated tickets ; Using a visited set for nodes: the same node can be used many times
+cost: O(E log E) time and O(E) extra space, because sorting costs E log E and each edge is pushed and popped once.
+
+@@ eulertour
+what: Do one DFS and give each node its entry time in order. Every subtree then covers one unbroken range of entry times. "Is a inside the subtree of b?" becomes a check on two numbers, and a subtree total becomes a range sum. This turns tree questions into array questions.
+signals: "remove two edges from a tree" ; compare many pairs of subtrees ; "is u an ancestor of v?" asked many times ; subtree sum or subtree xor ; update or query a whole subtree
+code:
+```python
+def minimum_score(nums: list[int], edges: list[list[int]]) -> int:
+    n = len(nums)
+    g = [[] for _ in range(n)]
+    for a, b in edges:
+        g[a].append(b)
+        g[b].append(a)
+    parent, order, stack = [-1] * n, [], [0]
+    while stack:                         # preorder: order[i] has entry time i
+        u = stack.pop()
+        order.append(u)
+        for v in g[u]:
+            if v != parent[u]:
+                parent[v] = u
+                stack.append(v)
+    tin = [0] * n
+    for i, u in enumerate(order):
+        tin[u] = i
+    xr, size = nums[:], [1] * n
+    for u in reversed(order[1:]):        # children before parents
+        xr[parent[u]] ^= xr[u]
+        size[parent[u]] += size[u]
+    total, best = xr[0], float("inf")
+    inside = lambda a, b: tin[b] <= tin[a] < tin[b] + size[b]   # a is in b's subtree
+    for u in range(1, n):
+        for v in range(u + 1, n):
+            if inside(v, u):
+                a, b, c = xr[v], xr[u] ^ xr[v], total ^ xr[u]
+            elif inside(u, v):
+                a, b, c = xr[u], xr[v] ^ xr[u], total ^ xr[v]
+            else:
+                a, b, c = xr[u], xr[v], total ^ xr[u] ^ xr[v]
+            best = min(best, max(a, b, c) - min(a, b, c))
+    return best
+```
+walk: #2322 Minimum Score After Removals on a Tree
+step: Take nums = [1, 5, 5, 4, 11] with edges 0-1, 1-2, 1-3, 3-4. The preorder is 0, 1, 3, 4, 2, so tin = {0:0, 1:1, 3:2, 4:3, 2:4}.
+step: Subtree xors, children first: xr[4] = 11, xr[3] = 4^11 = 15, xr[2] = 5, xr[1] = 5^5^15 = 15, xr[0] = 1^15 = 14. So total = 14.
+step: Sizes are 4:1, 3:2, 2:1, 1:4. The subtree of 1 is entry times 1 to 4, and the subtree of 3 is 2 to 3.
+step: Try nodes u = 1 and v = 2. Node 2 has entry time 4, inside range 1 to 4, so v is inside u.
+step: The three parts are a = xr[2] = 5, b = xr[1]^xr[2] = 10, c = total^xr[1] = 1. The score is 10 - 1 = 9.
+step: The other pairs give 15, 10, 11, 11 and 10, so the smallest score is 9.
+bugs: Mixing up which part to remove when one node is inside the other ; Using tin[b] <= tin[a] <= tin[b] + size[b] with a wrong end, off by one ; Trying to use the root as a cut node: the root has no edge above it ; Using deep recursion for DFS on a long path, which can overflow the stack
+cost: O(n) to number the tree and then O(n²) over pairs of cut edges, because each pair is checked in O(1) with the ranges.
+
+@@ floyd
+what: Floyd–Warshall keeps a table of the best known distance between every pair of nodes. For each node k in turn, ask if going through k is shorter than the current i to j distance. After all k are used, the table holds all shortest paths. It is only a few lines, but it takes O(n³), so n must be small.
+signals: "distance between every pair of cities" ; n is at most about 100 or 400 ; "city with the fewest neighbours within a threshold" ; all-pairs shortest path ; "transitive closure" of reachability
+code:
+```python
+def find_the_city(n: int, edges: list[list[int]], distance_threshold: int) -> int:
+    INF = float("inf")
+    d = [[INF] * n for _ in range(n)]
+    for i in range(n):
+        d[i][i] = 0
+    for u, v, w in edges:
+        d[u][v] = d[v][u] = min(d[u][v], w)
+    for k in range(n):                   # k must be the OUTER loop
+        for i in range(n):
+            for j in range(n):
+                if d[i][k] + d[k][j] < d[i][j]:
+                    d[i][j] = d[i][k] + d[k][j]
+    best, fewest = -1, INF
+    for i in range(n):
+        reach = sum(1 for j in range(n) if j != i and d[i][j] <= distance_threshold)
+        if reach <= fewest:              # ties go to the larger index
+            best, fewest = i, reach
+    return best
+```
+walk: #1334 Find the City With the Smallest Number of Neighbors at a Threshold Distance
+step: Take n = 4, threshold 4, edges 0-1 (3), 1-2 (1), 1-3 (4), 2-3 (1). Start with direct edges only.
+step: Using k = 1: d[0][2] = 3 + 1 = 4, and d[0][3] = 3 + 4 = 7.
+step: Using k = 2: d[1][3] = 1 + 1 = 2, and d[0][3] = 4 + 1 = 5. Using k = 3 changes nothing more.
+step: Final distances: 0-1 is 3, 0-2 is 4, 0-3 is 5, 1-2 is 1, 1-3 is 2, 2-3 is 1.
+step: Count the cities within 4: city 0 has 2, city 1 has 3, city 2 has 3, city 3 has 2.
+step: Cities 0 and 3 tie at 2. The rule picks the larger index, so return 3.
+bugs: Putting k in an inner loop: k must be the outermost loop ; Using a huge INF such as 10**9 that overflows when two INF values are added ; Forgetting d[i][i] = 0 ; Counting the city itself as its own neighbour ; Not taking the min for repeated edges between the same two cities
+cost: O(n³) time and O(n²) extra space, because three nested loops fill an n by n table.
+
+@@ minimax-path
+what: Some paths are judged by their worst step, not their total. Use Dijkstra, but let the cost of a path be the largest step on it. When you move on, take max(old cost, new step) instead of adding. The first time you pop the target, that value is the smallest possible worst step.
+signals: "minimise the maximum" difference or edge on a path ; "minimum effort" or "minimum risk" route ; "smallest value such that start and end are connected" ; path cost is its largest edge, not the sum ; can binary search on the answer and test connectivity
+code:
+```python
+import heapq
+
+def minimum_effort_path(heights: list[list[int]]) -> int:
+    rows, cols = len(heights), len(heights[0])
+    best = [[float("inf")] * cols for _ in range(rows)]
+    best[0][0] = 0
+    pq = [(0, 0, 0)]                     # (largest step so far, row, col)
+    while pq:
+        eff, r, c = heapq.heappop(pq)
+        if (r, c) == (rows - 1, cols - 1):
+            return eff
+        if eff > best[r][c]:
+            continue
+        for nr, nc in ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)):
+            if 0 <= nr < rows and 0 <= nc < cols:
+                ne = max(eff, abs(heights[nr][nc] - heights[r][c]))   # max, not sum
+                if ne < best[nr][nc]:
+                    best[nr][nc] = ne
+                    heapq.heappush(pq, (ne, nr, nc))
+    return 0
+```
+walk: #1631 Path With Minimum Effort
+step: Take heights [[1, 2, 2], [3, 8, 2], [5, 3, 5]]. Start with (effort 0, cell (0, 0)).
+step: From (0, 0): the cell to the right has step 1, and the cell below has step 2. Push efforts 1 and 2.
+step: Pop effort 1 at (0, 1). Its right neighbour (0, 2) costs max(1, 0) = 1. The cell below has height 8: step 6.
+step: Pop (0, 2) with 1, then (1, 2) with 1. Moving down to (2, 2) has step 3, so it gets effort 3.
+step: Pop effort 2 at (1, 0), then (2, 0) with 2, then (2, 1) with max(2, 2) = 2.
+step: From (2, 1) the move to (2, 2) has step 2, so (2, 2) improves from 3 to 2. Pop it: it is the target, so return 2.
+bugs: Adding step sizes instead of taking the max ; Marking a cell final on first push, not on first pop ; Skipping the check for a stale queue entry, which wastes time ; Returning the sum of steps along the found path
+cost: O(R · C · log(R · C)) time and O(R · C) extra space, because each cell enters the heap a few times and each heap step costs a log.
+
+@@ mst
+what: A minimum spanning tree joins all nodes with the smallest total edge cost. Kruskal sorts the edges from cheapest up. It takes an edge only if its ends are in different groups, which union–find checks fast. An edge inside one group would close a cycle, so it is skipped.
+signals: "connect all points" or "connect all cities" at minimum cost ; "minimum total length of cables or pipes" ; every node must be reachable, and extra edges are waste ; "spanning tree" ; the answer needs n - 1 edges
+code:
+```python
+def min_cost_connect_points(points: list[list[int]]) -> int:
+    n = len(points)
+    edges = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = abs(points[i][0] - points[j][0]) + abs(points[i][1] - points[j][1])
+            edges.append((d, i, j))
+    edges.sort()                         # cheapest edges first
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]   # path halving
+            x = parent[x]
+        return x
+
+    total = used = 0
+    for d, i, j in edges:
+        ri, rj = find(i), find(j)
+        if ri != rj:                     # joins two parts, so no cycle
+            parent[ri] = rj
+            total += d
+            used += 1
+            if used == n - 1:
+                break
+    return total
+```
+walk: #1584 Min Cost to Connect All Points
+step: Take points (0,0), (2,2), (3,10), (5,2), (7,0), numbered 0 to 4. Sorted edges start: 1-3 cost 3, 0-1 cost 4, 3-4 cost 4, then several of cost 7.
+step: Edge 1-3 joins two lone nodes: take it, total 3.
+step: Edge 0-1 joins node 0 to {1, 3}: take it, total 7. Edge 3-4 adds node 4: take it, total 11.
+step: Edges 0-3, 0-4 and 1-4 cost 7 each, but all their ends are already in {0, 1, 3, 4}. Skip them.
+step: Edge 1-2 cost 9 brings in node 2: take it, total 20. Now used = 4 = n - 1, so stop.
+step: Return 20.
+bugs: Forgetting to skip an edge whose ends are already joined ; Using find without path compression, so union–find gets slow ; Using a bad key when sorting: edges must sort by cost first ; Stopping at n edges instead of n - 1
+cost: O(n² log n) time and O(n²) extra space for a complete graph on n points, because there are about n²/2 edges and sorting dominates.
+
+@@ tarjan
+what: Run a DFS and give each node an entry time tin. For each node also keep low, the earliest entry time it can reach using its subtree and one back edge. If a child's low is greater than the parent's tin, the child's side cannot get above the parent, so the edge between them is a bridge.
+signals: "critical connections" or "bridges" in a network ; "articulation point" ; "strongly connected components" ; removing one edge disconnects the graph ; find edges that lie on no cycle
+code:
+```python
+def critical_connections(n: int, connections: list[list[int]]) -> list[list[int]]:
+    g = [[] for _ in range(n)]
+    for a, b in connections:
+        g[a].append(b)
+        g[b].append(a)
+    tin, low, timer, bridges = [-1] * n, [0] * n, 1, []
+    tin[0] = low[0] = 0
+    stack = [(0, -1, iter(g[0]))]        # explicit stack avoids recursion limits
+    while stack:
+        u, p, it = stack[-1]
+        for v in it:
+            if v == p:
+                continue
+            if tin[v] == -1:             # tree edge: go deeper
+                tin[v] = low[v] = timer
+                timer += 1
+                stack.append((v, u, iter(g[v])))
+                break
+            low[u] = min(low[u], tin[v]) # back edge: reach an older node
+        else:                            # all neighbours done: leave u
+            stack.pop()
+            if stack:
+                low[p] = min(low[p], low[u])
+                if low[u] > tin[p]:      # u's side cannot climb above p
+                    bridges.append([p, u])
+    return bridges
+```
+walk: #1192 Critical Connections in a Network
+step: Take n = 4 and edges 0-1, 1-2, 2-0, 1-3. Start at 0: tin[0] = low[0] = 0. Go to 1 (tin 1), then to 2 (tin 2).
+step: At 2 the neighbour 0 is already seen and is not its parent. It is a back edge: low[2] = min(2, 0) = 0.
+step: Leave 2. Update the parent: low[1] = min(1, 0) = 0. Is low[2] = 0 greater than tin[1] = 1? No, so 1-2 is not a bridge.
+step: Back at 1, go to 3 (tin 3). It has no other edges, so low[3] = 3.
+step: Leave 3. Is low[3] = 3 greater than tin[1] = 1? Yes, so [1, 3] is a bridge.
+step: Leave 1: low[0] stays 0 and 0 is not greater than tin[0]. Return [[1, 3]].
+bugs: Treating the parent as a back edge, which hides every bridge ; Using low[v] instead of tin[v] when handling a back edge (fine for bridges, wrong for other uses) ; Comparing low[child] >= tin[parent], which is the rule for articulation points, not bridges ; Deep recursion on a long chain, which crashes in Python
+cost: O(n + E) time and O(n + E) extra space, because the DFS visits each node and edge once.
+
+@@ zeroonebfs
+what: When every edge costs 0 or 1, you do not need a heap. Keep a deque. A 0-cost move goes to the front, so it is handled at once at the same distance. A 1-cost move goes to the back. The deque stays sorted by distance, so it acts like Dijkstra in O(V + E).
+signals: each move costs 0 or 1 ; "change the direction or sign with cost 1" ; follow the arrow for free, otherwise pay one ; grid with free and paid moves ; "minimum number of changes" to reach a cell
+code:
+```python
+from collections import deque
+
+def min_cost(grid: list[list[int]]) -> int:
+    rows, cols = len(grid), len(grid[0])
+    dirs = [(0, 1), (0, -1), (1, 0), (-1, 0)]      # signs 1, 2, 3, 4
+    dist = [[float("inf")] * cols for _ in range(rows)]
+    dist[0][0] = 0
+    dq = deque([(0, 0)])
+    while dq:
+        r, c = dq.popleft()
+        for i, (dr, dc) in enumerate(dirs):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols:
+                w = 0 if grid[r][c] == i + 1 else 1   # follow the arrow: free
+                if dist[r][c] + w < dist[nr][nc]:
+                    dist[nr][nc] = dist[r][c] + w
+                    if w == 0:
+                        dq.appendleft((nr, nc))
+                    else:
+                        dq.append((nr, nc))
+    return dist[rows - 1][cols - 1]
+```
+walk: #1368 Minimum Cost to Make at Least One Valid Path in a Grid
+step: Take grid [[1, 2], [4, 3]]. Sign 1 is right, 2 is left, 3 is down, 4 is up. dist[0][0] = 0, deque = [(0, 0)].
+step: Pop (0, 0). Its sign is 1, so right to (0, 1) is free: dist 0, pushed to the front. Down to (1, 0) costs 1: dist 1, pushed to the back.
+step: Pop (0, 1). Its sign is 2 (left). Down to (1, 1) is not the arrow, so it costs 1: dist[1][1] = 1, pushed to the back.
+step: Pop (1, 0). Its sign is 4 (up). Right to (1, 1) would cost 1 + 1 = 2, which is not better than 1.
+step: Pop (1, 1). Nothing improves. The answer is dist[1][1] = 1.
+bugs: Pushing 0-cost moves to the back, which breaks the order and gives wrong distances ; Using a visited flag instead of comparing distances, so a cheaper path is never found ; Mixing up the direction numbers and the order of dirs ; Using a heap anyway, which works but is slower
+cost: O(R · C) time and O(R · C) extra space, because each cell is improved only a few times and every deque operation is O(1).
+
+@@ buckets
+what: Treat the k groups as k buckets and place the items one at a time. Each item tries every bucket where it still fits. Two prunes keep it fast: skip a bucket that would overflow, and skip a bucket whose current fill equals one you already tried, as it leads to the same result. Sorting the big items first makes failures show up early.
+signals: "partition into k equal sum subsets" ; "split into k groups with the same total" ; every item must be used once ; k is small (about 4 to 16) ; "assign each item to one of k bins"
+code:
+```python
+def can_partition_k_subsets(nums: list[int], k: int) -> bool:
+    total = sum(nums)
+    if total % k:
+        return False
+    target = total // k
+    items = sorted(nums, reverse=True)   # big items first fail fast
+    if items[0] > target:
+        return False
+    fill = [0] * k
+
+    def place(i: int) -> bool:
+        if i == len(items):
+            return True
+        tried = set()
+        for b in range(k):
+            if fill[b] + items[i] > target or fill[b] in tried:
+                continue                 # too full, or same state as a bucket already tried
+            tried.add(fill[b])
+            fill[b] += items[i]
+            if place(i + 1):
+                return True
+            fill[b] -= items[i]
+        return False
+
+    return place(0)
+```
+walk: #698 Partition to K Equal Sum Subsets
+step: Take nums = [4, 3, 2, 3, 5, 2, 1], k = 4. The sum is 20, so target = 5. Sorted: 5, 4, 3, 3, 2, 2, 1. fill = [0, 0, 0, 0].
+step: Item 5 goes to bucket 0: fill = [5, 0, 0, 0]. Item 4 skips the full bucket 0 and goes to bucket 1: [5, 4, 0, 0].
+step: Item 3 does not fit in bucket 1 (4 + 3 > 5). It goes to bucket 2: [5, 4, 3, 0]. The second 3 goes to bucket 3: [5, 4, 3, 3].
+step: Item 2 fits only bucket 2: [5, 4, 5, 3]. The next 2 fits only bucket 3: [5, 4, 5, 5].
+step: Item 1 fits bucket 1: [5, 5, 5, 5]. All items are placed, so return True.
+bugs: Not skipping buckets with the same fill, which makes it exponential in practice ; Forgetting to undo fill[b] -= items[i] after a failed branch ; Not checking total % k or an item larger than the target ; Sorting ascending, so big items fail late
+cost: O(k^n) time in the worst case, but pruning makes it fast; O(n + k) extra space for the recursion and the buckets.
+
+@@ coin
+what: To make amount a, try every coin as the last one used. The rest is amount a - c, which is already solved. So dp[a] is the smallest dp[a - c] + 1 over all coins. Because coins can be reused, the table is filled from small amounts to large. This is faster than trying all coin combinations.
+signals: "fewest coins to make an amount" ; "number of ways to make change" ; each coin can be used any number of times ; "unlimited supply" of items ; return -1 if the target is impossible
+code:
+```python
+def coin_change(coins: list[int], amount: int) -> int:
+    INF = amount + 1                     # larger than any real answer
+    dp = [0] + [INF] * amount            # dp[a] = fewest coins to make a
+    for a in range(1, amount + 1):
+        for c in coins:
+            if c <= a and dp[a - c] + 1 < dp[a]:
+                dp[a] = dp[a - c] + 1
+    return dp[amount] if dp[amount] != INF else -1
+```
+walk: #322 Coin Change
+step: Take coins = [1, 2, 5], amount = 11. dp[0] = 0, all others start as a big value.
+step: dp[1] = 1 (coin 1). dp[2] = 1 (coin 2). dp[3] = 2 (coin 1 plus dp[2]). dp[4] = 2. dp[5] = 1 (coin 5).
+step: dp[6] = min(dp[5] + 1, dp[4] + 1, dp[1] + 1) = 2. dp[10] = dp[5] + 1 = 2.
+step: dp[11] tries coin 1: dp[10] + 1 = 3. Coin 2: dp[9] + 1 = 4. Coin 5: dp[6] + 1 = 3. The best is 3.
+step: The table is [0, 1, 1, 2, 2, 1, 2, 2, 3, 3, 2, 3]. Return 3 (5 + 5 + 1).
+bugs: Greedy: always take the biggest coin, which fails for coins like [1, 3, 4] ; Using 0 or -1 as the "impossible" mark, so min picks it by mistake ; Forgetting the dp[0] = 0 base case ; Returning dp[amount] without turning "impossible" into -1
+cost: O(amount · number of coins) time and O(amount) extra space, because each table cell tries every coin once.
+
+@@ griddp
+what: In a grid where you can only move right or down, every cell is reached from the cell above or the cell to its left. So its value is built from those two. A row only needs the row above it, and the row above is just the same array before the update. One array of one row is enough memory.
+signals: "robot moves only right or down" ; "number of unique paths" in a grid ; "minimum path sum" from top-left to bottom-right ; each cell depends on its top and left neighbours ; obstacles may block some cells
+code:
+```python
+def unique_paths(m: int, n: int) -> int:
+    row = [1] * n                        # first row: one way to reach each cell
+    for _ in range(m - 1):
+        for j in range(1, n):
+            row[j] += row[j - 1]         # row[j] is "above", row[j-1] is "left"
+    return row[-1]
+```
+walk: #62 Unique Paths
+step: Take m = 3 rows, n = 3 columns. The first row has exactly one way to reach each cell: row = [1, 1, 1].
+step: Row 2: row[1] += row[0] gives 2. Then row[2] += row[1] gives 2 + 1 = 3. Now row = [1, 2, 3].
+step: Row 3: row[1] += row[0] gives 3. Then row[2] += row[1] gives 3 + 3 = 6. Now row = [1, 3, 6].
+step: Return row[-1] = 6, the number of paths to the bottom-right corner.
+bugs: Starting the inner loop at j = 0, which has no left neighbour ; Looping m times instead of m - 1, because row 1 is already filled ; Building a full m by n table when one row is enough ; Swapping m and n when sizing the row
+cost: O(m · n) time and O(n) extra space, because each cell is computed once and only one row is kept.
+
+@@ kadane
+what: Look at the best subarray that must end at position i. It either extends the best one ending at i - 1, or it starts fresh at i. If the old run is negative, it only hurts, so start fresh. Keep the best answer seen over all positions. One pass replaces checking every pair of ends.
+signals: "maximum sum subarray" ; "contiguous" run with the largest total ; array may contain negative numbers ; "best segment ending here" ; one pass and O(1) memory wanted
+code:
+```python
+def max_sub_array(nums: list[int]) -> int:
+    cur = best = nums[0]
+    for x in nums[1:]:
+        cur = max(x, cur + x)            # start fresh at x, or extend the run
+        best = max(best, cur)
+    return best
+```
+walk: #53 Maximum Subarray
+step: Take nums = [-2, 1, -3, 4, -1, 2, 1, -5, 4]. Start: cur = best = -2.
+step: x = 1: cur = max(1, -2 + 1) = 1, so start fresh. best = 1. x = -3: cur = max(-3, 1 - 3) = -2.
+step: x = 4: cur = max(4, -2 + 4) = 4, start fresh again. best = 4.
+step: x = -1: cur = 3. x = 2: cur = 5. x = 1: cur = 6. best = 6.
+step: x = -5: cur = 1. x = 4: cur = 5. best stays 6.
+step: Return 6 for the subarray [4, -1, 2, 1].
+bugs: Starting cur and best at 0, which gives a wrong answer when all numbers are negative ; Resetting cur to 0 when it is negative instead of starting at x ; Returning cur instead of best ; Using max(cur + x, 0) and losing the case where the answer is one negative number
+cost: O(n) time and O(1) extra space, because each number is read once and only two values are kept.
+
+@@ knap01
+what: In 0/1 knapsack every item is used at most once. Keep a table of which sums are reachable. For each item x, a sum s becomes reachable if s - x was reachable before. Update sums from high to low, so the new x is never counted twice in the same pass. Subset sum is the special case with only yes or no values.
+signals: "partition into two equal subsets" ; "subset with sum exactly target" ; each item may be chosen at most once ; "can we reach the target?" ; values or weights are small enough for a table of size target
+code:
+```python
+def can_partition(nums: list[int]) -> bool:
+    total = sum(nums)
+    if total % 2:
+        return False
+    target = total // 2
+    reach = [True] + [False] * target    # reach[s]: some chosen items sum to s
+    for x in nums:
+        for s in range(target, x - 1, -1):   # high to low: x is used once
+            if reach[s - x]:
+                reach[s] = True
+    return reach[target]
+```
+walk: #416 Partition Equal Subset Sum
+step: Take nums = [1, 5, 11, 5]. The sum is 22, so target = 11. reach = {0}.
+step: Item 1: sums 1 becomes reachable. reachable = {0, 1}.
+step: Item 5: from 1 and 0 we get 6 and 5. reachable = {0, 1, 5, 6}.
+step: Item 11: from 0 we get 11. reachable = {0, 1, 5, 6, 11}.
+step: Item 5: from 5 we get 10, and from 6 we get 11 again. reachable = {0, 1, 5, 6, 10, 11}.
+step: Target 11 is reachable, so return True (11 versus 1 + 5 + 5).
+bugs: Looping s from low to high, so one item is used many times ; Not checking that the total is even first ; Using a table of size total instead of total // 2, which wastes time ; Forgetting reach[0] = True
+cost: O(n · target) time and O(target) extra space, because each item updates every sum once in a single array.
+
+@@ lcs
+what: Let dp[i][j] be the answer for the first i characters of one text and the first j of the other. If the last characters match, extend the answer of dp[i-1][j-1] by one. If not, drop one last character and take the better of dp[i-1][j] and dp[i][j-1]. This avoids trying all 2^n subsequences.
+signals: "longest common subsequence" ; "edit distance" between two strings ; two sequences are compared position by position ; "minimum deletions to make two strings equal" ; the state needs one index in each sequence
+code:
+```python
+def longest_common_subsequence(text1: str, text2: str) -> int:
+    m, n = len(text1), len(text2)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]   # dp[i][j]: first i of text1, first j of text2
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if text1[i - 1] == text2[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1] + 1
+            else:
+                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+    return dp[m][n]
+```
+walk: #1143 Longest Common Subsequence
+step: Take text1 = "abc" and text2 = "ac". The table has 4 rows and 3 columns of zeros. The row and column for the empty prefix stay 0.
+step: Row i = 1 ('a'): j = 1 ('a') matches, so dp[1][1] = dp[0][0] + 1 = 1. j = 2 ('c') does not match: dp[1][2] = max(0, 1) = 1.
+step: Row i = 2 ('b'): no matches. dp[2][1] = max(dp[1][1], dp[2][0]) = 1 and dp[2][2] = max(dp[1][2], dp[2][1]) = 1.
+step: Row i = 3 ('c'): j = 1 ('a') gives 1. j = 2 ('c') matches, so dp[3][2] = dp[2][1] + 1 = 2.
+step: Return dp[3][2] = 2, for the subsequence "ac".
+bugs: Off-by-one: indexing text1[i] instead of text1[i - 1] when the table has an extra row ; Making the table m by n instead of (m + 1) by (n + 1) ; Confusing subsequence with substring: on a mismatch a substring would reset to 0 ; Copying the table row by reference with [[0] * n] * m
+cost: O(m · n) time and O(m · n) extra space, because each pair of prefixes is computed once (O(min(m, n)) is possible with two rows).
+
+@@ lis
+what: Let dp[i] be the longest increasing subsequence that ends exactly at position i. It is one more than the best dp[j] among earlier items with a smaller value, or 1 if there are none. The answer is the largest dp value, not the last one. A faster O(n log n) version exists, but this table is the base idea.
+signals: "longest increasing subsequence" ; "longest strictly increasing" chain ; pick items in order, skipping some ; "nested envelopes" or "stack of boxes" style chains ; order of items matters and cannot change
+code:
+```python
+def length_of_lis(nums: list[int]) -> int:
+    dp = [1] * len(nums)                 # dp[i]: longest increasing run ending at i
+    for i in range(len(nums)):
+        for j in range(i):
+            if nums[j] < nums[i]:
+                dp[i] = max(dp[i], dp[j] + 1)
+    return max(dp)
+```
+walk: #300 Longest Increasing Subsequence
+step: Take nums = [10, 9, 2, 5, 3, 7, 101, 18]. Start with dp = [1, 1, 1, 1, 1, 1, 1, 1].
+step: The values 10, 9 and 2 have no smaller earlier value, so they stay 1. Value 5 sees 2: dp = 2. Value 3 sees 2: dp = 2.
+step: Value 7 sees 2 (1), 5 (2), 3 (2). So dp = 2 + 1 = 3.
+step: Value 101 sees 7 with dp 3, so dp = 4. Value 18 also sees 7, so dp = 4.
+step: The table is [1, 1, 1, 2, 2, 3, 4, 4]. Return max = 4, for example 2, 5, 7, 101.
+bugs: Returning dp[-1] instead of max(dp) ; Using <= instead of <, which allows equal values in a strictly increasing run ; Starting dp at 0 instead of 1 ; Confusing subsequence with subarray, which must be contiguous
+cost: O(n²) time and O(n) extra space, because each item looks back at all earlier items (a tails array with binary search gives O(n log n)).
+
+@@ partitiondp
+what: To split an array into segments, decide the length of the last segment. If the first i items end with a segment of length L, the answer is dp[i - L] plus the value of that segment. Try every allowed L and keep the best. Each prefix is solved once and reused.
+signals: "partition the array into subarrays of length at most k" ; each segment is scored by its max, sum or cost ; "split into groups" and add up a score ; choose where to cut ; answer for a prefix is built from a shorter prefix
+code:
+```python
+def max_sum_after_partitioning(arr: list[int], k: int) -> int:
+    n = len(arr)
+    dp = [0] * (n + 1)                   # dp[i]: best sum for the first i items
+    for i in range(1, n + 1):
+        big = 0
+        for length in range(1, min(k, i) + 1):
+            big = max(big, arr[i - length])          # max of the last `length` items
+            dp[i] = max(dp[i], dp[i - length] + big * length)
+    return dp[n]
+```
+walk: #1043 Partition Array for Maximum Sum
+step: Take arr = [1, 15, 7, 9, 2, 5, 10], k = 3. dp[0] = 0. A segment of length L is worth L times its maximum.
+step: dp[1] = 1. dp[2]: last segment [15] gives 1 + 15 = 16, or [1, 15] gives 2 · 15 = 30. So dp[2] = 30.
+step: dp[3]: [7] gives 30 + 7 = 37, [15, 7] gives 1 + 30 = 31, [1, 15, 7] gives 45. So dp[3] = 45.
+step: Continuing the same way: dp[4] = 54, dp[5] = 63, dp[6] = 72.
+step: dp[7]: [10] gives 72 + 10 = 82. [5, 10] gives 63 + 20 = 83. [2, 5, 10] gives 54 + 30 = 84.
+step: Return dp[7] = 84.
+bugs: Not updating the running max as the segment grows to the left ; Letting length go above i, which reads a negative index ; Taking the max of the whole array instead of the max of the segment ; Greedy cuts without trying every length
+cost: O(n · k) time and O(n) extra space, because each of the n prefixes tries up to k last-segment lengths.
+
+@@ statedp
+what: Some problems have a few modes you can be in, such as holding a share, just sold, or resting. Keep one value per mode: the best profit so far while in that mode. Each day, each mode is updated from the modes allowed to come before it. The rules (like a cooldown) are encoded in which transitions exist.
+signals: "buy and sell stock with cooldown" ; "at most one share at a time" ; a small fixed set of situations you can be in ; transitions allowed only from certain states ; "you cannot do X right after Y"
+code:
+```python
+def max_profit(prices: list[int]) -> int:
+    hold = float("-inf")                 # best profit while holding a share
+    sold = 0                             # best profit if we sold today (cooldown next)
+    rest = 0                             # best profit while holding nothing, free to buy
+    for p in prices:
+        prev_sold = sold
+        sold = hold + p
+        hold = max(hold, rest - p)
+        rest = max(rest, prev_sold)
+    return max(sold, rest)
+```
+walk: #309 Best Time to Buy and Sell Stock with Cooldown
+step: Take prices = [1, 2, 3, 0, 2]. Start hold = -inf, sold = 0, rest = 0.
+step: Day 1 (price 1): hold = max(-inf, 0 - 1) = -1, sold = -inf, rest = 0.
+step: Day 2 (price 2): sold = -1 + 2 = 1. Day 3 (price 3): sold = -1 + 3 = 2 and rest = 1 (from yesterday's sold).
+step: Day 4 (price 0): hold = max(-1, rest - 0) = 1, because we rest at 1 and buy at 0. Now rest = 2 and sold = -1.
+step: Day 5 (price 2): sold = hold + 2 = 3. rest = 2.
+step: Return max(sold, rest) = 3, from buy 1, sell 2, rest, buy 0, sell 2.
+bugs: Letting a buy follow a sell directly, which ignores the cooldown ; Updating hold, sold and rest in an order that reads already-changed values ; Starting hold at 0 instead of minus infinity ; Returning hold, which ends with a share unsold
+cost: O(n) time and O(1) extra space, because three values are updated once per day.
+
+@@ takeskip
+what: Walk through the items and decide for each one: skip it, or take it. Skipping keeps the best so far. Taking adds the item to the best result that is compatible with taking it, like the best from two houses back. Only the last two values are needed, so memory is constant.
+signals: "cannot pick two adjacent items" ; "rob houses" without alerting neighbours ; maximise total value with a conflict rule ; "delete and earn" style choices ; each item is either used or not
+code:
+```python
+def rob(nums: list[int]) -> int:
+    skip, take = 0, 0                    # best total up to two houses back, and up to the last house
+    for x in nums:
+        skip, take = take, max(take, skip + x)   # skip x, or take x plus the best before the last
+    return take
+```
+walk: #198 House Robber
+step: Take nums = [2, 7, 9, 3, 1]. Start with skip = 0 (best up to two houses back) and take = 0 (best up to the last house).
+step: House 2: new take = max(0, 0 + 2) = 2. Now (skip, take) = (0, 2).
+step: House 7: take = max(2, 0 + 7) = 7. Now (2, 7). House 9: take = max(7, 2 + 9) = 11. Now (7, 11).
+step: House 3: take = max(11, 7 + 3) = 11. Now (11, 11). House 1: take = max(11, 11 + 1) = 12.
+step: Return 12, from houses 2, 9 and 1.
+bugs: Updating skip and take one after the other, so the second uses the new first ; Greedy: taking all the largest numbers without checking neighbours ; Not handling an empty or one-item list ; Using skip + x when the best compatible value is the one before the neighbour
+cost: O(n) time and O(1) extra space, because each item is handled once and only two values are kept.
+
+@@ waysdp
+what: To count ways, say that the number of ways to reach state i is the sum of the ways of every state that leads to i. Start from one way for the empty start. Add each allowed move's count. When the answer is huge, take the remainder mod 10^9 + 7 at every step so numbers stay small.
+signals: "number of ways" to decode, climb, tile or build ; "return the answer modulo 10^9 + 7" ; the order of choices matters ; each step can take one of a few small moves ; "how many distinct paths or strings"
+code:
+```python
+def num_decodings(s: str) -> int:
+    MOD = 10**9 + 7                      # many "count ways" tasks ask for the answer mod this
+    n = len(s)
+    dp = [0] * (n + 1)                   # dp[i]: ways to decode the first i characters
+    dp[0] = 1
+    for i in range(1, n + 1):
+        if s[i - 1] != "0":              # last character alone: 1-9
+            dp[i] += dp[i - 1]
+        if i >= 2 and 10 <= int(s[i - 2:i]) <= 26:   # last two characters: 10-26
+            dp[i] += dp[i - 2]
+        dp[i] %= MOD
+    return dp[n]
+```
+walk: #91 Decode Ways
+step: Take s = "226". dp[0] = 1 (one way to decode nothing).
+step: i = 1, char "2": it is not "0", so dp[1] = dp[0] = 1. There is no two-character piece yet.
+step: i = 2, char "2": dp[2] = dp[1] = 1. The pair "22" is between 10 and 26, so add dp[0]: dp[2] = 2.
+step: i = 3, char "6": dp[3] = dp[2] = 2. The pair "26" is allowed, so add dp[1]: dp[3] = 3.
+step: Return 3: "2 2 6", "22 6" and "2 26".
+bugs: Counting a leading zero such as "06" as a valid pair ; Allowing a lone "0" as a character ; Forgetting the mod on one of the additions, so numbers grow without limit ; Using a pair limit of 27 or higher instead of 26
+cost: O(n) time and O(n) extra space, because each position adds up to two earlier values (O(1) space with two variables).
+
+@@ wordbreak
+what: Say prefix i is breakable if some shorter breakable prefix j is followed by a word s[j:i] in the dictionary. Put the words in a hash set for fast lookup. Fill dp from left to right. This beats trying every way to split the string, which grows exponentially.
+signals: "can the string be segmented into dictionary words?" ; words may be reused ; "break a sentence into valid words" ; a yes or no answer for the whole string ; every prefix can be checked from earlier prefixes
+code:
+```python
+def word_break(s: str, word_dict: list[str]) -> bool:
+    words = set(word_dict)               # hash set: O(1) average membership
+    dp = [True] + [False] * len(s)       # dp[i]: the first i characters can be split
+    for i in range(1, len(s) + 1):
+        for j in range(i):
+            if dp[j] and s[j:i] in words:
+                dp[i] = True
+                break
+    return dp[len(s)]
+```
+walk: #139 Word Break
+step: Take s = "leetcode", word_dict = ["leet", "code"]. dp[0] = True, all others False.
+step: For i = 1, 2, 3: the pieces "l", "le", "lee" (and others) are not words, so they stay False.
+step: i = 4: j = 0, dp[0] is True and "leet" is in the set. So dp[4] = True.
+step: i = 5, 6, 7: dp[4] is True, but "c", "co" and "cod" are not words. They stay False.
+step: i = 8: j = 4, dp[4] is True and s[4:8] = "code" is a word. So dp[8] = True.
+step: Return dp[8] = True.
+bugs: Using a list for the words, which makes each check slow ; Forgetting dp[0] = True ; Checking only the whole word list in order and not all split points ; Not breaking after a match, which is correct but wastes time
+cost: O(n² · L) time and O(n) extra space, because there are n² pairs (j, i) and each slice and hash costs up to L, the longest word length.
+
+@@ dpbinsearch
+what: Sort jobs by end time. For job i, the best total is either the best so far without it, or its profit plus the best total of jobs that end before it starts. That earlier job is found by binary search, because end times are sorted. This avoids scanning all earlier jobs each time.
+signals: "maximum profit" from jobs with start, end and profit ; chosen intervals must not overlap ; "weighted interval scheduling" ; sort by end and look for the last compatible item ; dp over earlier items that are compatible with this one
+code:
+```python
+from bisect import bisect_right
+
+def job_scheduling(start_time: list[int], end_time: list[int], profit: list[int]) -> int:
+    jobs = sorted(zip(end_time, start_time, profit))   # sort by end time
+    ends, best = [0], [0]                # best[i]: top profit using jobs that end by ends[i]
+    for e, s, p in jobs:
+        i = bisect_right(ends, s) - 1    # last finished time that is <= s
+        cand = best[i] + p
+        if cand > best[-1]:
+            ends.append(e)
+            best.append(cand)
+    return best[-1]
+```
+walk: #1235 Maximum Profit in Job Scheduling
+step: Take start = [1, 2, 3, 3], end = [3, 4, 5, 6], profit = [50, 10, 40, 70]. Sorted by end: (3, 1, 50), (4, 2, 10), (5, 3, 40), (6, 3, 70). Start with ends = [0], best = [0].
+step: Job (end 3, start 1, profit 50): bisect finds index 0, so cand = 0 + 50. Append: ends = [0, 3], best = [0, 50].
+step: Job (end 4, start 2, profit 10): cand = 0 + 10 = 10, not better than 50. Skip it.
+step: Job (end 5, start 3, profit 40): bisect_right([0, 3], 3) - 1 = 1, so cand = 50 + 40 = 90. Append: best = [0, 50, 90].
+step: Job (end 6, start 3, profit 70): the last compatible one is index 1 again, so cand = 50 + 70 = 120. Append.
+step: Return best[-1] = 120.
+bugs: Using bisect_left, which treats a job ending exactly at this start as overlapping ; Sorting by start time and then breaking the binary search ; Appending to the table even when cand is not an improvement ; Forgetting the sentinel (0, 0) that stands for "no earlier job"
+cost: O(n log n) time and O(n) extra space, because sorting and one binary search per job cost log n each.
+
+@@ dpmonoq
+what: When dp[i] needs the best dp value in a sliding window of the last k positions, a monotonic deque gives it in O(1). Keep indices in the deque with dp values going down from front to back. The front is always the best in the window. Old indices leave from the front, and weaker new ones are dropped from the back.
+signals: "jump at most k steps" ; dp value is the max or min over the last k states ; "sliding window maximum" inside a DP ; plain DP with an inner loop over k is too slow ; n up to 10^5
+code:
+```python
+from collections import deque
+
+def max_result(nums: list[int], k: int) -> int:
+    dp = [0] * len(nums)
+    dp[0] = nums[0]
+    dq = deque([0])                      # indices; their dp values go down from front to back
+    for i in range(1, len(nums)):
+        while dq[0] < i - k:             # front is out of the window
+            dq.popleft()
+        dp[i] = nums[i] + dp[dq[0]]      # front holds the best dp in the window
+        while dq and dp[dq[-1]] <= dp[i]:
+            dq.pop()                     # worse and older than i: never useful again
+        dq.append(i)
+    return dp[-1]
+```
+walk: #1696 Jump Game VI
+step: Take nums = [1, -1, -2, 4, -7, 3], k = 2. dp[0] = 1, deque = [0].
+step: i = 1: front 0 is in the window. dp[1] = -1 + 1 = 0. dp[0] = 1 is bigger, so keep it: deque = [0, 1].
+step: i = 2: front 0 is still within 2 steps. dp[2] = -2 + 1 = -1. Deque = [0, 1, 2].
+step: i = 3: index 0 is too old, so pop it. The front is 1 with dp 0. dp[3] = 4 + 0 = 4. It beats all, so deque = [3].
+step: i = 4: dp[4] = -7 + 4 = -3, deque = [3, 4]. i = 5: dp[5] = 3 + dp[3] = 7.
+step: Return dp[5] = 7.
+bugs: Storing values instead of indices, so you cannot tell when an item leaves the window ; Using < instead of <= when dropping from the back, which is harmless but keeps ties ; Removing from the front with an off-by-one window size ; Forgetting to pop old indices before reading the front
+cost: O(n) time and O(n) extra space, because each index enters and leaves the deque once.
+
+@@ dpprefix
+what: If dp[i][j] is the sum of a range of the previous row, adding that range for every cell is slow. Keep a running sum of the previous row. Moving j right by one adds the new element on the right and removes the one that fell out on the left. Each cell then costs O(1) instead of O(range).
+signals: dp value is a sum over a range of the previous row ; "count permutations with exactly k inversions" ; transitions of the form dp[i-1][j-t] for t in a range ; the plain DP is O(n · k · n) and too slow ; counts asked modulo 10^9 + 7
+code:
+```python
+def k_inverse_pairs(n: int, k: int) -> int:
+    MOD = 10**9 + 7
+    dp = [1] + [0] * k                   # row for 1 number: only 0 inverse pairs
+    for i in range(2, n + 1):
+        nxt, run = [0] * (k + 1), 0
+        for j in range(k + 1):
+            run += dp[j]                 # run = dp[j-i+1] + ... + dp[j] via a sliding sum
+            if j >= i:
+                run -= dp[j - i]
+            run %= MOD
+            nxt[j] = run
+        dp = nxt
+    return dp[k]
+```
+walk: #629 K Inverse Pairs Array
+step: Take n = 3, k = 1. For one number, dp = [1, 0]: one way with 0 pairs.
+step: Add number 2 (i = 2). j = 0: run = 1, so nxt[0] = 1. j = 1: run = 1 + 0 = 1 (j < 2, nothing leaves), so nxt[1] = 1.
+step: Now dp = [1, 1]: the arrays [1, 2] and [2, 1].
+step: Add number 3 (i = 3). j = 0: run = 1, nxt[0] = 1. j = 1: run = 1 + 1 = 2, nxt[1] = 2.
+step: Return dp[1] = 2, for the arrays [1, 3, 2] and [2, 1, 3].
+bugs: Forgetting to subtract the value that leaves the window, which is dp[j - i] ; Taking the mod only at the end, so numbers grow too large ; Subtracting with a negative result and not fixing it with a mod ; Starting the loop at i = 1 with a wrong first row
+cost: O(n · k) time and O(k) extra space, because each cell uses a running sum in O(1) and only one row is kept.
+
+@@ probdp
+what: Probability DP spreads chance step by step. Keep a table of the probability of being on each state. For each step, send a share of each state's probability to every state it can move to. The sum of the table at the end is the chance of the event you want. Expected values work the same way.
+signals: "probability that ... after k moves" ; each move picks equally among several choices ; "remains on the board" or "survives" ; "expected number of steps" ; the same state can be reached by many paths
+code:
+```python
+def knight_probability(n: int, k: int, row: int, column: int) -> float:
+    moves = [(1, 2), (2, 1), (-1, 2), (-2, 1), (1, -2), (2, -1), (-1, -2), (-2, -1)]
+    cur = [[0.0] * n for _ in range(n)]
+    cur[row][column] = 1.0               # all probability starts on one cell
+    for _ in range(k):
+        nxt = [[0.0] * n for _ in range(n)]
+        for r in range(n):
+            for c in range(n):
+                if cur[r][c]:
+                    for dr, dc in moves:
+                        nr, nc = r + dr, c + dc
+                        if 0 <= nr < n and 0 <= nc < n:
+                            nxt[nr][nc] += cur[r][c] / 8   # each move has chance 1/8
+        cur = nxt
+    return sum(map(sum, cur))            # mass that never fell off the board
+```
+walk: #688 Knight Probability in Chessboard
+step: Take n = 3, k = 2, start (0, 0). cur[0][0] = 1.0.
+step: Step 1: of the 8 knight moves, only (1, 2) and (2, 1) stay on the board. Each gets 1.0 / 8 = 0.125.
+step: Step 2 from (1, 2): only (0, 0) and (2, 0) are on the board. Each gets 0.125 / 8 = 0.015625.
+step: Step 2 from (2, 1): only (0, 0) and (0, 2) are on the board. Each gets 0.015625 as well.
+step: The board now holds four parts of 0.015625. Their sum is 0.0625.
+step: Return 0.0625. The rest of the probability fell off the board.
+bugs: Dividing by the number of valid moves instead of all 8 moves ; Reusing the same table in place, so one step spreads twice ; Counting paths and dividing at the end, which can overflow ; Not summing the table at the end
+cost: O(k · n² · 8) time and O(n²) extra space, because each step visits every cell and tries 8 moves.
+
+@@ submask
+what: To visit every subset of a mask, start with sub = mask and repeat sub = (sub - 1) & mask until sub is 0. Subtracting 1 flips the low bits, and the AND with mask keeps only the allowed bits. Each submask appears once. Over all masks, the total work is 3^n, not 4^n.
+signals: "all subsets of a set of letters or items" ; mask of up to about 20 bits ; "every letter of the word must be in the puzzle" ; combine two masks that do not overlap ; DP where a state uses the submasks of another state
+code:
+```python
+from collections import Counter
+
+def find_num_of_valid_words(words: list[str], puzzles: list[str]) -> list[int]:
+    bit = lambda ch: 1 << (ord(ch) - 97)
+    cnt = Counter()
+    for w in words:
+        m = 0
+        for ch in w:
+            m |= bit(ch)
+        cnt[m] += 1                      # how many words have exactly this letter set
+    ans = []
+    for p in puzzles:
+        first, rest = bit(p[0]), 0
+        for ch in p[1:]:
+            rest |= bit(ch)
+        total, sub = 0, rest
+        while True:                      # visits every submask of rest, then 0
+            total += cnt[sub | first]    # the first letter is mandatory
+            if sub == 0:
+                break
+            sub = (sub - 1) & rest
+        ans.append(total)
+    return ans
+```
+walk: #1178 Number of Valid Words for Each Puzzle
+step: Take words = ["aaaa", "abb", "cab"] and puzzle "abcdefg". The word masks are {a}, {a, b}, {a, b, c}, each with count 1.
+step: The first letter is a, and rest = {b, c, d, e, f, g}, which has 6 bits.
+step: Start with sub = rest and apply sub = (sub - 1) & rest to visit all 2^6 = 64 submasks. For each one, look up cnt[sub | a].
+step: When sub = {} the lookup is {a}: count 1. When sub = {b} it is {a, b}: count 1.
+step: When sub = {b, c} it is {a, b, c}: count 1. All other submasks find nothing.
+step: Total = 3. The answer for this puzzle is 3.
+bugs: Forgetting to handle sub = 0, so the empty submask is never visited ; Looping while sub > 0, which skips the empty set ; Not forcing the first letter of the puzzle ; Using a list of words per puzzle instead of precomputed counts
+cost: O(W · L + P · 2^6) time and O(W) extra space, because puzzles have 7 letters, so each puzzle has 64 submasks.
+
+@@ tspdp
+what: Some problems ask for a path that visits every node. Let the state be (set of visited nodes as a bitmask, current node). Moves go from one state to the next by stepping along an edge and setting a bit. With equal edge costs, BFS over these states finds the fewest steps. This uses at most 2^n · n states.
+signals: "visit every node" with n at most about 12 to 20 ; "shortest path visiting all nodes" ; "travelling salesman" ; may start anywhere and revisit nodes ; need to remember which nodes were already seen
+code:
+```python
+from collections import deque
+
+def shortest_path_length(graph: list[list[int]]) -> int:
+    n = len(graph)
+    full = (1 << n) - 1
+    q = deque((1 << i, i) for i in range(n))       # start anywhere: (visited mask, node)
+    seen = {(1 << i, i) for i in range(n)}
+    steps = 0
+    while q:
+        for _ in range(len(q)):          # one BFS level per step
+            mask, u = q.popleft()
+            if mask == full:
+                return steps
+            for v in graph[u]:
+                state = (mask | (1 << v), v)
+                if state not in seen:
+                    seen.add(state)
+                    q.append(state)
+        steps += 1
+    return 0
+```
+walk: #847 Shortest Path Visiting All Nodes
+step: Take graph = [[1, 2, 3], [0], [0], [0]]: node 0 is joined to 1, 2 and 3. full = 15 (binary 1111).
+step: Level 0 holds four start states (1, 0), (2, 1), (4, 2), (8, 3). None is full.
+step: Start at node 1: (2, 1) moves to (3, 0), visiting 0.
+step: Then (3, 0) moves to (7, 2), then back to (7, 0), because revisiting is allowed.
+step: Then (7, 0) moves to (15, 3). That is level 4, and the mask is full.
+step: Return steps = 4, for the walk 1, 0, 2, 0, 3.
+bugs: Keeping a visited set of nodes only, which forbids needed revisits ; Not starting from every node at once ; Forgetting that mask and node together make the state ; Checking for the full mask only after the BFS ends
+cost: O(2^n · n²) time and O(2^n · n) extra space, because there are 2^n · n states and each tries up to n edges.
+
+@@ kmp
+what: The KMP prefix function pi[i] is the length of the longest proper prefix of s[:i+1] that is also its suffix. It is built in one pass: on a mismatch, fall back to the next shorter border, pi[k - 1], instead of starting from zero. The text pointer never moves back, which is what makes it linear.
+signals: "longest prefix which is also a suffix" ; "find the pattern in the text" in linear time ; "shortest string with this as a prefix and suffix" ; border or period of a string ; repeated pattern inside a string
+code:
+```python
+def longest_prefix(s: str) -> str:
+    n = len(s)
+    pi = [0] * n                         # pi[i]: longest proper prefix of s[:i+1] that is also its suffix
+    k = 0
+    for i in range(1, n):
+        while k and s[i] != s[k]:
+            k = pi[k - 1]                # fall back to the next shorter border
+        if s[i] == s[k]:
+            k += 1
+        pi[i] = k
+    return s[:pi[-1]]
+```
+walk: #1392 Longest Happy Prefix
+step: Take s = "level". pi = [0, 0, 0, 0, 0], k = 0.
+step: i = 1 ('e'): it does not equal s[0] = 'l', and k is 0, so pi[1] = 0. The same for i = 2 ('v') and i = 3 ('e').
+step: i = 4 ('l'): it equals s[0] = 'l', so k = 1 and pi[4] = 1.
+step: The last value is 1, so the answer is s[:1] = "l".
+step: For "ababab" the table is [0, 0, 1, 2, 3, 4]. At i = 5 the border grows to 4, so the answer is "abab".
+bugs: Falling back to k = 0 on a mismatch instead of k = pi[k - 1] ; Using if instead of while for the fall back ; Allowing the whole string as its own border: the prefix must be proper ; Returning pi[-1] (a number) instead of the prefix string
+cost: O(n) time and O(n) extra space, because k goes up at most n times in total, so the fall backs add up to at most n.
+
+@@ manacher
+what: Manacher finds the longest palindrome around every centre in O(n). It remembers the palindrome that reaches furthest right. A new centre inside it is the mirror of an earlier centre, so its answer starts from the mirror's answer. Only the part beyond the right edge is checked character by character. Expanding around each centre from scratch is O(n²).
+signals: "longest palindromic substring" with n up to 10^5 ; "count all palindromic substrings" fast ; palindrome length known for every centre ; two non-overlapping palindromes ; the O(n²) expand-around-centre is too slow
+code:
+```python
+def max_product(s: str) -> int:
+    n = len(s)
+    d = [0] * n                          # d[i]: radius of the longest odd palindrome centred at i
+    l, r = 0, -1
+    for i in range(n):
+        k = 1 if i > r else min(d[l + r - i], r - i + 1)   # reuse the mirror image
+        while i - k >= 0 and i + k < n and s[i - k] == s[i + k]:
+            k += 1
+        d[i] = k
+        if i + k - 1 > r:
+            l, r = i - k + 1, i + k - 1
+    end, start = [1] * n, [1] * n        # longest odd palindrome ending / starting at each index
+    for i in range(n):
+        end[i + d[i] - 1] = max(end[i + d[i] - 1], 2 * d[i] - 1)
+        start[i - d[i] + 1] = max(start[i - d[i] + 1], 2 * d[i] - 1)
+    for i in range(n - 2, -1, -1):
+        end[i] = max(end[i], end[i + 1] - 2)       # trim both ends of a palindrome
+    for i in range(1, n):
+        start[i] = max(start[i], start[i - 1] - 2)
+    pre, suf = end[:], start[:]
+    for i in range(1, n):
+        pre[i] = max(pre[i], pre[i - 1])
+    for i in range(n - 2, -1, -1):
+        suf[i] = max(suf[i], suf[i + 1])
+    return max(pre[i] * suf[i + 1] for i in range(n - 1))
+```
+walk: #1960 Maximum Product of the Length of Two Palindromic Substrings
+step: Take s = "ababbb". The radii d (odd palindromes) come out as [1, 2, 2, 1, 2, 1]. For example d[1] = 2 is "aba" and d[4] = 2 is "bbb".
+step: At i = 3, the rightmost palindrome is "bab" (indices 1 to 3), so the mirror radius is reused. Only one more check is needed, and it fails.
+step: Each centre gives a palindrome of length 2 · d - 1 that ends at i + d - 1 and starts at i - d + 1. Trimming both ends gives shorter ones.
+step: pre[i] is the longest odd palindrome ending at or before i. suf[i] is the longest starting at or after i.
+step: pre[2] = 3 (from "aba") and suf[3] = 3 (from "bbb"), so the product is 9.
+step: No split does better, so return 9.
+bugs: Forgetting to update the rightmost palindrome (l, r) after expanding ; Reading the mirror radius without limiting it to r - i + 1 ; Using the even and odd cases in one array without separate handling ; Taking the best palindrome centred at each index instead of the best ending at each index
+cost: O(n) time and O(n) extra space, because the right edge only moves forward, so total expansion work is at most n.

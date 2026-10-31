@@ -1,0 +1,743 @@
+@@ ccontrol
+== Optimistic commit on immutable files
+kind: copy-on-write, lease
+when: Many writers update shared data, conflicts are rare, and you cannot hold locks (for example files on object storage).
+how: Each writer reads the current table version, for example 41. It writes new data files off to the side, which nobody else can see yet. No lock is held while it works, so a slow Spark job blocks nobody.
+To commit, the writer tries to create the next log entry, version 42, with an atomic "put if absent" operation. If that succeeds, the commit is done. If another writer already created 42, the loser reads the new entry and checks it. Did that commit touch files or partitions that I read or changed? If not, it retries as version 43. If yes, it fails and the job must rerun.
+This is optimistic concurrency control: validate at commit, abort on conflict. Disjoint partitions per writer keep the abort rate low. A hot partition touched by many jobs turns it into an abort storm.
+used: Delta Lake and Apache Iceberg commit protocols; Apache Hudi optimistic mode; Git push (a rejected non-fast-forward push is a validation failure).
+avoid: When most writers touch the same rows or files. Use a lock, a single-writer queue, or a database with row locks instead.
+flow:
+  Spark job A [svc: reads v41] -> Table log [log: object storage] : read version 41 | Both jobs read the table at version 41 and see the same files.
+  + Spark job B [svc: reads v41] -> Table log : read version 41
+  Spark job A -> Data files [lake: new Parquet] : stage new files | Job A writes its new files; they are invisible until a log entry names them.
+  Spark job A -> Table log : put v42 if absent | Job A wins the atomic create and its commit is now version 42.
+  Spark job B -x> Table log : put v42 rejected | Job B finds that v42 exists, so its create fails.
+  Spark job B -> Table log : validate, put v43 | Job B checks v42 touched other partitions only, so it retries as version 43.
+ref: paper | On Optimistic Methods for Concurrency Control | H. T. Kung and John T. Robinson, ACM TODS 1981 |
+ref: docs | Concurrency control in Delta Lake | Delta Lake documentation | https://docs.delta.io/latest/concurrency-control.html
+
+== Strict 2PL row locks with deadlock victim
+kind: pessimistic-lock
+when: Transactions are short, conflicts are likely, and you want the database to prevent anomalies by making callers wait.
+how: A transaction takes a shared lock before it reads a row and an exclusive lock before it writes. It keeps exclusive locks until commit. This is strict two-phase locking. The lock manager keeps a table of who holds and who waits for each row.
+When T1 holds A and wants B while T2 holds B and wants A, both wait forever. The engine finds this by searching the wait-for graph for a cycle. PostgreSQL starts this check after deadlock_timeout, which is 1 second by default. It aborts one transaction, the victim, and the other continues.
+The application must catch the error and retry the whole transaction. Updating rows in a fixed order, for example by primary key, makes most deadlocks disappear. A hot row limits the system: with a 1 ms lock hold, one row allows at most 1,000 updates per second.
+used: MySQL InnoDB row and next-key locks; SQL Server locking read committed; PostgreSQL row locks for writers (SELECT FOR UPDATE).
+avoid: Mostly read workloads, where MVCC snapshots avoid read locks; or when transactions span a slow network call.
+flow:
+  App 1 [client: txn T1] -> Lock manager [svc: lock table] : X lock row A | T1 gets an exclusive lock on row A.
+  App 2 [client: txn T2] -> Lock manager : X lock row B | T2 gets an exclusive lock on row B.
+  App 1 -> Lock manager : X lock row B | T1 asks for row B and must wait for T2.
+  App 2 -> Lock manager : X lock row A | T2 asks for row A and waits for T1. Now there is a cycle.
+  Lock manager -> Deadlock detector [svc: wait-for graph] : T1 waits T2, T2 waits T1 | After the timeout, the detector searches the graph and finds the cycle.
+  Deadlock detector -x> App 2 : abort T2 | T2 is chosen as victim and receives a deadlock error.
+  App 2 ~> Lock manager : retry T2 | The application retries T2 after T1 has committed and released its locks.
+ref: paper | The Notions of Consistency and Predicate Locks in a Database System | Eswaran, Gray, Lorie and Traiger, CACM 1976 |
+ref: docs | Explicit locking and deadlocks | PostgreSQL documentation | https://www.postgresql.org/docs/current/explicit-locking.html
+
+@@ indexing
+== Secondary index lookup then heap fetch
+kind: index-table, memory-tiering
+when: Queries pick a few rows out of a big table by a column that is not the primary key.
+how: A B-tree index stores the indexed column in sorted order, with a pointer to the row in the table (the heap). The planner compares the estimated number of matching rows with the table size. If few rows match, it walks the index and then fetches each row by its pointer.
+A B-tree on a table of 100 million rows is about 4 levels deep. The top levels stay in memory, so a lookup costs 1 or 2 disk reads for the leaf and 1 more for the heap row. A full scan would read every page.
+The index is not free. Every insert and update must change each index too, so a table with 8 indexes writes 9 structures. If a query asks for more than a few percent of the rows, a sequential scan is faster, and the planner will choose it. A covering index holds all needed columns and skips the heap fetch.
+used: PostgreSQL B-tree indexes and index-only scans; MySQL InnoDB secondary indexes (they point to the primary key); every OLTP database.
+avoid: Low-selectivity columns such as a yes/no flag, and write-heavy tables where each extra index slows every write.
+flow:
+  App [client] -> Query planner [svc: cost estimate] : WHERE email = 'x' | The planner sees a selective filter and chooses the email index.
+  Query planner -> Email index [store: B-tree 4 levels] : walk root to leaf | The walk reads 4 pages; the top 3 are almost always cached.
+  Email index -> Query planner : row pointer page 812 | The leaf entry holds a pointer to the row, not the row itself.
+  Query planner -> Heap table [db: 100M rows] : fetch page 812 | One random read returns the full row.
+  Heap table -> App : row | The query touched about 5 pages instead of millions.
+  App -> Heap table : INSERT row | Writes are the price: every insert also updates each index.
+  + Heap table ~> Email index : add entry
+ref: docs | Indexes | PostgreSQL documentation | https://www.postgresql.org/docs/current/indexes.html
+ref: paper | Organization and Maintenance of Large Ordered Indexes | Bayer and McCreight, Acta Informatica 1972 |
+
+== Sparse index over sorted segments
+kind: lsm-compaction, tiered-storage
+when: Data is written in sorted, immutable blocks or files, and you want fast lookups with a very small index.
+how: Instead of one index entry per record, keep one entry every few thousand records or every few kilobytes. This is a sparse index. To find a key, binary search the index for the last entry that is not larger than the key. Then read that one small block and scan it.
+Kafka does this for offsets. Each log segment has an offset index file that maps about every 4 KB of data to a byte position. A 1 GB segment then needs an index of only a few hundred kilobytes, which fits in memory. A consumer asking for offset 5,000,000 binary searches the index and reads forward from the nearest position.
+Analytics files do the same with min and max values per block (zone maps), so a filter can skip whole blocks. The trade is a small scan after each lookup, in return for a tiny index.
+used: Kafka log segment .index files; LSM-tree SSTable block indexes in RocksDB; Parquet row-group statistics.
+avoid: Unsorted data, or point lookups that must be answered with no scan at all. Use a dense hash or B-tree index.
+flow:
+  Consumer [client] -> Broker [svc: Kafka] : fetch offset 5,000,000 | A consumer asks for a message by offset.
+  Broker -> Segment list [store: base offsets] : find file | A search of segment base offsets picks the segment that starts at 4,900,000.
+  Broker -> Offset index [store: sparse in memory] : binary search | The index returns the nearest entry at or below the offset, with a byte position.
+  Broker -> Segment file [log: 1 GB on disk] : read from byte 61,440 | The broker reads from that position and scans a few records forward.
+  Segment file -> Consumer : records | The consumer receives data starting exactly at the requested offset.
+ref: docs | Kafka log implementation | Apache Kafka documentation | https://kafka.apache.org/documentation/#log
+ref: book | Designing Data-Intensive Applications, chapter 3 | Martin Kleppmann, 2017 |
+
+@@ isolation
+== Snapshot reads for reports beside writers
+kind: read-replicas, copy-on-write
+when: Long reports and many short updates run on one database, and reports must not block writers or see half-done work.
+how: Run the report in a REPEATABLE READ transaction. At its first query, the database takes a snapshot: it records which transactions have committed. Every row version written later is invisible to the report, so all its queries see one consistent moment.
+Writers keep working. They create new row versions instead of overwriting, so no read lock is needed. The report never waits, and the writers never wait for it.
+There are two costs. Old row versions cannot be cleaned up while the report runs, so a 2-hour report can bloat tables. And snapshot isolation allows write skew: two transactions read the same rows and write different rows, and together break a rule. For such invariants use SERIALIZABLE or an explicit lock.
+used: PostgreSQL REPEATABLE READ and SERIALIZABLE (SSI); Oracle and SQL Server snapshot isolation; MySQL InnoDB default REPEATABLE READ.
+avoid: Rules that span several rows (for example "at least one doctor on call") at plain snapshot level. Use SERIALIZABLE and retry.
+flow:
+  Report job [client: BEGIN RR] -> Database [db: row versions] : first query | The report gets a snapshot that fixes what it can see.
+  Order service [svc] -> Database : UPDATE order 7 | The writer adds a new version of row 7; the old version stays.
+  Database -> Order service : commit ok | The writer did not wait for the report.
+  Report job -> Database : second query | The report asks again, later in time.
+  Database -> Report job : old version of order 7 | The report still sees the version from its snapshot, so its numbers add up.
+  Report job -> Database : COMMIT | The report ends, and the old version can be cleaned up by vacuum.
+ref: paper | A Critique of ANSI SQL Isolation Levels | Berenson et al., SIGMOD 1995 |
+ref: docs | Transaction isolation | PostgreSQL documentation | https://www.postgresql.org/docs/current/transaction-iso.html
+
+== Serializable with retry loop
+kind: retry-backoff, idempotent-consumer
+when: A rule spans several rows, such as a balance check or a seat limit, and wrong answers are not acceptable.
+how: Set the transaction to SERIALIZABLE. The database now promises that the result equals some one-at-a-time order. PostgreSQL gets this with serializable snapshot isolation. It tracks read-write dependencies between transactions and aborts one when it sees a dangerous pattern. Other engines use range locks.
+The price is that the database may abort a healthy transaction with a serialization failure. So the application wraps each transaction in a retry loop. It catches that error, waits a short random time and runs the whole transaction again, up to a small limit such as 5 tries.
+The transaction body must be safe to repeat. Do not send an email or call a payment API inside it. Do those after commit, or use an idempotency key. Under heavy contention, aborts can be several times higher than at READ COMMITTED.
+used: PostgreSQL SERIALIZABLE; CockroachDB (serializable by default); Google Spanner; banking and booking code with retry middleware.
+avoid: High-contention counters and analytics reads; use READ COMMITTED with atomic updates, or snapshot reads.
+flow:
+  Booking API [svc: retry loop] -> Database [db: SERIALIZABLE] : BEGIN; count seats | The API reads how many seats are taken.
+  Booking API -> Database : INSERT booking | The API writes a booking if a seat is free.
+  Other API call [svc] -> Database : same seat, same time | A second request makes a conflicting read-write pair.
+  Database -x> Other API call : serialization failure | The database aborts one transaction to keep the result serial.
+  Other API call ~> Database : retry after jitter | The caller waits a short random time and reruns the whole transaction.
+  Database -> Booking API : COMMIT ok | The first transaction commits normally.
+ref: paper | Serializable Snapshot Isolation in PostgreSQL | Ports and Grittner, VLDB 2012 |
+
+@@ normalization
+== Normalized OLTP core with denormalized read models
+kind: cqrs, materialized-view
+when: A system needs correct writes without update anomalies, and also fast, simple reads for screens or reports.
+how: The write side keeps data in third normal form (3NF). Each fact is stored once: a customer's address lives in one row in customers, and orders point to it by key. Updating the address is one write, so no copy can disagree with another.
+Reads that need many joins are expensive. So a background job or a CDC stream builds a denormalized copy: one wide row per order with the customer name and city already inside. This copy can be a materialized view, a search index or a cache entry. It is derived data, and it can always be rebuilt from the normalized source.
+The source of truth stays normalized; the speed comes from the copy. The cost is staleness: the copy lags the source by seconds. Never write to the copy and expect the source to change.
+used: Postgres OLTP with Elasticsearch or Redis read models; Kimball star schemas fed from normalized source systems; e-commerce order history pages.
+avoid: Small apps with simple queries, where joins on indexed keys are fast enough and a copy is only extra work.
+flow:
+  Checkout API [svc] -> Orders DB [db: 3NF tables] : write order rows | Each fact is written once: customer, order, order lines.
+  Orders DB -> CDC connector [svc: reads the log] : committed changes | The connector reads committed changes from the database log.
+  CDC connector -> Projector [svc: joins rows] : order + customer rows | The projector joins the normalized rows into one flat document.
+  Projector -> Order view [store: one wide row] : upsert document | The wide copy is written; reads need no joins.
+  Web app [client] -> Order view : GET order page | The page is served from one lookup.
+  Support tool [client] -> Orders DB : change customer address | The fix goes to the normalized source only.
+  + Orders DB ~> Projector : change event
+ref: book | Database System Concepts, chapter on relational design | Silberschatz, Korth and Sudarshan |
+ref: paper | A Relational Model of Data for Large Shared Data Banks | E. F. Codd, CACM 1970 |
+
+@@ recovery
+== Write-ahead log with redo and undo on restart
+kind: wal, checkpoint-restart
+when: A database must keep committed work and drop unfinished work after a crash, without writing every page to disk at commit.
+how: Before a transaction commits, its log records are written to a sequential log and flushed with fsync. Data pages stay in the buffer pool and are written back later, in any order. The rule: a dirty page may reach disk only after its log record is durable. Commit is acknowledged when the log is safe, not the pages.
+After a crash, ARIES recovery runs three passes. Analysis reads the log from the last checkpoint and finds which transactions were active and which pages were dirty. Redo repeats all logged changes, so the pages return to their state at crash time. Undo then rolls back transactions that had not committed.
+Checkpoints limit the work. If a checkpoint happens every few minutes, recovery reads only the log after it. Each log record carries a log sequence number (LSN), and each page remembers the LSN of its last change, so redo skips pages that are already up to date.
+used: PostgreSQL WAL redo; MySQL InnoDB redo and undo logs; SQL Server and Db2 (ARIES family).
+avoid: Systems with no in-place pages to repair, such as pure log-structured stores that replay a log into memory; they use simpler replay.
+flow:
+  Client [client] -> Database [svc: buffer pool] : COMMIT txn 9 | A transaction ends and asks to commit.
+  Database -> WAL [log: LSN 4021] : append commit record | The commit record is appended to the log.
+  WAL -> Disk [store: fsync] : flush log | The log is forced to stable storage before the reply.
+  Database -> Client : committed | The client gets the answer; data pages are still only in memory.
+  * Database: crashed, memory lost | Power fails. Memory is lost, but the log survives on disk.
+  * Database: restart, redo from checkpoint | On restart, analysis finds the checkpoint and the dirty pages.
+  WAL -> Database : redo then undo | Redo repeats txn 9's changes. Undo removes txns that did not commit.
+ref: paper | ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking | Mohan et al., ACM TODS 1992 |
+ref: docs | Write-ahead logging | PostgreSQL documentation | https://www.postgresql.org/docs/current/wal-intro.html
+
+@@ relalgebra
+== Logical plan rewrite with predicate pushdown
+kind: interpreter-compiler, pipes-filters
+when: A query engine must run a SQL query fast without changing its answer.
+how: The parser turns SQL into a tree of relational operators: scan, select (filter), project, join, aggregate. Because each operator has algebraic laws, the optimizer may rewrite the tree. The answer stays the same, but the cost can drop a lot.
+The most common rewrite is pushing a filter below a join. Take a join of 1 billion orders with 1 million customers, followed by a filter on country = 'DE'. Run the filter first and the join sees only about 40,000 customers. Selections that touch one table also go into the scan, where partition pruning and Parquet statistics skip whole files. Projections are pushed down too, so only the needed columns are read.
+Next, the optimizer picks join order and join type using cost estimates. The physical plan is then run as a pipeline of operators. Bad statistics lead to bad rewrites, so keep table statistics fresh.
+used: Spark Catalyst; Trino and Presto planners; PostgreSQL planner; Calcite-based engines such as Flink SQL and Apache Drill.
+avoid: Engines that cannot see inside the query, such as opaque user code in a UDF; the optimizer cannot move filters past it.
+flow:
+  SQL text [note: JOIN + WHERE country] -> Parser [svc: builds tree] : syntax tree | The parser builds a tree of scan, join and filter operators.
+  Parser -> Logical optimizer [svc: algebra rules] : plan: Filter above Join | The first plan filters after the join, which is costly.
+  * Logical optimizer: filter pushed down | The filter moves under the join. The result stays the same by algebra.
+  Logical optimizer -> Physical planner [svc: cost model] : plan: Filter on scan | The new logical plan goes to cost-based choices.
+  Physical planner -> Executor [svc: operators] : hash join, pruned scan | It picks a hash join and a scan that skips files by statistics.
+  Executor -> Parquet files [lake: min/max stats] : read 3 of 400 files | Only files that may contain country DE are read.
+ref: paper | Spark SQL: Relational Data Processing in Spark | Armbrust et al., SIGMOD 2015 |
+ref: paper | A Relational Model of Data for Large Shared Data Banks | E. F. Codd, CACM 1970 |
+
+@@ relmodel
+== Fact and dimension tables joined by keys
+kind: star-schema, etl-elt
+when: Analysts need fast, simple queries over events such as sales or ad impressions, sliced by many attributes.
+how: Data is kept as relations (tables) with keys. A central fact table holds one row per event, such as an impression, with numeric measures and foreign keys. Small dimension tables hold the descriptive attributes: campaign, device, date, publisher.
+A query joins the fact table to the dimensions it needs and groups by their attributes. The join is a plain relational join on keys, so any SQL engine can run it. A fact table of 5 billion rows may join to dimensions of a few thousand to a few million rows. The engine broadcasts or hashes the small side.
+The relational model gives the contract: a key identifies a row, a foreign key points to exactly one dimension row, and the same query means the same thing in every engine. Surrogate keys keep facts stable when business keys change.
+used: Kimball warehouses in Snowflake, BigQuery and Redshift; dbt marts; ad-tech reporting tables joining impressions to campaigns.
+avoid: High-write transactional workloads, where normalized tables and constraints fit better. Use an OLTP schema.
+flow:
+  Impression events [lake: raw] -> Loader [svc: ELT job] : batch of rows | Raw events arrive in the warehouse.
+  Loader -> Fact impressions [db: 5B rows] : insert with foreign keys | Each row stores campaign_key and device_key plus measures.
+  Loader -> Dim campaign [db: 20K rows] : upsert descriptions | Descriptions live once, in a small dimension table.
+  Analyst [user] -> Query engine [svc: SQL] : sum clicks by advertiser | The analyst asks a business question in SQL.
+  Query engine -> Fact impressions : scan needed columns | The engine reads only the columns the query needs.
+  Query engine -> Dim campaign : hash join on key | The small table is hashed and joined to the facts on its key.
+ref: book | The Data Warehouse Toolkit | Ralph Kimball and Margy Ross, 3rd edition, 2013 |
+ref: paper | A Relational Model of Data for Large Shared Data Banks | E. F. Codd, CACM 1970 |
+
+== Constraints guard invariants in one transaction
+kind: db-invariants
+when: Several rows must always agree, for example debits and credits, and no application bug may break that.
+how: The relational model lets the schema state rules: primary keys, foreign keys, NOT NULL and CHECK constraints. The database checks them on every write, for every client. A bug in one service cannot insert an order for a customer that does not exist.
+For a ledger, a transfer is two rows: a debit and a credit. Both are inserted in one transaction. A deferred constraint or a trigger checks that the entries of the transaction sum to zero when it commits. If the check fails, the whole transaction rolls back.
+Rules in the schema are shared by every language and tool that touches the data. The cost is write latency, since each constraint is checked, and harder sharding, because a foreign key across shards is expensive.
+used: Postgres and MySQL ledgers and order systems; double-entry accounting tables; any system where one bad row costs real money.
+avoid: Very high-volume event ingestion, where checks add cost; validate upstream and store raw events instead.
+flow:
+  Payments API [svc] -> Postgres [db: constraints on] : BEGIN | The service starts one transaction for the transfer.
+  Payments API -> Postgres : insert debit -100 | The debit row is added; its account id must exist.
+  Payments API -> Postgres : insert credit +100 | The credit row is added in the same transaction.
+  Postgres -> Postgres constraint [svc: sum equals zero] : check at commit | A deferred check sums the entries of this transaction.
+  Postgres constraint -> Payments API : COMMIT ok | The sum is zero, so both rows become visible together.
+  Buggy job [svc] -x> Postgres : credit only +100 | A faulty job writes one side only.
+  Postgres constraint -x> Buggy job : rolled back | The check fails and the database rejects the whole transaction.
+ref: docs | Constraints | PostgreSQL documentation | https://www.postgresql.org/docs/current/ddl-constraints.html
+
+@@ sql
+== SQL models compiled to tables in the warehouse
+kind: etl-elt, medallion
+when: A team wants versioned, testable transformations that run inside the warehouse next to the data.
+how: Each transformation is one SELECT statement in a file. A tool such as dbt reads the files, finds the ref() calls between them and builds a dependency graph of models. It wraps each SELECT in CREATE TABLE AS or MERGE and runs them in order on the warehouse engine.
+SQL is declarative. The author says what result is wanted; the engine's optimizer picks scans, joins and parallelism. The data never leaves the warehouse, so a model over 2 billion rows runs on the warehouse cluster, not on the tool.
+Because models are plain text, they live in Git, get code review and run in CI with tests such as not-null and unique checks. Layers are common: raw, staging, then marts.
+used: dbt on Snowflake, BigQuery, Databricks and Redshift; SQLMesh; analytics engineering teams in most data companies.
+avoid: Logic that needs loops, external API calls or ML training; use Python jobs or Spark code for those steps.
+flow:
+  Git repo [store: SQL models] -> dbt [svc: compile and run] : models and refs | dbt reads every model file and the ref() links between them.
+  * dbt: DAG built | The graph tells dbt which model must run before which.
+  dbt -> Warehouse [db: Snowflake] : CREATE TABLE AS stg_orders | The first model reads raw tables and writes a staging table.
+  dbt -> Warehouse : CREATE TABLE AS fct_orders | The next model joins staging tables into a mart.
+  dbt -> Warehouse : run tests | Tests are SELECT queries that must return zero rows.
+  BI tool [client] -> Warehouse : SELECT from fct_orders | Dashboards read the finished mart with plain SQL.
+ref: docs | What is dbt | dbt Labs documentation | https://docs.getdbt.com/docs/introduction |
+ref: book | SQL Performance Explained | Markus Winand |
+
+== Prepared statements with bound parameters
+kind: parameterized-query
+when: An application builds queries from user input and must stay safe from injection and avoid repeated parsing.
+how: The application sends the SQL text with placeholders, such as WHERE id = $1, to the database once. The database parses it into a syntax tree, plans it and keeps the plan. Later the application sends only the parameter values.
+Values are bound to the already parsed tree. They can never become SQL keywords, so an input like ' OR 1=1 -- is just a string that matches no row. This is the real defense against SQL injection. Escaping strings by hand is fragile.
+Parse and plan work is saved on every call after the first. A pooler in transaction mode can break named prepared statements, so check how your pooler handles them. Identifiers such as table names cannot be bound; allow-list them in code.
+used: JDBC PreparedStatement and Python DB drivers; PostgreSQL extended protocol; ORMs such as Hibernate and SQLAlchemy.
+avoid: String concatenation of any user value into SQL; and dynamic table or column names built from input without an allow-list.
+flow:
+  Web app [svc: driver] -> Database [db: parser + planner] : PREPARE id = $1 | The app sends the query shape with a placeholder.
+  Database -> Plan cache [cache: parsed plan] : store plan | The database parses and plans once and keeps the result.
+  Web app -> Database : EXECUTE with 42 | Later calls send only the value.
+  Database -> Plan cache : reuse plan | No parsing is needed, so each call is cheaper.
+  Attacker [user] -x> Web app : id = 1 OR 1=1 | An attacker sends a quote and extra SQL as input.
+  Web app -> Database : EXECUTE with the string | The text is bound as one value and matches no row. Nothing runs.
+ref: docs | SQL Injection Prevention Cheat Sheet | OWASP | https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html
+
+@@ dstheory
+== Majority quorum tolerates f crashes
+kind: quorum, consensus-log
+when: Data must survive node crashes and stay consistent, and you can accept that a minority outage is survivable but a majority outage is not.
+how: Keep 2f+1 replicas to tolerate f crash failures. For 3 replicas f is 1, for 5 it is 2. A write counts only after a majority (f+1) stored it. A read or a leader election also needs a majority. Any two majorities share at least one node, so a later majority always sees the last committed write.
+This is why consensus systems run on odd sizes. 4 nodes tolerate only 1 failure, the same as 3, and cost more. The theory also gives limits. The FLP result says that in a fully asynchronous system no protocol can guarantee agreement if even one node may crash. Real systems add timeouts to be live, and keep safety even when timeouts are wrong.
+During a network partition, the side with a majority continues. The minority side stops accepting writes. This is the C over A choice of the CAP theorem.
+used: etcd and ZooKeeper (3 or 5 nodes); Raft groups in CockroachDB and TiKV; Kafka KRaft controllers; Spanner Paxos groups.
+avoid: Workloads that must stay writable on both sides of a partition. Use CRDTs or last-writer-wins with merge.
+flow:
+  Client [client] -> Leader [svc: node A] : write x=5 | The client sends a write to the leader of a 5-node group.
+  Leader -> Node B [svc], Node C [svc], Node D [svc], Node E [svc] : append x=5 | The leader copies the entry to the four followers.
+  Node B -> Leader : ack | Node B stores the entry and replies.
+  + Node C -> Leader : ack
+  Leader -> Client : committed | The leader holds 3 of 5 copies, a majority, so it can commit and reply.
+  Node D -x> Leader : no reply | Two nodes are down or cut off; this is within f = 2.
+  + Node E -x> Leader : no reply
+ref: paper | Impossibility of Distributed Consensus with One Faulty Process | Fischer, Lynch and Paterson, JACM 1985 |
+ref: paper | In Search of an Understandable Consensus Algorithm | Ongaro and Ousterhout, USENIX ATC 2014 |
+
+== Lease with fencing token against false failure
+kind: lease, fencing-token
+when: A node must act as sole owner of a resource, but failure detection by timeout can be wrong.
+how: No node can tell a crashed peer from a slow one, so a timeout is only a guess. If a lock service takes the lock from a client that merely paused, for 40 seconds in a garbage collection for example, two nodes both think they own the resource.
+The fix has two parts. First, ownership is a lease that expires, so a dead owner cannot hold it forever. Second, each grant carries a fencing token, a number that grows by one. The storage service remembers the highest token it has seen. It rejects any write that carries a smaller token.
+When the paused client wakes up and writes with token 33, the storage has already seen token 34, so the write fails. Safety no longer depends on clocks or timeouts being right. The cost is that the storage layer must check tokens.
+used: Chubby and ZooKeeper lock recipes with sequence numbers; etcd lease revisions; HDFS and cloud storage generation checks; Kleppmann's analysis of lock services.
+avoid: Resources that cannot check a token. Then make the operation idempotent or use a transaction in the resource itself.
+flow:
+  Client A [client: token 33] -> Lock service [svc: etcd] : acquire lease | Client A gets the lease with token 33.
+  Client A -> Storage [db: max token 33] : write with token 33 | The first write is accepted.
+  * Client A: paused 40 s | Client A stops in a long garbage collection pause.
+  Lock service -> Client B [client: token 34] : lease expired, grant | The lease times out and client B receives token 34.
+  Client B -> Storage : write with token 34 | The storage accepts the write and raises its maximum to 34.
+  Client A -x> Storage : write with token 33 | Client A wakes up and writes with its old token.
+  Storage -x> Client A : rejected | The storage sees 33 is below 34 and refuses.
+ref: blog | How to do distributed locking | Martin Kleppmann, 2016 | https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+ref: paper | The Chubby Lock Service for Loosely-Coupled Distributed Systems | Burrows, OSDI 2006 |
+
+@@ e2earg
+== Idempotency key for safe client retries
+kind: idempotent-consumer, retry-backoff
+when: A client must retry a request after a timeout, and the server must not do the work twice.
+how: Reliable delivery in lower layers is not enough. TCP can deliver a request, and the server can still crash before it replies. The client then cannot know if the charge happened. Only the two ends can solve this, so the end-to-end argument puts the check there.
+The client creates a unique idempotency key for each logical operation, for example a UUID, and sends it with every retry. The server stores the key with the result in the same transaction as the work. If the same key comes again, the server returns the saved result and does nothing new.
+Keys are kept for a limited time, for example 24 hours. The client retries with backoff and jitter, and always sends the same key. The server must treat a key with different parameters as an error.
+used: Stripe API Idempotency-Key header; payment and order APIs; AWS client tokens on EC2 RunInstances; Kafka idempotent producer ids.
+avoid: Naturally idempotent operations, such as setting a field to a value, which need no key.
+flow:
+  Client app [client] -> Payments API [svc] : POST charge, key K1 | The client sends a charge request with a fresh key.
+  Payments API -> Keys table [db: key and result] : insert K1 and charge | The server stores key K1 and the charge together in one transaction.
+  Payments API -x> Client app : response lost | The reply is lost on the network, so the client sees a timeout.
+  Client app ~> Payments API : retry, same key K1 | The client retries after a short random wait with the same key.
+  Payments API -> Keys table : lookup K1 | The server finds K1 was already processed.
+  Payments API -> Client app : saved result | The saved result returns, and the card is charged only once.
+ref: blog | Designing robust and predictable APIs with idempotency | Stripe blog | https://stripe.com/blog/idempotency
+ref: paper | End-to-End Arguments in System Design | Saltzer, Reed and Clark, ACM TOCS 1984 | https://web.mit.edu/Saltzer/www/publications/endtoend/endtoend.pdf
+
+== Application-level checksum across hops
+kind: layered-protocol, claim-check
+when: Data crosses many hops, proxies and storage layers, and silent corruption must be found by the final reader.
+how: Each link may check its own bytes: Ethernet has a CRC and TCP has a checksum. But a bug in a router, a memory error in a proxy or a bad disk can still change data between those checks. Lower layers cannot prove that the file is whole when it arrives.
+So the sender computes a hash of the full content, such as SHA-256 or CRC32C, and sends it with the data. The receiver recomputes the hash after the last hop and compares. If they differ, it discards the data and fetches it again. Link checks still help, since they catch most errors cheaply and early, but they are only an optimization.
+Large uploads often use per-part hashes plus one final hash for the whole object.
+used: Amazon S3 upload checksums (CRC32C, SHA-256); Google Cloud Storage CRC32C and MD5; Docker image digests; Git object hashes; HDFS block checksums.
+avoid: Trusted in-process copies where the cost of hashing adds nothing; and streams where late detection is useless and you must verify while reading.
+flow:
+  Uploader [client] -> Proxy [svc: TLS and retry] : bytes + SHA-256 | The sender computes a hash of the whole file and sends it with the data.
+  Proxy -> Object store [store: S3] : forward bytes | The proxy forwards the data; a fault here could flip a bit.
+  * Object store: hash recomputed | The store recomputes the hash over what it really holds.
+  Object store -x> Uploader : checksum mismatch | The hashes differ, so the upload is rejected.
+  Uploader ~> Object store : retry upload | The sender uploads again and the hashes now match.
+ref: paper | End-to-End Arguments in System Design | Saltzer, Reed and Clark, ACM TOCS 1984 | https://web.mit.edu/Saltzer/www/publications/endtoend/endtoend.pdf
+
+@@ waitfree
+== Lock-free queue with compare-and-swap retry
+kind: producer-consumer, thread-pool
+when: Many threads hand work to each other, and a lock would stall everyone when its holder is paused.
+how: Compare-and-swap (CAS) changes a memory word only if it still holds the value you expect. A lock-free queue uses CAS on its head and tail pointers. To enqueue, a thread reads the tail, prepares a new node and tries CAS to link it. If another thread won, the CAS fails and the thread reads again and retries.
+Some thread always makes progress, so the structure cannot deadlock, and a paused thread cannot block the rest. Herlihy showed why CAS is the right tool. Its consensus number is infinite, so it can build any wait-free object, while plain reads and writes (number 1) cannot even solve consensus between two threads.
+Lock-free is weaker than wait-free: one unlucky thread may retry many times. Under high contention, retries waste cycles and cache traffic.
+used: Java ConcurrentLinkedQueue (Michael–Scott queue); Java ForkJoinPool work-stealing deques; Linux kernel lock-free lists and llist; Rust crossbeam queues.
+avoid: Complex multi-field updates. A plain mutex is simpler, and it is often as fast when contention is low.
+flow:
+  Producer A [svc: thread] -> Queue tail [cache: pointer] : read tail = N1 | Producer A reads the current tail node.
+  Producer B [svc: thread] -> Queue tail : read tail = N1 | Producer B reads the same tail at the same moment.
+  Producer A -> Queue tail : CAS N1 to A-node | Producer A's CAS succeeds and its node is linked.
+  Producer B -x> Queue tail : CAS N1 fails | Producer B's CAS fails, since the tail moved on.
+  Producer B ~> Queue tail : reread, retry on A-node | Producer B reads the new tail and tries again; no lock was held.
+  Queue tail -> Consumer [svc: thread] : dequeue A-node | A consumer takes items from the head with its own CAS.
+ref: paper | Wait-Free Synchronization | Maurice Herlihy, ACM TOPLAS 1991 |
+ref: paper | Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms | Michael and Scott, PODC 1996 |
+
+== RCU: wait-free readers with copy-on-write updates
+kind: copy-on-write, memory-tiering
+when: Reads are far more common than writes, and readers must never wait or retry.
+how: Readers just follow a pointer to the data and read it. They take no lock and do no atomic write, so they never wait. A reader is wait-free: its steps are bounded.
+A writer makes a full copy of the node, changes the copy and then swaps the shared pointer with one atomic store. New readers see the new version at once. Readers that started earlier still use the old copy safely.
+The old copy must not be freed too early. The writer waits for a grace period, until every reader that could hold the old pointer has finished. Only then does it free the old copy. The writes are slower than with a lock, so use RCU where reads outnumber writes by a large factor, for example routing tables read on every packet and changed a few times per minute.
+used: Linux kernel RCU (routing tables, dentry cache, module lists); userspace-rcu library; similar idea in Java CopyOnWriteArrayList.
+avoid: Write-heavy data, or data where readers need a view that never changes during several steps without copying.
+flow:
+  Packet thread [svc: reader] -> Route table v1 [store: shared pointer] : read pointer | A reader follows the pointer with no lock.
+  Updater [svc: writer] -> Route table v2 [store: private copy] : copy and edit | The writer copies the table and edits the copy.
+  Updater -> Route table v1 : atomic pointer swap | One atomic store makes version 2 the visible version.
+  Packet thread -> Route table v2 : next read sees v2 | New reads get the new table, with no waiting.
+  Updater -> Grace period [note: wait for old readers] : wait | The writer waits until all old readers have finished.
+  Updater -> Route table v1 : free v1 | Now nobody can hold version 1, so memory is freed.
+ref: paper | Read-Copy Update: Using Execution History to Solve Concurrency Problems | McKenney and Slingwine, 1998 |
+ref: docs | What is RCU? | Linux kernel documentation | https://docs.kernel.org/RCU/whatisRCU.html
+
+@@ allocators
+== Size-class slabs with per-thread caches
+kind: memory-tiering, thread-pool
+when: A program allocates and frees millions of small objects across many threads, and a global malloc lock would be the bottleneck.
+how: The allocator rounds each request up to a size class, for example 8, 16, 32, 48 bytes. Memory is carved into pages that each hold objects of one class only. Free blocks of a class sit on a free list, so allocate and free are a few instructions.
+Each thread has its own cache of free blocks for each class. An allocation takes from the thread cache with no lock. When the cache is empty, the thread refills a batch from a shared central list, which takes a lock rarely. When the cache is too full, it returns a batch.
+One size per page removes external fragmentation inside a page, at the cost of some internal waste: a 33-byte request uses a 48-byte block. The Linux kernel does the same with the slab allocator for kernel objects such as inodes and sockets.
+used: tcmalloc, jemalloc and mimalloc; Linux SLUB slab allocator; Go runtime allocator (size classes with per-P caches).
+avoid: Huge or very long-lived blocks, where mmap directly is simpler; and real-time code that needs fixed worst-case time. Use a preallocated pool.
+flow:
+  Thread 1 [svc: web worker] -> Thread cache [cache: per thread] : malloc 40 bytes | The request rounds up to the 48-byte class.
+  Thread cache -> Thread 1 : block from free list | A free 48-byte block is returned with no lock.
+  Thread cache -x> Thread 1 : class 48 empty | After many calls, the free list for this class runs out.
+  Thread cache -> Central list [store: shared lock] : take 64 blocks | The cache refills a batch under one short lock.
+  Central list -> Page heap [store: 8 KB spans] : need new span | When the central list is empty, it asks for a fresh page.
+  Page heap -> OS [svc: kernel] : mmap more memory | The page heap grows the process memory from the kernel.
+ref: docs | TCMalloc design | Google TCMalloc documentation | https://google.github.io/tcmalloc/design.html
+ref: paper | The Slab Allocator: An Object-Caching Kernel Memory Allocator | Jeff Bonwick, USENIX 1994 |
+
+== Per-request arena freed all at once
+kind: arena-allocation
+when: Work comes in short units such as web requests, and many objects live exactly as long as the unit.
+how: At the start of a request, the server creates an arena (also called a pool or region): a chunk of memory with a bump pointer. Each allocation just moves the pointer forward, which takes a few instructions and has no per-object header.
+Nothing is freed one by one. When the request ends, the whole arena is released in one step, or reset to its start and reused. This removes a whole class of leaks and use-after-free bugs for those objects, and it avoids fragmentation, because memory comes back in big blocks.
+The price is that objects cannot be freed early. A long request that allocates a lot holds all of it until the end. Objects that must outlive the request need another allocator or must be copied out.
+used: nginx request pools; Apache APR pools; Go compiler and protobuf C++ arenas; game frame allocators.
+avoid: Long-lived processes with varied object lifetimes, where memory would grow without bound; use a general allocator or a GC.
+flow:
+  Request [client] -> Server [svc: worker] : HTTP request | A request arrives at a worker.
+  Server -> Arena [store: 64 KB block] : create arena | The worker takes one block and sets the bump pointer to zero.
+  Server -> Arena : alloc header, buffers | Each allocation only moves the pointer forward.
+  * Arena: 41 KB used | Parsing and rendering fill the arena without any free calls.
+  Server -> Client : response | The worker sends the reply.
+  Server -> Arena : reset | One reset releases every object at once; the block is reused.
+ref: docs | Memory management | nginx development guide | https://nginx.org/en/docs/dev/development_guide.html#memory_management
+
+@@ boot
+== Micro-VM direct kernel boot for fast scale-out
+kind: immutable-infra, autoscaling
+when: A platform must start isolated sandboxes in a fraction of a second, for example one per function call or per container.
+how: A normal PC boot runs firmware self-tests, scans devices, loads a bootloader and then the kernel. A micro-VM monitor skips most of that. It loads an uncompressed kernel image straight into guest memory, sets the CPU registers as the firmware would, and jumps to the kernel entry. The guest has only a few virtual devices: a network card, a block device and a serial console.
+The kernel then mounts a small root file system, starts PID 1, and that starts the application. Firecracker documents boot to user space in about 125 ms, and many micro-VMs can start per second on one host.
+Fast boot makes it practical to keep no idle capacity. The platform starts a VM when a request arrives, or restores a snapshot of a booted VM, which can be even faster. The cost is a minimal guest: no BIOS menus, no hotplug and few drivers.
+used: AWS Lambda and Fargate (Firecracker); Fly.io machines (Firecracker); Kata Containers and Cloud Hypervisor for sandboxed containers.
+avoid: General-purpose desktop or legacy guest operating systems that need full firmware and many devices; use a standard VM.
+flow:
+  Request router [svc] -> VM monitor [svc: Firecracker] : need sandbox | A cold request needs a new sandbox, so the router asks the host.
+  VM monitor -> Guest memory [store: kernel loaded] : copy kernel image | The monitor places the kernel in guest memory. No firmware step runs.
+  VM monitor -> Guest kernel [svc: virtual CPU] : jump to entry point | The virtual CPU starts running the kernel directly.
+  Guest kernel -> Root disk [db: read-only image] : mount root | The kernel mounts a small root file system.
+  Guest kernel -> App process [svc: PID 1] : exec init | The first process starts the function runtime in about 125 ms.
+  App process -> Request router : ready | The sandbox reports ready, and the router sends the request.
+ref: paper | Firecracker: Lightweight Virtualization for Serverless Applications | Agache et al., NSDI 2020 |
+ref: docs | Firecracker | Firecracker project | https://firecracker-microvm.github.io/
+
+== Chain of trust from firmware to kernel
+kind: chain-of-trust
+when: A fleet must prove that every machine runs only approved boot code, even if an attacker has root later or physical access.
+how: Trust starts in code that cannot be changed: the CPU's boot ROM, then firmware. With UEFI Secure Boot, the firmware holds a database of allowed signing keys. It checks the signature of the next stage before it runs it. Firmware checks the bootloader, the bootloader checks the kernel, and the kernel can check modules and the initramfs.
+Measured boot adds a second record. Each stage hashes the next stage and extends the hash into a TPM register (a PCR). The register can only be extended, never set. A remote server can later ask the TPM for a signed quote of these values and compare them with the expected ones.
+A machine that fails the check is kept off the network or gets no secrets. The cost is key management: signing keys must be rotated and protected, and every kernel update must be signed.
+used: Linux distributions with a signed shim and GRUB or systemd-boot; Windows Secure Boot and BitLocker; Chrome OS verified boot; cloud confidential VMs with virtual TPMs.
+avoid: Treating it as complete security. It does not protect a running system from a kernel bug; combine it with patching and runtime controls.
+flow:
+  Boot ROM [svc: immutable] -> UEFI firmware [svc: Secure Boot] : run firmware | The CPU starts in code that cannot be changed and runs the firmware.
+  UEFI firmware -> Bootloader [svc: shim and GRUB] : verify signature | Firmware checks the bootloader's signature against its key database.
+  Bootloader -> Kernel [svc: Linux] : verify and load | The bootloader checks the kernel before it jumps there.
+  UEFI firmware -> TPM [store: PCR registers] : extend hash | Each stage's hash is added to a register that cannot be reset.
+  Attestation server [svc] -> TPM : request signed quote | A remote server asks for the signed register values.
+  TPM -> Attestation server : quote | The server compares them with known good values and releases secrets only on a match.
+  Bootloader -x> Kernel : bad signature | An unsigned or changed kernel is refused.
+ref: spec | UEFI Specification: Secure Boot and Driver Signing | UEFI Forum |
+ref: docs | Linux kernel module signing and boot integrity | Linux kernel documentation | https://docs.kernel.org/admin-guide/module-signing.html
+
+@@ condvars
+== Blocking bounded queue between producers and workers
+kind: producer-consumer, thread-pool
+when: Producers can be faster than consumers, and idle workers must sleep instead of spinning.
+how: A mutex guards a queue with a fixed capacity, for example 1,000 items. Two condition variables sit beside it: not_empty and not_full. A worker takes the mutex and checks if the queue is empty. If it is, the worker calls wait(not_empty). That call releases the mutex and puts the thread to sleep in one atomic step.
+A producer adds an item and calls signal(not_empty), which wakes one worker. If the queue is full, the producer waits on not_full. This gives backpressure for free: a slow consumer makes producers block, so memory stays bounded.
+Always check the condition in a while loop, not an if. A woken thread must test again, because another thread may have taken the item first, and some systems wake threads spuriously. Sleeping threads use no CPU, which is the point of condition variables over polling.
+used: Java ArrayBlockingQueue and ThreadPoolExecutor workers; POSIX pthread_cond_wait in C servers; Go sync.Cond; Python queue.Queue.
+avoid: Hot paths with tiny critical sections and many cores; a lock-free queue or channels may scale better.
+flow:
+  Worker [svc: pool thread] -> Mutex [svc: queue lock] : lock | The worker takes the lock and checks the queue.
+  Worker -> Not-empty cv [queue: wait list] : wait, release lock | The queue is empty, so the worker sleeps and gives up the lock.
+  Producer [svc: request thread] -> Task queue [queue: 0 of 1000] : lock and add task | The producer adds task 1 under the same mutex.
+  Producer -> Not-empty cv : signal | The producer wakes one sleeping worker.
+  Not-empty cv -> Worker : wake and relock | The worker wakes, takes the lock again and rechecks the queue in a loop.
+  Worker -> Task queue : take task 1 | The queue is not empty, so the worker removes the task and runs it.
+  Producer -x> Task queue : full: wait on not-full | When 1,000 tasks wait, producers sleep too. This is backpressure.
+ref: paper | Monitors: An Operating System Structuring Concept | C. A. R. Hoare, CACM 1974 |
+ref: docs | pthread_cond_wait | POSIX / The Open Group Base Specifications | https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_cond_wait.html
+
+@@ ctxswitch
+== Event loop: one thread for many connections
+kind: event-loop, load-leveling
+when: A server holds tens of thousands of mostly idle connections, and a thread per connection would waste memory and switches.
+how: A thread-per-connection server needs a stack per thread, typically 8 MB of virtual memory and some real pages. The kernel also switches between runnable threads. A switch costs a few microseconds of direct work plus a colder CPU cache and TLB afterward.
+An event loop uses a few threads, often one per core. Each thread waits in epoll for sockets that are ready, then runs a short callback for each. When a callback would block, it starts a non-blocking operation and returns, so the thread moves on. A connection costs only a small struct, a few KB.
+So 50,000 idle connections need almost no switches. The rule is to never block the loop: a 50 ms CPU task stalls all connections on that thread. Long work goes to a worker pool.
+used: nginx workers; Redis main thread; Node.js libuv; Netty in the JVM; Envoy worker threads.
+avoid: CPU-heavy requests that run long without waiting for I/O; use threads or processes, or move the work to a pool.
+flow:
+  50K clients [client: mostly idle] -> epoll loop [svc: 1 thread per core] : sockets become ready | The loop sleeps in epoll_wait until some sockets have data.
+  epoll loop -> Handler [svc: short callback] : run for socket 812 | The loop runs a short handler for each ready socket.
+  Handler -> Backend [svc: upstream] : non-blocking request | The handler starts the call and returns at once, with no wait.
+  Backend -> epoll loop : reply ready | The reply later shows up as a new event.
+  epoll loop -> 50K clients : write response | The loop writes the reply to the right socket.
+  epoll loop -x> Handler : 50 ms CPU task | A slow handler blocks every other connection on this thread.
+  + Handler ~> Worker pool [svc: threads] : offload heavy work
+ref: blog | The C10K problem | Dan Kegel |
+ref: docs | epoll(7) | Linux man-pages | https://man7.org/linux/man-pages/man7/epoll.7.html
+
+== Thread per core with shared-nothing sharding
+kind: sharding, event-loop
+when: A data service on many cores must avoid lock contention and cache misses caused by threads moving between cores.
+how: Start one thread per CPU core and pin it there. Split the data by key hash so each thread owns one shard and is the only one that touches it. No locks protect that data, so there are no lock waits and no cache lines bouncing between cores.
+A request that lands on the wrong core is passed to the owner by a message queue between cores. Each thread runs its own event loop and a user-space scheduler, so tasks switch cheaply inside the thread, without the kernel. The thread almost never gets switched out, and its caches stay warm.
+The price is care. Hot keys overload one core. Cross-shard work needs messages. And all I/O must be non-blocking, because a blocking call stalls the whole shard.
+used: Seastar framework; ScyllaDB (built on Seastar); Redpanda; DPDK-based packet processors.
+avoid: Workloads with heavy cross-shard transactions or very skewed keys; a shared pool with locks is simpler and balances better.
+flow:
+  Client [client] -> Core 0 [svc: shard 0] : GET key k77 | The connection lands on core 0 by the network card's hashing.
+  Core 0 -> Core 3 [svc: shard 3] : message: owner of k77 | Hash of the key says shard 3 owns it, so core 0 sends a message.
+  Core 3 -> Shard 3 data [store: no locks] : read k77 | Only core 3 touches this data, so no lock is needed.
+  Core 3 -> Core 0 : value | The result goes back by a lock-free queue between cores.
+  Core 0 -> Client : response | Core 0 replies on its own connection.
+  * Core 3: hot key overloaded | A hot key keeps core 3 busy while other cores idle. This is the weak point.
+ref: docs | Seastar: shared-nothing design | Seastar project | https://seastar.io/shared-nothing/
+
+@@ deadlock
+== Global lock order enforced by tooling
+kind: lock-ordering
+when: Code takes more than one lock at a time, and deadlock must be impossible rather than only unlikely.
+how: Deadlock needs a cycle: thread 1 holds A and waits for B, while thread 2 holds B and waits for A. Remove the cycle by giving every lock a rank, and always take locks in rank order. If every thread takes A before B, no thread can hold B and wait for A.
+In small code the rule is in a comment. In large code, tools check it. The Linux kernel has lockdep. It records, for every pair of lock classes, the order in which they were taken. If it ever sees A then B on one path and B then A on another, it prints a warning, even if no deadlock happened in that run. So the bug is found in testing, before a timing accident in production.
+When the order is not known in advance, as when you lock two accounts for a transfer, sort by an id first. Avoid calling unknown code while holding a lock, because that code might take another.
+used: Linux kernel lockdep; ThreadSanitizer lock-order-inversion reports in C++ and Go; database code that updates rows in primary key order.
+avoid: Locks whose order cannot be fixed, such as arbitrary user callbacks. Use try-lock with timeout or one coarser lock.
+flow:
+  Thread 1 [svc: transfer 5 to 9] -> Lock A [svc: account 5] : lock lower id first | Thread 1 sorts the two ids and locks account 5 first.
+  Thread 2 [svc: transfer 9 to 5] -> Lock A : lock lower id first | Thread 2 also locks account 5 first, although it is the destination.
+  Thread 2 -x> Lock A : waits | Thread 2 waits here, while holding nothing.
+  Thread 1 -> Lock B [svc: account 9] : lock account 9 | Thread 1 gets the second lock; no cycle is possible.
+  Thread 1 -> Lock B : unlock B then A | Thread 1 finishes and releases both locks.
+  Lock A -> Thread 2 : granted | Thread 2 now runs. Both transfers finish with no deadlock.
+  Lockdep [svc: kernel checker] -> Thread 1 : warn on reverse order | In tests, lockdep reports any path that takes B before A.
+ref: docs | Runtime locking correctness validator | Linux kernel documentation | https://docs.kernel.org/locking/lockdep-design.html
+ref: book | Operating Systems: Three Easy Pieces, Common Concurrency Problems | Arpaci-Dusseau, 2018 | https://pages.cs.wisc.edu/~remzi/OSTEP/threads-bugs.pdf
+
+== Try-lock with timeout and randomized retry
+kind: timeout-deadline, retry-backoff
+when: Lock order cannot be fixed, or locks live in different processes or services, so a wait could last forever.
+how: Break the hold-and-wait condition. A thread takes the first lock, then tries the second with a timeout, for example 50 ms. If it fails, it releases everything it holds, waits a random short time and starts again. No thread waits forever while holding a lock.
+The random delay matters. Without it, two threads can release and retry in step, again and again. This is livelock. With jitter, one of them gets ahead.
+Databases use the same idea at larger scale. PostgreSQL waits one second by default (deadlock_timeout) before it searches for a cycle. Distributed systems cannot build a global wait graph cheaply, so they use lock timeouts and let the application retry the transaction.
+used: Java ReentrantLock.tryLock(timeout); PostgreSQL lock_timeout and deadlock_timeout; MySQL innodb_lock_wait_timeout; distributed lock clients with leases.
+avoid: When an operation cannot be undone halfway. Then use a single coarse lock or a fixed order.
+flow:
+  Worker 1 [svc: thread] -> Lock X [svc: mutex] : lock X | Worker 1 takes lock X.
+  Worker 2 [svc: thread] -> Lock Y [svc: mutex] : lock Y | Worker 2 takes lock Y.
+  Worker 1 -> Lock Y : tryLock 50 ms | Worker 1 wants Y, but only waits 50 ms.
+  Worker 2 -> Lock X : tryLock 50 ms | Worker 2 wants X with the same timeout. Both would wait forever without it.
+  Lock Y -x> Worker 1 : timeout | Worker 1's wait ends, and it releases X.
+  Worker 1 ~> Lock X : sleep randomly then retry | Worker 1 starts over after a random pause, so the two do not stay in step.
+  Lock X -> Worker 2 : granted | Worker 2 gets X and finishes its work.
+ref: book | Operating Systems: Three Easy Pieces, Deadlock | Arpaci-Dusseau, 2018 | https://pages.cs.wisc.edu/~remzi/OSTEP/threads-bugs.pdf
+ref: docs | Lock management settings | PostgreSQL documentation | https://www.postgresql.org/docs/current/runtime-config-locks.html
+
+@@ ebpf
+== XDP load balancer before the kernel stack
+kind: control-data-plane, load-shedding
+when: A network layer must forward or drop millions of packets per second per host with low CPU use.
+how: An XDP program is attached to the network driver. It runs on every packet before the kernel allocates its normal socket buffer, so work per packet is tiny. The program reads the headers, looks up a backend in an eBPF map and returns a verdict: pass, drop or transmit.
+For load balancing, it hashes the flow (source and destination IP and ports) to pick a backend. It then encapsulates the packet toward that backend and sends it out of the same interface, without entering the TCP/IP stack. The same hook drops attack traffic early, for example packets from a blocked source in a map.
+A user-space control program updates the maps: it adds backends and removes dead ones. The kernel verifier checks that the program always ends and cannot touch bad memory, so it is safe to load into a running kernel. The limit is the program size and the lack of full TCP state.
+used: Meta Katran; Cloudflare DDoS mitigation (XDP drop); Cilium eBPF load balancing for Kubernetes services.
+avoid: Logic that needs full TCP termination, TLS or complex L7 rules; use a proxy such as Envoy or HAProxy behind it.
+flow:
+  Internet clients [client] -> NIC driver [svc: XDP hook] : packets | Packets reach the driver at line rate.
+  NIC driver -> XDP program [svc: eBPF verified] : run on each packet | The program runs before the kernel builds a socket buffer.
+  XDP program -> Backend map [store: eBPF map] : hash flow to backend | A map lookup returns the backend for this flow.
+  XDP program -x> NIC driver : DROP blocked source | Attack packets from blocked sources are dropped here, very cheaply.
+  XDP program -> Backend server [svc: real server] : encapsulate and TX | Good packets are wrapped and sent out without the kernel stack.
+  Control agent [svc: user space] ~> Backend map : update backends | The agent adds and removes backends as health checks change.
+ref: docs | eBPF documentation | eBPF Foundation and Linux kernel | https://docs.kernel.org/bpf/
+ref: docs | Katran | Meta Open Source | https://github.com/facebookincubator/katran
+
+== In-kernel tracing with maps and a user agent
+kind: observability-pipeline, sidecar
+when: You need to see what a production host does, such as slow disk calls or retransmits, with low overhead and no code change.
+how: An eBPF program is attached to a hook: a kernel function (kprobe), a tracepoint, or a timer for CPU sampling. It runs in the kernel each time the event fires. It records only what is needed, such as a latency value, into an eBPF map, where counters and histograms are updated in place.
+This keeps the cost low. Instead of copying every event to user space, the kernel aggregates first. A user-space agent reads the maps every few seconds and exports the metrics. Continuous profilers sample stacks about 100 times per second per CPU and store them as flame graphs.
+The verifier rejects unsafe programs, so a bug cannot crash the kernel. Costs: you need a fairly recent kernel with BTF, and kernel function names can change between versions, so tools prefer stable tracepoints.
+used: bpftrace and BCC tools; Parca and Pyroscope continuous profiling; Pixie for Kubernetes; Cilium Hubble network flow visibility.
+avoid: When you need full payload capture of every packet; use packet capture. And very old kernels without BPF support.
+flow:
+  Application [svc: unmodified] -> Kernel hook [svc: kprobe on read] : syscall runs | The application makes a normal call, with no change to its code.
+  Kernel hook -> eBPF probe [svc: verified program] : event fires | The probe runs inside the kernel for this event.
+  eBPF probe -> Latency map [store: histogram] : add 3 ms to bucket | The probe updates a histogram in place and copies no event.
+  Agent [svc: user space] -> Latency map : read every 10 s | The agent reads the totals at its own pace.
+  Agent -> Metrics store [db: Prometheus] : export p99 latency | The agent exports the numbers as metrics.
+  Operator [user] -> Metrics store : query slow disks | The operator finds the slow host without any redeploy.
+ref: book | BPF Performance Tools | Brendan Gregg, 2019 |
+ref: docs | BPF Documentation | Linux kernel documentation | https://docs.kernel.org/bpf/
+
+@@ filesystems
+== Layered images with overlay and copy-on-write
+kind: copy-on-write, immutable-infra
+when: Many containers start from the same base image, and each must write files without copying the whole image or changing the shared layers.
+how: A container image is a stack of read-only layers, each a directory tree of file changes. The overlay file system merges them into one view. It adds a thin writable layer on top, private to the container.
+A read looks through the layers from top to bottom and returns the first match. A write to an existing file first copies the whole file up into the writable layer, then changes the copy. A delete is stored as a marker (a whiteout) in the top layer. The lower layers never change.
+Because layers are shared, 100 containers from one 500 MB image use 500 MB once, plus their own small changes. Layers are also cached by content hash, so a pull downloads only the missing ones. The cost is the copy-up of large files on first write. Put heavy write data on a volume instead.
+used: Docker and containerd with overlayfs; Kubernetes node image layers; Podman; OCI image format.
+avoid: Databases and write-heavy data inside the container layer. Use a mounted volume or a persistent disk.
+flow:
+  Registry [store: image layers] -> Node cache [store: layers by digest] : pull missing layers | The node downloads only layers it does not have.
+  Node cache -> Overlay mount [svc: overlayfs] : lower dirs: layers 1 to 4 | The layers become read-only lower directories.
+  Container [svc: process] -> Overlay mount : read /etc/app.conf | The read passes down to layer 3 and returns the file.
+  Container -> Overlay mount : write /etc/app.conf | The first write needs a change to a lower file.
+  Overlay mount -> Upper dir [store: writable layer] : copy up, then edit | The file is copied into the writable layer and edited there.
+  Container -> Volume [db: persistent disk] : database files | Heavy data goes to a volume, outside the layers.
+ref: docs | Overlay Filesystem | Linux kernel documentation | https://docs.kernel.org/filesystems/overlayfs.html
+ref: docs | OverlayFS storage driver | Docker documentation | https://docs.docker.com/engine/storage/drivers/overlayfs-driver/
+
+== Immutable files per segment with delete by unlink
+kind: lsm-compaction, tiered-storage
+when: A storage engine appends data in large chunks and must remove old data cheaply, with no rewrite.
+how: The engine writes data into files that, once full, are never changed. A Kafka partition is a series of segment files of 1 GB by default. An LSM tree writes immutable sorted files (SSTables). Writing is sequential append, which file systems and disks do fast.
+Deleting old data is just removing a file. A retention job unlinks the oldest segment, and the file system frees its blocks at once. There is no in-place delete and no rewrite of the whole data set. Compaction merges small files into bigger ones and then unlinks the inputs.
+The file system also gives you the page cache for free: recent segments stay in memory, and reads of hot data never touch the disk. The costs are many open files, which need raised limits, and space held until the old files are unlinked.
+used: Kafka log segments; RocksDB and LevelDB SSTables; Elasticsearch and Lucene segments; Prometheus TSDB blocks.
+avoid: Workloads that update small records in place, where a page-based B-tree store fits better.
+flow:
+  Producer [client] -> Active segment [log: file 00123.log] : append records | Writes go to the end of the newest file, which is a sequential write.
+  Active segment -> Sealed segment [log: read-only file] : roll at 1 GB | When the file is full, the engine closes it and opens a new one.
+  Consumer [client] -> Page cache [cache: kernel memory] : read recent data | Recent reads hit the memory cache, with no disk read.
+  Page cache -> Sealed segment : miss: read from disk | Old data is read from the file on a cache miss.
+  Retention job [svc: timer] -> Sealed segment : unlink after 7 days | The job removes the oldest file in one cheap call.
+  Sealed segment -> Disk space [store: free blocks] : blocks freed | The file system frees the blocks at once. Nothing is rewritten.
+ref: docs | Kafka log implementation | Apache Kafka documentation | https://kafka.apache.org/documentation/#log
+ref: paper | The Log-Structured Merge-Tree (LSM-Tree) | O'Neil et al., Acta Informatica 1996 |
+
+@@ fsjournal
+== Ordered-mode metadata journal
+kind: wal, checkpoint-restart
+when: A file system must not be left corrupt after a power loss, and a full check of the disk at boot would take hours.
+how: One file operation, such as creating a file, changes several blocks: the inode, the directory and the free-space map. If power fails after only some are written, the file system is inconsistent. A journal makes the group of changes atomic.
+In ext4's default ordered mode, file data blocks are written to their final place first. Then the metadata changes are written into the journal as one transaction, ending with a commit block. Only after the commit is durable does the file system write the metadata to its home location (this step is the checkpoint). Last, the journal space is freed.
+After a crash, mount reads the journal. Transactions with a commit block are replayed. A transaction without one is ignored. Recovery takes seconds, not hours, because it reads only the journal, which is a few hundred MB. Journaling protects the file system structure. It does not make your own data durable unless you call fsync.
+used: ext4 (jbd2 journal); XFS metadata log; NTFS log file; JFS and ext3.
+avoid: Copy-on-write file systems such as ZFS or Btrfs already stay consistent without a journal; and data you must keep needs fsync anyway.
+flow:
+  Application [client] -> Page cache [cache: dirty pages] : create file, write data | The write goes to memory and returns at once.
+  Page cache -> Data blocks [db: final place] : write file data first | In ordered mode, data is written before the metadata that points to it.
+  Page cache -> Journal [log: ring on disk] : inode, dir, bitmap | The metadata changes are written as one transaction.
+  Journal -> Journal commit [note: commit block] : write commit block | The commit block marks the transaction complete; replay will trust it.
+  Journal -> Metadata blocks [db: inode table] : checkpoint | After the commit is durable, the metadata goes to its home place.
+  Journal -x> Metadata blocks : power loss before commit | A crash before the commit block means the transaction is dropped.
+  * Journal: replay at mount | At mount, committed transactions are replayed, and half-done ones are ignored.
+ref: docs | ext4 General Information (journal modes) | Linux kernel documentation | https://docs.kernel.org/admin-guide/ext4.html
+ref: paper | Analysis and Evolution of Journaling File Systems | Prabhakaran et al., USENIX ATC 2005 |
+
+== External journal on a fast device
+kind: wal, tiered-storage
+when: A file system on slow disks spends too much time on journal writes, and you can put the journal on a faster device.
+how: Every metadata change goes through the journal, and each commit must be flushed. On a large array of spinning disks the head must move between the journal and the data area. That slows both.
+ext4 and XFS can keep the journal on a separate device. You can place it on a small NVMe or SSD partition, for example 1 GB to 4 GB. Journal writes are sequential and small, so a fast device handles them with very low latency. The big disks then only receive data and checkpoints.
+The journal must survive as long as the file system. If the journal device is lost, the file system may not mount, so mirror the journal device or use a battery-backed one. This pattern is mainly useful for metadata-heavy loads on slow media, such as many small files on HDD arrays.
+used: ext4 external journal (mke2fs -O journal_dev); XFS external log device (mkfs.xfs -l logdev); storage servers with HDD arrays and small SSD journals.
+avoid: All-flash systems, where the gain is small and a second device is one more thing to lose.
+flow:
+  Application [client] -> File system [svc: ext4] : many small file creates | A metadata-heavy load creates many transactions.
+  File system -> Journal SSD [log: mirrored NVMe] : commit transaction | Each commit is a short sequential write on the fast device.
+  Journal SSD -> File system : durable | The commit returns in well under a millisecond.
+  File system ~> Data array [db: HDD array] : checkpoint in batches | The slow array receives metadata and data in large batches, not one by one.
+  Journal SSD -x> File system : device lost | If the single journal device fails, the file system may not mount. Mirror it.
+ref: docs | mke2fs(8) and ext4 journal options | e2fsprogs man pages | https://man7.org/linux/man-pages/man8/mke2fs.8.html
+
+@@ fsync
+== Group commit: many transactions, one fsync
+kind: batching, wal
+when: A database must make every commit durable, but a disk flush costs 0.1 to 10 ms and would cap throughput.
+how: A commit is acknowledged only after its log record is on stable storage, so each commit needs an fsync. An fsync on a good NVMe drive may take 0.1 ms, on a cloud network disk 1 to 2 ms, and on a spinning disk about 10 ms. At 2 ms, one fsync per commit allows only 500 commits per second.
+Group commit lets many transactions share one flush. Backends append their log records to a shared buffer. The first one to arrive becomes the leader and flushes the buffer. Others that arrive during the flush wait, and their records go into the next flush. One fsync of 50 records makes 50 transactions durable together.
+Throughput grows with load: the busier the system, the bigger each group. The cost is a little extra latency for the first transaction in a group. Some engines add a tiny delay to collect more commits.
+used: PostgreSQL WAL writer with commit_delay and commit_siblings; MySQL InnoDB binary log group commit; etcd batching of Raft log writes.
+avoid: Workloads where occasional loss of the last second is fine. Relax durability (for example synchronous_commit off in PostgreSQL).
+flow:
+  Txn 1 [client] -> WAL buffer [cache: shared memory] : append commit record | Transaction 1 adds its record and becomes the flush leader.
+  Txn 2 [client] -> WAL buffer : append commit record | Transaction 2 arrives during the flush and waits.
+  + Txn 3 [client] -> WAL buffer : append commit record
+  WAL buffer -> WAL file [log: on NVMe] : write 50 records | The leader writes all waiting records in one write call.
+  WAL file -> Disk [store: stable storage] : one fsync | A single fsync makes all 50 commits durable.
+  Disk -> Txn 1, Txn 2, Txn 3 : durable, ack | All waiting transactions are told to commit together.
+ref: docs | WAL configuration (commit_delay) | PostgreSQL documentation | https://www.postgresql.org/docs/current/wal-configuration.html
+ref: paper | Implementation Techniques for Main Memory Database Systems | DeWitt et al., SIGMOD 1984 |
+
+== Atomic file replace: write, fsync, rename
+kind: copy-on-write, wal
+when: A program must replace a config, snapshot or index file so that a crash leaves either the full old file or the full new file.
+how: Writing in place is risky. A crash in the middle leaves half of the new bytes and half of the old. So write the new content to a temporary file in the same directory. Call fsync on that file, so its data is on disk. Then rename it over the old name. Rename is atomic on POSIX file systems: readers see the old file or the new one, never a mix.
+The last step is easy to forget. Call fsync on the directory, so the rename itself is durable. Without it, after a crash the old name may come back.
+The same recipe protects database checkpoints, package manager state and editor saves. It costs two syncs and a temporary copy of the file. The temporary file must be on the same file system, because rename does not work across file systems.
+used: RocksDB CURRENT file update; Git ref and index updates (lock file, then rename); editors that save through a temp file.
+avoid: Very large files that change a little each time. Use a journal or log with append and fsync instead.
+flow:
+  Program [svc: snapshot writer] -> Temp file [store: state.json.tmp] : write new content | The program writes the new version to a separate file.
+  Program -> Temp file : fsync file | The data of the new file reaches stable storage.
+  Program -> Directory [store: config dir] : rename tmp over state.json | One atomic rename swaps the name from old to new.
+  Program -> Directory : fsync directory | The rename itself is made durable.
+  Reader [client] -> Directory : open state.json | A reader sees the complete old or complete new file only.
+  Program -x> Temp file : crash before rename | A crash before the rename leaves the old file intact.
+ref: docs | rename(2) | Linux man-pages | https://man7.org/linux/man-pages/man2/rename.2.html
+ref: docs | fsync(2) | Linux man-pages | https://man7.org/linux/man-pages/man2/fsync.2.html
+
+@@ iomodels
+== Readiness reactor with epoll
+kind: event-loop, thread-pool
+when: One process serves thousands of sockets, and most of them are idle at any moment.
+how: Blocking reads need one thread per socket. Instead, the server sets sockets to non-blocking mode and registers them with epoll. Then it calls epoll_wait, which sleeps until the kernel says some sockets are ready. The call returns a list of only the ready ones, so the cost depends on the number of active sockets, not the total. The older select and poll calls scan every socket each time.
+For each ready socket, the loop calls read until it returns "would block", handles the data and writes the response. The loop runs on one thread per core. Heavy work goes to a pool, so the loop never stalls.
+Epoll tells you a socket is ready. You still make the read call yourself, so each read or write is one system call. Epoll works well for network sockets, but it does not help with regular files, which are always reported as ready.
+used: nginx; Redis; Node.js (libuv); HAProxy; Netty; Envoy.
+avoid: Disk-heavy work on regular files (epoll cannot wait on them); use io_uring or a thread pool for file I/O.
+flow:
+  Clients [client: 10K sockets] -> Kernel [svc: TCP stack] : packets arrive | Data arrives on a few of the 10,000 connections.
+  Event loop [svc: epoll_wait] -> Kernel : wait for ready sockets | The loop sleeps in the kernel and uses no CPU while idle.
+  Kernel -> Event loop : 3 ready sockets | The call returns only the three sockets that have data.
+  Event loop -> Kernel : read socket 12 | The loop issues one non-blocking read for each ready socket.
+  Event loop -> Worker pool [svc: threads] : parse and query | Heavy work moves off the loop thread.
+  Worker pool ~> Event loop : result | The result is returned to the loop, which writes the response.
+ref: docs | epoll(7) | Linux man-pages | https://man7.org/linux/man-pages/man7/epoll.7.html
+ref: blog | The C10K problem | Dan Kegel |
+
+== io_uring batched submission for storage I/O
+kind: batching, offload-accelerator
+when: A storage engine or proxy issues many disk and network operations per second, and system call cost is a measurable part of the CPU time.
+how: io_uring gives the process two ring buffers shared with the kernel. The application writes operations (read, write, accept, send) as entries into the submission ring. It can queue hundreds of operations and then make one system call to submit them all. The kernel runs them, using its own threads where needed, and writes the results into the completion ring.
+The application reads completions from shared memory, with no system call. With an optional polling mode, the kernel thread polls the submission ring, so even the submit call disappears. So one call can replace hundreds. Unlike epoll, it completes the operation for you, and it works for regular files too.
+Costs: a newer kernel is needed, the API is larger, and some distributions or sandboxes disable it for security reasons. Check your runtime policy before you depend on it.
+used: Seastar (io_uring reactor backend); TigerBeetle; RocksDB and libuv have optional io_uring paths; Rust runtimes such as tokio-uring and glommio.
+avoid: Low-rate workloads where epoll is enough; and environments that block io_uring through seccomp or policy.
+flow:
+  Storage engine [svc: user space] -> Submission ring [queue: shared memory] : queue 64 reads | The engine writes 64 read requests into shared memory.
+  Storage engine -> Kernel [svc: io_uring] : one submit call | A single system call hands all 64 to the kernel.
+  Kernel -> NVMe drive [db: SSD] : issue 64 reads | The kernel issues the reads to the drive in parallel.
+  NVMe drive -> Completion ring [queue: shared memory] : results | Finished reads are written to the completion ring.
+  Storage engine -> Completion ring : poll, no syscall | The engine reads results from memory, with no system call.
+ref: docs | Efficient IO with io_uring | Jens Axboe, 2019 | https://kernel.dk/io_uring.pdf
+ref: docs | io_uring(7) | Linux man-pages | https://man7.org/linux/man-pages/man7/io_uring.7.html
+
+@@ ipc
+== Unix pipeline of small filters
+kind: pipes-filters, producer-consumer
+when: A job can be built from small steps that each read a stream and write a stream, and you want to reuse the steps.
+how: The shell creates a pipe between each pair of commands, as in cat log | grep ERROR | sort | uniq -c. A pipe is a kernel buffer, 64 KB by default on Linux. One process writes into it, and the next reads from it.
+The buffer gives backpressure. If the reader is slow, the buffer fills up and the writer blocks in write(). If the writer is slow, the reader blocks in read(). No step needs a lock or a custom protocol, and memory stays bounded. Steps run at the same time on different cores, so a 4-stage pipeline can use 4 cores.
+When the writer exits, the reader sees end-of-file and finishes. The tools only know bytes and lines, so each does one job. The same idea appears in data pipelines and middleware chains. Limits: pipes work only between processes on one host, and a stream of text has no schema.
+used: Unix shells and command-line data work (grep, awk, sort); build scripts; ffmpeg piping into encoders.
+avoid: Structured data with many fields and types; use files with a schema or a message queue between hosts.
+flow:
+  Shell [svc: bash] -> cat [svc: process] : fork and exec | The shell creates a pipe and starts all stages.
+  cat -> Pipe 1 [queue: 64 KB buffer] : write log lines | The first process writes into the kernel buffer.
+  Pipe 1 -> grep [svc: process] : read lines | The next process reads from the buffer as data arrives.
+  grep -> Pipe 2 [queue: 64 KB buffer] : write ERROR lines | Only matching lines move on.
+  Pipe 2 -> sort [svc: process] : read lines | The last stage sorts and prints.
+  Pipe 2 -x> grep : buffer full, writer blocks | If sort is slow, the buffer fills and grep blocks. This is backpressure.
+ref: book | The Art of Unix Programming, chapter on pipes | Eric S. Raymond, 2003 |
+ref: docs | pipe(7) | Linux man-pages | https://man7.org/linux/man-pages/man7/pipe.7.html
+
+== SIGTERM graceful shutdown with a hard kill deadline
+kind: graceful-shutdown
+when: A service must be stopped during a deploy or scale-down without dropping requests in flight.
+how: The orchestrator sends SIGTERM to the process. A signal is a small message from the kernel, and the program can catch it. On SIGTERM the service stops accepting new work, finishes the requests in flight, closes its connections and exits with code 0.
+Kubernetes follows this order. It removes the pod from the service endpoints and runs any preStop hook. It sends SIGTERM to each container, and waits for terminationGracePeriodSeconds, 30 seconds by default. If the process is still running, it sends SIGKILL. SIGKILL cannot be caught, so the process dies at once and loses any work in flight.
+Two details matter. Removing from endpoints and sending SIGTERM happen at nearly the same time, so load balancers may still send a few requests for several seconds. Many services wait a short time, then drain. And the app must be PID 1 or its parent must forward the signal, or SIGTERM never arrives.
+used: Kubernetes pod termination; Docker stop (SIGTERM then SIGKILL after 10 seconds by default); systemd stop; nginx graceful quit; gunicorn and Go http.Server.Shutdown.
+avoid: Relying on it for data safety. A crash gives no signal, so use durable logs and idempotent handlers too.
+flow:
+  Kubelet [svc: node agent] -> Endpoints [store: service routing] : remove pod from service | The pod is taken out of the load-balancing list.
+  Kubelet -> App container [svc: PID 1] : SIGTERM | The process gets a signal it can catch.
+  App container -> Load balancer [svc] : fail readiness check | The app reports not ready, so no new requests arrive.
+  * App container: draining 12 requests | The app finishes the requests that are already running.
+  App container -> Kubelet : exit code 0 | The app closes connections and exits before the deadline.
+  Kubelet -x> App container : SIGKILL after 30 s | If the app is still running at the deadline, SIGKILL ends it with no cleanup.
+ref: docs | Pod lifecycle: termination of Pods | Kubernetes documentation | https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination
+ref: docs | signal(7) | Linux man-pages | https://man7.org/linux/man-pages/man7/signal.7.html

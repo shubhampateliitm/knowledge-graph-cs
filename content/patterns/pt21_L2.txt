@@ -1,0 +1,907 @@
+@@ paxos
+== Replicated log behind a small metadata service
+kind: consensus-log, consistent-core
+when: A large system needs one small, always-correct source of truth for locks, configuration or leader names, and it must survive machine failures.
+how: Five replicas run Multi-Paxos. Each client request becomes a slot in a shared log. The leader sends the command to all replicas, and a slot is chosen once a majority (3 of 5) has accepted it. Every replica then applies chosen slots in order to the same state machine, so all copies give the same answers.
+Two replicas can be down and the service still works. A replica must write its promise and accepted value to disk before it replies. Otherwise a restart could make it forget a vote, and two values could be chosen.
+Large data clusters do not run Paxos on every write. They ask this small cluster only for rare decisions, such as who owns a shard or who holds a lock.
+used: Google Chubby (a Paxos-based lock service); Spanner replicates each split with Paxos; Apache ZooKeeper and etcd use cousins of the same idea (ZAB and Raft).
+avoid: When you need to store bulk data or serve high write rates from one group; shard the data and keep consensus only for metadata.
+flow:
+  Client [client] -> Leader [svc: replica 1] : write lock A | A client sends a command to the current leader of the group.
+  Leader -> Replica 2 [svc], Replica 3 [svc], Replica 4 [svc], Replica 5 [svc] : accept slot 17 | The leader proposes the command for log slot 17 to every replica.
+  Replica 2, Replica 3 -> Leader : accepted | A replica writes the value to disk first, then replies.
+  * Leader: slot 17 chosen | Three of five replicas, including the leader, hold the value, so the slot is chosen.
+  Leader -> Client : ok | The leader applies the command and answers the client.
+  Leader ~> Replica 4, Replica 5 : learn slot 17 | Slow replicas learn the result later and apply it in order.
+ref: paper | Paxos Made Simple | Leslie Lamport, 2001 |
+ref: paper | The Chubby Lock Service for Loosely-Coupled Distributed Systems | Burrows, OSDI 2006 |
+
+== Leader change with ballot numbers
+kind: leader-election, fencing-token
+when: The current leader of a replicated group fails or is slow, and another node must take over without losing chosen values.
+how: Every attempt to lead uses a ballot number, which is a counter that only grows. A new candidate picks a higher ballot and sends a prepare message to all replicas. A replica that sees the higher ballot promises to ignore all lower ones.
+Each promise carries the highest value that replica already accepted. The candidate must re-propose the value with the highest ballot among a majority of replies. This rule is why a value that was already chosen is never lost. After the prepare phase, the new leader sends accept messages for the later slots, and the old leader's messages are rejected.
+The cost is duelling candidates. Two nodes can keep raising ballots and block each other. Real systems use random delays or a timeout to pick one candidate.
+used: Multi-Paxos implementations in Spanner, Chubby and Megastore-style stores; the same ballot idea appears as terms in Raft and views in Viewstamped Replication.
+avoid: When one fixed node is acceptable and downtime is fine; a simple primary with manual failover is easier.
+flow:
+  Old leader [svc: ballot 5] -x> Replica B [svc] : accept slot 20 | The old leader is cut off, so its accept message never arrives.
+  Candidate [svc: replica C] -> Replica B, Replica D [svc] : prepare ballot 6 | After a timeout, replica C asks a majority to promise ballot 6.
+  Replica B -> Candidate : promise, accepted: slot 19 | The reply carries the highest value B has already accepted.
+  + Replica D -> Candidate : promise
+  * Candidate: leader, ballot 6 | With a majority of promises, replica C becomes leader and re-proposes any accepted value.
+  Candidate -> Replica B, Replica D : accept slot 19 | The new leader first finishes slot 19, so no chosen value is lost.
+  Old leader -x> Replica D : accept ballot 5 | Replicas reject ballot 5 because they promised 6, so the old leader cannot cause harm.
+ref: paper | Paxos Made Live: An Engineering Perspective | Chandra, Griesemer & Redstone, PODC 2007 |
+
+== One Paxos group per shard, two-phase commit across them
+kind: sharding, consensus-log, two-phase-commit
+when: A database must keep data in many places, survive machine loss, and still run transactions that touch several shards.
+how: Split the key space into ranges. Each range is replicated by its own Paxos group, usually three or five replicas in different zones. A write inside one range needs only one Paxos round in that group.
+A transaction that touches two ranges uses two-phase commit. The leader of each group is a participant, and one of them acts as coordinator. The coordinator and each participant write their prepare and commit records through their own Paxos group. So a crash of a coordinator machine does not block the transaction, because another replica of the group takes over the record.
+Latency is the sum of Paxos rounds. With replicas in different regions, each round costs a cross-region round trip, which can be tens of milliseconds.
+used: Google Spanner; open-source Raft-based systems such as CockroachDB and TiKV use the same layout with Raft instead of Paxos.
+avoid: When all data fits on one primary with replicas; plain leader-follower replication is simpler and faster.
+flow:
+  Client [client] -> Coordinator [svc: leader of range A] : write keys in A and B | A transaction writes keys in two ranges.
+  Coordinator -> Group A log [log: 3 replicas] : prepare record | The prepare record is made durable by a Paxos majority, so it survives a crash.
+  Coordinator -> Participant [svc: leader of range B] : prepare | The coordinator asks the other range to prepare.
+  Participant -> Group B log [log: 3 replicas] : prepare record | The participant also logs its vote through its own group.
+  Participant -> Coordinator : prepared | The participant votes yes.
+  Coordinator -> Group A log : commit record | Once all votes are yes, the commit decision is logged by a majority.
+  Coordinator -> Client : committed | The client gets the answer. The participant learns the decision and commits.
+ref: paper | Spanner: Google's Globally-Distributed Database | Corbett et al., OSDI 2012 |
+
+@@ pbft
+== Permissioned ledger with 3f+1 validators
+kind: consensus-log
+when: Several organisations share one ledger, do not fully trust each other, and a few of them may lie or be hacked.
+how: The group has n = 3f + 1 validators to tolerate f faulty ones; with 4 validators, one may lie. A leader orders each client request. Replicas then exchange signed messages in three phases (pre-prepare, prepare, commit). A request commits at a replica after it sees 2f + 1 matching messages.
+Any two sets of 2f + 1 replicas share at least one honest replica. This overlap is why liars cannot make two honest replicas commit different orders.
+The client waits for f + 1 identical replies, because at least one of them is honest. Messages grow with the square of the number of replicas, so groups stay small, usually 4 to 100 nodes.
+used: Tendermint-based chains such as Cosmos and Hyperledger Fabric 3 (SmartBFT ordering) use BFT voting; Diem used HotStuff, a later protocol in the same family.
+avoid: When all nodes belong to one trusted owner and fail only by crashing; use Raft, which needs 2f + 1 nodes and fewer messages.
+flow:
+  Client [client] -> Primary [svc: validator 1] : request | The client sends a signed request to the primary.
+  Primary -> Validator 2 [svc], Validator 3 [svc], Validator 4 [svc: faulty] : pre-prepare #9 | The primary assigns sequence number 9 and sends it to all.
+  Validator 2 -> Validator 3, Primary : prepare #9 | Each replica tells all others which order it accepted.
+  Validator 4 -x> Validator 3 : conflicting prepare | The faulty validator sends a wrong value, and it is outvoted.
+  * Validator 3: prepared (2f+1) | Validator 3 has 3 matching messages, which is 2f + 1 for f = 1.
+  Validator 3 -> Primary, Validator 2 : commit #9 | Replicas exchange commit messages and then execute request 9.
+  Validator 2 -> Client : reply | The client accepts the result after f + 1 = 2 matching replies.
+ref: paper | Practical Byzantine Fault Tolerance | Castro & Liskov, OSDI 1999 |
+
+== View change when the primary lies or stalls
+kind: leader-election, heartbeat
+when: The primary may be faulty or silent, and honest replicas must replace it without losing committed requests.
+how: Each replica starts a timer when it receives a client request. If the request is not executed in time, the replica stops accepting normal messages and sends a view-change message for view v + 1. The message lists the requests the replica has prepared.
+The primary of the new view is chosen by a fixed rule, for example view number modulo n. It waits for 2f + 1 view-change messages, then sends a new-view message. This message re-proposes every request that was prepared before, so nothing committed is lost.
+A client that sees no reply sends its request to all replicas. This makes a silent primary visible. Replicas that wait too long start the view change, and time limits double after each failed attempt to avoid endless churn.
+used: PBFT and its descendants such as BFT-SMaRt; the idea of rotating leaders is central to HotStuff-style protocols.
+avoid: When the system has no Byzantine risk; a crash-only leader election in Raft is much cheaper.
+flow:
+  Client [client] -> Primary [svc: view 0 faulty] : request | The client sends a request, but the primary ignores it.
+  Client -> Replica 2 [svc], Replica 3 [svc], Replica 4 [svc] : request to all | After a timeout, the client sends it to every replica.
+  Replica 2 -x> Primary : forward request | The replicas forward it and start timers, but get no pre-prepare.
+  Replica 2 -> Replica 3, Replica 4 : view-change v=1 | A timer expires, and the replica asks for view 1.
+  + Replica 3 -> Replica 2, Replica 4 : view-change v=1
+  * Replica 2: primary of view 1 | Replica 2 gets 2f + 1 view-change messages and takes over.
+  Replica 2 -> Replica 3, Replica 4 : new-view | The new primary re-proposes prepared requests and then orders the pending one.
+ref: paper | Practical Byzantine Fault Tolerance and Proactive Recovery | Castro & Liskov, ACM TOCS 2002 |
+
+@@ pow
+== Open blockchain with proof-of-work mining
+kind: open-consensus
+when: Anyone must be able to join and propose blocks, and no identity or central operator can be trusted.
+how: Users broadcast transactions to a peer-to-peer network. Each miner collects them into a candidate block and searches for a nonce so that the block hash is below a target. Finding one takes huge amounts of hashing, but checking it takes one hash.
+The first miner to succeed broadcasts the block. Other nodes verify it and build the next block on top of it. When two miners find blocks at once, nodes follow the chain with the most work, and the shorter branch is dropped.
+A transaction becomes safer with each block on top of it. Bitcoin waits about 6 blocks, about 1 hour, for large payments. The target is adjusted every 2016 blocks to keep one block per 10 minutes. The security cost is energy: an attacker needs most of the network's hash power.
+used: Bitcoin; Litecoin and Dogecoin use the same idea; Ethereum used proof of work until 2022.
+avoid: When members are known and few; use BFT voting or Raft. Also avoid it when energy cost or slow finality is not acceptable.
+flow:
+  Wallet [client] -> Mempool [store: pending txs] : signed transaction | A user sends a signed payment to peers, and it waits in the mempool.
+  Mempool -> Miner A [svc: hashing], Miner B [svc: hashing] : pick transactions | Each miner builds its own candidate block from pending payments.
+  Miner A -> Peer network [svc: full nodes] : block 801, valid nonce | Miner A finds a nonce first and broadcasts the block.
+  Peer network -> Miner B : block 801 | Nodes verify with one hash. Miner B drops its work and mines on top of block 801.
+  Miner B -x> Peer network : stale block 801' | A competing block found slightly later is dropped when blocks 802 and later are built on A's.
+  * Peer network: 6 confirmations | After six more blocks, rewriting the payment would need most of the hash power.
+ref: paper | Bitcoin: A Peer-to-Peer Electronic Cash System | Satoshi Nakamoto, 2008 | https://bitcoin.org/bitcoin.pdf
+
+== Proof-of-stake validators with attestations and finality
+kind: open-consensus
+when: You want open membership like a public blockchain, but without the energy cost of mining, and with a clear point of finality.
+how: A participant locks coins as a deposit (stake). On Ethereum, a validator needs 32 ETH. Time is split into slots of 12 seconds, and 32 slots form an epoch. In each slot, one validator is picked at random, weighted by stake, to propose a block.
+A committee of other validators signs votes (attestations) for the block. At the end of an epoch, if two thirds of the stake voted for a checkpoint, it is justified. A second round makes it final. Reverting a finalized block would need at least a third of the stake to break the rules.
+Cheating is punished. A validator that signs two conflicting votes is slashed, which burns part of its deposit. Missing duties costs small penalties. So the attack cost is money at risk, not electricity.
+used: Ethereum since the Merge in September 2022; Cardano, Solana and Cosmos chains use stake-based designs in different forms.
+avoid: When the validator set is small and known; plain BFT voting is simpler. Avoid it when the stake is concentrated in few hands.
+flow:
+  Staker [user] -> Deposit contract [svc: 32 ETH] : stake | A staker locks 32 ETH to become a validator.
+  Deposit contract -> Beacon chain [log: slots of 12 s] : activate validator | The validator joins the active set after a queue.
+  Beacon chain -> Proposer [svc: picked at random] : your slot | The protocol picks one validator by weighted random choice for each slot.
+  Proposer -> Committee [svc: attesters] : block for slot 100 | The proposer publishes a block, and a committee checks it.
+  Committee -> Beacon chain : attestations | The committee signs votes for the block and the checkpoint.
+  * Beacon chain: epoch justified, then final | Two thirds of the stake voted, and finality follows after a second epoch.
+  Beacon chain -x> Proposer : slashed | A validator that signed two conflicting blocks loses part of its stake.
+ref: docs | Proof-of-stake (PoS) | ethereum.org documentation | https://ethereum.org/developers/docs/consensus-mechanisms/pos/
+
+@@ quorum
+== Tunable quorum reads and writes (N, R, W)
+kind: quorum
+when: A key-value store has to stay available when replicas are down, and each caller wants to choose between speed and freshness.
+how: Each key is stored on N replicas, for example N = 3. A write returns after W replicas confirm it. A read asks R replicas and returns the newest version it sees. If R + W is more than N, every read set overlaps every write set in at least one replica, so a read sees the latest acknowledged write.
+With N = 3, W = 2 and R = 2, one replica can be down and both reads and writes still work. Setting W = 1 and R = 1 is faster but may return old data. Setting W = 3 makes reads cheap, but one down replica blocks all writes.
+A coordinator node sends requests to all N replicas and waits for the fastest W or R answers. So slow replicas do not delay the result. Replicas that missed a write are fixed later by read repair or background anti-entropy.
+used: Amazon Dynamo (the design paper); Apache Cassandra and Riak use tunable consistency levels such as QUORUM.
+avoid: When you need strict ordering of operations across keys; a quorum is not a transaction, and concurrent writes can still conflict. Use consensus.
+flow:
+  Client [client] -> Coordinator [svc: any node] : write k=v2, W=2 | The client sends a write to any node, which acts as coordinator.
+  Coordinator -> Replica A [db: v2], Replica B [db: v2], Replica C [db: v1] : write v2 | The coordinator sends the write to all three replicas of the key.
+  Replica A, Replica B -> Coordinator : ack | Two replicas confirm after they store the value.
+  Coordinator -> Client : ok | After two acks the write succeeds, though replica C still holds v1.
+  Client -> Coordinator : read k, R=2 | A later read asks two replicas.
+  Coordinator -> Replica B, Replica C : read | The set {B, C} overlaps the write set {A, B} on B.
+  * Coordinator: newest is v2 | The coordinator returns v2 and repairs replica C in the background.
+ref: paper | Dynamo: Amazon's Highly Available Key-value Store | DeCandia et al., SOSP 2007 |
+
+== Majority quorum for leader and log commit
+kind: consensus-log, quorum
+when: A replicated log or lock service must never lose a committed entry, even after the leader changes.
+how: The group has 2f + 1 replicas, usually 3 or 5, and a quorum is any majority. An entry is committed when a majority stores it on disk. A new leader must also win votes from a majority.
+Any two majorities share at least one replica. So the new leader's voters include at least one replica that holds each committed entry, and the leader can recover it. The group tolerates f failures: 1 of 3, 2 of 5.
+This is stronger than R + W > N only because the overlap is used for election too. The cost is that a minority partition cannot make progress. It stops writes rather than risk two leaders.
+used: etcd, ZooKeeper, Consul and Kafka KRaft controllers all commit with majority quorums; Spanner groups use the same rule.
+avoid: When you want writes to continue in every partition; use leaderless replication with conflict merging, such as CRDTs.
+flow:
+  Client [client] -> Leader [svc: replica 1] : put x=5 | A client writes to the leader.
+  Leader -> Replica 2 [svc], Replica 3 [svc], Replica 4 [svc], Replica 5 [svc] : append entry 12 | The leader sends the entry to all followers.
+  Replica 2, Replica 3 -> Leader : stored | Two followers store the entry and reply.
+  * Leader: entry 12 committed | The leader plus two followers is 3 of 5, a majority, so the entry is committed.
+  Leader -x> Replica 5 : append lost | Replica 5 is partitioned and misses the entry.
+  Leader -> Client : ok | The client is told only after the majority has stored the entry.
+  Replica 5 -x> Replica 4 : vote for me | If replica 5 starts an election, it cannot get a majority, and any majority holds entry 12.
+ref: paper | In Search of an Understandable Consensus Algorithm | Ongaro & Ousterhout, USENIX ATC 2014 | https://raft.github.io/raft.pdf
+
+@@ raft
+== One Raft group per key range
+kind: sharding, consensus-log
+when: A database must scale past one machine, keep three copies of every row, and fail over without losing acknowledged writes.
+how: The key space is cut into ranges of about 64 to 512 MB. Each range is its own Raft group with three or five replicas on different nodes. One node can hold thousands of replicas, and it is leader for some of them and follower for the others.
+A write goes to the range leader. The leader appends it to its log, sends it to the followers, and commits once a majority stores it. Reads and writes for different ranges run in parallel on different leaders.
+If a node dies, each range it led elects a new leader in about a second or less. Ranges that grow too large are split, and busy ones are moved to other nodes by a placement service.
+used: CockroachDB, TiKV (under TiDB) and YugabyteDB each run Raft per range or tablet.
+avoid: When one primary with replicas is enough; thousands of Raft groups add heartbeat and tuning work.
+flow:
+  SQL layer [svc: gateway] -> Range 7 leader [svc: node 1] : write key k | The gateway finds the range that owns key k and sends the write to its leader.
+  Range 7 leader -> Node 2 [svc: follower], Node 3 [svc: follower] : AppendEntries | The leader appends to its log and copies the entry to two followers.
+  Node 2 -> Range 7 leader : ack | One follower is enough: the leader plus one is 2 of 3.
+  * Range 7 leader: committed | A majority has the entry, so it is committed and applied.
+  Range 7 leader -> SQL layer : ok | The client gets the answer.
+  Range 7 leader -x> Node 3 : node 1 fails | Later, node 1 crashes.
+  Node 3 -> Node 2 : RequestVote, term 4 | A follower times out and asks for votes. It becomes the new leader of range 7.
+ref: paper | In Search of an Understandable Consensus Algorithm | Ongaro & Ousterhout, USENIX ATC 2014 | https://raft.github.io/raft.pdf
+
+== Raft-backed control-plane store
+kind: consistent-core, control-loop
+when: A large cluster needs one small store for desired state, with strong consistency and change notifications.
+how: Run three or five etcd members. They use Raft to replicate every write. Clients talk to the leader for writes, and members forward writes to it. The data set is small, often a few GB at most, because every member keeps all of it.
+In Kubernetes, only the API server talks to etcd. Controllers and kubelets use the API server to watch objects. When a user applies a Deployment, the API server stores it in etcd, and controllers see the change and act until the real state matches.
+Three members tolerate one failure, and five tolerate two. More members do not add speed, because each write still waits for a majority.
+used: Kubernetes keeps all cluster state in etcd; Kafka KRaft controllers use Raft for cluster metadata; Consul servers use Raft.
+avoid: When data is large or write rates are high; keep bulk data elsewhere and store only pointers and metadata here.
+flow:
+  kubectl [client] -> API server [svc: stateless] : apply Deployment | A user submits desired state to the API server.
+  API server -> etcd leader [db: Raft leader] : write /deployments/web | The API server writes through the etcd leader.
+  etcd leader -> etcd follower 1 [db], etcd follower 2 [db] : replicate | The leader sends the entry to the other members.
+  * etcd leader: committed | A majority has stored the write.
+  etcd leader ~> Controller [svc: watches] : watch event | A watch stream tells controllers about the new object.
+  Controller -> API server : create 3 Pods | The controller acts to make the real state match the desired state.
+ref: docs | etcd learning: data model and Raft | etcd documentation | https://etcd.io/docs/v3.5/learning/
+
+== Linearizable reads with the read index
+kind: leader-follower, lease
+when: Clients need reads that never return stale data, but writing a log entry for every read is too slow.
+how: A read does not need a log entry, because it does not change state. The leader records its current commit index as the read index. It then confirms that it is still leader by exchanging heartbeats with a majority.
+After the confirmation, the leader waits until its state machine has applied entries up to the read index. Then it answers from local state. The read sees every write that was committed before it started.
+A leader lease can skip the heartbeat round: the leader trusts that no other leader can exist before its lease expires. This is faster but depends on bounded clock drift. Followers can also serve reads by asking the leader for its read index.
+used: etcd serves linearizable reads with ReadIndex by default; TiKV and CockroachDB use leader leases for fast reads.
+avoid: When slightly old data is fine; serve stale reads from followers and avoid the leader round trip.
+flow:
+  Client [client] -> Leader [svc: commit index 90] : read key k | A client asks for a linearizable read.
+  Leader -> Follower 1 [svc], Follower 2 [svc] : heartbeat | The leader checks that a majority still follows it, so no newer leader exists.
+  Follower 1 -> Leader : ok | One confirmation plus the leader is a majority of 3.
+  + Follower 2 -x> Leader : no reply
+  * Leader: applied index 90 | The leader waits until it has applied entries up to the read index.
+  Leader -> Client : value of k | The leader answers from local state without writing a log entry.
+ref: paper | Consensus: Bridging Theory and Practice (PhD thesis, ch. 6) | Diego Ongaro, Stanford, 2014 |
+
+@@ replication
+== Leader–follower with read replicas and failover
+kind: leader-follower, read-replicas, active-passive
+when: One database holds the truth, reads far outnumber writes, and a primary failure must not lose the service for long.
+how: The primary accepts all writes and appends them to its write-ahead log. Followers stream that log and replay it. Reads can go to followers, so read capacity grows with each replica.
+Replication can be synchronous or asynchronous. Asynchronous is faster, but a crash can lose the last few commits, and followers show old data for a short time (replication lag). Synchronous waits for at least one follower and costs one round trip per commit.
+When the primary fails, a manager picks the follower with the most log, promotes it, and moves traffic. The old primary must be fenced and rebuilt as a follower. Otherwise two primaries accept writes (split brain).
+used: PostgreSQL streaming replication with Patroni; MySQL replication with Orchestrator; Amazon RDS Multi-AZ and read replicas.
+avoid: When writes must be accepted in several regions at once; use multi-leader or consensus-based replication.
+flow:
+  App [client] -> Primary [db: accepts writes] : INSERT order | All writes go to the primary.
+  Primary -> Replica 1 [db: lag 40 ms], Replica 2 [db: lag 40 ms] : stream WAL | Followers receive the log and replay it.
+  App -> Replica 1 : SELECT report | Read-heavy queries use a replica. The result can be a little old.
+  Primary -x> Manager [svc: failover tool] : heartbeat lost | The primary stops responding.
+  Manager -> Replica 2 : promote | The manager promotes the follower with the most log.
+  * Replica 2: new primary | Replica 2 now accepts writes. The old primary is fenced before it returns as a follower.
+  App -> Replica 2 : INSERT order | Traffic moves to the new primary.
+ref: docs | High Availability, Load Balancing, and Replication | PostgreSQL documentation | https://www.postgresql.org/docs/current/high-availability.html
+
+== Multi-leader replication across regions
+kind: multi-region
+when: Users in several regions need fast local writes, and the system must keep working when a region or the links between regions fail.
+how: Each region has its own leader that accepts writes and acts as follower for the others. A write is acknowledged locally, in a few milliseconds, then sent to other regions in the background. Round trips between continents cost 100 ms or more, so this avoids waiting for them.
+The price is conflicts: two regions can change the same item before they see each other's change. The system needs a rule. Last-writer-wins by timestamp is simple but can drop a write. Merge functions, CRDTs or asking the application are safer.
+Keep replication links in one direction per pair or use loop checks, so a change does not circle forever. Plan for each region to take full traffic if another fails.
+used: Amazon DynamoDB global tables (last-writer-wins); CouchDB and PouchDB sync; Cassandra multi-datacenter clusters; calendar and notes apps with offline editing.
+avoid: When the data needs strict constraints such as unique names or account balances; use a single leader or consensus per record.
+flow:
+  EU user [user] -> EU leader [db: region eu] : write profile v2 | A European user writes locally and gets an answer in a few ms.
+  US user [user] -> US leader [db: region us] : write profile v3 | At the same time a US user changes the same item.
+  EU leader ~> US leader : replicate v2 | The change is sent across the ocean in the background.
+  US leader ~> EU leader : replicate v3 | The US change travels the other way.
+  * US leader: conflict v2 vs v3 | Both regions see two writes to one item that neither knew about.
+  US leader -> EU leader : merge rule picks v3 | A fixed rule such as last-writer-wins makes both sides end with the same value.
+ref: docs | How DynamoDB global tables work | AWS documentation | https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/V2globaltables_HowItWorks.html
+
+== Leaderless replication with repair
+kind: quorum, gossip
+when: Writes must keep working when some replicas are down, and you accept that replicas may differ for a short time.
+how: A client or coordinator sends each write to all N replicas of the key and waits for W acknowledgements. If a replica is down, the coordinator stores a hint for it and replays the hint when the replica returns (hinted handoff).
+Reads ask several replicas. When they return different versions, the coordinator returns the newest and writes it to the stale replica (read repair). A background job compares Merkle trees of the data on each replica and copies only the ranges that differ (anti-entropy).
+Gossip spreads the list of live nodes, so no leader or central registry is needed. There is no failover step, because there is no leader to fail.
+used: Amazon Dynamo; Apache Cassandra; Riak; ScyllaDB.
+avoid: When you need transactions or unique constraints across many rows; use a leader-based or consensus-based database.
+flow:
+  Client [client] -> Coordinator [svc: any node] : write k, W=2 | Any node can coordinate a write.
+  Coordinator -> Replica A [db], Replica B [db], Replica C [db: down] : write | The coordinator sends the write to all three replicas.
+  Replica A, Replica B -> Coordinator : ack | Two acks meet W = 2, so the client is answered.
+  Coordinator ~> Hints [store: hint for C] : keep hint | The coordinator stores a hint for the replica that did not answer.
+  Hints ~> Replica C : replay hint | Replica C comes back, and the hint brings it up to date.
+  Replica A ~> Replica B : Merkle tree compare | A background job finds and copies any ranges that still differ.
+ref: paper | Dynamo: Amazon's Highly Available Key-value Store | DeCandia et al., SOSP 2007 |
+
+@@ retries
+== Client retry with full jitter and a retry budget
+kind: retry-backoff
+when: A call fails for short reasons such as a timeout or a 503, and many clients may fail at the same time.
+how: The client waits before each retry. The wait is random between 0 and min(cap, base times 2 to the power of attempt). With base 100 ms and cap 20 s, the limit grows 100 ms, 200 ms, 400 ms and so on. Randomness is called full jitter. It spreads clients out so they do not retry at the same moment.
+Add limits. Use at most 3 to 5 attempts, and stop when the overall deadline ends. Add a retry budget: for example, allow retries to be at most 10 percent of normal calls. This stops a slow dependency from receiving three times its normal load.
+Retry only errors that can succeed: timeouts, 429, 503, connection resets. Never retry 400 or 404 errors.
+used: AWS SDKs use exponential backoff with jitter; gRPC retry policies; Google SRE guidance on retry budgets.
+avoid: When the operation is not safe to repeat and has no idempotency key; or when the dependency is clearly down, where a circuit breaker should stop calls.
+flow:
+  Client [client] -> Service [svc: overloaded] : request | The first call reaches a service that is slow.
+  Service -x> Client : 503 | The service answers with an error that may be temporary.
+  * Client: wait random 0..200 ms | After attempt 1 the limit is 200 ms, and the client picks a random delay inside it.
+  Client -> Retry budget [store: max 10% extra] : may I retry? | A shared budget says yes, because retries are still under 10 percent of calls.
+  Client -> Service : retry 1 | The retry arrives at a time different from other clients' retries.
+  Service -x> Client : 503 again | The service is still busy.
+  * Client: wait random 0..400 ms | After attempt 2 the limit doubles.
+  Client -> Service : retry 2 | This time the service has recovered and answers with success.
+ref: blog | Exponential Backoff And Jitter | Marc Brooker, AWS Architecture Blog, 2015 | https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+
+== Retries in the mesh proxy with per-try timeouts
+kind: service-mesh, retry-backoff, timeout-deadline
+when: Many services in many languages need the same retry rules, and you do not want each team to code them.
+how: A sidecar proxy such as Envoy sits next to each service. A route policy says how many retries are allowed, which errors to retry, and how long each try may take. For example: 2 retries, on connect failure and 503, with a 300 ms limit per try and a 1 s limit overall.
+The proxy retries on another healthy instance when it can, because the same instance may be the problem. Retry budgets in Envoy limit retries to a share of active requests, so a failure does not turn into a storm.
+Retries at every layer multiply. If three layers each try three times, the bottom service sees up to 27 calls for one user request. Retry at one layer, usually the edge or the caller closest to the user.
+used: Envoy and Istio retry policies; Linkerd retries with a retry budget; gRPC service config.
+avoid: When the call is not idempotent or the layer above already retries; set retries to zero there.
+flow:
+  Service A [svc] -> Proxy A [svc: sidecar] : call B | Service A makes a plain call and knows nothing about retries.
+  Proxy A -> Proxy B1 [svc: instance 1] : attempt 1, 300 ms | The proxy picks an instance and sets a per-try timeout.
+  Proxy B1 -x> Proxy A : 503 | Instance 1 is overloaded and fails.
+  Proxy A -> Proxy B2 [svc: instance 2] : attempt 2 | The proxy retries on a different instance after a short backoff.
+  Proxy B2 -> Proxy A : 200 OK | The second instance answers.
+  Proxy A -> Service A : 200 OK | Service A sees only success, plus a slightly longer latency.
+ref: docs | Envoy: HTTP routing, retry policy | Envoy documentation | https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/router_filter#x-envoy-retry-on
+
+== Safe retries with idempotency keys
+kind: idempotent-consumer, retry-backoff
+when: A retry could repeat a payment or an order, and the client cannot tell whether the first try worked.
+how: The client creates a unique key, such as a UUID, once per user action. It sends the key in a header with every attempt of that action. The server stores the key together with the result of the first attempt.
+If the same key arrives again, the server returns the stored result and does not run the work again. If the first attempt is still running, the server returns a conflict, or waits. The key and result are saved in the same transaction as the business change, so a crash cannot separate them.
+Keys are kept for a limited time, for example 24 hours. After that a key may be reused, so clients must not keep retrying for longer than this.
+used: Stripe's Idempotency-Key header; payment APIs from other providers; Kafka idempotent producers use sequence numbers for the same goal.
+avoid: When the operation is naturally idempotent, such as setting a value (PUT); a key store adds no value.
+flow:
+  Client [client] -> Payments API [svc] : POST charge, key K1 | The client sends a charge with a new key.
+  Payments API -> Keys table [db: key and result] : insert K1 plus charge | The API saves the key and the charge in one transaction.
+  Payments API -x> Client : response lost | The network drops the answer, so the client does not know the result.
+  Client -> Payments API : retry, key K1 | After a backoff, the client sends the same request with the same key.
+  Payments API -> Keys table : lookup K1 | The API finds K1 already done.
+  Payments API -> Client : stored result | The client gets the first result and the card is charged only once.
+ref: docs | Idempotent requests | Stripe API documentation | https://docs.stripe.com/api/idempotent_requests
+
+@@ truetime
+== Commit wait for external consistency
+kind: commit-wait
+when: A distributed database must make transaction order match real time, so a later transaction never appears to run before an earlier one.
+how: The clock API returns an interval [earliest, latest] that holds the true time. In Spanner this interval is usually a few milliseconds wide. The leader picks a commit timestamp s that is at least the latest time of the clock at commit.
+The leader then waits until the earliest time of the clock is past s before it reports the commit and releases locks. This pause is called commit wait. After it, s is surely in the past everywhere. Any transaction that starts later gets a larger timestamp.
+Commit wait costs about the width of the uncertainty, often 1 to 7 ms. The wait overlaps with the Paxos replication of the commit, so it adds little. Better clocks give shorter waits and more throughput.
+used: Google Spanner and Cloud Spanner; Spanner's design is the reference for this approach.
+avoid: When you have no tight bound on clock error; use hybrid logical clocks or a single timestamp oracle instead.
+flow:
+  Client [client] -> Leader [svc: Paxos leader] : commit transaction | The client asks the leader to commit.
+  Leader -> TrueTime API [svc: GPS and atomic] : now() | The leader reads the clock interval.
+  TrueTime API -> Leader : [100.000, 100.007] | The true time is somewhere in the 7 ms interval.
+  * Leader: commit timestamp s = 100.007 | The leader picks the latest possible time as the commit timestamp.
+  Leader -> Replicas [log: Paxos replicas] : replicate commit s | At the same time, the leader sends the commit record to the replicas.
+  * Leader: wait until earliest > s | The leader waits until s is surely in the past everywhere.
+  Leader -> Client : committed at s | The client learns the result only now. Any later transaction gets a larger timestamp.
+ref: paper | Spanner: Google's Globally-Distributed Database | Corbett et al., OSDI 2012 |
+
+== Lock-free snapshot reads at a timestamp
+kind: copy-on-write, read-replicas
+when: Large read-only queries must see a consistent view of the data without blocking writers or being blocked by them.
+how: The database stores several versions of each row, each tagged with its commit timestamp. A read-only transaction picks one read timestamp. It reads, from any replica, the newest version at or below that timestamp. No locks are taken.
+A replica can serve a read at time t only when it knows it has seen every write up to t. This is called safe time. For a fresh read, the replica may ask its leader or wait a little. For a stale read, for example 10 seconds old, any nearby replica answers at once.
+Because TrueTime makes timestamps match real time, a read at "now" is also consistent with every committed transaction. Old versions are removed after a garbage collection window.
+used: Google Spanner read-only transactions and stale reads; the same multi-version idea is used by most databases, with different clocks.
+avoid: When data must be read at the latest moment with no staleness and few replicas are nearby; read from the leader.
+flow:
+  Report job [client] -> Spanner API [svc: picks timestamp] : read at t = 10 s ago | The job asks for a bounded-stale snapshot.
+  Spanner API -> Nearby replica [svc: safe time 2 s ago] : read, ts t | The nearest replica is chosen, not the leader.
+  Nearby replica -> Versions [db: rows with timestamps] : newest version <= t | The replica reads the version at or below t.
+  Writer [client] -> Leader [svc] : update row | At the same time a writer commits new versions at later timestamps.
+  Leader ~> Nearby replica : replicate new version | New versions do not change what the snapshot sees.
+  Nearby replica -> Report job : consistent rows | The job gets a consistent view without any lock.
+ref: paper | Spanner: Google's Globally-Distributed Database | Corbett et al., OSDI 2012 |
+
+== Uncertainty-interval reads without special clocks
+kind: commit-wait
+when: You want mostly consistent ordering across nodes, but you only have ordinary clocks kept in sync by NTP.
+how: Each node uses a hybrid logical clock. Every node is assumed to be within a maximum clock offset of the others, for example 500 ms in CockroachDB by default. A read at timestamp t treats any value written between t and t plus the offset as uncertain.
+If a read finds a value inside that window, the database cannot tell if the write came before or after the read. So it restarts the read at a higher timestamp, just above that value. This keeps reads correct, at the cost of a retry.
+If a node's clock drifts beyond a safe limit, it shuts itself down. This protects correctness. A smaller offset means fewer restarts, so cloud time services with tight bounds help.
+used: CockroachDB (max offset and uncertainty restarts); Amazon Time Sync Service and ClockBound give cloud clock error bounds.
+avoid: When you can afford GPS or atomic clocks and need the shortest waits; or when clock error cannot be bounded at all.
+flow:
+  Client [client] -> Node A [svc: clock 10.000] : read key k at 10.000 | The read gets timestamp 10.000 from node A.
+  Node A -> Node B [svc: leaseholder of k] : read, ts 10.000 | The key lives on node B, which holds the lease for it.
+  Node B -> Node A : found value at 10.200 | Node B has a value written at 10.200, inside the 500 ms uncertainty window.
+  * Node A: uncertain, bump to 10.200 | The read cannot know if the write happened first, so it moves up.
+  Node A -> Node B : read again, ts 10.200 | The read restarts above that value.
+  Node B -> Node A : value | The read now sees the value and is correct.
+  Node A -> Client : result | The client sees a small delay from one restart.
+ref: docs | Transactions: clock synchronization and uncertainty | CockroachDB documentation | https://www.cockroachlabs.com/docs/stable/architecture/transaction-layer
+
+@@ twopc
+== Atomic commit across databases with a durable coordinator
+kind: two-phase-commit, wal
+when: One business action must change two or more databases, and either all changes happen or none does.
+how: A transaction manager starts the work on every participant database. When the application says commit, phase one begins. The manager sends prepare to each participant. A participant writes all its changes and a prepared record to its log, forces it to disk, and votes yes. After a yes it must keep its locks and wait.
+If every vote is yes, the manager writes a commit record to its own log, and this write is the decision point. Phase two then sends commit to all. If any vote is no, or a reply times out, the manager logs abort and sends abort.
+The weak point is the wait. If the manager crashes after participants voted yes, they hold locks until it comes back and reads its log. So run the manager with a durable log and fast restart.
+used: XA transactions in Java EE with PostgreSQL, MySQL and Oracle; PostgreSQL PREPARE TRANSACTION; Microsoft MSDTC.
+avoid: When services are owned by different teams or can be slow; locks held across the network hurt. Use a saga with compensating steps.
+flow:
+  App [client] -> Coordinator [svc: txn manager] : commit | The application asks the manager to commit a transfer.
+  Coordinator -> Orders DB [db: prepared], Payments DB [db: prepared] : PREPARE | Phase one: each database logs its changes and the prepared state.
+  Orders DB, Payments DB -> Coordinator : vote yes | Both participants log the prepared state and vote yes.
+  Coordinator -> Coordinator Log [log: decision] : COMMIT record | The manager writes commit to disk. This is the point of no return.
+  Coordinator -> Orders DB, Payments DB : COMMIT | Phase two: the participants make the changes visible and release locks.
+  Coordinator -x> Payments DB : crash before COMMIT | If the manager fails here, the payments database stays blocked until recovery.
+ref: book | Transaction Processing: Concepts and Techniques | Gray & Reuter, 1992 |
+
+== Single commit point in a transaction row
+kind: two-phase-commit
+when: A distributed store must commit a multi-row transaction without a separate coordinator process.
+how: The client picks one written cell as the primary lock and records it in every other lock. In phase one, it writes data and a lock for each row. If any lock is already held by another transaction, it aborts.
+To commit, the client replaces the primary lock with a write record in one atomic row operation. This single operation is the commit point. After that the transaction is committed, even if the client dies.
+Then the client cleans up the other locks one by one. If the client crashed, another transaction that meets a stale lock looks at the primary. If the primary shows a commit record it rolls the lock forward. Otherwise it removes the lock and the transaction rolls back.
+used: Google Percolator on Bigtable; TiKV's transaction layer follows the Percolator model.
+avoid: When the store has no single-row atomic operation, or when contention is high; many conflicting locks cause aborts.
+flow:
+  Client [client] -> Row A [db: primary lock] : write data and lock | Phase one: the client writes row A first, and its lock is the primary.
+  Client -> Row B [db: lock to primary] : write data and lock | Row B gets a lock that points to row A.
+  Client -> Row A : swap lock for commit | One atomic write on row A is the commit point.
+  * Client: transaction committed | From now on the outcome cannot change, even if the client crashes.
+  Client ~> Row B : release lock | The client then cleans up the secondary locks.
+  Reader [client] -> Row B : read | A reader that finds a stale lock on B checks row A.
+  Reader -> Row A : is it committed? | Row A shows a commit record, so the reader rolls B forward.
+ref: paper | Large-scale Incremental Processing Using Distributed Transactions and Notifications | Peng & Dabek, OSDI 2010 |
+
+== Kafka transactions across partitions
+kind: two-phase-commit, idempotent-consumer
+when: A stream job reads from one topic and writes to several output topics, and its output must appear all at once or not at all.
+how: The producer registers with a transaction coordinator, a broker role with its own log. It writes records to many partitions, and the coordinator remembers which partitions took part. The consumer offsets of the input are added to the same transaction.
+On commit, the coordinator first writes a prepare-commit record to its transaction log. This is the decision point. It then writes a commit marker into every partition. Consumers with isolation level read_committed skip records until the marker arrives, and skip aborted records.
+If the coordinator crashes, a new one reads the log and finishes the markers. Throughput cost is small for batches: one transaction per 100 ms adds a few round trips.
+used: Kafka Streams with processing.guarantee set to exactly_once_v2; Apache Flink's Kafka sink in exactly-once mode.
+avoid: When writes go to a system outside Kafka; use an idempotent sink or an outbox. Avoid very small transactions, which waste round trips.
+flow:
+  Stream job [svc: read-process-write] -> Txn coordinator [svc: broker role] : begin, add partitions | The job registers every output partition it will write.
+  Stream job -> Topic A [log: partition 0], Topic B [log: partition 3] : records | Records are written, but readers do not see them yet.
+  Stream job -> Txn coordinator : commit | The job also commits the input offsets in the same transaction.
+  Txn coordinator -> Txn log [log: __transaction_state] : PREPARE_COMMIT | The decision is logged first, so a new coordinator can finish it.
+  Txn coordinator -> Topic A, Topic B : commit markers | A marker in each partition makes the records visible.
+  Topic A -> Reader [client: read_committed] : visible records | The reader sees the records only after the marker.
+ref: docs | Transactions in Apache Kafka | Confluent blog | https://www.confluent.io/blog/transactions-apache-kafka/
+
+@@ vectorclocks
+== Version vectors to detect sibling writes
+kind: quorum, crdt
+when: A replicated key-value store accepts writes on any replica, and it must tell an update from a conflict.
+how: Each value carries a version vector: one counter per replica that has written to it. When a replica writes, it increases its own counter. A client reads a value together with its vector and sends the vector back with the next write.
+Compare two vectors entry by entry. If every entry of one is at most the other, it is older, and it can be dropped. If each is larger in some entry, the writes are concurrent. The store keeps both as siblings and returns both on the next read.
+The client or the application merges siblings, for example by taking the union of two shopping carts, and writes the result with a vector that covers both. Vector size grows with the number of writers, so systems prune old entries or use dotted version vectors.
+used: Riak (dotted version vectors); the Dynamo paper used vector clocks for its shopping cart.
+avoid: When a simple rule such as last-writer-wins is acceptable; it is smaller but loses concurrent updates. Or use CRDTs to merge without client code.
+flow:
+  Client 1 [client] -> Replica A [db: A:1] : put cart=[book] | The first write creates version A:1.
+  Replica A ~> Replica B [db: A:1] : replicate A:1 | The write reaches replica B in the background.
+  Client 1 -> Replica A : put [book pen] ctx A:1 | An update from A:1 becomes A:2. It is newer, so no conflict.
+  Client 2 [client] -> Replica B : put [book cup] ctx A:1 | A second client updated B before seeing A:2. This becomes A:1, B:1.
+  * Replica B: A:1,B:1 vs A:2 | Neither vector covers the other, so the two writes are concurrent.
+  Client 1 -> Replica B : get cart | A read returns both versions as siblings, with a merged context.
+  Client 1 -> Replica A : put merged ctx A2 B1 | The client merges the carts and writes a version that covers both.
+ref: paper | Dynamo: Amazon's Highly Available Key-value Store | DeCandia et al., SOSP 2007 |
+
+== Causal delivery in a replicated chat or feed
+kind: logical-clock
+when: Users in several regions post and reply, and a reply must never be shown before the message it answers.
+how: Each region keeps a vector with one counter per region. When a region sends a message, it increases its own counter and attaches the vector. A message depends on everything the vector says the sender had already seen.
+A receiving region delivers a message from region j only if two checks hold. It has already delivered all earlier messages from j, and it has delivered everything else listed in the vector. If not, it holds the message in a buffer.
+When the missing message arrives, the buffer is checked again, and waiting messages are released. This gives causal order without a global clock or a single leader. Concurrent messages can still show in different order in different regions, which is acceptable.
+used: Causal broadcast in group communication libraries; causal consistency in the COPS research system and in MongoDB causal sessions; replicated comment systems.
+avoid: When all users must see one global order; use a leader or total-order broadcast. Avoid it when the number of nodes is very large, since vectors grow.
+flow:
+  User EU [user] -> Region EU [svc: vector 1 0] : post "Lunch?" | A user posts a message in Europe.
+  Region EU ~> Region US [svc: vector 0 0] : msg 1 vector 1 0 | The message travels slowly to the US.
+  Region EU ~> Region ASIA [svc: vector 0 0] : msg 1 vector 1 0 | The message also goes to Asia.
+  Region ASIA -> Region US : reply vector 1 1 | Asia saw msg 1 and sends a reply that depends on it.
+  * Region US: hold reply | The reply arrives first. The US has not delivered msg 1, so it buffers the reply.
+  Region EU ~> Region US : msg 1 delivered | When msg 1 arrives, the US delivers it and then releases the reply.
+ref: paper | Time, Clocks, and the Ordering of Events in a Distributed System | Leslie Lamport, CACM 1978 |
+
+== State vectors to sync collaborative documents
+kind: crdt, gossip
+when: Several editors, some offline, must end with the same document and exchange only what the other side is missing.
+how: Every operation is tagged with a client id and a counter for that client. Each peer keeps a state vector: for each client id, the highest counter it has seen. This vector is the compact summary of everything the peer knows.
+To sync, peer A sends its state vector to peer B. B compares it with its own and sends only the operations A lacks. A does the same in return. Operations are applied with CRDT rules, so they can arrive in any order and the results converge.
+The vector grows with the number of clients that ever wrote, which is small for documents with a few editors. Sync works over any transport, such as WebSocket, peer-to-peer or a file.
+used: Yjs and Automerge both sync with version or state vectors; local-first editors and shared note apps follow this idea.
+avoid: When there is one server that orders all edits and clients are always online; an operation log with revision numbers is simpler.
+flow:
+  Laptop [client: A:5 B:2] -> Server [svc: A:3 B:4] : state vector A5 B2 | The laptop sends a short summary of what it has.
+  Server -> Laptop : ops B:3..B:4 | The server sends only the operations the laptop lacks.
+  Laptop -> Server : ops A:4..A:5 | The laptop sends its new operations in return.
+  * Laptop: has A:5, B:4 | Both sides now hold the same operations.
+  Server ~> Phone [client: A:2 B:1] : ops A3-A5 B2-B4 | A phone that was offline for days gets everything it missed in one message.
+  Phone -> Server : state vector A5 B4 | The phone confirms its new state.
+ref: docs | Yjs: document updates and state vectors | Yjs documentation | https://docs.yjs.dev/api/document-updates
+
+@@ vr
+== Primary-backup replicated state machine
+kind: consensus-log, leader-follower
+when: A service must keep running after a machine fails, and all copies must return the same answers in the same order.
+how: Run 2f + 1 replicas, such as 3. One is primary for the current view. A client sends a request to the primary, which assigns the next number in its log and sends a prepare message to the backups. Each backup adds the entry to its log and replies.
+When the primary has replies from f backups (so f + 1 including itself), it commits the entry. It executes the request and answers the client. Backups learn the commit number in the next message and execute in the same order.
+Because the log order is fixed by the primary and checked by a majority, every replica runs the same sequence. The service code only needs to be deterministic.
+used: The idea behind Raft and the replicated logs of many databases; TigerBeetle uses Viewstamped Replication for its ledger.
+avoid: When the service is not deterministic or the data is huge; replicate the data with a storage layer instead.
+flow:
+  Client [client] -> Primary [svc: view 0] : request op 5 | The client sends an operation to the current primary.
+  Primary -> Backup 1 [svc], Backup 2 [svc] : Prepare view 0, op 5 | The primary logs the entry as number 5 and asks backups to log it.
+  Backup 1 -> Primary : PrepareOK | One backup is enough: the primary plus it is 2 of 3.
+  * Primary: op 5 committed | A majority holds the entry, so it is committed.
+  Primary -> Client : reply | The primary executes the operation and answers.
+  Primary ~> Backup 1, Backup 2 : commit number 5 | Backups learn the commit and execute the operation too.
+ref: paper | Viewstamped Replication Revisited | Liskov & Cowling, MIT technical report, 2012 |
+
+== View change after the primary fails
+kind: leader-election, consensus-log
+when: The primary stops responding, and the backups must pick a new one without losing committed operations.
+how: Backups expect a message from the primary within a timeout. If none comes, a backup moves to view v + 1 and sends a start-view-change message to all. The primary of the new view is replica number (v + 1) mod n, so no election vote is needed.
+When a replica gets start-view-change from f others, it sends its log and view number to the new primary. The new primary waits for f + 1 such messages. It takes the most up-to-date log, and sends a start-view message with that log to the backups.
+Any committed entry is in the log of at least one replica in every majority, so it appears in the new log. Backups install the log and the service resumes in the new view.
+used: Viewstamped Replication in research and in TigerBeetle; Raft's election replaces this fixed rotation with votes.
+avoid: When the failure model includes lying nodes; use Byzantine fault tolerance.
+flow:
+  Primary [svc: view 0 down] -x> Backup 1 [svc] : no heartbeat | The primary crashes, and backups get nothing.
+  Backup 1 -> Backup 2 [svc], Replica 0 [svc: new primary] : StartViewChange v=1 | After a timeout, a backup asks for view 1.
+  Backup 2 -> Replica 0 : DoViewChange, log | Each backup sends its log to the primary of view 1.
+  * Replica 0: has f+1 logs | The new primary chooses the most up-to-date log. It holds all committed entries.
+  Replica 0 -> Backup 1, Backup 2 : StartView v=1, log | The new primary sends the log, and backups install it.
+  Client [client] -> Replica 0 : retry request | The client finds the new primary and sends its request again.
+ref: paper | Viewstamped Replication: A New Primary Copy Method to Support Highly-Available Distributed Systems | Oki & Liskov, PODC 1988 |
+
+== Replacing a failed machine by reconfiguration
+kind: consensus-log
+when: A replica is gone for good, or you want to move the group to new machines, and the group must stay correct.
+how: The group has an epoch number and a configuration, which is the list of replicas. An operator, or an automatic tool, sends a reconfiguration request to the primary. The primary puts it in the log like any other operation.
+When the request commits, the old group stops accepting client requests. It sends the state to the new members, so they can catch up. When enough new members have the state, the new group starts the next epoch.
+A replica that was removed and comes back sees that its epoch is old and shuts down. This stops a removed machine from taking part in decisions. The group is unavailable only for the short transfer.
+used: Viewstamped Replication Revisited describes this; Raft solves the same problem with membership changes.
+avoid: When the group is fixed and small; just restart the failed node with its disk instead.
+flow:
+  Operator [user] -> Primary [svc: epoch 1] : replace R3 with R4 | An operator asks to change the group.
+  Primary -> Replica 2 [svc], Replica 3 [svc: old] : Prepare reconfig | The request goes through the log, like any operation.
+  * Primary: reconfig committed | A majority holds the entry. The old group stops serving requests.
+  Primary -> Replica 4 [svc: new] : state transfer | The new member gets the log and state.
+  Replica 4 -> Primary : StartEpoch ready | When enough new members are ready, the new epoch starts.
+  Replica 3 -x> Primary : old epoch 1 | A removed replica that returns is rejected, and it shuts down.
+ref: paper | Viewstamped Replication Revisited | Liskov & Cowling, MIT technical report, 2012 |
+
+@@ zab
+== ZooKeeper ensemble: one leader orders all writes
+kind: consensus-log, consistent-core
+when: A system needs a small, strongly ordered store for configuration and coordination that many clients can read fast.
+how: A ZooKeeper ensemble has 3 or 5 servers. One is leader. Clients may connect to any server. A write is forwarded to the leader, which gives it a zxid: an epoch number plus a counter. The leader sends the proposal to all followers in order.
+Each follower writes the proposal to its log, then acknowledges. After a majority has acknowledged, the leader tells everyone to commit. Every server applies writes in zxid order, so all copies change in the same order.
+Reads are served from the local server's memory, so read throughput grows with every server. A local read can be a little old. A client that needs the latest value calls sync first.
+used: Apache ZooKeeper; Kafka before KRaft stored cluster metadata in it; HBase and Hadoop HA setups use it.
+avoid: When you need to store large data or serve heavy write traffic; ZooKeeper is for small metadata. Raft-based etcd is an alternative.
+flow:
+  Client [client] -> Follower 1 [svc: connected server] : setData /config | A client writes through the server it is connected to.
+  Follower 1 -> Leader [svc: epoch 3] : forward write | Followers forward all writes to the leader.
+  Leader -> Follower 1, Follower 2 [svc] : PROPOSAL zxid 3:77 | The leader sends the proposal with the next zxid.
+  Follower 1, Follower 2 -> Leader : ACK | Followers log the proposal and acknowledge it.
+  * Leader: majority acked | Leader plus one follower is 2 of 3, so it commits.
+  Leader -> Follower 1, Follower 2 : COMMIT 3:77 | All servers apply the write in the same order.
+  Follower 1 -> Client : ok | The client gets the answer. Reads stay local to each server.
+ref: paper | Zab: High-performance broadcast for primary-backup systems | Junqueira, Reed & Serafini, DSN 2011 |
+
+== Leader recovery with discovery and sync
+kind: leader-election, fencing-token
+when: The ZooKeeper leader fails, and a new leader must continue without losing committed writes or mixing old and new histories.
+how: Servers run a leader election. They vote for the server with the highest last zxid, so the winner has the most complete log. The winner starts a new epoch, which is the first part of every later zxid.
+In the discovery phase, the new leader collects the latest epoch from a quorum, and picks a larger one. In the sync phase, it brings each follower to the same history. It sends missing transactions or tells the follower to truncate extra ones.
+Only after a quorum is synchronized does the leader start broadcast. Followers reject proposals from older epochs, so a stale leader that comes back cannot change anything.
+used: Apache ZooKeeper; the same idea appears as terms in Raft and views in Viewstamped Replication.
+avoid: When one fixed node is acceptable and a short outage is fine; plain primary-backup is simpler.
+flow:
+  Leader [svc: epoch 3] -x> Follower 1 [svc] : crash | The leader fails, and followers lose contact.
+  Follower 1 -> Follower 2 [svc: last zxid 3:77] : vote, last zxid 3:77 | Servers vote for the one with the most complete log.
+  * Follower 2: elected, epoch 4 | The winner has the highest zxid. It picks a new epoch number.
+  Follower 2 -> Follower 1 : NEWEPOCH 4 | Discovery: the leader tells a quorum the new epoch, and followers accept it.
+  Follower 2 -> Follower 1 : DIFF or TRUNC | Sync: the leader sends missing writes or tells the follower to drop extra ones.
+  Follower 2 -> Follower 1 : start broadcast | After a quorum is in sync, new proposals use epoch 4.
+  Leader -x> Follower 1 : PROPOSAL epoch 3 | The old leader returns, but followers reject its old epoch.
+ref: paper | Zab: High-performance broadcast for primary-backup systems | Junqueira, Reed & Serafini, DSN 2011 |
+
+== Ephemeral nodes for membership and locks
+kind: leader-election, service-discovery, lease
+when: Applications need to know who is alive, who is leader, or who holds a lock, and a crashed process must release its claim.
+how: A client opens a session with timeouts, kept alive by pings. It creates an ephemeral znode, which is deleted when the session ends. For group membership, each service instance creates an ephemeral child under /services. Watchers get a notification when the child list changes.
+For leader election, each candidate creates an ephemeral sequential node under /election. The candidate with the lowest number is leader. Each other candidate watches only the node just before it, so a failure wakes one waiter and not all.
+Every change goes through ZAB, so all clients see the same order of changes. Session timeouts of 5 to 30 seconds are common, which sets how fast a dead node is noticed.
+used: Apache Curator recipes; Kafka (pre-KRaft) controller election and broker registration; HBase master election; Solr and SolrCloud.
+avoid: When a long pause can fool the session timeout; add fencing tokens such as the zxid, because a paused leader may think it still leads.
+flow:
+  Node A [svc: candidate] -> ZooKeeper [db: ZAB ensemble] : create ephemeral seq node | Each candidate creates an ephemeral sequential node.
+  Node B [svc: candidate] -> ZooKeeper : create ephemeral seq node | The second candidate gets a higher number.
+  * Node A: lowest number, leader | Node A holds number 0001 and starts leading.
+  Node B -> ZooKeeper : watch node 0001 | Node B watches only the node just before its own.
+  Node A -x> ZooKeeper : session expires | Node A crashes, and its ephemeral node is deleted.
+  ZooKeeper ~> Node B : watch event | Node B is told, sees it has the lowest number, and becomes leader.
+ref: docs | ZooKeeper Recipes and Solutions | Apache ZooKeeper documentation | https://zookeeper.apache.org/doc/current/recipes.html
+
+@@ a11y
+== Accessibility tree between the page and assistive tools
+kind: none
+when: Blind, low-vision or motor-impaired users operate your web or mobile UI with a screen reader, voice control or a switch.
+how: The browser reads the HTML and builds two trees: the visual DOM and a separate accessibility tree. Each node has a role (button, heading, textbox), an accessible name (for example the label text) and states (checked, expanded, disabled). Native elements such as button and input give correct roles for free. ARIA attributes add what native HTML cannot express.
+The browser exposes this tree through the platform API: UI Automation on Windows, NSAccessibility on macOS, AT-SPI on Linux, and the accessibility services on Android and iOS. A screen reader such as NVDA, JAWS or VoiceOver reads the tree, speaks it, and sends actions like click back to the element.
+The first rule of ARIA is to use a native element if one exists. A div with a click handler has no role, no focus and no keyboard support, so the tools cannot see or use it.
+used: Chrome, Firefox and Safari build the tree from HTML and ARIA; WCAG 2.2 and the European Accessibility Act (applies from June 2025) make this a legal duty in many markets.
+avoid: When someone adds ARIA to fix a custom widget that could be a native element; a wrong ARIA role is worse than none.
+flow:
+  HTML page [note: semantic markup] -> Browser [svc: DOM and a11y tree] : button, label, heading | The browser parses native elements and ARIA attributes.
+  Browser -> Platform API [svc: UIA or AT-SPI] : role, name, state | For each node, the browser exposes its role, name and state.
+  Platform API -> Screen reader [svc: NVDA or VoiceOver] : tree events | The screen reader subscribes to focus and change events.
+  Screen reader -> User [user] : speech or braille | The user hears "Submit, button".
+  User -> Screen reader : press Enter | The user acts by keyboard, not by sight.
+  Screen reader -> Browser : invoke action | The action goes back through the platform API.
+  Browser -> HTML page : click event | The page handler runs, exactly as for a mouse click.
+ref: spec | WAI-ARIA Authoring Practices Guide | W3C | https://www.w3.org/WAI/ARIA/apg/
+
+== Accessibility checks as a CI quality gate
+kind: quality-gate
+when: Many teams ship UI changes every day, and accessibility bugs must be caught before release, not after complaints.
+how: Run automated checks at three points. In unit and component tests, axe-core runs on rendered components and fails on rules like missing labels or low contrast. In end-to-end tests with Playwright or Cypress, axe scans each key page. A CI job can also run Lighthouse and block a merge if the score drops.
+Automated tools find only a part of the problems, roughly a third by common estimates. Keyboard order, focus handling and the meaning of alt text need people. So add a short manual checklist for each release: tab through the page, use a screen reader on the main flow, zoom to 200 percent.
+Track results over time. Assign each violation to the owning team, and fail the build only on new violations, so old debt does not stop all work.
+used: axe-core from Deque is open source and used in many CI setups; Lighthouse CI; GOV.UK and large design-system teams add manual audits.
+avoid: When used as the only check; a green automated scan does not mean the product is usable with a screen reader.
+flow:
+  Developer [user] -> Git repo [store: pull request] : push change | A developer opens a pull request.
+  Git repo -> CI runner [svc: build and test] : trigger | CI builds the app and starts the tests.
+  CI runner -> Component tests [svc: axe-core] : render and scan | Each component is rendered and checked for rule violations.
+  CI runner -> E2E tests [svc: Playwright plus axe] : scan key pages | The tests walk main flows and scan each page.
+  Component tests -x> CI runner : 2 new violations | A missing label fails the build and blocks the merge.
+  CI runner -> Developer : report with fix hints | The report names the element and the rule.
+  Developer -> Git repo : fix and push | The fix passes, and a human also does a screen reader check before release.
+ref: docs | axe-core: accessibility testing engine | Deque Systems | https://github.com/dequelabs/axe-core
+
+== Design system with accessible components
+kind: none
+when: Many product teams build screens, and each would otherwise rebuild menus, dialogs and tabs with its own keyboard and ARIA bugs.
+how: A platform team ships a component library where each widget follows the WAI-ARIA Authoring Practices pattern. A dialog traps focus, restores it on close and closes on Escape. A menu supports arrow keys. Roles, names and states are set inside the component, so product teams cannot forget them.
+Product code passes content, such as the label text, and props. Design tokens fix colors so text contrast meets WCAG 2.2 (at least 4.5 to 1 for normal text) in both light and dark themes. The library has its own accessibility tests, so a fix reaches all products with one version bump.
+Headless libraries such as Radix UI and React Aria give behavior without style, so each brand can add its own look.
+used: React Aria (Adobe), Radix UI, Material Design components and GOV.UK Design System include accessibility behavior.
+avoid: When a team wraps the library and removes labels or focus outlines; code review and tests must guard the contract.
+flow:
+  Design tokens [store: colors] -> Component library [svc: dialog menu tabs] : contrast-safe colors | Tokens are checked for contrast before release.
+  Component library -> Accessibility tests [svc: axe plus manual] : each release | The library team tests keyboard use and screen readers.
+  Component library -> Product app [svc: feature code] : npm package | Product teams install a new version.
+  Product app -> Component library : Dialog title="Pay" | The app passes content and props, not ARIA code.
+  Component library -> Browser [svc: a11y tree] : role=dialog, focus trap | The component sets the role, name and focus handling.
+  Browser -> Screen reader [svc: NVDA or VoiceOver] : "Pay, dialog" | The user hears the dialog name and cannot tab out of it.
+ref: docs | React Aria: accessibility, internationalization and interactions | Adobe | https://react-spectrum.adobe.com/react-aria/
+
+@@ allreduce
+== Bucketed gradient all-reduce overlapped with backward
+kind: data-parallel
+when: You train a model that fits on one GPU, and you want to use many GPUs to process more data per step.
+how: Every GPU holds a full copy of the model and runs forward and backward on its own slice of the batch. Gradients must then be averaged across GPUs, so that all copies stay equal. This is done with all-reduce.
+Waiting until the whole backward pass ends would leave the network idle. So PyTorch DDP groups gradients into buckets, 25 MB by default. When all gradients of a bucket are ready, it starts an all-reduce for that bucket while backward continues on earlier layers. Compute and communication overlap.
+After the last bucket finishes, every GPU applies the same optimizer step. The model has to be small enough that weights, gradients and optimizer state fit in memory on one GPU.
+used: PyTorch DistributedDataParallel with NCCL; Horovod; most large vision and language model training before model size forced sharding.
+avoid: When the model does not fit in one GPU's memory; use FSDP or ZeRO, or tensor and pipeline parallelism.
+flow:
+  Data loader [svc: shards batch] -> GPU 0 [svc: model copy], GPU 1 [svc: model copy] : micro-batches | Each GPU gets a different slice of the batch.
+  GPU 0 -> Backward pass [svc: last layer first] : layers 24 to 17 | Backward runs from the last layer to the first.
+  * GPU 0: bucket 1 ready | The gradients of the last layers fill the first 25 MB bucket.
+  GPU 0 -> NCCL ring [svc: all-reduce] : bucket 1 | The all-reduce for bucket 1 starts while backward goes on.
+  GPU 1 -> NCCL ring : bucket 1 | Every GPU sends the same bucket.
+  NCCL ring -> GPU 0, GPU 1 : averaged gradients | All GPUs receive the same averaged gradient.
+  GPU 0 ~> Optimizer step [note: same on all GPUs] : after last bucket | Each GPU applies the same update, so copies stay equal.
+ref: paper | PyTorch Distributed: Experiences on Accelerating Data Parallel Training | Li et al., VLDB 2020 |
+
+== Hierarchical all-reduce: NVLink inside, network across
+kind: data-parallel
+when: Training spans many servers, and the links inside a server are far faster than the links between servers.
+how: A server with 8 GPUs connects them with NVLink, at hundreds of GB/s per GPU. Servers connect through InfiniBand or Ethernet at 25 to 100 GB/s per server or less. A flat ring over all GPUs would be limited by the slow links.
+A hierarchical all-reduce first reduces the data inside each server over NVLink. One GPU or a slice per GPU then takes part in a second all-reduce across servers. Finally the result is spread again inside each server. Only a share of the data crosses the slow network.
+Ring all-reduce sends 2(N-1)/N times the data size per GPU, which is close to the optimal. For small messages, tree algorithms have lower latency. NCCL picks ring or tree and builds the layout from the detected topology.
+used: NVIDIA NCCL (ring and tree, topology-aware); NCCL SHARP in-network reduction on InfiniBand; MPI libraries for HPC.
+avoid: When the job runs on a single server; one flat all-reduce over NVLink is enough.
+flow:
+  GPU 0 [svc: server A] -> GPU 1 [svc: server A] : reduce over NVLink | Inside server A the GPUs sum their gradients on the fast links.
+  GPU 4 [svc: server B] -> GPU 5 [svc: server B] : reduce over NVLink | Server B does the same at the same time.
+  GPU 1 -> GPU 5 : all-reduce over IB | One partial sum per server crosses the slower network.
+  GPU 5 -> GPU 1 : global sum | The two servers exchange partial sums and add them.
+  * GPU 1: global sum ready | Server A's leader now holds the sum of all GPUs.
+  GPU 1 -> GPU 0 : broadcast over NVLink | The sum is shared inside the server over the fast links.
+  GPU 5 -> GPU 4 : broadcast over NVLink | Server B shares the sum in the same way.
+ref: docs | NCCL: collective operations and algorithms | NVIDIA documentation | https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/
+
+== Tensor-parallel layers with an all-reduce per block
+kind: model-parallel
+when: A single layer is too large or too slow for one GPU, so the layer itself must be split across GPUs.
+how: In Megatron-style tensor parallelism, a transformer block is split across, for example, 8 GPUs inside one server. The first matrix multiply of the MLP is split by columns, and the second by rows. Each GPU computes its part with no communication between the two multiplies.
+At the end of the block, each GPU holds a partial sum of the output. An all-reduce adds them, so every GPU has the full output. The same pattern repeats for attention. So each block needs two all-reduces in the forward pass and two in the backward pass.
+These all-reduces are on the critical path, with no overlap. So tensor parallelism stays inside a server with NVLink. Across servers, use pipeline or data parallelism.
+used: Megatron-LM; NVIDIA NeMo; tensor-parallel serving in vLLM and TensorRT-LLM for large LLMs.
+avoid: Across slow links; the all-reduce per layer would dominate step time. Use pipeline parallelism across servers.
+flow:
+  Input activations [store: full copy] -> GPU 0 [svc: columns 0-3], GPU 1 [svc: columns 4-7] : same input | Every GPU gets the same input.
+  GPU 0, GPU 1 -> Local matmul [svc: own weight slice] : MLP part | Each GPU multiplies its own slice of the weights, with no communication.
+  Local matmul -> NVLink all-reduce [svc: sum of partials] : partial outputs | The slices run in parallel, and each GPU holds a partial sum.
+  NVLink all-reduce -> GPU 0, GPU 1 : full output | After the sum, all GPUs hold the same output and continue.
+ref: paper | Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism | Shoeybi et al., 2019 |
+
+@@ ann
+== Sharded vector search with scatter–gather
+kind: scatter-gather, sharding
+when: You have more vectors than one machine can hold or search fast, for example 500 million embeddings, and queries must answer in tens of milliseconds.
+how: Split the vectors across shards, for example 10 shards each with its own HNSW graph in memory. A router receives the query vector and sends it to every shard in parallel.
+Each shard walks its graph and returns its own top k, say 100, with distances. The router merges the lists and returns the global top k. Adding replicas of each shard raises query throughput and gives availability.
+HNSW queries visit only a few thousand nodes, so one shard answers in a few milliseconds. The cost is memory: the graph needs vectors plus links, often more than 1 KB per vector at high dimension. The shard count sets total latency, since the router waits for the slowest shard.
+used: Elasticsearch and OpenSearch k-NN, Milvus, Qdrant, Weaviate and Vespa all shard vector indexes and merge results.
+avoid: When the data fits on one machine; a single index avoids the merge step and the slowest-shard delay.
+flow:
+  App [client] -> Router [svc: query coordinator] : query vector, top 10 | The app sends one query vector to the router.
+  Router -> Shard 1 [db: HNSW graph], Shard 2 [db: HNSW graph], Shard 3 [db: HNSW graph] : search top 100 | The router sends the query to every shard at the same time.
+  Shard 1 -> Router : 100 ids with distances | Each shard walks its graph and returns its best matches.
+  Shard 2 -> Router : 100 ids with distances | The second shard answers in the same way.
+  Shard 3 -x> Router : slow, timeout 50 ms | A slow shard can be skipped, with lower recall for that query.
+  * Router: merge and cut to 10 | The router merges the lists by distance.
+  Router -> App : 10 nearest ids | The app receives the global top 10.
+ref: paper | Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs | Malkov & Yashunin, IEEE TPAMI 2020 | https://arxiv.org/abs/1603.09320
+
+== Approximate candidates then exact rerank
+kind: two-tower-retrieval, rag
+when: The index uses compressed or approximate scores, but the final answer must be accurate, as in retrieval for an LLM or for recommendations.
+how: Stage one is ANN search. It returns, for example, the top 200 candidates from millions of vectors, using a fast graph or compressed codes. Recall at this stage matters most, because a missed item cannot be recovered later.
+Stage two scores only these 200 candidates with a better model. It can be exact distance on full vectors, or a cross-encoder that reads the query and each passage together. A cross-encoder costs about 5 to 20 ms per batch of candidates on GPU, which is affordable for 200 items but not for millions.
+The system keeps the top 5 or 10 after reranking. Tune the number of candidates: more raises recall and cost.
+used: RAG systems built with Pinecone, Qdrant, pgvector or Elasticsearch plus a reranker such as Cohere Rerank or open cross-encoders; recommender candidate generation before ranking.
+avoid: When the corpus is small, say under 100,000 vectors; exact search on a GPU or CPU is simple and exact.
+flow:
+  Query [client] -> Embedding model [model: text to vector] : question text | The query is turned into a vector.
+  Embedding model -> ANN index [db: HNSW] : query vector | The ANN index gets the vector.
+  ANN index -> Reranker [model: cross-encoder] : top 200 candidates | The index returns many candidates fast, with approximate scores.
+  * Reranker: score 200 pairs | The reranker reads the query with each candidate, which is slow but accurate.
+  Reranker -> LLM [model: answers] : best 5 passages | Only the best 5 passages go into the prompt.
+  LLM -> Query : answer with sources | The user gets an answer grounded in the retrieved text.
+ref: paper | Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks | Lewis et al., NeurIPS 2020 | https://arxiv.org/abs/2005.11401
+
+== Compressed index in memory, full vectors on SSD
+kind: memory-tiering, tiered-storage
+when: A billion vectors would need terabytes of RAM, and the cost of that memory is too high.
+how: Store compressed codes in RAM and the full vectors on SSD. With product quantization (PQ), each vector of 768 floats, 3 KB, becomes a code of 32 to 64 bytes. A billion codes then need 32 to 64 GB.
+An IVF index first picks the few closest clusters of the query, so only those clusters are scanned. Scoring uses the codes in memory. This gives a shortlist of, say, 1000 candidates.
+Then the system reads the full vectors of the shortlist from SSD and reranks them with exact distances. Some systems, such as DiskANN, put the graph on SSD and keep compressed vectors in RAM. Reads per query stay at a few dozen random SSD reads.
+used: FAISS IVF-PQ; DiskANN (used in Microsoft products); Milvus and other vector databases offer IVF-PQ and disk indexes.
+avoid: When memory is cheap compared to the data size, or when recall must be very high; use full-precision HNSW in RAM.
+flow:
+  Query [client] -> IVF centroids [cache: in RAM] : query vector | The query is compared with a few thousand cluster centers.
+  IVF centroids -> PQ codes [cache: 64 GB in RAM] : closest 16 clusters | Only these clusters are scanned, which is a small share of the data.
+  PQ codes -> Reranker [svc: exact distance] : shortlist of 1000 | Fast approximate scores give a shortlist.
+  Reranker -> Vector files [lake: full vectors on SSD] : read 1000 vectors | The system reads full vectors from SSD for the shortlist only.
+  Vector files -> Reranker : exact vectors | The full vectors arrive.
+  Reranker -> Query : top 10 | The final order uses exact distances.
+ref: paper | Billion-scale similarity search with GPUs | Johnson, Douze & Jégou, IEEE Transactions on Big Data 2019 | https://arxiv.org/abs/1702.08734
+
+@@ chunkedprefill
+== Chunked prefill mixed with decode steps
+kind: continuous-batching, batching
+when: Long prompts block ongoing chats, so users who are already getting tokens see sudden pauses.
+how: A prefill pass processes the whole prompt at once, for example 32,000 tokens, and can take over a second. If a step is used only for that prompt, all running decodes wait. Users see the token stream stop.
+With chunked prefill, the scheduler sets a token budget per step, for example 2048 tokens. Each step first includes one decode token from every running request, then fills the rest of the budget with a chunk of a waiting prompt. A 32,000-token prompt takes about 16 steps.
+Decode steps never wait long, so inter-token latency stays steady. Prefill compute fills GPU math units that decode leaves idle. A smaller chunk smooths latency but takes longer to finish the prompt, so the budget is a tuning knob.
+used: vLLM (chunked prefill is enabled by default in recent versions); SGLang; TensorRT-LLM; the Sarathi-Serve research system introduced the idea.
+avoid: When all prompts are short, since chunking adds little; or when prefill and decode need separate hardware, as in disaggregated serving.
+flow:
+  Request A [client: decoding] -> Scheduler [svc: budget 2048 tokens] : decode token | A running chat needs one token every step.
+  Request B [client: 32k prompt] -> Scheduler : prefill 32,000 tokens | A new long prompt arrives.
+  Scheduler -> GPU [svc: one batch per step] : 1 decode + 2047 prefill | The step mixes one decode token and the first chunk of B.
+  GPU -> Request A : token 41 | Request A keeps its steady pace, without a long pause.
+  * Scheduler: B has 29,953 tokens left | The remaining prompt is split into further chunks.
+  GPU -> Request B : first token | After about 16 steps, B's prefill is done and it starts to decode.
+ref: paper | Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve | Agrawal et al., OSDI 2024 | https://arxiv.org/abs/2403.02310
+
+== Disaggregated prefill and decode pools
+kind: pipes-filters, offload-accelerator
+when: You have strict goals for both time to first token and speed of later tokens, and mixed batching on the same GPUs cannot meet both.
+how: Prefill is compute-bound and decode is memory-bandwidth-bound. So run them on different GPU pools. A router sends a new request to a prefill worker. That worker processes the prompt and creates the KV cache.
+The KV cache is then sent over a fast link, such as NVLink or RDMA over InfiniBand, to a decode worker. The decode worker generates the tokens and streams them to the user. A KV cache for a long prompt can be gigabytes, so transfer speed matters.
+Each pool has its own parallelism settings and batch sizes. Prefill can use small batches for low latency, and decode large batches for throughput. The price is moving the KV cache and running a more complex system.
+used: Research systems DistServe and Splitwise; open-source serving stacks such as vLLM, SGLang and NVIDIA Dynamo support disaggregated serving.
+avoid: When traffic is small or the network between GPUs is slow; chunked prefill on one pool is simpler.
+flow:
+  User [user] -> Router [svc: picks workers] : prompt of 8,000 tokens | A request arrives at the router.
+  Router -> Prefill worker [svc: compute-bound] : run prefill | The router sends it to a prefill pool.
+  Prefill worker -> Decode worker [svc: memory-bound] : KV cache over RDMA | The finished KV cache moves to a decode GPU.
+  * Decode worker: KV cache loaded | The decode worker can now generate without redoing the prompt.
+  Decode worker -> User : tokens stream | Tokens stream back at a steady rate.
+  Decode worker ~> Router : free KV blocks | The decode worker reports free memory so the router can balance load.
+ref: paper | DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving | Zhong et al., OSDI 2024 | https://arxiv.org/abs/2401.09670
+
+== Scaling prefill and decode pools on different signals
+kind: autoscaling
+when: Prefill and decode load change differently, for example many long prompts but short answers, and one scaling rule wastes GPUs.
+how: Prefill load depends on prompt tokens per second. Decode load depends on the number of active sequences and the KV cache memory they hold. So each pool is scaled by its own metric.
+The prefill pool scales on queue length or time to first token. If TTFT rises above the target, for example 500 ms, add prefill workers. The decode pool scales on KV cache use or inter-token latency. If the cache is above 85 percent full, add decode workers.
+Keep the ratio in view. Too few decode workers make the KV cache full and block new requests. Too few prefill workers make users wait for the first token. New GPU workers need minutes to load weights, so use a warm buffer.
+used: Common in disaggregated stacks such as NVIDIA Dynamo and llm-d; usually built on Kubernetes autoscaling with custom metrics.
+avoid: When a single mixed pool serves a steady load; one rule on GPU use is enough.
+flow:
+  Metrics [store: TTFT and KV use] -> Autoscaler [svc: custom metrics] : TTFT 900 ms | Prefill latency is above the 500 ms target.
+  Autoscaler -> Prefill pool [svc: 4 workers] : scale to 6 | The autoscaler adds two prefill workers.
+  Metrics -> Autoscaler : KV use 92% | The decode cache is nearly full.
+  Autoscaler -> Decode pool [svc: 8 workers] : scale to 10 | Decode gets more workers for more KV memory.
+  * Prefill pool: 6 workers | New workers load the model weights and become ready.
+  Prefill pool -> Decode pool : KV cache transfer | Both pools are balanced again.
+ref: docs | llm-d: Kubernetes-native distributed LLM inference | llm-d project | https://llm-d.ai/
+
+@@ contbatch
+== Iteration-level scheduling loop in an inference server
+kind: continuous-batching
+when: Requests of different lengths arrive all the time, and a static batch would leave the GPU idle while it waits for the longest one.
+how: The scheduler runs one loop. Each iteration generates one token for every request in the batch. After each iteration it removes requests that finished and adds waiting requests, if memory allows. A new request joins within one step, which is tens of milliseconds.
+With static batching, a batch of 8 lasts until its longest request ends, so short requests wait and slots stay empty. With continuous batching, the slot of a finished request is reused at once. Reported gains are often several times more throughput on mixed workloads.
+A new request first needs a prefill step for its prompt. The scheduler can run prefill and decode together or in separate iterations. Output tokens are streamed to each client as they are made.
+used: Orca introduced iteration-level scheduling; vLLM, TensorRT-LLM (in-flight batching), SGLang and Hugging Face TGI all use it.
+avoid: When requests are offline, equal in length and processed in large batches; static batching is simple and just as fast.
+flow:
+  Client 1 [client] -> Waiting queue [queue: requests] : prompt, 200 tokens | New requests wait for a slot.
+  Waiting queue -> Scheduler [svc: runs each step] : admit if memory allows | At each step the scheduler pulls requests from the queue.
+  Scheduler -> GPU batch [svc: 6 running requests] : step N: 1 token each | One decoding step produces one token for every request in the batch.
+  GPU batch -> Client 1 : token stream | Each client receives its token right away.
+  * GPU batch: request 3 done | Request 3 reaches its end-of-text token.
+  Scheduler -> GPU batch : replace slot 3 | A waiting request takes the free slot in the next step, without waiting for the others.
+ref: paper | Orca: A Distributed Serving System for Transformer-Based Generative Models | Yu et al., OSDI 2022 |
+
+== Admission control tied to the KV cache budget
+kind: load-shedding, load-leveling
+when: The GPU can run only as many sequences as its KV cache memory holds, and overload would crash or stall the server.
+how: Each running request holds a KV cache that grows with every token. The scheduler tracks free cache blocks. It admits a waiting request only if enough blocks exist for its prompt and some room to grow.
+If memory runs out during decoding, the scheduler preempts a request. It either swaps its cache to CPU memory, or drops it and recomputes it later. This is slow but keeps the server alive.
+At the front, a gateway limits queue length. When the queue is too long, new requests get a fast 429 or 503 with a retry hint. A short queue with fast rejection is better than minutes of waiting and then a timeout.
+used: vLLM paged KV cache with preemption; TensorRT-LLM and SGLang scheduler limits; API gateways with per-model queue limits.
+avoid: When the load is steady and under capacity; extra limits only add rejections.
+flow:
+  Gateway [svc: queue limit 64] -> Waiting queue [queue: depth 20] : request | The gateway accepts a request while the queue is short.
+  Waiting queue -> Scheduler [svc: block manager] : need 40 blocks | The scheduler checks the free KV blocks.
+  Scheduler -> GPU batch [svc: running] : admit | Enough blocks are free, so the request joins the batch.
+  * Scheduler: free blocks 2 | A long decode uses the last blocks.
+  Scheduler -> Waiting queue : preempt request 7 | The scheduler preempts a request. Its cache is swapped out or dropped, and it is queued again.
+  Gateway -x> Waiting queue : 429 when depth is 64 | When the queue is full, the gateway rejects new requests at once.
+ref: paper | Efficient Memory Management for Large Language Model Serving with PagedAttention | Kwon et al., SOSP 2023 | https://arxiv.org/abs/2309.06180
+
+== Priority classes for interactive and batch traffic
+kind: priority-queue, continuous-batching
+when: Chat users need fast replies, and offline jobs such as summarizing a million documents can wait but must fill idle GPUs.
+how: Requests carry a priority, for example interactive or batch. The scheduler picks waiting requests by priority first and arrival time second. Interactive requests take free slots first.
+Batch requests fill the remaining capacity. When interactive load rises and memory is full, the scheduler preempts batch requests, which resume later. So the GPU stays busy at night and responsive at noon.
+Add per-class limits so batch jobs cannot starve forever, and so one tenant cannot take all slots. Track queue time and time to first token for each class, and alert when the interactive class passes its goal.
+used: Common in managed LLM services that offer a cheaper batch tier; vLLM offers a priority scheduling policy option.
+avoid: When all traffic has the same latency goal; a single first-come queue is fair and simple.
+flow:
+  Chat app [client: interactive] -> Priority queue [queue: two classes] : request, priority 0 | A user chat request is marked high priority.
+  Batch job [client: offline] -> Priority queue : 10,000 requests prio 1 | A batch job queues many low priority requests.
+  Priority queue -> Scheduler [svc: picks by class] : interactive first | The scheduler always takes high priority requests first.
+  Scheduler -> GPU batch [svc: mixed batch] : fill free slots | Idle capacity is filled with batch requests.
+  * Scheduler: chat spike | A burst of chats arrives and the batch is full.
+  Scheduler -x> GPU batch : preempt batch requests | Batch requests give up their slots, then resume later.
+ref: docs | vLLM: scheduler and optimization options | vLLM documentation | https://docs.vllm.ai/en/latest/configuration/optimization/
+
+@@ denoising
+== Training by predicting the added noise
+kind: iterative-denoising
+when: You want a generative model of images, audio or video that is easy to train and does not need a separate adversary.
+how: Take a real training example x. Pick a random noise level t between 1 and about 1000. Add Gaussian noise to x to get a noisy version x_t. The amount of noise follows a fixed schedule, so at the largest t the example is almost pure noise.
+The network gets x_t and t as input, and must predict the noise that was added. The loss is the mean squared error between the true noise and the prediction. Each training example uses one random t, so the model learns all noise levels in one run.
+The loss is simple and stable, and it does not need paired data. Training a large model needs many GPUs for days or weeks. Some models predict the clean image or a velocity instead of the noise, which behaves better at high noise levels.
+used: DDPM (Ho et al., 2020) introduced this loss; Stable Diffusion, DALL-E style models and audio and video diffusion models use variants of it.
+avoid: When you need fast sampling and cannot afford many steps; look at GANs or distilled and consistency models.
+flow:
+  Dataset [lake: clean images] -> Noiser [svc: adds Gaussian noise] : image x | A clean example is loaded.
+  Noiser -> Denoiser net [model: U-Net or DiT] : x_t and level t | The noisy image and the noise level go to the network.
+  Denoiser net -> Loss [svc: mean squared error] : predicted noise | The network predicts the noise that was added.
+  Noiser -> Loss : true noise | The true noise is known, because the noiser made it.
+  Loss -> Denoiser net : gradient | The error is used to update the weights.
+  * Denoiser net: better at every level | After millions of steps it removes noise well at all levels.
+ref: paper | Denoising Diffusion Probabilistic Models | Ho, Jain & Abbeel, NeurIPS 2020 | https://arxiv.org/abs/2006.11239
+
+== Iterative sampling loop with classifier-free guidance
+kind: iterative-denoising
+when: You need to generate a sample that follows a text prompt, and you can spend 20 to 50 network calls per sample.
+how: Start from pure Gaussian noise. At each step, the network predicts the noise in the current sample. A sampler such as DDIM or DPM-Solver removes a part of it and moves to a lower noise level. After 20 to 50 steps the result is a clean sample.
+Classifier-free guidance makes the output follow the prompt. At each step the network runs twice: once with the prompt and once with an empty prompt. The final prediction is the unconditional one plus a scale, for example 7.5, times the difference. A higher scale follows the prompt more closely but reduces variety.
+Cost is steps times two network calls. Fewer steps with better solvers, or a distilled model with 1 to 4 steps, cut the cost.
+used: Stable Diffusion pipelines with DDIM, Euler or DPM-Solver samplers; classifier-free guidance appears in most text-to-image and text-to-video models.
+avoid: When latency must be a single forward pass; use a distilled or consistency model, or a different model family.
+flow:
+  Noise [store: random tensor] -> Denoiser net [model: U-Net or DiT] : x_T at step 30 | Sampling starts from pure noise.
+  Prompt [note: text embedding] -> Denoiser net : condition | The text embedding steers the prediction.
+  Denoiser net -> Guidance [svc: scale 7.5] : cond and uncond noise | The net runs with and without the prompt.
+  Guidance -> Sampler [svc: DDIM or DPM-Solver] : guided noise estimate | The two predictions are mixed with the scale.
+  Sampler -> Denoiser net : x_(t-1) | The sampler removes some noise and loops back for the next step.
+  * Sampler: step 30 of 30 | After the last step the sample is clean.
+ref: paper | Classifier-Free Diffusion Guidance | Ho & Salimans, 2022 | https://arxiv.org/abs/2207.12598
+
+== Latent diffusion pipeline with text encoder and decoder
+kind: pipes-filters, online-offline
+when: You want to generate high-resolution images from text without paying the cost of denoising every pixel.
+how: A pretrained autoencoder compresses an image, for example 512 by 512 pixels, into a latent that is 8 times smaller on each side, 64 by 64. The denoising network works on latents, which cuts compute by many times. The diffusion model is trained offline on latents of a large image set.
+At serving time, a text encoder such as CLIP or T5 turns the prompt into embeddings. The denoiser loops 20 to 50 steps in latent space, using the embeddings through cross-attention. The autoencoder's decoder then turns the final latent into pixels.
+A safety checker or watermark step can sit after the decoder. Each stage can be cached or placed on its own GPU: text embeddings of common prompts are reused.
+used: Stable Diffusion (latent diffusion, Rombach et al., 2022); many open and hosted text-to-image services use the same pipeline layout.
+avoid: When pixel-level detail matters and the autoencoder loses it, such as exact text or fine structure; pixel-space or high-resolution refiner stages may be needed.
+flow:
+  Prompt [client] -> Text encoder [model: CLIP or T5] : prompt text | The prompt becomes a sequence of embeddings.
+  Text encoder -> Denoiser [model: U-Net or DiT] : embeddings | The denoiser uses them through cross-attention at each step.
+  Noise [store: 64 by 64 latent] -> Denoiser : random latent | Sampling starts from noise in latent space, not in pixel space.
+  Denoiser -> Sampler [svc: loop 30 steps] : noise estimate | The sampler removes noise step by step, at low cost per step.
+  Sampler -> Denoiser : next latent | The loop repeats with a cleaner latent.
+  Sampler -> VAE decoder [model: latent to pixels] : clean latent | The final latent goes to the decoder.
+  VAE decoder -> Safety filter [svc: checks image] : 512 by 512 image | The decoder produces pixels, and a filter checks them.
+  Safety filter -> Prompt : final image | The user receives the image.
+ref: paper | High-Resolution Image Synthesis with Latent Diffusion Models | Rombach et al., CVPR 2022 | https://arxiv.org/abs/2112.10752

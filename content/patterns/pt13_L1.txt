@@ -1,0 +1,819 @@
+@@ cpucomp
+== Cache blocking (tiling) for matrix work
+kind: memory-tiering, data-locality
+when: A compute loop touches far more data than fits in cache, and the same values are used many times.
+how: A naive matrix multiply reads whole rows and columns from DRAM again and again, and the core waits on memory. Blocking splits the matrices into tiles, so that three tiles (one each of A, B and C) fit in L2 cache. For example, three 128 by 128 tiles of doubles use about 393 KB.
+The library loads one tile from DRAM once, then reuses each value about 128 times from cache and registers. Inside the tile, the inner kernel uses SIMD fused multiply-add instructions and keeps the C values in registers. Data moves from DRAM to L2 to L1 to registers, and each level is used as much as possible before the next load.
+Tile sizes depend on the cache sizes of the exact CPU, so fast libraries tune them per chip. The gain is large: a blocked kernel can run many times faster than the naive loop.
+used: OpenBLAS, BLIS and Intel oneMKL matrix kernels; NumPy and PyTorch CPU paths call them; databases use the same idea in blocked joins and sorts.
+avoid: When the working set already fits in cache, or the work has no reuse (a single pass over a stream); then memory bandwidth is the limit and tiling adds nothing.
+flow:
+  Application [svc: calls dgemm] -> BLAS library [svc: tiles the loops] : C = A x B | The application calls a tuned BLAS routine instead of writing the three loops itself.
+  BLAS library -> DRAM [store: big matrices] : request tile of A, B | The library asks for one tile of A and one of B at a time, not whole rows.
+  DRAM -> L2 cache [cache: 1 MB] : 128x128 tiles | Each tile is loaded once and stays in L2 while it is reused.
+  L2 cache -> Core [svc: AVX FMA] : stream operands | The core multiplies from registers with SIMD instructions and reads L2 for the next values.
+  Core -> L2 cache : update C tile | Partial results of the C tile stay in cache until the tile is finished.
+  Core -x> DRAM : naive loop misses | Without tiling, each step misses cache and waits about 80 ns for DRAM.
+ref: paper | Anatomy of High-Performance Matrix Multiplication | Goto & van de Geijn, ACM TOMS 2008 |
+ref: book | Computer Systems: A Programmer's Perspective, 3rd ed. | Bryant & O'Hallaron, 2015 |
+
+== Thread-per-core, shared-nothing server
+kind: sharding, event-loop
+when: A server must handle millions of small requests per second on a many-core machine, and locks and cache misses between cores are hurting.
+how: Instead of many threads sharing one heap and locks, start one thread per core and pin it to that core. Each thread owns a slice of the data (a shard) and its own memory. A request goes to the core that owns its key.
+Each core runs its own event loop with non-blocking I/O, so it never sleeps in a lock. Cross-core work is sent as a message in a queue, not by touching shared data. This avoids cache-line bouncing (the coherence traffic between cores) and keeps data in the local L1 and L2 caches.
+On a multi-socket machine, each thread also uses memory from its own NUMA node. The cost is design effort: hot keys can overload one core, and every shared structure must become messages.
+used: Seastar framework, which is the base of ScyllaDB and Redpanda; shard-aware drivers for ScyllaDB.
+avoid: When the workload is low-rate or needs heavy shared state; a plain thread pool is simpler.
+flow:
+  Client driver [client: shard-aware] -> Core 0 shard [svc: keys 0-33%] : GET key 17 | The driver hashes the key and connects to the core that owns it.
+  Client driver -> Core 1 shard [svc: keys 34-66%] : GET key 50 | Another key goes straight to another core, so the cores never share state.
+  Core 0 shard -> Core 1 shard : forward message | If a request lands on the wrong core, it is passed as a message, not by locking shared data.
+  Core 0 shard -> NVMe [store: own queue] : async write | Each core has its own disk queue and writes without blocking.
+  Core 1 shard -> NVMe : async write | Cores do not wait for each other.
+ref: docs | Seastar: shared-nothing design | Seastar project | https://seastar.io/shared-nothing/
+
+== Vectorized batch execution in analytics engines
+kind: batching, pipeline-stages
+when: A query engine scans billions of values on CPUs, and per-row function calls waste most of the CPU time.
+how: A row-at-a-time engine calls many virtual functions per row, and the pipeline stalls on branches and cache misses. A vectorized engine passes small column batches (for example 2,048 values in DuckDB) between operators instead.
+Each operator runs a tight loop over a batch. The compiler turns such loops into SIMD code: one AVX2 instruction compares 8 32-bit integers, and AVX-512 compares 16. The batch fits in L1 or L2 cache, so values are read once from memory and reused by the next operator. A filter does not copy rows; it produces a selection vector of positions that pass.
+This is why one CPU core can scan more than a billion values per second. The cost is that very complex per-row logic is harder to express.
+used: DuckDB, ClickHouse, Velox (Meta) and Apache DataFusion; Snowflake and Databricks Photon use the same family of ideas.
+avoid: For OLTP lookups of single rows, where the cost is index access, not scanning.
+flow:
+  Query [client] -> Scan operator [svc: reads columns] : plan | The planner builds a pipeline of operators that pass batches along.
+  Parquet files [lake] -> Scan operator : column chunks | The scan reads only the needed columns, in compressed form.
+  Scan operator -> Filter [svc: SIMD compare] : batch of 2,048 | The scan hands a whole batch to the filter, not one row at a time.
+  Filter -> Aggregate [svc: hash table in L2] : selection vector | The filter marks passing positions; the aggregate sums only those values.
+  Aggregate -> Result [note: one small table] : partial sums | Each thread keeps its own partial result and the engine merges them at the end.
+ref: paper | MonetDB/X100: Hyper-Pipelining Query Execution | Boncz, Zukowski & Nes, CIDR 2005 |
+
+@@ embedded
+== Interrupt service routine with deferred processing
+kind: event-loop, producer-consumer
+when: Hardware events arrive at unpredictable times, and the handler for each must be very short.
+how: The hardware raises an interrupt, and the CPU jumps to the interrupt service routine (ISR). The ISR does only the minimum: it reads the data register, clears the flag, and puts the byte in a ring buffer. It then signals a task, for example with a semaphore or a flag.
+The main loop or an RTOS task wakes up later and does the slow work, such as parsing a frame and sending it over the radio. This keeps interrupt latency low, often a few microseconds, so no other event is missed.
+The buffer must be sized for the worst burst. At 115,200 baud, about 11,520 bytes arrive per second, so a 256-byte buffer holds about 22 ms of data. If the task is too slow, the buffer overflows, so firmware counts dropped bytes.
+used: UART, SPI and ADC drivers in FreeRTOS and Zephyr (Zephyr gives an ISR a work queue); bare-metal firmware on ARM Cortex-M.
+avoid: When the work is long or may block; never call blocking functions or allocate memory inside an ISR.
+flow:
+  UART [svc: hardware] -> ISR [svc: runs in us] : RX interrupt | A byte arrives and the hardware interrupts the CPU.
+  ISR -> Ring buffer [queue: 256 bytes] : push byte | The ISR stores the byte and returns at once.
+  ISR ~> Parser task [svc: RTOS task] : give semaphore | The ISR wakes the task, which was sleeping.
+  Parser task -> Ring buffer : pop bytes | The task reads many bytes at its own pace, outside the interrupt.
+  Parser task -> Radio [svc: BLE or LoRa] : send packet | After a full frame is parsed, the task sends it out.
+  ISR -x> Ring buffer : buffer full | If the task is too slow, new bytes are dropped and an overflow counter grows.
+ref: docs | Interrupts | Zephyr Project documentation | https://docs.zephyrproject.org/latest/kernel/services/interrupts.html
+
+== Fixed-rate control loop with a watchdog
+kind: control-loop, heartbeat
+when: Firmware must read sensors and drive an actuator at a fixed rate, and must recover by itself if the code hangs.
+how: A hardware timer fires every 1 ms and starts the control task. The task reads the sensor, runs the control law (for example a PID controller), and writes a new value to the actuator, such as a PWM duty cycle. A fixed period gives the math a stable time step. The task must finish before the next tick, which is its deadline.
+In an RTOS the control task has the highest priority, so logging or communication tasks cannot delay it. This is the idea of rate-monotonic scheduling: shorter periods get higher priority.
+A watchdog timer is a separate hardware counter. The control task kicks (resets) it every cycle, only after its self-checks pass. If the code hangs or misses deadlines, the kick stops, and after about 100 ms the watchdog resets the chip into a safe state.
+used: Motor controllers, flight controllers such as PX4 and ArduPilot, automotive ECUs, insulin pumps; the independent watchdog on STM32 chips.
+avoid: When timing is not critical; a simple loop on a general OS is enough then.
+flow:
+  Timer [svc: 1 kHz tick] -> Control task [svc: top priority] : tick every 1 ms | The timer starts the task at a fixed rate; the deadline is the next tick.
+  Sensor ADC [svc] -> Control task : sample | The task reads the current sensor value.
+  Control task -> Motor driver [svc: PWM output] : new duty cycle | The task writes the control output, then finishes before the deadline.
+  Control task -> Watchdog [svc: 100 ms timeout] : kick | After the checks pass, the task resets the watchdog counter.
+  Control task -x> Watchdog : task hangs, no kick | A hung task stops sending kicks.
+  Watchdog -> Motor driver : reset to safe state | After the timeout the watchdog resets the chip and the outputs go to a safe state.
+ref: paper | Scheduling Algorithms for Multiprogramming in a Hard-Real-Time Environment | Liu & Layland, JACM 1973 |
+
+== Dual-slot firmware update with rollback
+kind: blue-green, immutable-infra
+when: Devices in the field must be updated over the air, and a bad image must never leave a device dead.
+how: Flash holds two image slots: slot A with the running version and slot B for the new one. The device downloads the new image into slot B while A keeps running. The bootloader checks the signature and hash of the image before use.
+The bootloader marks B as a test image and boots it once. If the new firmware starts and confirms itself (for example after it connects to the server), B becomes permanent. If it crashes or the watchdog resets the chip before confirming, the bootloader goes back to slot A on the next boot.
+This costs flash: you need space for two images, or a swap area. It protects devices that nobody can reach to fix.
+used: MCUboot (used by Zephyr and other RTOSes); Android A/B system updates and ChromeOS use the same two-slot idea.
+avoid: On chips with very small flash, where two slots do not fit; then use a small recovery image.
+flow:
+  Update server [svc] -> Slot B [store: new image] : signed image | The device downloads the image into the unused slot while slot A keeps running.
+  Bootloader [svc: MCUboot] -> Slot B : verify signature | The bootloader checks the signature and hash before it trusts the image.
+  Bootloader -> Slot B : boot once as test | The new version is started in test mode only for one boot.
+  Slot B -x> Bootloader : crash, no confirm | The new firmware fails before it confirms itself.
+  Bootloader -> Slot A [store: old image] : roll back | On the next boot the bootloader returns to the known good image.
+ref: docs | MCUboot design | MCUboot project | https://docs.mcuboot.com/design.html
+
+@@ gpucomp
+== Overlap data copy with GPU compute
+kind: offload-accelerator, pipeline-stages
+when: A GPU job is waiting for input data, and the GPU sits idle between steps.
+how: The CPU is the host and prepares the work. CPU worker processes read and decode the next batch while the GPU trains on the current one. The batch is placed in pinned (page-locked) host memory, so the GPU can copy it by DMA without the CPU.
+A copy stream moves batch N+1 to the GPU while the compute stream runs batch N. Streams are ordered queues of GPU work, and independent streams can overlap. The training step does not wait, because the copy is asynchronous.
+Good loaders keep several batches ahead. If the data loader is slower than the GPU, the GPU shows low utilization, and the fix is more workers or faster storage, not a bigger GPU. A PCIe Gen5 x16 link moves about 60 GB/s, much less than HBM, so copies must be hidden.
+used: PyTorch DataLoader with pin_memory and non_blocking copies; NVIDIA DALI for GPU image decoding; TensorFlow tf.data prefetch.
+avoid: When the model is so heavy that data loading is a tiny share of the step; the overlap then gains little.
+flow:
+  Dataset [store: files] -> Loader workers [svc: CPU processes] : read and decode | CPU workers read and decode the next batches in parallel.
+  Loader workers -> Pinned buffer [queue: page-locked RAM] : batch N+1 | Ready batches wait in pinned memory, a few steps ahead.
+  Pinned buffer ~> GPU [svc: copy + compute streams] : async copy over PCIe | The copy engine moves batch N+1 while the compute stream works on batch N.
+  Training loop [svc: Python] -> GPU : launch kernels, batch N | The host only queues kernels and does not wait for them to finish.
+  GPU -x> Training loop : starved, waits for data | If the loader is too slow, the GPU idles; this shows as low utilization.
+ref: docs | CUDA C++ Best Practices Guide: asynchronous transfers | NVIDIA | https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/
+
+== Tiled kernel in on-chip memory (FlashAttention style)
+kind: memory-tiering, offload-accelerator
+when: A GPU kernel is slow because it moves intermediate results through HBM, not because it lacks arithmetic.
+how: GPU memory has levels. HBM is large (80 GB on an H100) and about 3 TB/s, while shared memory in each SM is small (up to 228 KB) and much faster. A kernel that writes a large intermediate result to HBM and reads it back is memory-bound.
+Attention is the classic case. A standard version writes the N by N score matrix to HBM, then reads it for softmax, then again for the multiply with V. FlashAttention loads a tile of Q, K and V into shared memory, computes scores, runs an online softmax and the multiply with V, and writes only the final output tile. The N by N matrix is never stored.
+The result is the same up to rounding, with less HBM traffic and memory that grows linearly with sequence length. Kernel fusion is the general form of this idea.
+used: FlashAttention in PyTorch, vLLM and most LLM training stacks; fused kernels from Triton and cuDNN.
+avoid: For small kernels that are compute-bound already; check with a roofline analysis first.
+flow:
+  Q, K, V in HBM [store: 80 GB, 3 TB/s] -> Shared memory [cache: up to 228 KB/SM] : load one tile | The kernel loads a small tile of Q, K and V into fast on-chip memory.
+  Shared memory -> Tensor cores [svc: matrix units] : tile matmul | Tensor cores compute scores for this tile only.
+  Tensor cores -> Shared memory : scores and running softmax | The softmax is updated online, so no full row is needed.
+  Shared memory -> Output O in HBM [store] : write output tile | Only the final output tile goes back to HBM, once.
+  Tensor cores -x> Output O in HBM : N x N matrix never written | The large score matrix, the main cost of normal attention, is never stored in HBM.
+ref: paper | FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness | Dao et al., NeurIPS 2022 |
+
+== Continuous batching for LLM serving
+kind: continuous-batching, batching
+when: Many users send text requests of very different lengths, and you want high GPU use with low delay.
+how: LLM decoding makes one token per step, and a decode step reads all model weights from HBM. So running many requests in one batch shares that cost, and throughput rises a lot. But requests finish at different times.
+With continuous batching, the scheduler decides at every step: finished requests leave the batch and waiting requests join at once. No request waits for the longest one. KV cache memory is split into fixed blocks (paged attention), so memory is not wasted on unused space.
+The prompt (prefill) is compute-heavy, and decoding is memory-bound. Some servers split or chunk them so a long prompt does not stall other users. The trade-off is that a bigger batch gives more throughput but also more delay per token.
+used: vLLM, TensorRT-LLM, SGLang and Hugging Face TGI; the idea comes from the Orca paper.
+avoid: For a single offline job where a fixed large batch is enough.
+flow:
+  Users [user] -> Request queue [queue: waiting] : prompts | Requests arrive at random times with different lengths.
+  Request queue -> Scheduler [svc: runs each step] : admit if KV space | At every step the scheduler adds waiting requests if KV blocks are free.
+  Scheduler -> GPU [svc: decode step] : batch of 48 sequences | The GPU decodes one token for each sequence in the batch.
+  GPU -> KV cache [cache: paged blocks] : append K and V | Each sequence appends its new key and value to its own blocks.
+  GPU -> Users : stream token | Tokens go back to users as they are made.
+  * Scheduler: 2 finished, 3 joined | Finished sequences leave and new ones join at the very next step.
+ref: paper | Orca: A Distributed Serving System for Transformer-Based Generative Models | Yu et al., OSDI 2022 |
+ref: paper | Efficient Memory Management for LLM Serving with PagedAttention | Kwon et al., SOSP 2023 |
+
+@@ hpc
+== Ring all-reduce for gradient sync
+kind: data-parallel
+when: Many GPUs train the same model on different data shards and must average gradients every step.
+how: Each GPU holds a full copy of the model and computes gradients on its own batch. All-reduce makes every GPU end with the sum of all gradients. A central parameter server would be a bottleneck, so the ring algorithm is used.
+Split the gradient into N chunks for N GPUs. In reduce-scatter, each GPU sends one chunk to its right neighbour and adds the chunk it gets from the left, for N-1 steps. Then each GPU owns one fully summed chunk. In all-gather, the summed chunks travel around the ring for another N-1 steps.
+Each GPU sends 2(N-1)/N times the gradient size, which is almost 2 times and nearly independent of N. So bandwidth per link stays constant as the cluster grows. Latency grows with N, so large clusters use trees or hierarchical rings.
+used: NCCL in PyTorch DistributedDataParallel; Horovod; Baidu's original ring all-reduce for deep learning.
+avoid: Very large models whose weights do not fit on one GPU; use sharding (FSDP, ZeRO) or model parallelism.
+flow:
+  GPU 0 [svc: grads g0] -> GPU 1 [svc: grads g1] : chunk 0 | Step 1 of reduce-scatter: each GPU sends one chunk to its right neighbour.
+  GPU 1 -> GPU 2 [svc: grads g2] : chunk 1 + sum | Each GPU adds the received chunk to its own and passes the result on.
+  GPU 2 -> GPU 3 [svc: grads g3] : chunk 2 + sum | After N-1 steps each GPU owns one chunk summed over all GPUs.
+  GPU 3 -> GPU 0 : summed chunks | In all-gather, the finished chunks go around once more, so all GPUs have the full sum.
+  * GPU 0: all gradients summed | All four GPUs now hold the same averaged gradient, and each applies the same optimizer step.
+ref: blog | Bringing HPC Techniques to Deep Learning | Andrew Gibiansky, Baidu Research, 2017 | https://andrew.gibiansky.com/blog/machine-learning/baidu-allreduce/
+ref: docs | NCCL documentation | NVIDIA | https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/
+
+== Hierarchical parallelism over a two-speed network
+kind: model-parallel, data-parallel
+when: A model is too big for one GPU, and the cluster has a fast network inside a node and a slower one between nodes.
+how: Match the communication to the links. Tensor parallelism splits each layer across the 8 GPUs of one node. It needs an all-reduce in every layer, so it uses NVLink, which gives about 900 GB/s per GPU on an H100 node.
+Between nodes, the links are slower (InfiniBand NDR is 400 Gb/s, about 50 GB/s, per port). So pipeline parallelism puts groups of layers on different nodes and passes only activations, a small message. Data parallelism then replicates this whole group and averages gradients once per step across the groups.
+This is called 3D parallelism. The rule is simple: the most chatty collective runs on the fastest link. The cost is more complex code and pipeline bubbles, which micro-batches reduce.
+used: Megatron-LM and DeepSpeed for large language model training; NVIDIA DGX SuperPOD style clusters.
+avoid: Small models that fit on one GPU; plain data parallelism is simpler and fast enough.
+flow:
+  Node 1 [svc: 8 GPUs, layers 1-16] -> Node 1 : all-reduce per layer | Tensor parallel shards talk over NVLink inside the node, many times per step.
+  Node 1 -> Leaf switch [svc: InfiniBand] : activations | Pipeline stage 1 sends its activations over the slower inter-node network.
+  Leaf switch -> Node 2 [svc: 8 GPUs, layers 17-32] : activations | Stage 2 computes the next layers and sends gradients back in the backward pass.
+  Node 2 -> Leaf switch : activation gradients | The backward pass runs in the reverse direction.
+  Node 1 ~> Node 3 [svc: replica of Node 1] : gradient all-reduce | Once per step, the data-parallel replicas average gradients across the fabric.
+ref: paper | Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM | Narayanan et al., SC 2021 |
+
+== Asynchronous checkpoint and restart
+kind: checkpoint-restart
+when: A job runs for weeks on thousands of devices, and some device will fail during the run.
+how: With thousands of GPUs, a failure happens every few hours, so a long run must be able to restart. The job saves a checkpoint (model weights, optimizer state and data position) every N steps. For a 70-billion parameter model with Adam, this is about 1 TB, because optimizer state is large.
+To avoid stalling the GPUs, each node first copies its shard to local NVMe or host memory, which takes seconds. Training continues, and a background process uploads the shard to the parallel file system or object storage.
+After a failure, the scheduler replaces the bad node and all ranks restart from the latest complete checkpoint. You lose at most the steps since the last checkpoint. A shorter interval loses less but costs more I/O, so the interval is chosen from the failure rate and the checkpoint time.
+used: PyTorch Distributed Checkpoint; DeepSpeed and Megatron checkpoints; Slurm clusters in national labs.
+avoid: Short jobs, where rerunning from the start is cheaper than saving state.
+flow:
+  Training job [svc: 1,024 GPUs] -> Local NVMe [store: per node] : save shard | Each node writes its own shard locally in seconds and training continues.
+  Local NVMe ~> Object store [lake: durable] : background upload | A background process copies the shard to durable storage.
+  Training job -x> Scheduler [svc: Slurm] : node 87 fails | One node fails, and the whole synchronous job stops.
+  Scheduler -> Training job : replace node, restart | The scheduler gives a spare node and restarts all ranks.
+  Object store -> Training job : load last checkpoint | All ranks load the latest complete checkpoint and continue.
+ref: docs | PyTorch Distributed Checkpoint | PyTorch documentation | https://docs.pytorch.org/docs/stable/distributed.checkpoint.html
+
+@@ searchengine
+== Scatter-gather query over shards and replicas
+kind: scatter-gather, sharding, read-replicas
+when: An index is too big or too busy for one machine, and every query must still see all documents.
+how: The index is split into primary shards, and each shard is a separate Lucene index. Each shard has replica copies on other nodes. A query goes to any node, which acts as coordinator. The coordinator picks one copy (primary or replica) of every shard and sends the query to all shards in parallel.
+Each shard finds its own top results (the top from+size hits, by BM25 score) and returns only document ids and scores. The coordinator merges these small lists into the global top 10. Then the fetch phase asks only the shards that own those 10 documents for the stored fields.
+More replicas add query capacity and survive node loss. More shards add data capacity but add more fan-out, and the slowest shard sets the latency. This is why tail latency matters, and why slow queries may be retried on another replica.
+used: Elasticsearch and OpenSearch clusters; Solr in SolrCloud mode; Vespa uses a similar content-node fan-out.
+avoid: Very small indexes, where one shard on one node is faster; too many tiny shards waste memory.
+flow:
+  Client [client] -> Coordinator node [svc: any node] : search "red shoes" | Any node can take the request and becomes the coordinator.
+  Coordinator node -> Shard 1 [svc: replica on node 2], Shard 2 [svc: primary on node 3], Shard 3 [svc: replica on node 1] : query phase | The coordinator sends the query to one copy of every shard, in parallel.
+  Shard 1, Shard 2, Shard 3 -> Coordinator node : top 10 ids and scores | Each shard returns only its local top hits, not full documents.
+  * Coordinator node: merged global top 10 | The coordinator sorts the partial lists into one list of 10 hits.
+  Coordinator node -> Shard 2 : fetch phase | Only the shards that own winning documents are asked for the stored fields.
+  Coordinator node -> Client : 10 results | The client gets the final page.
+ref: docs | Elasticsearch: reading and writing documents | Elastic documentation | https://www.elastic.co/docs/deploy-manage/distributed-architecture/reading-and-writing-documents
+
+== Hybrid retrieval, then rerank
+kind: two-tower-retrieval, rag
+when: Keyword search misses meaning, vector search misses exact terms, and the best ranking model is too slow to run on every document.
+how: The query goes to two cheap retrievers at once. The lexical index (BM25 over the inverted index) finds documents with the exact words, and the vector index (HNSW) finds documents with similar meaning. Each returns about 100 candidates.
+A fusion step combines the two lists, for example with reciprocal rank fusion: each document scores the sum of 1/(60 + rank) over the lists. This needs no score calibration between BM25 and cosine similarity.
+The fused top 50 to 100 go to an expensive reranker, such as a learned-to-rank model or a cross-encoder, which reads query and document together. Only about 10 results are shown. The pattern is a funnel: cheap and wide first, costly and narrow last. The same funnel feeds retrieval for LLM answers.
+used: Elasticsearch hybrid search with RRF; Vespa; OpenSearch; Weaviate; e-commerce and enterprise search stacks.
+avoid: When one signal is enough, such as a catalog lookup by exact SKU; then the extra stages only add delay.
+flow:
+  Query service [svc] -> Lexical index [store: BM25], Vector index [store: HNSW] : same query | The query goes to both retrievers in parallel.
+  Lexical index -> Fusion [svc: RRF] : 100 candidates | The keyword retriever returns its best 100 ids.
+  Vector index -> Fusion : 100 candidates | The vector retriever returns its best 100 ids, with partly different documents.
+  Fusion -> Reranker [model: cross-encoder] : top 50 | The fused list is cut to 50, so the slow model sees few documents.
+  Reranker -> Query service : top 10, scored | The reranker orders the 50 by relevance, and the service returns 10.
+ref: paper | Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods | Cormack, Clarke & Buettcher, SIGIR 2009 |
+
+== Index fed from the database by change data capture
+kind: cdc, lsm-compaction
+when: The source of truth is a database, and search needs a fresh, query-shaped copy of it.
+how: A search index is derived data, never the source of truth. Debezium reads the database's change log and writes each row change to Kafka. An indexer consumes the topic, builds documents (it may join and flatten rows), and sends bulk requests of a few thousand documents to the search cluster.
+Inside the engine, new documents go to an in-memory buffer. A refresh (about every 1 second in Elasticsearch) writes a new small immutable segment that is searchable. A background merge combines small segments into big ones and drops deleted documents, as in a log-structured store.
+To change the mapping or analyzers, build a new index from scratch by replaying the topic or a snapshot, then switch an alias to it. Reads never stop. Lag from the database to search is usually seconds.
+used: Elasticsearch and OpenSearch fed by Debezium; Logstash JDBC pipelines; Solr with Kafka connectors.
+avoid: When search is the primary store, such as logs, where the data is written straight to the index.
+flow:
+  Postgres [db: source of truth] -> Debezium [svc: Kafka Connect] : WAL changes | Debezium reads committed row changes from the write-ahead log.
+  Debezium -> Change topic [log: Kafka] : row events | Each change becomes one event in Kafka.
+  Change topic -> Indexer [svc: builds documents] : poll | The indexer reads events and builds search documents.
+  Indexer -> Search index [store: Lucene segments] : bulk of 2,000 docs | Bulk requests are much cheaper than single writes.
+  * Search index: refresh, new segment | After about 1 second a new segment makes the documents searchable.
+  Indexer ~> Search index : reindex, then swap alias | A new index is built in the background; an alias switch moves readers to it.
+ref: docs | Elasticsearch: near real-time search | Elastic documentation | https://www.elastic.co/docs/manage-data/data-store/near-real-time-search
+
+@@ cloudcomp
+== Stateless tier across availability zones
+kind: horizontal-scale, autoscaling, active-passive
+when: A web service must survive the loss of a data center and follow a daily load curve without manual work.
+how: Run identical, stateless app servers in at least three availability zones (AZs) of one region. Zones are separate buildings with their own power and network, a few milliseconds apart. A load balancer spreads requests over healthy servers in all zones and stops using a server that fails its health check.
+An autoscaling group adds or removes servers by a metric such as average CPU at 60 percent, or requests per target. New servers start from the same machine image, so scaling is a copy, not a repair. Session state goes to a cache or token, not to local disk.
+State lives in a managed database with a synchronous standby in another zone. On primary failure the database promotes the standby, typically in one to two minutes. You pay only for the capacity in use, and you size for zone loss: with three zones, run so that two can carry the load.
+used: AWS Auto Scaling groups with an Application Load Balancer and Multi-AZ RDS; the same shape on GCP managed instance groups and Azure scale sets.
+avoid: When one zone is acceptable, as for a test system; or when state cannot leave the server, as in some legacy apps.
+flow:
+  Users [user] -> Load balancer [svc: all zones] : HTTPS request | One DNS name points to the load balancer, which has an address in every zone.
+  Load balancer -> App zone a [svc: 4 servers], App zone b [svc: 4 servers], App zone c [svc: 4 servers] : round robin | Requests go to healthy servers in every zone.
+  App zone a, App zone b, App zone c -> Database [db: primary in zone a] : SQL | All servers share one managed database.
+  Database ~> Standby [db: sync copy in zone b] : synchronous replication | Each commit is copied to a standby in another zone before it is acknowledged.
+  Autoscaler [svc: CPU target 60%] -> App zone b : add 2 servers | When CPU passes the target, the autoscaler launches more servers from the image.
+  Load balancer -x> App zone c : zone fails | Health checks fail, so traffic moves to zones a and b.
+ref: docs | Reliability pillar: use fault isolation | AWS Well-Architected Framework | https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html
+
+== Separate storage from elastic compute
+kind: storage-compute-split
+when: Data volume and query demand grow at different speeds, and several teams need the same data at the same time.
+how: Keep the data in object storage, which is cheap, durable (11 nines on S3) and shared. Compute is a set of clusters that you start on demand, and they read the data over the network. Each job gets its own cluster, so a heavy ETL job does not slow down the dashboard users.
+You scale each side alone: add storage without paying for CPUs, and add CPUs for an hour without moving data. Idle clusters are stopped, so you stop paying for them. A catalog or table format tells the compute which files make up a table.
+The cost is network latency: object storage reads take tens of milliseconds, not microseconds. Engines hide this with local SSD caches, large sequential reads and column pruning.
+used: Snowflake, Databricks, BigQuery, Amazon Athena and Redshift Spectrum; Trino on S3; Apache Iceberg and Delta tables.
+avoid: For low-latency OLTP, where every read must be a few milliseconds; use local or block storage.
+flow:
+  Object storage [lake: S3] -> ETL cluster [svc: nightly 64 nodes] : read Parquet | The nightly job reads the files, and the cluster ends when the job ends.
+  Object storage -> BI cluster [svc: always on 8 nodes] : read Parquet | The dashboard cluster reads the same files at the same time.
+  BI cluster -> SSD cache [cache: local disk] : hot files | Hot files are cached on local SSD to hide object-store latency.
+  ETL cluster -> Object storage : write new files | The ETL job writes new files and a new table version.
+  Table catalog [svc: Iceberg or Delta] -> BI cluster : current file list | The catalog tells every cluster which files belong to the table now.
+ref: paper | The Snowflake Elastic Data Warehouse | Dageville et al., SIGMOD 2016 |
+
+== Direct-to-storage upload with a pre-signed URL
+kind: valet-key, event-driven
+when: Clients upload large files, and your servers should not carry the bytes.
+how: The client asks your API for permission to upload. The API checks who the user is, then creates a pre-signed URL: a link to one object key, valid for a short time (for example 15 minutes) and signed with the server's credentials. The client sends the file straight to object storage with that URL.
+The API never touches the data, so it stays small and cheap. Object storage scales to any number of parallel uploads and supports multipart upload for big files.
+When the object is created, the storage service emits an event. It goes to a queue or a function that validates the file, scans for malware and starts processing. This makes the whole flow event-driven, with no polling.
+used: Amazon S3 pre-signed URLs with S3 event notifications; Google Cloud Storage signed URLs; Azure SAS tokens; video and photo upload services.
+avoid: When the server must inspect or transform every byte before storing it; then stream through a service.
+flow:
+  Browser [client] -> Upload API [svc: checks auth] : request upload, file.mp4 | The client asks to upload and proves who it is.
+  Upload API -> Browser : pre-signed URL, 15 min | The API returns a signed link for one key, with a short expiry.
+  Browser -> Object storage [lake: S3] : PUT file, multipart | The file goes straight to storage, not through the API.
+  Object storage ~> Event queue [queue: SQS] : ObjectCreated | Storage emits an event after the object is complete.
+  Event queue -> Processor [svc: function] : event | A worker validates, scans and transcodes the file.
+  Browser -x> Object storage : URL expired | After expiry the same link is rejected.
+ref: docs | Sharing objects with presigned URLs | Amazon S3 User Guide | https://docs.aws.amazon.com/AmazonS3/latest/userguide/ShareObjectPreSignedURL.html
+
+@@ containers
+== Sidecar container in a pod
+kind: sidecar, service-mesh
+when: Every service needs the same helper, such as a proxy, a log shipper or a certificate refresher, in any language.
+how: A pod holds several containers that share one network namespace (one IP, localhost) and can share volumes. The main app container does the business work. A second container, the sidecar, runs the helper next to it.
+In a service mesh, the sidecar is a proxy such as Envoy. Outgoing calls from the app are redirected to it, and it adds mutual TLS, retries and metrics. In a logging setup, the app writes files to a shared volume and a shipper like Fluent Bit reads and forwards them.
+The sidecar lives and dies with the pod, and you update it without changing app code. The cost is extra memory and CPU in every pod, plus extra network hops. Since Kubernetes 1.33, native sidecar containers (init containers with restartPolicy Always) start before the app and stop after it.
+used: Istio and Linkerd sidecar mode; Fluent Bit and Vector log shippers; Cloud SQL Auth Proxy.
+avoid: When there are thousands of tiny pods and the overhead matters; a per-node agent or ambient mesh uses less.
+flow:
+  Caller [client] -> Envoy sidecar [svc: same pod] : HTTPS request | Traffic reaches the pod and the sidecar proxy takes it first.
+  Envoy sidecar -> App container [svc: port 8080] : plain HTTP on localhost | The sidecar ends TLS and calls the app over the shared localhost.
+  App container -> Shared volume [store: emptyDir] : write log files | The app only writes files and knows nothing about the log backend.
+  Fluent Bit sidecar [svc: log shipper] -> Shared volume : tail files | A second sidecar reads the same volume.
+  Fluent Bit sidecar -> Log backend [store: Loki or Elasticsearch] : batched logs | Logs are sent in batches to central storage.
+ref: docs | Sidecar containers | Kubernetes documentation | https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/
+
+== Build once, promote the same image
+kind: immutable-infra, blue-green
+when: Teams ship often, and staging and production must run exactly the same bits.
+how: CI builds an image from a Dockerfile. Each instruction adds a read-only layer, and unchanged layers are cached, so rebuilds take seconds. CI pushes the image to a registry and refers to it by its content digest (sha256), which cannot change, not by a movable tag.
+The same digest is deployed to staging, and later to production. Only configuration and secrets differ, and they are injected at start. A node pulls only the layers it does not have, and the runtime stacks them with overlayfs and adds a thin writable layer.
+Rollback is a deploy of the old digest. Nothing is patched in place, so servers do not drift. Scan the image for known vulnerabilities in CI and sign it, so only trusted digests can run.
+used: Docker and OCI registries (Docker Hub, ECR, GHCR); Kubernetes deployments by digest; Sigstore cosign for signing.
+avoid: For data that must survive, such as database files; keep state in volumes, not in image layers.
+flow:
+  CI pipeline [svc: build and scan] -> Registry [store: OCI images] : push image, sha256 digest | CI pushes layers once and records the content digest.
+  Registry -> Staging node [svc: containerd] : pull missing layers | The node pulls only layers it does not already have.
+  Staging node -> CI pipeline : tests pass | Tests run against the exact digest that will go to production.
+  Registry -> Prod node [svc: containerd] : pull same digest | Production runs the same bits, with different config.
+  Prod node -x> Registry : tag moved, not used | Using the digest means a changed tag cannot swap the image.
+ref: spec | OCI Image Format Specification | Open Container Initiative | https://github.com/opencontainers/image-spec
+
+== Resource limits as a bulkhead on a shared node
+kind: bulkhead
+when: Many tenants or services share one machine, and one runaway process must not hurt the others.
+how: Each container runs in its own cgroup with limits. A memory limit of 512 MiB is a hard cap. A CPU limit uses the kernel's fair scheduler quota, so a container that wants more is throttled, not killed. Kubernetes requests tell the scheduler where the pod fits, and limits cap use at run time.
+If a container passes its memory limit, the kernel's OOM killer ends only the processes in that cgroup. The other containers on the node are not touched, and the orchestrator restarts the dead one. Namespaces keep each container's processes and network private.
+Limits must be chosen with care. A CPU limit that is too low causes latency spikes through throttling, and a memory limit that is too low causes restarts. Watch throttling and OOM metrics.
+used: Kubernetes pod resources and quality-of-service classes; Docker --memory and --cpus; multi-tenant CI runners.
+avoid: For hard security isolation between hostile tenants; use micro-VMs, which have separate kernels.
+flow:
+  Orchestrator [svc: scheduler] -> Node [svc: Linux kernel] : place pods by requests | The scheduler puts pods where the requested CPU and memory fit.
+  Node -> Service A [svc: limit 512 MiB] : start in own cgroup | Each container gets its own cgroup with a memory and CPU cap.
+  Node -> Batch job B [svc: limit 256 MiB] : start in own cgroup | Job B shares the node but not the memory budget.
+  Batch job B -x> Node : leaks past 256 MiB | The leak hits the cgroup limit.
+  * Batch job B: OOM killed | The kernel kills only job B; service A keeps serving.
+  Orchestrator -> Batch job B : restart | The orchestrator restarts job B with backoff.
+ref: docs | Resource Management for Pods and Containers | Kubernetes documentation | https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+
+@@ coordination
+== Leader election with a lease and fencing token
+kind: leader-election, lease, fencing-token
+when: Only one instance may do a job at a time, such as run a scheduler, but the job must continue if that instance dies.
+how: All replicas try to create the same key in etcd or ZooKeeper, attached to a lease with a time to live (TTL), for example 15 seconds. The first create succeeds and that replica is the leader. The others watch the key.
+The leader keeps its lease alive with heartbeats. If it crashes, the lease expires after the TTL, the key is deleted, and the watchers wake up and race again. The coordination service is a consensus cluster, so only one create can win.
+A paused leader (for example a long GC pause) may still believe it is the leader. So each election also gives a number that only grows, such as the etcd revision. The leader sends this token with every write, and storage rejects tokens older than the latest it has seen. Without this, two leaders can corrupt data.
+used: Kubernetes controller-manager and scheduler leader election with Lease objects; etcd election API; Kafka's older ZooKeeper controller election.
+avoid: When the work can be safely repeated by any replica (idempotent); then skip election and let all run.
+flow:
+  Replica A [svc: candidate] -> etcd [db: Raft, 3 nodes] : create key with lease 15s | The first create wins, so A becomes the leader.
+  Replica B [svc: candidate] -x> etcd : create fails, key exists | B loses the race and watches the key.
+  Replica A -> etcd : keep-alive every 5s | The leader renews its lease to stay the leader.
+  Replica A -> Storage [store: checks token] : write, token 41 | Each write carries the fencing token from the election.
+  * Replica A: crashed | A stops sending keep-alives.
+  etcd ~> Replica B : key deleted | After the TTL, the key expires and B is notified.
+  Replica B -> Storage : write, token 42 | The new leader has a higher token, so any late write with token 41 is rejected.
+ref: blog | How to do distributed locking | Martin Kleppmann, 2016 | https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+
+== Consistent core for cluster metadata
+kind: consistent-core, consensus-log
+when: A large cluster needs one agreed view of metadata, such as who leads each partition, but its data path must stay fast.
+how: A small group of 3 or 5 nodes runs a consensus protocol (Raft in etcd and Kafka KRaft, ZAB in ZooKeeper). It stores only small, important data: topic definitions, partition leaders, membership. Every change is an entry in a replicated log, committed when a majority has stored it.
+The large data cluster does not run consensus for its data. Brokers read the metadata log from the core and cache it. When a broker misses its heartbeats, the core marks it dead and picks new leaders for its partitions. Clients see one consistent answer.
+Three nodes tolerate one failure, and five tolerate two. A write needs a majority round trip, so the core handles hundreds to thousands of writes per second, not millions. Keep the core small and never put bulk data in it.
+used: Kafka KRaft controllers (Kafka 4.0 removed ZooKeeper); Kubernetes keeps all cluster state in etcd; HBase and ClickHouse Keeper use a ZooKeeper-style core.
+avoid: For high-volume data; shard the data cluster and keep only its metadata in the core.
+flow:
+  Admin client [client] -> Controller leader [svc: KRaft quorum of 3] : create topic | The request goes to the leader of the consensus group.
+  Controller leader -> Controller follower 1 [svc: replica], Controller follower 2 [svc: replica] : append log entry | The leader copies the entry to the followers.
+  Controller follower 1 -> Controller leader : ack | One follower plus the leader is a majority of 3, so the entry commits.
+  Broker 1 [svc: data node] -> Controller leader : heartbeat | Brokers send heartbeats so the core knows who is alive.
+  Controller leader -> Broker 1 : metadata records | Brokers fetch the committed metadata and cache it.
+  Broker 1 -x> Controller leader : heartbeats stop | If a broker goes silent, the leader marks it fenced and moves its partitions.
+ref: paper | In Search of an Understandable Consensus Algorithm | Ongaro & Ousterhout, USENIX ATC 2014 |
+ref: docs | KRaft overview | Apache Kafka documentation | https://kafka.apache.org/documentation/#kraft
+
+== Service registry with ephemeral nodes and watches
+kind: service-discovery, heartbeat
+when: Instances come and go, and clients must find the live ones without a hard-coded list.
+how: Each service instance opens a session with the coordination service and creates an ephemeral node, for example /services/api/10.0.1.7, holding its address. The node exists only while the session lives, and the session lives only while heartbeats arrive.
+Clients list the children of /services/api and set a watch. When an instance joins or its session expires, the service deletes or adds the node and sends the watchers a notification. Clients then re-read the list. ZooKeeper watches fire once, so the client must set a new watch after each event.
+The same tree can hold configuration: clients watch a config node and reload on change. Reads can be served by any server in the cluster and may be slightly stale, while writes are ordered by the leader.
+used: ZooKeeper-based discovery in older Hadoop, Kafka and Solr clusters; Apache Curator recipes; etcd watches under Kubernetes; Consul as a registry with its own gossip.
+avoid: For very large fleets with high churn; a DNS or mesh registry with health checks scales better.
+flow:
+  API instance [svc: 10.0.1.7] -> ZooKeeper [db: 3-node ensemble] : create ephemeral node | The instance registers its address in a node tied to its session.
+  API instance -> ZooKeeper : session heartbeat | Heartbeats keep the session, and so the node, alive.
+  Client service [svc] -> ZooKeeper : list children, set watch | The client reads the live instances and asks to be told about changes.
+  Client service -> API instance : request | The client calls an instance from its list.
+  API instance -x> ZooKeeper : crash, heartbeats stop | The instance dies without saying goodbye.
+  ZooKeeper ~> Client service : watch event, node deleted | After the session timeout, the node is deleted and the client is notified.
+ref: docs | ZooKeeper recipes and solutions | Apache ZooKeeper documentation | https://zookeeper.apache.org/doc/current/recipes.html
+
+@@ multiregion
+== Warm standby in a second region
+kind: active-passive
+when: A region outage is rare but must not end the business, and you accept a few minutes of downtime and a little data loss.
+how: One region serves all traffic. A second region holds a copy of the database through asynchronous replication, and a small, scaled-down copy of the app. Replication lag is usually seconds, and this lag is the RPO (the data you may lose). The time to switch is the RTO.
+A health check watches the primary. When it fails for several checks in a row, a person or an automated runbook promotes the standby database, scales up the standby app, and changes DNS or the global load balancer to the second region. A low DNS TTL (about 60 seconds) makes clients move fast.
+Practice the failover, because untested plans fail. Failing back is a second migration: the old primary must be rebuilt as a replica. Cost is lower than active-active, because the standby app runs small.
+used: AWS Aurora Global Database or RDS cross-region replicas with Route 53 failover; Azure Site Recovery; PostgreSQL streaming replication to another region.
+avoid: When the target RTO is seconds or RPO is zero; use active-active or synchronous replication.
+flow:
+  Users [user] -> Global DNS [svc: health checks] : app.example.com | DNS answers with the primary region while its health check passes.
+  Global DNS -> Primary region [svc: full size] : requests | All traffic goes to region 1.
+  Primary region -> Primary DB [db: region 1] : writes | Writes go to the primary database.
+  Primary DB ~> Standby DB [db: region 2 replica] : async replication, lag 2s | Changes are copied after commit, so a crash can lose the last 2 seconds.
+  Global DNS -x> Primary region : health check fails | The primary region stops answering health checks.
+  Global DNS -> Standby region [svc: scaled down] : fail over, promote DB | The standby database is promoted and the standby app is scaled up. Traffic moves here.
+ref: docs | Disaster recovery options in the cloud | AWS Well-Architected Framework | https://docs.aws.amazon.com/whitepapers/latest/disaster-recovery-workloads-on-aws/disaster-recovery-options-in-the-cloud.html
+
+== Active-active with local writes and conflict merge
+kind: multi-region, crdt
+when: Users are worldwide, every region must accept writes with low latency, and a region loss must cause no outage.
+how: Each region runs the full stack and its own copy of the data. GeoDNS or anycast sends a user to the nearest healthy region. A write is committed in the local region, in milliseconds, and then replicated to the other regions in the background, usually within a second.
+Two regions may change the same item at once. The system needs a merge rule. The simplest is last writer wins by timestamp, which can lose one update. Better rules are CRDTs (counters, sets) that merge without loss, or app-level merging. Another way is to give each user a home region, so most writes never conflict.
+If a region fails, DNS moves its users to the next region. The data of the last second may reach them late, so the app must accept stale reads. This costs more: you pay for full capacity in every region, plus cross-region transfer.
+used: DynamoDB global tables (last writer wins); Cassandra with multiple data centers; Redis Enterprise CRDB; Azure Cosmos DB multi-region writes.
+avoid: For data that needs strict uniqueness or balances, such as payments; there use a single-writer or consensus design.
+flow:
+  EU user [user] -> EU region [svc: app + table] : write cart item | The user is routed to the nearest region and the write commits locally.
+  EU region -> EU table [db: local replica] : local commit, 8 ms | The write is acknowledged after the local commit, with no cross-ocean wait.
+  EU table ~> US table [db: local replica] : async replicate, under 1s | The change is sent to the other region in the background.
+  US user [user] -> US region [svc: app + table] : write same cart | A user in the US changes the same item at about the same time.
+  US region -> US table : local commit | The US region also commits locally. Now both tables hold different values.
+  US table -> EU table : merge, newest wins | On replication, the merge rule picks one value, so both regions end up equal.
+ref: paper | Dynamo: Amazon's Highly Available Key-value Store | DeCandia et al., SOSP 2007 |
+ref: paper | Conflict-free Replicated Data Types | Shapiro et al., SSS 2011 |
+
+== Synchronous consensus across regions
+kind: consensus-log, quorum
+when: You need zero data loss and strong consistency even if a whole region fails, and you can pay latency for it.
+how: Each data range is replicated by a consensus group (Paxos or Raft) with replicas in three regions. A write goes to the group leader. The leader sends it to the replicas, and commits when a majority, 2 of 3, has stored it. So the write waits for the nearest other region, not the farthest.
+The commit latency is therefore about one round trip to the second-nearest region, for example 10 to 70 ms depending on distance. If one region is lost, the other two still form a majority, and a new leader is chosen within seconds. RPO is zero and RTO is seconds.
+Reads are the cost saver. The leader can read locally, and follower replicas can serve slightly stale reads. Placing leaders near the users who write each range (leader preferences) keeps most writes fast.
+used: Google Spanner multi-region configurations; CockroachDB with survive-region-failure; YugabyteDB; Azure Cosmos DB with strong consistency.
+avoid: When writes must be a few milliseconds from every continent; use local writes with async replication.
+flow:
+  App [client] -> Leader replica [svc: region A] : write row | The write goes to the leader of the data range.
+  Leader replica -> Replica B [svc: region B], Replica C [svc: region C] : append log entry | The leader sends the entry to both other regions in parallel.
+  Replica B -> Leader replica : ack, 12 ms | The nearest region answers first.
+  * Leader replica: committed with 2 of 3 | A majority holds the entry, so the write is durable.
+  Leader replica -> App : commit ok | The app waits only for the second-nearest region.
+  Replica C -x> Leader replica : region C offline | Losing one region does not stop writes, because A and B are still a majority.
+ref: paper | Spanner: Google's Globally Distributed Database | Corbett et al., OSDI 2012 |
+
+@@ orchestration
+== Reconciliation control loop
+kind: control-loop
+when: You want to declare a goal state, such as 3 copies of a service, and have the system keep it true even when machines fail.
+how: The user submits desired state to the API server, which stores it in etcd. A controller watches that state and the real state. When they differ, it takes small actions to close the gap, and then looks again. It is a loop that never ends; it does not run a script once.
+For a Deployment of 3 replicas, the Deployment controller makes a ReplicaSet. The ReplicaSet controller counts pods. If a node dies and only 2 pods are left, it creates a third. Controllers are level-triggered: they compare states and do not depend on seeing every event, so a missed event is repaired on the next pass.
+Many controller copies run for availability, but only one is active, chosen by a lease. Each controller does one narrow job, so new features are added as new controllers (operators) without changing the core.
+used: Kubernetes controllers and operators; Terraform plan and apply (a one-shot version of the idea); Argo CD and Flux.
+avoid: For one-time tasks with strict step order; use a workflow engine.
+flow:
+  kubectl [client] -> API server [svc: validates] : apply, replicas 3 | The user states the goal and does not say how to reach it.
+  API server -> etcd [db: Raft store] : store desired state | The goal is stored durably in etcd.
+  Controller manager [svc: controllers] -> API server : watch Deployments and Pods | The controllers watch for changes, never polling nodes directly.
+  Controller manager -> API server : create 3 Pods | The controller creates the missing pods to match the goal.
+  Node 2 [svc: kubelet] -x> API server : node dies, 1 Pod lost | The kubelet stops reporting, and one pod is gone.
+  Controller manager -> API server : create replacement Pod | The loop sees 2 of 3 and creates one more. The goal is true again.
+ref: docs | Controllers | Kubernetes documentation | https://kubernetes.io/docs/concepts/architecture/controller/
+
+== Filter and score scheduling of pods
+kind: scheduler-agent
+when: Many workloads with different resource needs share a pool of machines, and placement must be quick and fair.
+how: The scheduler watches the API server for pods with no node. For each pod it runs two phases. Filter removes nodes that cannot run the pod: not enough free CPU or memory, a taint the pod does not tolerate, a node selector or affinity rule that does not match.
+Score then ranks the remaining nodes with plugins, for example prefer the least loaded node, spread replicas across zones, or pack tightly to free whole nodes. The pod goes to the best score. This is a heuristic for bin packing, which is hard to solve exactly.
+The scheduler only writes a binding (the node name) in the API. The kubelet agent on that node sees it, starts the containers, and reports status. This split keeps the scheduler simple, and a different scheduler can be used for special jobs such as gang scheduling of GPU jobs.
+used: kube-scheduler; Volcano and Kueue for batch and GPU jobs; Karpenter adds nodes when pods stay pending; Hadoop YARN and Mesos use similar placement.
+avoid: When placement is fixed by hand, such as a single large node for one job.
+flow:
+  API server [svc] -> Scheduler [svc: watches pending Pods] : Pod web-7 has no node | The scheduler sees an unscheduled pod through a watch.
+  Scheduler -> Node 1 [svc: 80% CPU used], Node 2 [svc: 30% CPU used], Node 3 [svc: tainted GPU] : filter and score | Each node is checked for room, taints and affinity.
+  Node 3 -x> Scheduler : filtered out, taint | Node 3 has a taint that the pod does not tolerate.
+  * Scheduler: Node 2 best score | Node 2 has the most free CPU and wins the scoring.
+  Scheduler -> API server : bind Pod to Node 2 | The scheduler writes only the binding.
+  API server ~> Node 2 : kubelet watch fires | The kubelet starts the containers and reports status.
+ref: docs | Kubernetes Scheduler | Kubernetes documentation | https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/
+
+== Rolling update gated by readiness probes
+kind: blue-green, health-check
+when: You must ship a new version without downtime, and stop automatically if the new version is broken.
+how: A Deployment replaces pods in small steps. With maxSurge 25 percent and maxUnavailable 25 percent, it starts a few new pods and removes a few old ones, so capacity never drops far.
+A new pod receives traffic only after its readiness probe passes, for example GET /healthz returns 200. Until then it is not in the Service endpoints. If the probe never passes, the rollout stalls, and the old pods keep serving. The operator sees the stall and runs a rollback to the previous ReplicaSet.
+Old pods get SIGTERM, are removed from endpoints, and have a grace period (30 seconds by default) to finish requests. For safer releases, use a canary (a few percent of traffic) or blue-green with two full copies. Rolling updates mean two versions run at once, so schema and API changes must be compatible.
+used: Kubernetes Deployments; Argo Rollouts and Flagger for canary steps; Amazon ECS rolling updates.
+avoid: When two versions cannot run together, such as an incompatible data format; use a maintenance window or blue-green.
+flow:
+  Deployment controller [svc: maxSurge 25%] -> New pod v2 [svc: starting] : create pod | The controller adds a v2 pod before it removes any v1 pod.
+  New pod v2 -> Service endpoints [svc: routes traffic] : readiness probe OK | After the probe passes, the pod is added to the endpoints.
+  Users [user] -> Service endpoints : requests | Users reach v1 and v2 pods during the rollout.
+  Deployment controller -> Old pod v1 [svc: draining] : SIGTERM, 30s grace | A v1 pod is removed from endpoints and then told to stop.
+  New pod v2 -x> Service endpoints : probe fails | If the probe keeps failing, the pod gets no traffic.
+  * Deployment controller: rollout paused | The rollout stops and v1 pods keep serving, until someone rolls back.
+ref: docs | Performing a Rolling Update | Kubernetes documentation | https://kubernetes.io/docs/tutorials/kubernetes-basics/update/update-intro/
+
+@@ serverless
+== Queue-triggered functions with a dead-letter queue
+kind: competing-consumers, load-leveling, dead-letter
+when: Work arrives in bursts, and each item can be processed alone and then forgotten.
+how: Producers put messages in a queue such as Amazon SQS. The platform polls the queue for you and starts function instances that take batches, for example 10 messages at a time. More messages mean more concurrent instances, and when the queue is empty, instances stop. You do not run a worker fleet.
+The queue absorbs a burst, so a slow database behind the function is not overrun. Set a maximum concurrency, for example 50, to protect it. If a function fails, the message becomes visible again after a timeout and is retried. After a set number of tries, for example 5, the message moves to a dead-letter queue for study.
+Delivery is at least once, so the function must be idempotent. The batch can partly fail, so the function should report which messages failed, and not fail the whole batch.
+used: AWS Lambda with SQS event source mapping; Google Cloud Run with Pub/Sub push; Azure Functions with Service Bus triggers.
+avoid: For steady high load, where always-on containers cost less; and for work that takes more than the function time limit.
+flow:
+  Producer [svc] -> Work queue [queue: SQS] : message | Producers add messages at any speed, and the queue holds them.
+  Work queue -> Function [svc: up to 50 instances] : batch of 10 | The platform polls and starts instances in proportion to the backlog.
+  Function -> Orders DB [db: limited connections] : write result | The concurrency cap keeps the load on the database safe.
+  Function -x> Work queue : error, message returns | A failed message becomes visible again after the timeout.
+  Work queue ~> Dead-letter queue [queue: DLQ] : after 5 failed tries | A message that keeps failing is moved aside, so it stops blocking work.
+ref: docs | Using Lambda with Amazon SQS | AWS Lambda documentation | https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html
+
+== Function behind an API gateway with a connection proxy
+kind: api-gateway, horizontal-scale
+when: An HTTP API has spiky or low traffic, and you want to pay per request and run no servers.
+how: The API gateway receives the HTTPS request, checks authentication and rate limits, and invokes a function with the request as JSON. If no idle instance exists, the platform starts a new sandbox (a micro-VM or container): a cold start of roughly 100 ms to a few seconds, depending on runtime and package size. Later requests reuse the warm instance.
+A function instance handles one request at a time, so 1,000 concurrent requests create 1,000 instances. If each opens a database connection, a classic database with a limit of a few hundred connections fails. A connection proxy (such as RDS Proxy) pools connections and shares a few hundred among thousands of instances.
+Keep functions stateless; data goes to the database or object storage. To reduce cold starts, use provisioned concurrency, snapshots, or small packages.
+used: Amazon API Gateway with AWS Lambda and RDS Proxy; Google Cloud Run functions; Cloudflare Workers; Azure Functions.
+avoid: For long-running or very steady traffic, and for latency-critical paths that cannot take a cold start; use containers.
+flow:
+  Client [client] -> API gateway [svc: auth, rate limit] : POST /orders | The gateway authenticates the call and applies limits first.
+  API gateway -> Function [svc: new sandbox] : invoke | No warm instance is free, so the platform starts a sandbox. This is the cold start.
+  Function -> Connection proxy [svc: RDS Proxy] : reuse pooled connection | Instances share a small pool and do not open new database connections.
+  Connection proxy -> Postgres [db: 200 connections max] : SQL | The proxy keeps total connections below the database limit.
+  Function -x> Postgres : direct, 1,000 connections | Without the proxy, a burst of instances exhausts connections and requests fail.
+  Function -> Client : 201 Created | The response returns through the gateway, and the instance stays warm for later requests.
+ref: docs | Using Amazon RDS Proxy with AWS Lambda | AWS documentation | https://docs.aws.amazon.com/lambda/latest/dg/services-rds.html
+
+== Workflow state machine with compensation
+kind: saga
+when: A business process spans several functions or services, takes time, and must be undone cleanly if a step fails.
+how: Each function is small and stateless, so the process state must live somewhere else. A workflow service (AWS Step Functions, Azure Durable Functions, Temporal) holds a state machine. It calls step 1, saves the result, calls step 2, and so on. It keeps the state while it waits, which can be days, and you pay nothing while it waits.
+Each step has a retry rule with backoff and a catch rule. If charging payment fails after stock was reserved, the catch path runs the compensation step: release the stock. This is a saga, because there is no distributed transaction across services.
+The workflow service gives a visible history of each run, which helps debugging. Steps must be idempotent, since a retry may run a step twice. Choose the central coordinator when the flow is complex; for simple flows, events between services are enough.
+used: AWS Step Functions with Lambda; Azure Durable Functions; Temporal and Cadence for code-based workflows.
+avoid: For a single short step; call the function directly. And for very high-rate, millisecond flows, where state transitions cost too much.
+flow:
+  Order API [svc] -> Workflow engine [svc: state machine] : start order 7 | A request starts a run of the state machine.
+  Workflow engine -> Reserve stock [svc: function] : step 1 | The engine calls the first function and stores its result.
+  Workflow engine -> Charge payment [svc: function] : step 2 | The next step runs only after step 1 succeeded.
+  Charge payment -x> Workflow engine : card declined | Step 2 fails after retries.
+  Workflow engine -> Release stock [svc: function] : compensate step 1 | The catch path undoes the earlier step.
+  * Workflow engine: order 7 cancelled | The run ends in a clean, known state.
+ref: paper | Sagas | Garcia-Molina & Salem, SIGMOD 1987 |
+ref: docs | AWS Step Functions: error handling | AWS documentation | https://docs.aws.amazon.com/step-functions/latest/dg/concepts-error-handling.html
+
+@@ virtualization
+== Micro-VM per tenant or function
+kind: bulkhead, immutable-infra
+when: You run code from many mutually untrusted tenants on shared servers, and need a strong wall between them with fast start.
+how: Each function or sandbox runs in its own micro-VM on KVM, with its own guest kernel. A container shares the host kernel, so one kernel bug can expose all tenants. A VM boundary is much harder to cross, because the guest only reaches the host through a small virtual device model.
+Firecracker is a minimal virtual machine monitor: it has a few devices and no BIOS, so a micro-VM starts in about 125 ms and uses about 5 MiB of overhead. A host can run thousands of them. A pool of pre-booted or snapshot-restored VMs hides even that start time.
+The orchestrator places each invoke on a host, assigns a micro-VM and reuses it while it is warm. Hardware side channels remain a risk, so providers also avoid putting different tenants on the same core at the same time.
+used: AWS Lambda and AWS Fargate (Firecracker); Fly.io Machines; Kata Containers and gVisor are alternatives with the same goal.
+avoid: When all code is trusted and start cost matters little; plain containers use less memory.
+flow:
+  Invoke API [svc] -> Placement [svc: picks a host] : run function F | The control plane chooses a worker host with free capacity.
+  Placement -> Worker host [svc: KVM + Firecracker] : start sandbox | The host receives the request to run function F.
+  Worker host -> MicroVM A [svc: tenant 1] : restore snapshot, 125 ms | A micro-VM is started or restored from a snapshot.
+  Worker host -> MicroVM B [svc: tenant 2] : start for another tenant | A second tenant runs on the same host, in a separate VM.
+  MicroVM A -x> MicroVM B : cannot reach memory | The hypervisor and nested page tables block direct access between guests.
+ref: paper | Firecracker: Lightweight Virtualization for Serverless Applications | Agache et al., NSDI 2020 |
+
+== Live migration for host maintenance
+kind: live-migration
+when: A host must be patched or drained, and the VMs on it must not stop.
+how: The hypervisor copies the VM's memory to another host while the VM keeps running. It first copies all pages. The VM keeps writing, so some pages become dirty. The hypervisor copies the dirty pages again, and repeats this in rounds until the remaining set is small.
+Then it pauses the VM for a short time, often tens of milliseconds, sends the last dirty pages and the CPU state, and resumes the VM on the new host. Network traffic is redirected to the new host, and disk data is shared storage or copied too.
+A VM that writes memory very fast may never converge, so the system limits its speed or falls back to post-copy (run on the target first, fetch pages on demand). Direct device assignment (a GPU passed through) makes live migration hard, so such VMs are usually restarted instead.
+used: VMware vMotion; KVM and QEMU live migration; Google Compute Engine live migrates VMs during host maintenance; Hyper-V.
+avoid: For VMs with passed-through devices or huge fast-changing memory; schedule a restart instead.
+flow:
+  Maintenance system [svc] -> Host 1 [svc: source, VM running] : drain host | An operator or an automated system decides to empty host 1.
+  Host 1 -> Host 2 [svc: target] : copy all memory pages | Round 1 copies the whole memory while the VM keeps running.
+  Host 1 -> Host 2 : copy dirty pages, 3 rounds | Each round copies the pages changed since the last, and the set shrinks.
+  * Host 1: VM paused 30 ms | When few pages remain, the VM is paused for a very short time.
+  Host 1 -> Host 2 : last pages + CPU state | The final pages and the CPU registers are sent.
+  Host 2 -> Network [svc: switch or SDN] : announce new location | The VM resumes on host 2, and the network sends its traffic there.
+ref: paper | Live Migration of Virtual Machines | Clark et al., NSDI 2005 |
+
+== Golden image with copy-on-write clones
+kind: copy-on-write, immutable-infra
+when: You must start many identical VMs fast, and keep them identical and easy to replace.
+how: A build job (for example Packer) creates a golden image: a disk with the OS and the software installed. The image is read-only and has a version. Each new VM does not copy the disk. It gets a thin copy-on-write overlay (qcow2 backing file, or a snapshot-based volume) that stores only the blocks that this VM writes.
+Creating a VM takes seconds, and 100 VMs share one base, so storage use is small. Per-VM settings come at boot from cloud-init or instance metadata. If a VM is damaged, you discard its overlay and create a new one.
+To patch, build a new image version and roll instances to it, rather than updating running servers. This stops configuration drift. The cost is a build pipeline, and long-lived data must live on separate volumes.
+used: AWS AMIs and EBS snapshots; OpenStack Glance with Ceph clones; libvirt and QEMU qcow2 backing files; VMware linked clones.
+avoid: For pet servers with unique state; or when you need full independent disks for performance isolation.
+flow:
+  Image build [svc: Packer] -> Golden image [store: v42] : bake OS and software | The build job produces a new, versioned image.
+  Golden image -> Hypervisor [svc: KVM host] : base for new VMs | The host reads the same base image for every clone.
+  Hypervisor -> VM 1 [svc: overlay 120 MB] : create overlay, 2s | Each VM gets a small overlay file, not a full copy.
+  Hypervisor -> VM 2 [svc: overlay 90 MB] : create overlay, 2s | A second clone shares the same base.
+  VM 1 -> Overlay file [store: per-VM blocks] : writes go to overlay | Changed blocks are written to the overlay; the base is never changed.
+  Image build -> Hypervisor : roll to v43 | A patch means a new image version and new VMs, not changes in place.
+ref: docs | QEMU disk images: qcow2 backing files | QEMU documentation | https://www.qemu.org/docs/master/system/images.html
+
+@@ wsc
+== One shared cluster with priorities and preemption
+kind: scheduler-agent, priority-queue
+when: You run thousands of services and batch jobs, and separate clusters for each would leave most machines idle.
+how: All work shares one large cluster (a cell). Jobs carry a priority and a resource request. The scheduler places both serving tasks and batch tasks on the same machines, and an agent on each machine starts and watches the tasks. Mixing them raises machine use, because serving jobs reserve more than they use.
+Serving jobs are high priority. Batch jobs are low priority and can be killed at any time. When a serving job needs more room, for example in a traffic spike, the scheduler preempts (evicts) batch tasks on that machine. The batch tasks go back to the queue and run later or elsewhere.
+Because batch tasks are built to restart, the loss is small. The scheduler state is replicated, for example by Paxos, so the scheduler itself survives failure. Cost is also an engineering rule: the fleet is bought for serving peaks and batch fills the gaps.
+used: Google Borg (the model for Kubernetes); Meta Twine; Kubernetes with priority classes and preemption; Hadoop YARN queues.
+avoid: For work that cannot be restarted or must have a fixed machine, such as some licensed or hardware-bound jobs.
+flow:
+  Web service [svc: high priority] -> Cell scheduler [svc: replicated] : submit, 200 tasks | The serving job asks for resources with a high priority.
+  Batch job [svc: low priority] -> Cell scheduler : submit, 5,000 tasks | The batch job accepts low priority and any machine.
+  Cell scheduler -> Machine 17 [svc: agent runs tasks] : place web and batch tasks | Both kinds of task share the machine, so it is well used.
+  * Machine 17: web traffic doubles | A spike makes the web tasks need their full reserved CPU and memory.
+  Cell scheduler -x> Machine 17 : preempt batch tasks | The scheduler evicts the low priority tasks to make room.
+  Cell scheduler ~> Batch job : retry elsewhere later | Evicted batch tasks return to the queue and restart on another machine.
+ref: paper | Large-scale cluster management at Google with Borg | Verma et al., EuroSys 2015 |
+
+== Hedged requests to cut tail latency
+kind: hedged-requests, scatter-gather
+when: A request fans out to many servers, and the slowest server sets the total time.
+how: In a fan-out of 100 leaf servers, if each leaf is slow (over 1 s) in 1 percent of calls, then about 63 percent of user requests see at least one slow leaf. Rare slowness on one machine becomes common slowness for users.
+A hedged request sends the call to one replica first. If no answer comes within a short delay, usually the 95th percentile latency, it sends the same call to a second replica. The first answer wins and the other call is cancelled. This adds only about 5 percent more load, and it cuts the 99.9th percentile sharply.
+It works for idempotent reads, and it needs replicas and spare capacity. Related tools are tied requests (both servers know about each other and cancel when one starts) and removing slow machines from rotation.
+used: Google's search and storage back ends (described in The Tail at Scale); gRPC hedging policy; Cassandra speculative retry; Envoy hedged retries.
+avoid: For non-idempotent writes, and when the system is already overloaded; extra requests make it worse.
+flow:
+  Root server [svc: fan-out to 100] -> Leaf 1 replica A [svc: slow 1s] : query shard 1 | The root asks one replica of each shard.
+  Root server -x> Leaf 1 replica A : no answer in 12 ms | The wait passes the hedge delay (the 95th percentile).
+  Root server -> Leaf 1 replica B [svc: healthy] : same query, hedged | The root sends the same query to a second replica of the shard.
+  Leaf 1 replica B -> Root server : answer in 5 ms | The second replica answers first.
+  Root server -> Leaf 1 replica A : cancel | The slow call is cancelled to save capacity.
+ref: paper | The Tail at Scale | Dean & Barroso, CACM 2013 |
+
+== Replicated storage with automatic repair
+kind: heartbeat, data-locality
+when: Thousands of cheap disks and machines are in use, so some fail every day, and data must not be lost.
+how: A file is cut into large blocks, for example 128 MB in HDFS. Each block is stored on 3 machines. Rack-aware placement puts one copy on the writer's rack and two on another rack, so a rack switch failure leaves a copy. A metadata server (the NameNode or GFS master) keeps the map of blocks to machines.
+Every storage node sends a heartbeat every few seconds, with a list of its blocks. If heartbeats stop for about 10 minutes, the metadata server marks the node dead. It finds blocks that now have only 2 copies and tells other nodes to copy them from a surviving replica. No human is needed.
+The same map lets jobs run near their data: the scheduler starts a task on a machine that holds the block, so the network is not the bottleneck. Three copies cost 3 times the disk, so cold data may use erasure coding, with about 1.5 times the size.
+used: Google File System and Colossus; Apache HDFS; Ceph; object stores that use erasure codes.
+avoid: When data is small and needs transactions; use a replicated database.
+flow:
+  Client [client] -> NameNode [svc: block map] : create file | The client asks where to write each block.
+  Client -> DataNode 1 [svc: rack 1] : write block 7 | The client writes to the first node, which passes the data to the others.
+  DataNode 1 -> DataNode 2 [svc: rack 2], DataNode 3 [svc: rack 2] : pipeline copy | Three copies exist, on two racks.
+  DataNode 2 -> NameNode : heartbeat + block list | Nodes report that they are alive and what they hold.
+  DataNode 3 -x> NameNode : heartbeat stops | A machine dies, and block 7 has only two copies.
+  NameNode -> DataNode 1 : copy block 7 to DataNode 4 | The NameNode orders a new third copy, so replication is restored.
+ref: paper | The Google File System | Ghemawat, Gobioff & Leung, SOSP 2003 |
+ref: book | The Datacenter as a Computer, 3rd ed. | Barroso, Hölzle & Ranganathan, 2018 |
+
+@@ featurestore
+== Offline store for training, online store for serving
+kind: feature-store, online-offline
+when: A model is trained on history in batch but must read the same features in a few milliseconds for each live request.
+how: Features are defined once in code. A batch job computes them from the warehouse and writes the full history to the offline store (a warehouse table or Parquet files). Training reads from there in large scans.
+A materialization job copies only the latest value for each entity (user id, item id) into the online store, a key-value database such as Redis or DynamoDB. At request time, the model service looks up the entity id and gets all its features in a few milliseconds.
+Because both stores come from one definition, training and serving see the same numbers. This removes training-serving skew, the bug where a feature is computed by two different code paths. The trade-off is freshness: the online value is only as new as the last materialization, for example 15 minutes.
+used: Feast (open source); Databricks Feature Store; Tecton; Vertex AI Feature Store; SageMaker Feature Store.
+avoid: When there are few features and one model; computing them in the service is simpler.
+flow:
+  Warehouse [lake: raw events] -> Feature job [svc: batch SQL] : read events | A scheduled job computes features, for example orders in the last 30 days.
+  Feature job -> Offline store [lake: full history] : append rows with timestamp | All values are kept with time stamps for training.
+  Offline store -> Online store [cache: Redis or DynamoDB] : materialize latest | Only the newest value per user is copied for fast lookups.
+  Model service [svc: ranking] -> Online store : get features for user 42 | At request time the service reads all features with one key lookup.
+  Online store -> Model service : 12 values, 3 ms | The values match what the model saw in training.
+ref: docs | Feast documentation: architecture | Feast project | https://docs.feast.dev/getting-started/architecture
+ref: book | Machine Learning Design Patterns | Lakshmanan, Robinson & Munn, O'Reilly 2020 |
+
+== Point-in-time correct training sets
+kind: feature-store, feedback-loop
+when: You build training data from past events, and a feature must show only what was known at the moment of each label.
+how: Take a label table: one row per example, with an entity id, an event time and the outcome, such as a user who clicked at 10:05. For each row, the feature store finds the most recent feature value with a timestamp at or before 10:05. This is an as-of join (point-in-time join).
+A normal join on the entity id alone would use today's value, such as a 30-day purchase count that includes purchases after the click. That is label leakage: the model learns from the future, scores well offline, and then fails in production.
+The offline store keeps all feature values with timestamps so any past moment can be rebuilt. A feature can also have a time to live, so a value that is too old becomes null, as it would be in production. The join is costly for large data, so engines sort and bucket by entity and time.
+used: Feast get_historical_features; Databricks and Tecton point-in-time joins; Spark and BigQuery as-of joins.
+avoid: For features that never change, such as a country code; a normal join is fine then.
+flow:
+  Label table [store: labels] -> Point-in-time join [svc: as-of join] : 10M examples | Each label row has its own event time.
+  Feature history [lake: values with timestamps] -> Point-in-time join : all versions | The store keeps every version of each feature value.
+  Point-in-time join -> Training set [lake: Parquet] : latest value before event | Each example gets the value that was known then.
+  Point-in-time join -x> Training set : value after event time | Values from the future are never used, so there is no leakage.
+  Training set -> Trainer [model: gradient boosting] : fit | The model trains on data that looks like production.
+ref: docs | Point-in-time joins | Feast documentation | https://docs.feast.dev/getting-started/concepts/point-in-time-joins
+
+== Streaming features from one transformation
+kind: windowed-agg, kappa-arch, feature-store
+when: A feature must be fresh within seconds, such as clicks in the last 10 minutes, and must also match the training data.
+how: Events flow through Kafka to a stream job (for example Flink). The job keeps a sliding window per user, such as a count over the last 10 minutes. A watermark decides when late events are too late. It writes each updated value to the online store and appends it to the offline store.
+The same transformation code feeds both stores, so training and serving cannot drift. The online lookup is fresh to within a few seconds, which batch jobs cannot give. For history, the offline store holds all values with timestamps.
+To fix a bug or add a feature to old data, replay the retained Kafka topic through the new job version. The cost is running a stateful stream job around the clock, with checkpoints and monitoring. Use streaming features only where freshness changes the model's accuracy.
+used: Fraud and recommendation systems that use Flink or Spark Structured Streaming with Feast, Tecton or Databricks; ad pacing and click-rate features.
+avoid: For features that change slowly, such as age or country; a daily batch job is cheaper.
+flow:
+  Click topic [log: Kafka] -> Stream job [svc: Flink, 10 min window] : events | The job reads click events in event-time order, within a watermark.
+  Stream job -> Online store [cache: Redis] : clicks_10m = 7 | Each update replaces the user's value, so serving sees fresh data.
+  Stream job -> Offline store [lake: Iceberg table] : same row with time | The same value is appended for training, so there is only one code path.
+  Model service [svc: ranking] -> Online store : get clicks_10m | At request time the service reads the fresh count.
+  Click topic ~> Stream job : replay after code fix | Replay with a new job version rebuilds history from the retained topic.
+ref: docs | Stream processing and event time | Apache Flink documentation | https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/
+
+@@ mlops
+== Training pipeline with a gated model registry
+kind: online-offline, gitops
+when: Models must be retrained often and shipped safely, and each served model must be traceable to its code and data.
+how: Code, pipeline definition and config live in Git. A commit or a schedule starts the pipeline, a DAG run by an orchestrator such as Airflow, Kubeflow or Dagster: validate the data, train, evaluate, then register. Each step is idempotent, so a rerun with the same inputs gives the same output.
+The evaluation step compares the new model with the current production model (the champion) on a fixed test set. If it is not better by a set margin, the pipeline stops. If it passes, the model is saved in the registry with its data version, code commit, parameters and metrics. This gives lineage for audit.
+A person or a rule promotes the version from Staging to Production, and the serving system pulls that version. Rolling back means pointing the alias back to the old version. The cost is the tooling and the discipline to version data.
+used: MLflow Model Registry; Kubeflow Pipelines; SageMaker Pipelines; Vertex AI Pipelines; Databricks with Unity Catalog.
+avoid: For a one-off research model; notebooks and a saved file are enough.
+flow:
+  Git repo [store: code + config] -> Pipeline [svc: Airflow DAG] : commit or schedule | A commit or a timer starts a pipeline run.
+  Pipeline -> Trainer [model: new version] : validated data v12 | The data is checked first, and then the model is trained.
+  Trainer -> Evaluator [svc: vs champion] : test set metrics | The new model is compared with the model in production.
+  Evaluator -x> Pipeline : AUC lower, stop | If the new model is worse, the run ends and nothing is registered.
+  Evaluator -> Model registry [store: versions + lineage] : register v13 | A passing model is stored with its code commit, data version and metrics.
+  Model registry -> Serving [svc: pulls Production alias] : promote v13 | Promotion moves the Production alias to v13, and serving loads it.
+ref: docs | MLflow Model Registry | MLflow documentation | https://mlflow.org/docs/latest/ml/model-registry/
+ref: paper | Hidden Technical Debt in Machine Learning Systems | Sculley et al., NeurIPS 2015 |
+
+== Shadow, then canary model rollout
+kind: shadow-ab, blue-green
+when: A new model scored well offline, but live traffic can differ and a bad model would hurt users.
+how: First run the new model in shadow mode. The router sends every request to the champion, whose answer is returned, and a copy to the challenger, whose answer is only logged. You compare the two on real traffic: latency, error rate, score distribution and, once labels arrive, accuracy. Users are not affected.
+If shadow looks good, start a canary: 1 percent of users get the challenger's answers, then 5, 25 and 100 percent. At each step the system compares business metrics, such as click rate, with the control group, and checks guard metrics such as latency. A bad result triggers an automatic rollback to the champion.
+Keep the previous model loaded for fast rollback. Shadow mode doubles compute cost for a while. For effects that need real user reactions, use an A/B test with statistical power after the canary.
+used: SageMaker shadow variants; Seldon and KServe canary rollouts; Vertex AI traffic split; ad and recommendation ranking systems.
+avoid: When the model has side effects that cannot be copied or hidden, such as a model that sends messages.
+flow:
+  Router [svc: traffic split] -> Champion v12 [model: serves 100%] : request | Every user request goes to the current model.
+  Router ~> Challenger v13 [model: shadow] : copy of request | A copy goes to the new model, and its answer is not shown.
+  Champion v12 -> Prediction log [log: both answers] : score + latency | The log stores the answers of both models for comparison.
+  Challenger v13 -> Prediction log : score + latency | The offline job compares them on real traffic.
+  * Router: canary 5% to v13 | After shadow looks good, 5 percent of users get v13's answers.
+  Challenger v13 -x> Router : guard metric breached | A latency or quality guard fails, and the router returns all traffic to v12.
+ref: book | Designing Machine Learning Systems | Chip Huyen, O'Reilly 2022 |
+
+== Drift monitoring that triggers retraining
+kind: feedback-loop, control-loop
+when: The world changes after deployment, and model quality will fall unless you notice and retrain.
+how: The serving system logs each request's features, the prediction and an id. Later, true labels arrive (a click, a purchase, a chargeback) and are joined to the log by id. A monitor job compares two things regularly: input drift, which means the live feature distribution against the training data (for example a population stability index above 0.2), and quality, which means accuracy or calibration once labels exist.
+Labels are often late, for days or weeks, so input drift and prediction drift are the early signals. When a threshold is crossed, the monitor raises an alert or starts the training pipeline. The new model goes through the same evaluation and rollout gates.
+This closes the loop between serving and training. Retrain on a schedule too, because a threshold can miss slow decay. Avoid automatic retraining without gates, since bad new data can poison the model.
+used: Evidently AI and WhyLabs style monitors; SageMaker Model Monitor; Vertex AI Model Monitoring; fraud and ad-click models that retrain daily.
+avoid: For static problems with stable data, where a fixed model and a yearly review are enough.
+flow:
+  Model service [svc: ranking] -> Prediction log [log: features + score] : log each request | Every prediction is stored with its inputs and a request id.
+  Outcome events [log: labels] -> Prediction log : join by request id | Labels arrive later and are attached to the logged prediction.
+  Prediction log -> Monitor [svc: drift + quality] : daily window | The monitor compares live data with the training baseline.
+  * Monitor: PSI 0.31 on price | A key feature has moved far from training data.
+  Monitor -> Retrain pipeline [svc: DAG] : trigger run | The alert starts the training pipeline with fresh data.
+  Retrain pipeline -> Model service : new version after gates | The new model is deployed only after evaluation and rollout checks.
+ref: book | Designing Machine Learning Systems | Chip Huyen, O'Reilly 2022 |
+
+@@ contentid
+== Fingerprint index with offset voting
+kind: index-table, precompute
+when: A short, noisy clip must be matched against millions of reference tracks within a second.
+how: At ingest, each reference track is turned into a spectrogram. The system keeps only strong peaks, which survive noise and compression, and pairs nearby peaks. Each pair (frequency 1, frequency 2, time difference) becomes a hash of about 32 bits, stored with the track id and the time of the anchor peak. This builds a large inverted index from hash to a list of (track, time).
+At query time, the client makes the same hashes from a few seconds of audio. The server looks up each hash. For every candidate track it builds a histogram of (reference time minus query time). A real match has many hashes with the same offset, and this gives a clear peak. Random matches spread over all offsets.
+Voting makes the match robust to dropped hashes and background noise. The index is sharded by hash, so a lookup is a few fast key reads. Reference building is offline work (precompute), and only the lookup is done online.
+used: Shazam's published algorithm (Wang, 2003); YouTube Content ID and Audible Magic style systems use related fingerprint indexes.
+avoid: For cover versions or remixes, where peaks differ; use learned embeddings and nearest-neighbour search.
+flow:
+  Phone [client: records 5 s] -> Fingerprinter [svc: spectrogram peaks] : audio | The client or server turns audio into peak pairs.
+  Fingerprinter -> Hash index [store: inverted] : 400 hashes | Each hash is a key lookup into the sharded index.
+  Hash index -> Voter [svc: offset histogram] : candidate tracks, times | All tracks that share any hash are returned, with times.
+  * Voter: random hits dropped | Tracks whose offsets are scattered have no peak, so they are dropped.
+  Voter -> Phone : track 8812, offset 61 s | The track with a sharp offset peak is the match.
+ref: paper | An Industrial-Strength Audio Search Algorithm | Avery Wang, ISMIR 2003 |
+
+== Smart-TV ACR from screen samples to events
+kind: batching, event-driven
+when: A TV platform must know what is on screen, for audience measurement and ad targeting, with user consent.
+how: The TV samples video frames or audio about every second. It computes a compact fingerprint on the device, so raw pixels do not leave the TV. It batches fingerprints for some seconds and sends them to the ACR service with a device id.
+On the server, the reference index is built from live channel feeds ingested within seconds, plus libraries of shows and ads. A match gives a content id and a time position. The result is a viewing event: device, channel or program, ad, start and end.
+Events go to a stream (Kafka), and then to reports and audience segments, for example "saw this ad" or "watches live sports". Users must opt in, and laws such as GDPR, CCPA and state rules on video data apply, so consent is checked before any data is used. The cost is the always-on ingest of every channel, and matching at a scale of millions of TVs.
+used: Common in smart-TV platforms: Samba TV, Vizio Inscape and LG Ad Solutions run ACR; Gracenote and others supply program metadata.
+avoid: When there is no consent or the content is not in the reference set; do not fall back to guessing.
+flow:
+  Smart TV [client: samples every 1 s] -> ACR gateway [svc: batches] : fingerprint batch | Fingerprints, not pixels, are sent, in batches to save bandwidth.
+  Channel feeds [svc: live ingest] -> Reference index [store: live and VOD] : new fingerprints | Reference fingerprints for live TV are added within seconds of airing.
+  ACR gateway -> Reference index : look up batch | The gateway searches the index for each fingerprint.
+  Reference index -> Event stream [log: Kafka] : viewing event | Each match becomes an event with content id and time.
+  Event stream -> Audience segments [svc: ad measurement] : consumed | Reports and ad segments are built from the events, for opted-in devices only.
+
+== LSH candidates, then verification
+kind: two-tower-retrieval, scatter-gather
+when: Uploaded video must be checked against a very large reference set, and an exact comparison with every item is too slow.
+how: Each video is reduced to keyframes. Each frame gets a perceptual hash, for example a 64-bit pHash, which changes little after resizing, light compression or small crops. Comparing a frame with every reference frame would take billions of Hamming distance checks.
+Locality-sensitive hashing (LSH) narrows the search. The 64 bits are split into 4 bands of 16 bits, and each band is a bucket key. Two frames that are alike match in at least one band with high probability. Only frames that share a bucket are candidates, perhaps a few hundred.
+A verifier then checks the candidates: Hamming distance under a limit such as 10 bits, and several frames in a row that line up in time. Only verified matches go to the rights policy: block, monetize or track. The index buckets are sharded, and the verifier runs on a small set. This cuts cost while keeping recall high.
+used: Meta's open-source PDQ and TMK hashes; Microsoft PhotoDNA for known abusive images; YouTube Content ID style matching.
+avoid: For edits that change the image strongly, such as heavy crops or filters, where hashes no longer match; use learned embeddings.
+flow:
+  Upload [client: new video] -> Keyframe hasher [svc: 64-bit pHash] : frames | Keyframes are extracted and hashed.
+  Keyframe hasher -> LSH index [store: 4 band buckets] : band keys | Each of the four bands is a key for a bucket lookup.
+  LSH index -> Verifier [svc: Hamming + time] : 300 candidates | Only frames in a shared bucket are checked.
+  * Verifier: distance 24 dropped | Candidates over the bit limit are rejected.
+  Verifier -> Rights policy [svc: rules] : match, reference 4410 | A verified match goes to the rule for that rights holder.
+ref: paper | Similarity Estimation Techniques from Rounding Algorithms | Charikar, STOC 2002 |
